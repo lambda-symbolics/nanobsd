@@ -272,7 +272,7 @@
                           (when (and dpy id)
                             (let ((w (xlib::lookup-window dpy id)))
                               (when w
-                                (xlib:clear-area w :exposures-p t)
+                                (xlib:clear-area w :x 0 :y 0 :width 1 :height 1 :exposures-p t)
                                 (xlib:display-force-output dpy)))))))
                  (ignore-errors (when dpy (xlib:close-display dpy))))))
            :name "lispbsd-ml-refresher"))))
