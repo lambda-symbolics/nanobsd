@@ -2343,7 +2343,7 @@ void
 acpi_enter_freeze(void)
 {
 	struct acpi_softc *sc = acpi_softc;
-	device_t curdev;
+	device_t curdev, parent;
 	deviter_t di;
 
 	if (sc == NULL || sc->sc_sleepstate != ACPI_STATE_S0)
@@ -2387,7 +2387,12 @@ acpi_enter_freeze(void)
 	KERNEL_LOCK(1, NULL);
 	for (curdev = deviter_first(&di, DEVITER_F_ROOT_FIRST);
 	     curdev != NULL; curdev = deviter_next(&di)) {
-		if (!device_is_active(curdev) || acpi_s2idle_keep(curdev))
+		if (device_is_active(curdev) || !device_is_enabled(curdev))
+			continue;
+		if (acpi_s2idle_keep(curdev))
+			continue;
+		parent = device_parent(curdev);
+		if (parent != NULL && !device_is_active(parent))
 			continue;
 		aprint_normal("s2idle: resume %s\n", device_xname(curdev));
 		(void)pmf_device_resume(curdev, PMF_Q_NONE);
