@@ -244,6 +244,9 @@ static void		acpi_sleep_init(struct acpi_softc *);
 static int		sysctl_hw_acpi_fixedstats(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_sleepstate(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_sleepstates(SYSCTLFN_PROTO);
+static int		sysctl_hw_acpi_freeze(SYSCTLFN_PROTO);
+static volatile int	acpi_freeze_active;
+static volatile int	acpi_freeze_wake;
 
 static bool		  acpi_is_scope(struct acpi_devnode *);
 static ACPI_TABLE_HEADER *acpi_map_rsdt(void);
@@ -1792,6 +1795,12 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 	    sysctl_hw_acpi_sleepstates, 0, NULL, 0,
 	    CTL_CREATE, CTL_EOL);
 
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "freeze", SYSCTL_DESCR("Enter s2idle freeze (write 1)"),
+	    sysctl_hw_acpi_freeze, 0, NULL, 0,
+	    CTL_CREATE, CTL_EOL);
+
 	err = sysctl_createv(clog, 0, &rnode, &rnode,
 	    CTLFLAG_PERMANENT, CTLTYPE_NODE,
 	    "stat", SYSCTL_DESCR("ACPI statistics"),
@@ -2300,3 +2309,76 @@ out:
 }
 
 #endif	/* ACPI_ACTIVATE_DEV */
+
+/*
+ * LISPBSD s2idle (freeze): reuse the working pmf suspend/resume halves of the
+ * S3 path but skip the firmware transition (acpi_md_sleep), which never resumes
+ * on this Modern-Standby platform.  Devices go to D3 (display/GPU/WiFi off), the
+ * calling thread polls in a low-power sleep so CPUs idle deep, and a wake source
+ * (power button; see acpi_button.c) clears the flag to resume.
+ */
+void
+acpi_enter_freeze(void)
+{
+	struct acpi_softc *sc = acpi_softc;
+
+	if (sc == NULL || sc->sc_sleepstate != ACPI_STATE_S0)
+		return;
+
+	aprint_normal_dev(sc->sc_dev, "s2idle: freezing (device suspend)\n");
+
+	if (pmf_system_suspend(PMF_Q_NONE) != true) {
+		aprint_error_dev(sc->sc_dev, "s2idle: device suspend failed\n");
+		(void)pmf_system_resume(PMF_Q_NONE);
+		return;
+	}
+
+	sc->sc_sleepstate = ACPI_STATE_S3;
+	acpi_wakedev_commit(sc, ACPI_STATE_S3);
+
+	acpi_freeze_active = 1;
+	acpi_freeze_wake = 0;
+	while (acpi_freeze_wake == 0)
+		kpause("s2idle", false, MAX(1, hz / 10), NULL);
+	acpi_freeze_active = 0;
+
+	acpi_wakedev_commit(sc, ACPI_STATE_S0);
+	(void)pmf_system_resume(PMF_Q_NONE);
+	sc->sc_sleepstate = ACPI_STATE_S0;
+
+	aprint_normal_dev(sc->sc_dev, "s2idle: resumed\n");
+}
+
+bool
+acpi_freeze_wakeup(void)
+{
+	if (acpi_freeze_active != 0) {
+		acpi_freeze_wake = 1;
+		return true;
+	}
+	return false;
+}
+
+static int
+sysctl_hw_acpi_freeze(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node;
+	int err, t;
+
+	if (acpi_softc == NULL)
+		return ENOSYS;
+
+	t = 0;
+	node = *rnode;
+	node.sysctl_data = &t;
+
+	err = sysctl_lookup(SYSCTLFN_CALL(&node));
+
+	if (err || newp == NULL)
+		return err;
+
+	if (t != 0)
+		acpi_enter_freeze();
+
+	return 0;
+}
