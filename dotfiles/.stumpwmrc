@@ -275,7 +275,7 @@
                               (when id
                                 (let ((w (xlib::lookup-window dpy id)))
                                   (when w
-                                    (xlib:clear-area w :exposures-p t)
+                                    (xlib:send-event w :exposure (quote (:exposure)) :window w :x 0 :y 0 :width 8192 :height 100 :count 0)
                                     (xlib:display-force-output dpy))))))
                         (serious-condition ()
                           (ignore-errors (when dpy (xlib:close-display dpy)))
