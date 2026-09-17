@@ -1,0 +1,9 @@
+# LISPBSD: GENERIC without the built-in i915 KMS driver and without genfb on
+# PCI, so the patched i915drmkms module (Tiger Lake force-probe) can claim the
+# GPU when loaded from /etc/modules.conf. Console output appears once the DRM
+# module attaches (intelfb); the machine is always reachable over ssh.
+include "arch/amd64/conf/GENERIC"
+#ident "LISPBSD-$Revision$"
+no i915drmkms* at pci?
+no intelfb* at intelfbbus?
+no genfb* at pci?
