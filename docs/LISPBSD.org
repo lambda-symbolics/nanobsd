@@ -1,0 +1,274 @@
+#+TITLE: lispbsd cheat sheet (ThinkPad X1 Nano, NetBSD 11.0)
+#+STARTUP: showall
+
+Short, task-shaped. Each heading = one thing you might want to do.
+Remote commands from another box: =ssh root@10.0.0.25 /bin/sh -c '...'=
+(root's login shell is cclsh, so wrap remote commands in =/bin/sh=).
+
+* Network
+** Which interface is which
+- =iwx0=  WiFi (Intel AX201, ported driver, module =if_iwx=)
+- =axen0= USB ethernet (Ugreen dongle)
+- =wg0=   WireGuard to velho, this machine is =10.0.0.25=
+- Check: =ifconfig iwx0= (look for =status: active= and =inet=), =netstat -rn -f inet | grep default=
+** Connect to a new WiFi network
+1. Interactive, no reboot needed:
+   #+begin_src sh
+   wpa_cli -i iwx0
+   > scan            # wait 5 s
+   > scan_results
+   > add_network     # prints N
+   > set_network N ssid "Name"
+   > set_network N psk "password"      # open network instead: set_network N key_mgmt NONE
+   > enable_network N
+   > save_config     # writes /etc/wpa_supplicant.conf
+   > quit
+   #+end_src
+2. Or edit =/etc/wpa_supplicant.conf= (all networks from the Linux laptop are already in there) and run =wpa_cli -i iwx0 reconfigure=.
+3. DHCP happens by itself (dhcpcd runs for all interfaces).
+** Reset WiFi if it wedges
+#+begin_src sh
+service wpa_supplicant restart; sleep 10; ifconfig iwx0
+#+end_src
+Nuclear option: =modunload if_iwx; modload if_iwx; service wpa_supplicant restart=.
+** WireGuard
+- Service: =service wgpeer status|restart= (script /etc/rc.d/wgpeer, key in /etc/wireguard/wg0.private).
+- It pings 10.0.0.1 in a loop because NetBSD wg(4) has no persistent-keepalive.
+
+* Power
+** Battery: how much, how long
+=battery= → charge %, state, watts, estimated time left (until empty / until full).
+=battery -s= → one line (used in the StumpWM bar).
+** Brightness
+=brightness= (show %), =brightness 40=, =brightness +10=, =brightness -10=. Keys: XF86 brightness keys in StumpWM.
+The ACPI brightness sysctls do nothing without the GPU driver, so this drives the panel PWM
+directly (=iblc=, root only; =iblc dump= shows the raw registers; non-root goes through the =brightnessd= service). Firmware boots the panel at ~33 %.
+** What saves power
+- CPU frequency: two options.
+  1. =estd= (default now): scales by load, tuned so one busy thread ramps it (-l 4 -h 10).
+  2. HWP / Speed Shift (better: the CPU picks its own speed in microseconds):
+     =modload /stand/amd64/11.0/modules/hwp/hwp.kmod= then =/etc/rc.d/estd stop=.
+     Bias: =sysctl -w machdep.hwp.epp=128= (balanced) … =192= (battery, set by powerd) … =255= (max saving), 0 = max performance.
+     To make it permanent: add =hwp= to =/etc/modules.conf= and set =estd=NO= in =/etc/rc.conf=. HWP stays on until reboot.
+- Deep CPU sleep (C2/C3): stock NetBSD only ever uses C1 (see =vmstat -e | grep acpicpu=).
+  Boot menu entry 2 (CSTATE kernel) fixes that; if it runs fine, make it the default (see Kernels).
+- WiFi power save (opt-in, needs the rebuilt driver → after a reboot): =ifconfig iwx0 powersave= (WiFi reconnects once).
+  Undo with =ifconfig iwx0 -powersave=. Permanent: =ifconfig_iwx0="powersave"= in =/etc/rc.conf=.
+- =powerd= on charger unplug: brightness 50 % and HWP bias 192; on plug: 100 % and 128 (/etc/powerd/scripts/acadapter).
+- Lid close: no S3 suspend on this firmware (=hw.acpi.sleep.states= = S0 S4 S5), so powerd just switches the
+  backlight off and restores it on open (/etc/powerd/scripts/lid_switch). Check BIOS → Config → Power → Sleep State
+  for a "Linux"/"S3" option; if it appears in =hw.acpi.sleep.states= as S3, =sysctl -w hw.acpi.sleep.state=3= can be tried.
+- Bar shows watts: =battery= prints the current draw; ~6–7 W idle is expected while the GPU has no driver (it cannot power down).
+* Screen resolution (UEFI framebuffer)
+X runs on the plain framebuffer (wsfb) at whatever mode the bootloader left: currently native 2160x1350
+(=xdpyinfo | grep dimensions=). If it ever comes up at 1024x768: at the boot menu choose "Drop to boot prompt",
+type =gop= (lists modes), =gop 2160x1350=, =boot=; then put =gop 2160x1350;= before =boot= in the first
+=menu== line of =/boot.cfg= to make it permanent. Everything is software-rendered, so a slow CPU clock feels laggy
+(see What saves power).
+
+* Desktop (StumpWM, niri-style keys, Super = Mod)
+- Console autologs in as =mag= and starts X + StumpWM. Other consoles (Ctrl+Alt+F2…) need a password.
+- Super+Return terminal (alacritty) · Super+P launcher · Super+Q close · Super+Shift+E quit
+- Super+Arrows focus · Super+Ctrl+Arrows move · Super+C/I/E/A/H/T workspaces 1–6 · Super+Ctrl+letter move there
+- Super+F maximize toggle · Super+Shift+F fullscreen · Super+comma/period split · Super+Shift+R remove split
+- Super+D/W width, Super+Shift+D/W height · Print screenshot (~/screenshot-*.png) · Super+; StumpWM command line
+- TrackPoint: hold the middle button and nudge the stick to scroll (X "mouse" driver wheel emulation).
+  The touchpad has no driver (dwiic cannot map its registers on this machine).
+- Restart X after config changes: Super+Shift+E, then type =exit= at the console prompt (autologin starts X again) or =startx=.
+- Config: =~/.stumpwmrc=, =~/.xinitrc=, =/etc/X11/xorg.conf= (backup of the old mouse setup: xorg.conf.bak-ws).
+
+* Shell (cclsh) and prompt
+- Login shell for root and mag: =/usr/local/bin/cclsh= (saved SBCL image). Prompt = starship (=~/.config/starship.toml=).
+- Startup file: =~/.config/cclsh/startup.lisp= (PATH, EDITOR=emacs, eza aliases, zoxide).
+- Rebuild the image after changing cclsh sources in =/usr/local/lib/cclsh/src=:
+  =sbcl --non-interactive --load /usr/local/lib/cclsh/build-image.lisp && mv /usr/local/lib/cclsh/cclsh-image.new /usr/local/lib/cclsh/cclsh-image=
+- Emergency shell: =/bin/sh= (also in /etc/shells; =chsh= or =usermod -s /bin/sh mag= to switch back).
+
+* Emacs
+=emacs= (30.2, X11 build). Config copied from guix-lho: =~/.emacs.d/init.el=, =meow-code.el=, =themes/=.
+Packages come from MELPA via package.el on NetBSD (meow, sly, rust-mode, eat installed; ghostel/exwm/parinfer not available here).
+
+* Updating
+** Packages (pkgsrc binaries, quarterly branch of NetBSD 11.0)
+#+begin_src sh
+pkgin update && pkgin upgrade      # everything
+pkgin install foo / pkgin remove foo / pkgin search foo
+#+end_src
+Things built by hand (not pkgin): niri sources in /usr/local/src, wmenu, cclsh image, the iwx module.
+** Base system (NetBSD itself)
+Minor/security updates: =pkgin install sysupgrade= then =sysupgrade auto https://cdn.netbsd.org/pub/NetBSD/NetBSD-11.0=
+(fetches sets, installs, runs etcupdate; reboot after). After a kernel update rebuild the WiFi module:
+#+begin_src sh
+cd /usr/src/sys/modules/if_iwx && make && make install   # or copy if_iwx.kmod to /stand/amd64/11.0/modules/if_iwx/
+#+end_src
+(kernel sources live in /usr/src/sys; the driver is dev/pci/if_iwx*.c, notes in /root/nbsd11/PORTING-NOTES.md on the Linux box)
+** Kernels in the boot menu
+1 = stock GENERIC (default), 2 = CSTATE (GENERIC + deep C-states patch, /netbsd.cstate), 3/4 = i915 experiments (do not work).
+If CSTATE runs for a day without trouble: =cp /netbsd.cstate /netbsd= (keep =/netbsd.generic= as a copy first) or
+change =default=2= in =/boot.cfg=. Sources: =/usr/src/sys/arch/amd64/conf/CSTATE=, patch in
+=/root/nbsd11/acpicpu-cstate-tsc.patch= (Linux box). Rebuild: =cd /usr/src/sys/arch/amd64/conf && config CSTATE && cd ../compile/CSTATE && make -j8=.
+After a NetBSD base upgrade the patch, the CSTATE kernel, if_iwx and hwp modules must be rebuilt.
+
+* Fixing things
+- No console output but ssh works? You booted a test kernel; reboot and take entry 1.
+- Package files missing/odd: never run two =pkgin= at once; =pkg_admin check= verifies.
+- Clock wrong after long power-off: =ntpdate -b pool.ntp.org= (runs at boot too).
+- Emacs dies at startup: run =emacs --debug-init=. The init is shared with the Guix machine; Linux-only bits
+  (exwm, parinfer-rust, ghostel) are guarded with =locate-library= / =system-type= checks — keep new ones guarded too.
+- cclsh Tab completion, Ctrl-C, window size: fixed in the SBCL layer (source in /usr/local/lib/cclsh/src/cclsh,
+  rebuild with =cd /usr/local/lib/cclsh && sbcl --non-interactive --load build-image.lisp && mv cclsh-image.new cclsh-image=).
+- Logs: =/var/log/messages=, =dmesg=, X: =/var/log/Xorg.0.log=, StumpWM: run =stumpwm= from a console to see errors.
+
+* Update 2026-09-16 — corrections and fixes
+
+Several earlier notes were wrong. Current truth:
+
+** Emacs "void: file-name-sans-extension" — FIXED
+This was never an exwm problem. Root cause: cclsh launches programs with
+posix_spawn(3), and on NetBSD a program started as the *direct* posix_spawn
+child of the threaded SBCL shell starts with a corrupted runtime. Emacs then
+errors on file-name-sans-extension at its first idle timer. Interposing one
+ordinary execve fixes it (=sh -c 'exec emacs'= is clean; a direct =emacs= is
+void). Fix: a tiny re-exec shim installed as =/usr/local/bin/emacs= (source
+/root/nbsd11/emacs-shim.c) that execs /usr/pkg/bin/emacs. Just run =emacs= as
+usual. The cclsh source was also fixed (source/sbcl/process.lisp resets
+SIGTTIN/TTOU/TSTP in children) but that alone does not fix emacs; the live
+login image was left as-is. The exwm block was removed from ~/.emacs.d/init.el.
+
+** CPU speed / battery — use HWP, not estd
+There is no =machdep.est= on this Tiger Lake, so estd could never work
+(=estd=NO= now). Frequency is governed by the *hwp* kernel module (Intel Speed
+Shift), autoloaded via =/etc/modules.conf=. Tunable: =sysctl -w
+machdep.hwp.epp=N= (0 = full performance, 255 = max power saving, 128 =
+balanced; powerd sets it per AC/battery). With HWP the CPU turbos to ~4.4 GHz
+on demand instead of being stuck near 1.2 GHz — this was the main cause of the
+sluggish screen/input.
+
+** Native resolution — automatic now
+genfb starts at 1024x768 unless GOP is set. =/boot.cfg= now runs =gop 2160x1350= (select the GOP mode by resolution; =gop 1= is mode index 1 = 640x480 on this firmware) before
+booting (default entry), giving native 2160x1350 with no manual step. If the
+screen is ever blank at boot, pick menu entry 2 ("without gop").
+
+** Mouse — reverted to the ws driver
+xorg.conf uses =Driver "ws"= again (it works). =Driver "mouse"= killed the
+pointer. Restart X after any xorg.conf change. TrackPoint middle-button scroll
+is not available in X on this hardware (the kernel pms driver emits no scroll
+events); it would need a kernel patch.
+
+** CSTATE kernel — abandoned
+/netbsd.cstate black-screens on boot; it is removed from the boot menu. GENERIC
+(C1 only) is the boot kernel. The power win is HWP, above.
+
+** Timezone
+=/etc/localtime= now points at Europe/Prague.
+
+* Update 2026-09-16 (afternoon) — PAT fix, MTRR warning, stumpwm spin
+- *Screen redraw was 100x slower on 7 of 8 CPUs.* NetBSD 11 programs the x86 PAT
+  (page attribute table) only on CPU 0 (=pat_init()= runs from =cpu_attach= on the
+  boot CPU; =cpu_hatch= never calls it), so write-combining mappings such as the
+  framebuffer are effectively uncached on CPUs 1-7 (67 MB/s vs 6.7 GB/s; a full
+  2160x1350 repaint took 200 ms). Fix: kernel module =patfix= (source
+  =/usr/src/sys/modules/patfix=, installed =/stand/amd64/11.0/modules/patfix=,
+  autoloaded from =/etc/modules.conf=). =sysctl machdep.patfix.pat= shows the PAT
+  per CPU; test with =schedctl -A <cpu> /var/tmp/fbprobe=.
+- *Never use x86_64_set_mtrr / MTRR tools on this kernel.* NetBSD's MTRR code
+  truncates bases/masks to 36 bits; any MTRR change rewrites the firmware entries
+  wrongly (the 64-bit MMIO entries become base 0 / mask 0 = whole memory UC) and
+  the machine crawls at ~7 MB/s RAM bandwidth until a reboot. Not needed anyway:
+  PAT WC works once patfix is loaded.
+- *Reboot hangs after "syncing disks"* also when issued over ssh (not a su/cclsh
+  problem). Root fs is clean at next boot, so the hang is in device shutdown or
+  the final reset. To debug: reboot from a text console (Ctrl+Alt+F1, log in,
+  =shutdown -r now=) and note the last line printed.
+- *stumpwm mode-line spin:* with the mode-line enabled stumpwm burns ~13% CPU and
+  X ~10-17% doing ~1400 X round trips/s (32-byte replies); =s-o= (toggle
+  mode-line) stops it instantly. Root cause still open.
+- Boot menu now selects the GOP mode by resolution (=gop 2160x1350=).
+
+* Update 2026-09-16 (evening) — perf/battery deep dive
+- PATFIX (biggest win): NetBSD 11 programs the CPU page-attribute table only on CPU 0,
+  so the framebuffer was uncached on CPUs 1-7 -> 67 MB/s vs 6.7 GB/s writes, ~200 ms per
+  full repaint. That was the "dystopic" Emacs/Firefox redraw. Module =patfix= now programs
+  PAT on every CPU (autoloads via /etc/modules.conf; =sysctl machdep.patfix.pat=).
+- Deep C-states: module =cidle= installs an MWAIT idle loop with a tunable hint
+  (=sysctl machdep.cidle.hint=, 0x60 default) because acpicpu(4) only ever picks C1.
+  Cores now reach C7 ~96%. Saves ~0.35 W. =sysctl machdep.cidle.residency= shows the MSRs.
+- Battery floor now ~6.3 W (was ~8-10) = ~7 h. Remaining drain: the iGPU never
+  power-gates (RC6 disabled: GEN6_RC_CONTROL reads 0) so the package is stuck at PC2;
+  reaching PC6+ needs GPU RC6, which needs the i915 driver (see below).
+- Reboot hang root cause: =reboot= panics in the iwx driver (recursive rw-lock:
+  iwx_ioctl -> ifioctl_common -> in6_ifattach -> iwx_ioctl again; the rw_write_held()
+  recursion guard does not catch it). WORKAROUND: reboot from a text console with
+  =shutdown -r now= (does the clean rc.d shutdown first) — this works. Fix pending in
+  the driver (track the owning LWP explicitly instead of rw_write_held()).
+- stumpwm mode-line spin = a stumpwm/X busy loop (~14000 GetInputFocus round-trips/s),
+  NOT a kernel bug (a C replica of its select() blocks correctly). =s-o= (toggle the
+  mode-line off) stops it and saves ~1 W. Root cause in stumpwm still open.
+- Xauthority lock errors after a forced power-off = stale =~/.Xauthority-c/-l= lock
+  files. Fix: =rm -f ~/.Xauthority-c ~/.Xauthority-l= then restart X.
+- WiFi: iwx module rebuilt to advertise IEEE80211_C_PMGT so =ifconfig iwx0 powersave=
+  is accepted (installed, active next boot).
+- Boot menu selects the GOP mode by resolution (=gop 2160x1350=), not index.
+
+* i915 GPU debug attempt (2026-09-16) — firmware + capture setup
+- Root of "i915 doesn't work": NetBSD 11's drm is a Jan-2020 Linux snapshot (DRIVER_DATE
+  20200114 ~ Linux 5.6). Tiger Lake (dev 0x9a40) is present but behind require_force_probe
+  (Linux itself marked it experimental then; has_rps=false /* disabled for debugging */).
+  Linux 5.9/5.10 made it stable. So the fix is a *targeted* backport of the TGL fixes from
+  Linux 5.7-5.9, not a full re-import.
+- First mandatory prerequisite was MISSING: the i915 firmware was not installed at all.
+  Installed the exact blobs the driver requests, from kernel.org linux-firmware:
+    /libdata/firmware/i915drmkms/i915/{tgl_dmc_ver2_04.bin, tgl_guc_35.2.0.bin, tgl_huc_7.0.3.bin}
+  (also copied to /libdata/firmware/i915/ as a path fallback). Driver name is i915drmkms;
+  request_firmware path = /libdata/firmware/<cd_name>/<image>.
+- Debug boot: boot.cfg has a non-default "DEBUG i915 GPU kernel" entry -> boot /netbsd.i915
+  (GENERIC #1 with DDB, DDB_COMMANDONENTER="trace;show registers"; onpanic defaults to 1
+  during early autoconf, before sysctl.conf lowers it). i915 attaches before root is mounted
+  rw, so a hang/panic there is safe to power-cycle. Crash dumps work (dev dk2, savecore=YES,
+  /var/crash) — a panic (even black-screen) can be captured with a blind `sync` at db{0}>.
+- Capture procedure: boot the DEBUG entry. If db{0}> trace appears -> photograph it, then
+  `sync` to dump+reboot. If black screen -> try Ctrl-Alt-Esc (fromconsole=1) then blind
+  `sync`; else hold power, boot GENERIC. Read the dump with crash(8) -N /var/crash/netbsd.N.
+
+* i915 progress (2026-09-16 afternoon) — firmware works, DEBUG_GEM fix
+- With the TGL firmware installed, /netbsd.i915 now attaches: DMC firmware loads
+  (tgl_dmc_ver2_04.bin v2.4), driver probes, reaches GPU engine init. First real fault:
+  gen8_reset_engines times out on bcs0/vcs0/vcs2/vecs0 (NOT rcs0) -> the driver wedges
+  the GT -> a debug-only assertion (intel_lrc.c:2370 process_csb) turned that into a fatal
+  panic. Root: NetBSD force-set CONFIG_DRM_I915_DEBUG_GEM=1 (# XXX) in
+  i915drm/files.i915drmkms; production Linux builds it =0, where GEM_BUG_ON is a no-op and
+  i915 keeps KMS alive on a wedged GT (see i915_gem_init: "-EIO ... keep KMS alive").
+- Fix applied + rebuilt /netbsd.i915 (GENERIC #3): files.i915drmkms -> DEBUG_GEM=0, and
+  i915_gem.h line 40 "#ifdef" -> "#if" so the value 0 selects the no-op GEM_BUG_ON
+  (NetBSD's IS_ENABLED(x) is just (x), so the flag must be *defined to 0*, not undefined;
+  backups .bak-debuggem). Next: boot menu entry 4; expect either a working (wedged, no 3D)
+  KMS display, or a new/different assertion -> crash dump -> iterate. Deeper TODO: the
+  engine-reset timeout itself (forcewake is held FORCEWAKE_ALL, so it's a TGL reset-domain
+  issue, likely a Linux 5.7-5.9 backport).
+
+* i915 WORKS for display (2026-09-16) — GENERIC #4 /netbsd.i915
+- Boot menu entry 4 now brings up the real i915 KMS display: intelfb0 at native
+  2160x1350x32, wsdisplay0/console on intelfb0 (not genfb), X at 2160x1350 (wsfb on
+  intelfb), StumpWM + Firefox running. Framebuffer 7 GB/s on all CPUs.
+- Two fixes made it work (both in-tree, rebuilt via compile/GENERIC): (1) CONFIG_DRM_I915_DEBUG_GEM
+  0 not 1 + i915_gem.h #ifdef->#if, so the survivable GPU-reset failure stops being a fatal BUG;
+  (2) HAS_RPS guard in intel_rps_mark_interactive (RPS is off on TGL, its power.mutex is unusable).
+- LIMITATIONS: GPU render engines are WEDGED (gen8_reset_engines times out on all engines) =>
+  NO 3D acceleration (Firefox etc. are software-rendered). And the powered-but-not-power-gated
+  GPU keeps the package out of all package C-states (pc2..pc10 = 0, was 87% pc2 on genfb) =>
+  BATTERY IS WORSE on this kernel than plain GENERIC. Net: great for display/resolution, bad for
+  battery, no accel. Default boot stays GENERIC; entry 4 is opt-in.
+- Note: ACPI backlight nodes now appear (hw.acpi.acpiout15/16.brightness) with i915's opregion;
+  may replace the iblc MMIO hack (untested). gop in boot.cfg is redundant now (i915 self-modesets)
+  but harmless.
+- NEXT to make it fully good: fix the engine-reset timeout (forcewake is held, so a TGL reset-
+  domain issue; backport the Linux 5.7-5.9 gen11/gen12 reset fix). That un-wedges the GPU ->
+  enables RC6/RPS (battery) and render accel.
+
+* i915 accel blocker isolated (2026-09-16) — execlists submission
+- Instrumented boot proved: GPU interrupts WORK (irq_calls=28 handled=28), but the
+  render ring is never loaded (RING_START=0/CTL=0) => the execlists context submission
+  (ELSP) doesn't put a ring on the engine, so the default-context batch never executes
+  and wedges accel. NOT a reset or interrupt problem (both fine).
+- State: native KMS display + battery both work (entry 4 / /netbsd.i915 GENERIC #9).
+  Accel remains blocked on TGL execlists context/LRC/PPGTT submission (deep, uncertain).
