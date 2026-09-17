@@ -2435,6 +2435,63 @@ acpi_lps0_dsm(const uint8_t *uuid, int rev, int func, bool query)
 }
 
 static void
+acpi_lps0_dump_obj(ACPI_OBJECT *o, int depth)
+{
+	uint32_t j;
+	if (o == NULL || depth > 6)
+		return;
+	switch (o->Type) {
+	case ACPI_TYPE_INTEGER:
+		aprint_normal("LPI:%*s int %llu\n", depth*2, "",
+		    (unsigned long long)o->Integer.Value);
+		break;
+	case ACPI_TYPE_STRING:
+		aprint_normal("LPI:%*s str '%s'\n", depth*2, "",
+		    o->String.Pointer);
+		break;
+	case ACPI_TYPE_PACKAGE:
+		aprint_normal("LPI:%*s pkg[%u]\n", depth*2, "",
+		    o->Package.Count);
+		for (j = 0; j < o->Package.Count; j++)
+			acpi_lps0_dump_obj(&o->Package.Elements[j], depth+1);
+		break;
+	default:
+		aprint_normal("LPI:%*s type %d\n", depth*2, "", o->Type);
+		break;
+	}
+}
+
+static void
+acpi_lps0_dump_constraints(void)
+{
+	ACPI_OBJECT_LIST list;
+	ACPI_OBJECT args[4];
+	ACPI_BUFFER cb = { ACPI_ALLOCATE_BUFFER, NULL };
+
+	if ((acpi_lps0_intel_mask & (1U << 1)) == 0)
+		return;
+	args[0].Type = ACPI_TYPE_BUFFER;
+	args[0].Buffer.Length = 16;
+	args[0].Buffer.Pointer = __UNCONST(acpi_lps0_uuid_intel);
+	args[1].Type = ACPI_TYPE_INTEGER;
+	args[1].Integer.Value = 1;
+	args[2].Type = ACPI_TYPE_INTEGER;
+	args[2].Integer.Value = 1;		/* GET_DEVICE_CONSTRAINTS */
+	args[3].Type = ACPI_TYPE_PACKAGE;
+	args[3].Package.Count = 0;
+	args[3].Package.Elements = NULL;
+	list.Count = 4;
+	list.Pointer = args;
+	if (ACPI_SUCCESS(AcpiEvaluateObject(acpi_lps0_handle,
+	    __UNCONST("_DSM"), &list, &cb)) && cb.Pointer != NULL) {
+		aprint_normal_dev(acpi_softc->sc_dev, "LPI constraints:\n");
+		acpi_lps0_dump_obj((ACPI_OBJECT *)cb.Pointer, 0);
+	}
+	if (cb.Pointer != NULL)
+		ACPI_FREE(cb.Pointer);
+}
+
+static void
 acpi_lps0_probe(void)
 {
 	char hid[] = "PNP0D80";
@@ -2454,6 +2511,7 @@ acpi_lps0_probe(void)
 	aprint_normal_dev(acpi_softc->sc_dev,
 	    "LPS0: found, intel_mask=0x%x msft_mask=0x%x\n",
 	    acpi_lps0_intel_mask, acpi_lps0_msft_mask);
+	acpi_lps0_dump_constraints();
 }
 
 static void
