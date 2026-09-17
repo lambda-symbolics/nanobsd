@@ -250,6 +250,7 @@ static int		sysctl_hw_acpi_fixedstats(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_sleepstate(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_sleepstates(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_freeze(SYSCTLFN_PROTO);
+static int		sysctl_hw_acpi_wake(SYSCTLFN_PROTO);
 static volatile int	acpi_freeze_active;
 static volatile int	acpi_freeze_wake;
 
@@ -1806,6 +1807,12 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 	    sysctl_hw_acpi_freeze, 0, NULL, 0,
 	    CTL_CREATE, CTL_EOL);
 
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "wake", SYSCTL_DESCR("Wake from s2idle freeze (write 1)"),
+	    sysctl_hw_acpi_wake, 0, NULL, 0,
+	    CTL_CREATE, CTL_EOL);
+
 	err = sysctl_createv(clog, 0, &rnode, &rnode,
 	    CTLFLAG_PERMANENT, CTLTYPE_NODE,
 	    "stat", SYSCTL_DESCR("ACPI statistics"),
@@ -2379,7 +2386,7 @@ acpi_enter_freeze(void)
 
 	acpi_freeze_active = 1;
 	acpi_freeze_wake = 0;
-	{ int _i; for (_i = 0; _i < 200 && acpi_freeze_wake == 0; _i++)
+	{ int _i; for (_i = 0; _i < 3000 && acpi_freeze_wake == 0; _i++)
 		kpause("s2idle", false, MAX(1, hz / 10), NULL); }
 	acpi_freeze_active = 0;
 	aprint_normal_dev(sc->sc_dev, "s2idle: waking (woke=%d)\n",
@@ -2419,6 +2426,30 @@ acpi_freeze_wakeup(void)
 		return true;
 	}
 	return false;
+}
+
+static int
+sysctl_hw_acpi_wake(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node;
+	int err, t;
+
+	if (acpi_softc == NULL)
+		return ENOSYS;
+
+	t = 0;
+	node = *rnode;
+	node.sysctl_data = &t;
+
+	err = sysctl_lookup(SYSCTLFN_CALL(&node));
+
+	if (err || newp == NULL)
+		return err;
+
+	if (t != 0)
+		(void)acpi_freeze_wakeup();
+
+	return 0;
 }
 
 static int
