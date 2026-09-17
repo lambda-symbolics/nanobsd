@@ -2328,15 +2328,18 @@ acpi_s2idle_keep(device_t dev)
 {
 	const char *n = device_xname(dev);
 
-	/* keep the crash-dump path and bus topology powered */
-	return (strncmp(n, "nvme", 4) == 0 || strncmp(n, "ld", 2) == 0 ||
-	        strncmp(n, "dk", 2) == 0   || strncmp(n, "wd", 2) == 0 ||
-	        strncmp(n, "sd", 2) == 0   || strncmp(n, "ppb", 3) == 0 ||
-	        strncmp(n, "pci", 3) == 0  || strncmp(n, "cpu", 3) == 0 ||
-	        strncmp(n, "acpi", 4) == 0 ||
-	        strncmp(n, "iwx", 3) == 0  || strncmp(n, "xhci", 4) == 0 ||
-	        strncmp(n, "usb", 3) == 0  || strncmp(n, "uhub", 4) == 0 ||
-	        strncmp(n, "axen", 4) == 0);
+	/*
+	 * s2idle: suspend ONLY the display stack (biggest power/heat draw,
+	 * proven safe via drvctl).  Keep everything else running -- suspending
+	 * low-level infrastructure (interrupt controllers, timers, buses) is
+	 * unnecessary for s2idle and hard-resets the box on resume.
+	 */
+	if (strncmp(n, "i915drmkms", 10) == 0 ||
+	    strncmp(n, "intelfb", 7) == 0 ||
+	    strncmp(n, "wsdisplay", 9) == 0)
+		return false;	/* do NOT keep -> allow suspend */
+
+	return true;		/* keep alive */
 }
 
 void
