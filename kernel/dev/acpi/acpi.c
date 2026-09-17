@@ -114,6 +114,8 @@ __KERNEL_RCSID(0, "$NetBSD: acpi.c,v 1.303.2.1 2026/06/27 10:46:19 martin Exp $"
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
+#include <sys/kthread.h>
+#include <sys/condvar.h>
 #include <sys/rndsource.h>
 #include <sys/sysctl.h>
 #include <sys/systm.h>
@@ -253,6 +255,11 @@ static int		sysctl_hw_acpi_freeze(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_wake(SYSCTLFN_PROTO);
 static volatile int	acpi_freeze_active;
 static volatile int	acpi_freeze_wake;
+static kmutex_t		acpi_freeze_mtx;
+static kcondvar_t	acpi_freeze_cv;
+static volatile int	acpi_freeze_req;
+static int		acpi_freeze_thread_started;
+static void		acpi_freeze_thread(void *);
 
 static bool		  acpi_is_scope(struct acpi_devnode *);
 static ACPI_TABLE_HEADER *acpi_map_rsdt(void);
@@ -2452,6 +2459,20 @@ sysctl_hw_acpi_wake(SYSCTLFN_ARGS)
 	return 0;
 }
 
+static void
+acpi_freeze_thread(void *arg)
+{
+	for (;;) {
+		mutex_enter(&acpi_freeze_mtx);
+		while (acpi_freeze_req == 0)
+			cv_wait(&acpi_freeze_cv, &acpi_freeze_mtx);
+		acpi_freeze_req = 0;
+		mutex_exit(&acpi_freeze_mtx);
+
+		acpi_enter_freeze();
+	}
+}
+
 static int
 sysctl_hw_acpi_freeze(SYSCTLFN_ARGS)
 {
@@ -2470,8 +2491,25 @@ sysctl_hw_acpi_freeze(SYSCTLFN_ARGS)
 	if (err || newp == NULL)
 		return err;
 
-	if (t != 0)
-		acpi_enter_freeze();
+	if (t != 0) {
+		if (acpi_freeze_thread_started == 0) {
+			mutex_init(&acpi_freeze_mtx, MUTEX_DEFAULT, IPL_NONE);
+			cv_init(&acpi_freeze_cv, "s2idlrq");
+			if (kthread_create(PRI_NONE, KTHREAD_MPSAFE, NULL,
+			    acpi_freeze_thread, NULL, NULL, "s2idle") == 0)
+				acpi_freeze_thread_started = 1;
+			else {
+				cv_destroy(&acpi_freeze_cv);
+				mutex_destroy(&acpi_freeze_mtx);
+			}
+		}
+		if (acpi_freeze_thread_started != 0) {
+			mutex_enter(&acpi_freeze_mtx);
+			acpi_freeze_req = 1;
+			cv_signal(&acpi_freeze_cv);
+			mutex_exit(&acpi_freeze_mtx);
+		}
+	}
 
 	return 0;
 }
