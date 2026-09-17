@@ -1,0 +1,29 @@
+#!/bin/sh
+# S0ix (PC10) suspend for the X1 Nano. RC6 + all LPI devices D3 + display off
+# + freeze the desktop session so the package STAYS in PC10 + LPS0 handshake.
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin
+XA=$(ps auxww 2>/dev/null | grep -o '\-auth [^ ]*' | head -1 | awk '{print $2}')
+BR=/var/run/s0ix.brightness
+dpms(){ DISPLAY=:0 XAUTHORITY="$XA" xset dpms force "$1" 2>/dev/null; }
+lps0(){ sysctl -w hw.acpi.sleep.lps0="$1" >/dev/null 2>&1; }
+d3(){ pcictl pci0 write -d 13 -f 2 0x84 0x3; pcictl pci0 write -d 13 -f 3 0x84 0x3; pcictl pci0 write -d 8 -f 0 0xe0 0x3; }
+d0(){ pcictl pci0 write -d 13 -f 2 0x84 0x0; pcictl pci0 write -d 13 -f 3 0x84 0x0; pcictl pci0 write -d 8 -f 0 0xe0 0x0; }
+case "$1" in
+suspend)
+	sysctl -n hw.acpi.acpiout15.brightness > $BR 2>/dev/null
+	dpms off
+	d3
+	for d in xhci0 xhci1 ppb1 ppb2 iwx0; do drvctl -S $d 2>/dev/null; done
+	lps0 1
+	logger -t s0ix "suspend: desktop frozen, LPI D3, display off, LPS0 entry"
+	;;
+resume)
+	lps0 0
+	for d in iwx0 ppb1 ppb2 xhci0 xhci1; do drvctl -R $d 2>/dev/null; done
+	d0
+	dpms on
+	b=$(cat $BR 2>/dev/null)
+	[ -n "$b" ] && { sysctl -w hw.acpi.acpiout15.brightness="$b" >/dev/null 2>&1; sysctl -w hw.acpi.acpiout16.brightness="$b" >/dev/null 2>&1; }
+	logger -t s0ix "resume: desktop resumed, brightness $b"
+	;;
+esac

@@ -1,14 +1,8 @@
 #!/bin/sh
-# powerd(8) lid hook -> OS s2idle freeze. $2 = pressed (closed) / released (open).
-logger -p info -t lid "lid_switch: $*"
+# powerd(8) lid hook -> S0ix (PC10) suspend. $2 = pressed(closed)/released(open).
+logger -p info -t lid "lid: $*"
 case "$2" in
-pressed)
-	logger -p info -t lid "lid closed -> s2idle freeze"
-	/sbin/sysctl -w hw.acpi.sleep.freeze=1 >/dev/null 2>&1
-	;;
-released)
-	logger -p info -t lid "lid opened -> wake"
-	/sbin/sysctl -w hw.acpi.sleep.wake=1 >/dev/null 2>&1
-	;;
+pressed)  /usr/local/bin/s0ix suspend ;;
+released) /usr/local/bin/s0ix resume  ;;
 esac
 exit 0
