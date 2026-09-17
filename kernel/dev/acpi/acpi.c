@@ -2351,7 +2351,16 @@ acpi_s2idle_keep(device_t dev)
 	if (strncmp(n, "i915drmkms", 10) == 0 ||
 	    strncmp(n, "intelfb", 7) == 0 ||
 	    strncmp(n, "wsdisplay", 9) == 0 ||
-	    strncmp(n, "iwx", 3) == 0)
+	    strncmp(n, "iwx", 3) == 0 ||
+	    strncmp(n, "xhci", 4) == 0 ||
+	    strncmp(n, "uhub", 4) == 0 ||
+	    strncmp(n, "ugen", 4) == 0 ||
+	    strncmp(n, "uhidev", 6) == 0 ||
+	    strncmp(n, "audio", 5) == 0 ||
+	    strncmp(n, "hdafg", 5) == 0 ||
+	    strncmp(n, "hdaudio", 7) == 0 ||
+	    strncmp(n, "spkr", 4) == 0 ||
+	    strncmp(n, "midi", 4) == 0)
 		return false;	/* do NOT keep -> allow suspend */
 
 	return true;		/* keep alive */
