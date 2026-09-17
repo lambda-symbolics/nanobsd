@@ -1,0 +1,4 @@
+*.o
+*.kmod
+*.kmod.map
+*.core
