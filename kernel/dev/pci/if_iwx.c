@@ -7411,7 +7411,7 @@ iwx_run(struct iwx_softc *sc)
 	if (err) {
 		printf("%s: could not send power command (error %d)\n",
 		    DEVNAME(sc), err);
-		return err;
+		/* LISPBSD: PS/power cmd is an optimization; never abort assoc */
 	}
 
 	if (ic->ic_opmode == IEEE80211_M_MONITOR)
@@ -8001,7 +8001,7 @@ iwx_init_hw(struct iwx_softc *sc)
 	if (err) {
 		printf("%s: could not send power command (error %d)\n",
 		    DEVNAME(sc), err);
-		goto err;
+		/* LISPBSD: PS/power cmd is an optimization; never abort init */
 	}
 
 	if (sc->sc_nvm.lar_enabled) {

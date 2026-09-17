@@ -230,10 +230,11 @@
 ;;;; StumpWM's periodic *mode-line-timer* keeps the event loop in a finite-timeout
 ;;;; xlib:event-listen, which this SBCL/NetBSD build busy-polls (~871k syscalls/s, ~2.5 W).
 ;;;; Fix: cancel that timer (loop then blocks on X) and refresh from a background thread on
-;;;; its OWN X connection issuing a 1x1 ClearArea(:exposures t) -> the server posts a real
-;;;; Expose so the main thread does its native double-buffered (flash-free) redraw.  The
-;;;; connection is opened lazily inside the loop and reopened on any error, so a startup
-;;;; race or transient failure self-heals within one interval instead of freezing the clock.
+;;;; its OWN X connection with a full-window ClearArea(:exposures t) -> the server posts a
+;;;; real Expose so the main thread does its native redraw.  (interrupt-thread was tried but
+;;;; corrupts the SBCL heap; a 1px clear is ignored by the WM.)  15 s interval keeps the
+;;;; one-frame flash rare while the HH:MM clock stays accurate; the connection reopens on
+;;;; any error so a startup race self-heals instead of freezing the clock.
 (defun lispbsd-ml-window-id ()
   (ignore-errors
     (let* ((head (current-head))
@@ -251,7 +252,6 @@
       (list "^B[%g]^b %W ^> " '(:eval (lispbsd-ml-right))))
 (ignore-errors (update-all-mode-lines))
 
-;; cancel StumpWM's own periodic mode-line timer (the busy-poll trigger)
 (ignore-errors
   (let ((sym (find-symbol "*MODE-LINE-TIMER*" :stumpwm)))
     (when (and sym (boundp sym) (symbol-value sym))
@@ -259,7 +259,7 @@
       (setf (symbol-value sym) nil))))
 
 (defvar *lispbsd-ml-thread* nil)
-(defun lispbsd-start-ml-refresher (&optional (interval 3))
+(defun lispbsd-start-ml-refresher (&optional (interval 15))
   (unless (and *lispbsd-ml-thread* (sb-thread:thread-alive-p *lispbsd-ml-thread*))
     (setf *lispbsd-ml-thread*
           (sb-thread:make-thread
@@ -275,12 +275,11 @@
                               (when id
                                 (let ((w (xlib::lookup-window dpy id)))
                                   (when w
-                                    (xlib:clear-area w :x 0 :y 0 :width 1 :height 1
-                                                       :exposures-p t)
+                                    (xlib:clear-area w :exposures-p t)
                                     (xlib:display-force-output dpy))))))
                         (serious-condition ()
                           (ignore-errors (when dpy (xlib:close-display dpy)))
                           (setf dpy nil))))
                  (ignore-errors (when dpy (xlib:close-display dpy))))))
            :name "lispbsd-ml-refresher"))))
-(lispbsd-start-ml-refresher 3)
+(lispbsd-start-ml-refresher 15)
