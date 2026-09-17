@@ -2350,7 +2350,8 @@ acpi_s2idle_keep(device_t dev)
 	 */
 	if (strncmp(n, "i915drmkms", 10) == 0 ||
 	    strncmp(n, "intelfb", 7) == 0 ||
-	    strncmp(n, "wsdisplay", 9) == 0)
+	    strncmp(n, "wsdisplay", 9) == 0 ||
+	    strncmp(n, "iwx", 3) == 0)
 		return false;	/* do NOT keep -> allow suspend */
 
 	return true;		/* keep alive */
