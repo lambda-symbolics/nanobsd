@@ -1,0 +1,279 @@
+;;;; StumpWM configuration for lispbsd (NetBSD, X11 on wsfb).
+;;;; Mirrors the niri keybindings used on the Linux ThinkPad: Super is the
+;;;; modifier, bindings live on the top map, six named workspaces (groups).
+
+(in-package :stumpwm)
+
+;;;; -- Appearance --
+
+(setf *mouse-focus-policy* :sloppy)
+(setf *window-border-style* :thin)
+(set-focus-color "#ffffff")
+(set-unfocus-color "#505050")
+(set-float-focus-color "#ffffff")
+(set-float-unfocus-color "#505050")
+(set-fg-color "#c5c9c5")
+(set-bg-color "#080606")
+(set-border-color "#505050")
+(set-msg-border-width 1)
+(setf *message-window-gravity* :center)
+(setf *input-window-gravity* :center)
+(setf *normal-border-width* 1)
+(setf *maxsize-border-width* 1)
+(setf *transient-border-width* 1)
+(setf *window-format* "%m%n%s%20t")
+
+(handler-case
+    (set-font "-windows-profontwindows-medium-r-normal--12-120-72-72-c-60-microsoft-cp1252")
+  (error () nil))
+
+;;;; -- Workspaces --
+
+(defparameter *workspace-names* '("1" "2" "3" "4" "5" "6"))
+
+(when (equal (group-name (current-group)) "Default")
+  (setf (group-name (current-group)) (first *workspace-names*)))
+(dolist (name (rest *workspace-names*))
+  (unless (find-group (current-screen) name)
+    (gnewbg name)))
+
+;;;; -- Commands --
+
+(defcommand terminal () ()
+  "Open a terminal window, reusing the alacritty daemon when it runs."
+  (run-shell-command
+   "alacritty msg --socket /tmp/alacritty.sock create-window 2>/dev/null || alacritty"))
+
+(defcommand launcher () ()
+  "Run dmenu with the niri wmenu look."
+  (run-shell-command
+   "dmenu_run -fn 'ProFontExtended-9' -nb '#000000' -nf '#ffffff' -sb '#E46876' -sf '#000000'"))
+
+(defcommand screenshot () ()
+  "Save a screenshot into the home directory like niri does."
+  (run-shell-command "scrot \"$HOME/screenshot-%Y-%m-%d_%H-%M-%S.png\""))
+
+(defcommand volume-up () ()
+  "Raise the master volume."
+  (run-shell-command "mixerctl -w outputs.master=+16"))
+
+(defcommand volume-down () ()
+  "Lower the master volume."
+  (run-shell-command "mixerctl -w outputs.master=-16"))
+
+(defcommand volume-mute () ()
+  "Toggle master mute."
+  (run-shell-command "mixerctl -w outputs.master.mute=toggle"))
+
+(defcommand brightness-up () ()
+  "Raise the panel backlight."
+  (run-shell-command "brightness +10"))
+
+(defcommand brightness-down () ()
+  "Lower the panel backlight."
+  (run-shell-command "brightness -10"))
+
+(defcommand monitors-off () ()
+  "Blank the display, like niri's power-off-monitors."
+  (run-shell-command "xset dpms force off"))
+
+(defcommand toggle-maximize () ()
+  "Show only the current frame, or restore the previous frame layout."
+  (if (cdr (group-frames (current-group)))
+      (progn (dump-group-to-file "/tmp/stumpwm-frames-before-maximize")
+             (only))
+      (when (probe-file "/tmp/stumpwm-frames-before-maximize")
+        (restore-from-file "/tmp/stumpwm-frames-before-maximize")
+        (delete-file "/tmp/stumpwm-frames-before-maximize"))))
+
+;;;; -- Key bindings (niri layout, Super instead of Mod) --
+
+(defmacro bind-top (&rest pairs)
+  "Bind each KEY to COMMAND on the top-level map."
+  `(progn
+     ,@(loop for (key command) on pairs by #'cddr
+             collect `(define-key *top-map* (kbd ,key) ,command))))
+
+(bind-top
+ "s-q"              "delete"
+ "s-Left"           "move-focus left"
+ "s-Right"          "move-focus right"
+ "s-Up"             "move-focus up"
+ "s-Down"           "move-focus down"
+ "s-C-Left"         "move-window left"
+ "s-C-Right"        "move-window right"
+ "s-C-Up"           "move-window up"
+ "s-C-Down"         "move-window down"
+ "s-Home"           "select-window-by-number 0"
+ "s-End"            "pull-hidden-other"
+ "s-c"              "gselect 1"
+ "s-i"              "gselect 2"
+ "s-e"              "gselect 3"
+ "s-a"              "gselect 4"
+ "s-h"              "gselect 5"
+ "s-t"              "gselect 6"
+ "s-C-c"            "gmove 1"
+ "s-C-i"            "gmove 2"
+ "s-C-e"            "gmove 3"
+ "s-C-a"            "gmove 4"
+ "s-C-h"            "gmove 5"
+ "s-C-t"            "gmove 6"
+ "s-comma"          "vsplit"
+ "s-period"         "hsplit"
+ "s-S-r"            "remove"
+ "s-r"              "iresize"
+ "s-f"              "toggle-maximize"
+ "s-S-f"            "fullscreen"
+ "s-S-c"            "balance-frames"
+ "s-d"              "resize -60 0"
+ "s-w"              "resize 60 0"
+ "s-S-d"            "resize 0 -60"
+ "s-S-w"            "resize 0 60"
+ "s-Tab"            "next"
+ "s-S-Tab"          "prev"
+ "Print"            "screenshot"
+ "s-S-e"            "quit"
+ "s-S-p"            "monitors-off"
+ "s-p"              "launcher"
+ "s-Return"         "terminal"
+ "s-S-Return"       "exec alacritty"
+ "s-o"              "mode-line"
+ "s-semicolon"      "colon"
+ "s-x"              "eval"
+ "XF86AudioRaiseVolume" "volume-up"
+ "XF86AudioLowerVolume" "volume-down"
+ "XF86AudioMute"        "volume-mute"
+ "XF86MonBrightnessUp"   "brightness-up"
+ "XF86MonBrightnessDown" "brightness-down")
+
+;;;; -- Mode line (waybar-style right side) --
+;;; A background daemon (/usr/local/bin/statusbard, started from ~/.xinitrc)
+;;; refreshes /tmp/.statusline; the mode-line only reads that file, so a redraw
+;;; never forks a subprocess on the event thread.  Colours match ~/.config/waybar.
+
+(defvar *sb-file* "/tmp/.statusline")
+
+(defun sb-read ()
+  "Return the cached status line, or \"\" if it isn't there yet."
+  (handler-case
+      (with-open-file (s *sb-file* :if-does-not-exist nil)
+        (if s (or (read-line s nil nil) "") ""))
+    (error () "")))
+
+(defun sb-get (line key &optional (default "?"))
+  "Value of KEY=... in the whitespace-separated status LINE."
+  (let* ((needle (concatenate 'string key "="))
+         (pos (search needle line)))
+    (if pos
+        (let* ((start (+ pos (length needle)))
+               (end (or (position #\Space line :start start) (length line)))
+               (v (subseq line start end)))
+          (if (zerop (length v)) default v))
+        default)))
+
+(defun sb-block (bg fg text)
+  "A waybar-like coloured block with a little horizontal padding."
+  (format nil "^(:bg \"~a\")^(:fg \"~a\") ~a ^n" bg fg text))
+
+(defun sb-battery-block (line)
+  (let* ((p (sb-get line "bat")) (st (sb-get line "bats"))
+         (pn (or (parse-integer p :junk-allowed t) 100))
+         (prefix (cond ((string= st "chg") "[++]") ((string= st "plug") "[==]")
+                       ((string= st "full") "[00]") (t "[--]")))
+         (text (format nil "~a~a% BAT" prefix p)))
+    (cond ((member st '("chg" "plug" "full") :test #'string=)
+           (sb-block "#26A65B" "#ffffff" text))
+          ((<= pn 15) (sb-block "#f53c3c" "#ffffff" text))
+          (t (sb-block "#ffffff" "#000000" text)))))
+
+(defun sb-audio-block (line)
+  (let ((vol (if (string= (sb-get line "volm" "off") "on") "MUTED"
+                 (format nil "~a% VOL" (sb-get line "vol"))))
+        (mic (if (string= (sb-get line "micm" "off") "on") "MUTED"
+                 (format nil "~a% MIC" (sb-get line "mic")))))
+    (sb-block "#8ba4b0" "#000000" (format nil "~a ~a" vol mic))))
+
+(defun sb-right ()
+  "Right side, waybar order: RAM TEMP CPU AUDIO [WIFI] BAT CLOCK."
+  (handler-case
+      (let* ((line (sb-read))
+             (ssid (sb-get line "ssid" "")))
+        (format nil "~a ~a ~a ~a ~a~a ~a"
+                (sb-block "#000000" "#ffffff" (format nil "~a% RAM" (sb-get line "ram")))
+                (sb-block "#000000" "#ffffff" (format nil "~a~aC" (sb-get line "temp") (code-char 176)))
+                (sb-block "#E6C384" "#000000" (format nil "~a% CPU" (sb-get line "cpu")))
+                (sb-audio-block line)
+                (if (plusp (length ssid))
+                    (concatenate 'string (sb-block "#2980b9" "#ffffff" ssid) " ") "")
+                (sb-battery-block line)
+                (sb-block "#E46876" "#000000" (sb-get line "clk" "--:--"))))
+    (error () "")))
+
+(setf *mode-line-background-color* "#000000")
+(setf *mode-line-foreground-color* "#ffffff")
+(setf *mode-line-border-color* "#000000")
+(setf *mode-line-border-width* 0)
+(setf *mode-line-pad-x* 2)
+(setf *mode-line-pad-y* 1)
+(setf *mode-line-timeout* 3)
+;; left side unchanged (groups + windows); ^> right-justifies the waybar blocks
+(setf *screen-mode-line-format*
+      (list "^B[%g]^b %W ^> " '(:eval (sb-right))))
+(enable-mode-line (current-screen) (current-head) t)
+
+;;;; -- Startup --
+
+(run-shell-command "hsetroot -solid '#0A0A0A'")
+(run-shell-command "pgrep -x alacritty >/dev/null || { rm -f /tmp/alacritty.sock; alacritty --daemon --socket /tmp/alacritty.sock; }")
+
+;;;; ==== LISPBSD battery fix: mode-line refresh without the SBCL busy-poll (2026-09-17) ====
+;;;; StumpWM's periodic *mode-line-timer* keeps the event loop in a finite-timeout
+;;;; xlib:event-listen, which this SBCL/NetBSD build busy-polls (~871k syscalls/s, ~2.5 W).
+;;;; Fix: cancel that timer (loop then blocks on X) and refresh the bar from a background
+;;;; thread on its OWN X connection via ClearArea(:exposures t) -> the server posts a real
+;;;; Expose -> the main thread wakes and redraws.  A crash in the thread ends only the
+;;;; thread, never the WM.  /tmp/ml-render is a breadcrumb proving redraws happen.
+(defun lispbsd-ml-window-id ()
+  (ignore-errors
+    (let* ((head (current-head))
+           (ml (and head (head-mode-line head))))
+      (when ml (xlib:window-id (mode-line-window ml))))))
+
+(defun lispbsd-ml-right ()
+  (ignore-errors
+    (with-open-file (s "/tmp/ml-render" :direction :output
+                                        :if-exists :supersede :if-does-not-exist :create)
+      (format s "~d~%" (get-universal-time))))
+  (sb-right))
+
+(setf *screen-mode-line-format*
+      (list "^B[%g]^b %W ^> " '(:eval (lispbsd-ml-right))))
+(ignore-errors (update-all-mode-lines))
+
+;; cancel StumpWM's own periodic mode-line timer (the busy-poll trigger)
+(ignore-errors
+  (let ((sym (find-symbol "*MODE-LINE-TIMER*" :stumpwm)))
+    (when (and sym (boundp sym) (symbol-value sym))
+      (cancel-timer (symbol-value sym))
+      (setf (symbol-value sym) nil))))
+
+(defvar *lispbsd-ml-thread* nil)
+(defun lispbsd-start-ml-refresher (&optional (interval 3))
+  (unless (and *lispbsd-ml-thread* (sb-thread:thread-alive-p *lispbsd-ml-thread*))
+    (setf *lispbsd-ml-thread*
+          (sb-thread:make-thread
+           (lambda ()
+             (let ((dpy (ignore-errors (xlib:open-default-display))))
+               (unwind-protect
+                    (loop
+                      (sleep interval)
+                      (ignore-errors
+                        (let ((id (lispbsd-ml-window-id)))
+                          (when (and dpy id)
+                            (let ((w (xlib::lookup-window dpy id)))
+                              (when w
+                                (xlib:clear-area w :exposures-p t)
+                                (xlib:display-force-output dpy)))))))
+                 (ignore-errors (when dpy (xlib:close-display dpy))))))
+           :name "lispbsd-ml-refresher"))))
+(lispbsd-start-ml-refresher 3)
