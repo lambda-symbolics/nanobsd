@@ -1,0 +1,15 @@
+#!/bin/sh
+# webcam on|off|status - enable/disable the internal camera (uvideo on uhub3).
+# "off" detaches the driver (privacy; camera unusable). Non-root uses doas.
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
+HUB=uhub3
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="doas"
+present(){ drvctl -l "$HUB" 2>/dev/null | grep -q uvideo0; }
+case "${1:-status}" in
+  off)    $SUDO drvctl -d uvideo1 2>/dev/null; $SUDO drvctl -d uvideo0 2>/dev/null
+          present && echo "webcam: still on (detach failed)" || echo "webcam: OFF" ;;
+  on)     $SUDO drvctl -r "$HUB" 2>/dev/null; sleep 1
+          present && echo "webcam: ON" || echo "webcam: on (re-attach pending; retry or replug)" ;;
+  status) present && echo "webcam: ON" || echo "webcam: OFF" ;;
+  *) echo "usage: webcam [on|off|status]" >&2; exit 1 ;;
+esac
