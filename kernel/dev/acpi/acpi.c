@@ -2328,7 +2328,10 @@ acpi_s2idle_keep(device_t dev)
 	        strncmp(n, "dk", 2) == 0   || strncmp(n, "wd", 2) == 0 ||
 	        strncmp(n, "sd", 2) == 0   || strncmp(n, "ppb", 3) == 0 ||
 	        strncmp(n, "pci", 3) == 0  || strncmp(n, "cpu", 3) == 0 ||
-	        strncmp(n, "acpi", 4) == 0);
+	        strncmp(n, "acpi", 4) == 0 ||
+	        strncmp(n, "iwx", 3) == 0  || strncmp(n, "xhci", 4) == 0 ||
+	        strncmp(n, "usb", 3) == 0  || strncmp(n, "uhub", 4) == 0 ||
+	        strncmp(n, "axen", 4) == 0);
 }
 
 void
