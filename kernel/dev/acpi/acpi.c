@@ -2356,6 +2356,151 @@ acpi_s2idle_keep(device_t dev)
 	return true;		/* keep alive */
 }
 
+/* ---- LPS0 / Low Power S0 Idle (Modern Standby) _DSM handshake ---- */
+/* UUIDs stored in ACPI ToUUID() byte order. */
+static const uint8_t acpi_lps0_uuid_intel[16] = {
+	0xa0, 0x40, 0xeb, 0xc4, 0xd2, 0x6c, 0xe2, 0x11,
+	0xbc, 0xfd, 0x08, 0x00, 0x20, 0x0c, 0x9a, 0x66 };
+static const uint8_t acpi_lps0_uuid_msft[16] = {
+	0x56, 0x0d, 0xe0, 0x11, 0x64, 0xce, 0xce, 0x47,
+	0x83, 0x7b, 0x1f, 0x89, 0x8f, 0x9a, 0xa4, 0x61 };
+
+#define ACPI_LPS0_SCREEN_OFF	3
+#define ACPI_LPS0_SCREEN_ON	4
+#define ACPI_LPS0_ENTRY		5
+#define ACPI_LPS0_EXIT		6
+#define ACPI_LPS0_MS_ENTRY	7
+#define ACPI_LPS0_MS_EXIT	8
+
+static ACPI_HANDLE	acpi_lps0_handle;
+static uint32_t		acpi_lps0_intel_mask;
+static uint32_t		acpi_lps0_msft_mask;
+static int		acpi_lps0_probed;
+
+static ACPI_STATUS
+acpi_lps0_find(ACPI_HANDLE h, uint32_t lvl, void *ctx, void **rv)
+{
+	acpi_lps0_handle = h;
+	return AE_OK;
+}
+
+/*
+ * Evaluate _DSM(uuid, rev, func, empty-package) on the LPS0 device.
+ * For func 0 (query) returns the supported-function bitmask; other
+ * functions are fire-and-forget notifications to the platform.
+ */
+static uint32_t
+acpi_lps0_dsm(const uint8_t *uuid, int rev, int func, bool query)
+{
+	ACPI_OBJECT_LIST list;
+	ACPI_OBJECT args[4];
+	ACPI_BUFFER buf = { ACPI_ALLOCATE_BUFFER, NULL };
+	ACPI_OBJECT *ret;
+	uint32_t mask = 0;
+	ACPI_STATUS rv;
+
+	if (acpi_lps0_handle == NULL)
+		return 0;
+
+	args[0].Type = ACPI_TYPE_BUFFER;
+	args[0].Buffer.Length = 16;
+	args[0].Buffer.Pointer = __UNCONST(uuid);
+	args[1].Type = ACPI_TYPE_INTEGER;
+	args[1].Integer.Value = rev;
+	args[2].Type = ACPI_TYPE_INTEGER;
+	args[2].Integer.Value = func;
+	args[3].Type = ACPI_TYPE_PACKAGE;
+	args[3].Package.Count = 0;
+	args[3].Package.Elements = NULL;
+	list.Count = 4;
+	list.Pointer = args;
+
+	rv = AcpiEvaluateObject(acpi_lps0_handle, __UNCONST("_DSM"), &list,
+	    query ? &buf : NULL);
+	if (ACPI_FAILURE(rv))
+		return 0;
+
+	if (query && buf.Pointer != NULL) {
+		ret = buf.Pointer;
+		if (ret->Type == ACPI_TYPE_BUFFER) {
+			uint32_t i;
+			for (i = 0; i < ret->Buffer.Length && i < 4; i++)
+				mask |= (uint32_t)ret->Buffer.Pointer[i] <<
+				    (i * 8);
+		}
+	}
+	if (buf.Pointer != NULL)
+		ACPI_FREE(buf.Pointer);
+	return mask;
+}
+
+static void
+acpi_lps0_probe(void)
+{
+	char hid[] = "PNP0D80";
+
+	if (acpi_lps0_probed)
+		return;
+	acpi_lps0_probed = 1;
+
+	(void)AcpiGetDevices(hid, acpi_lps0_find, NULL, NULL);
+	if (acpi_lps0_handle == NULL) {
+		aprint_normal_dev(acpi_softc->sc_dev,
+		    "LPS0: no PNP0D80 device found\n");
+		return;
+	}
+	acpi_lps0_intel_mask = acpi_lps0_dsm(acpi_lps0_uuid_intel, 1, 0, true);
+	acpi_lps0_msft_mask  = acpi_lps0_dsm(acpi_lps0_uuid_msft, 0, 0, true);
+	aprint_normal_dev(acpi_softc->sc_dev,
+	    "LPS0: found, intel_mask=0x%x msft_mask=0x%x\n",
+	    acpi_lps0_intel_mask, acpi_lps0_msft_mask);
+}
+
+static void
+acpi_lps0_run(int func, int use_msft)
+{
+	const uint8_t *uuid = use_msft ?
+	    acpi_lps0_uuid_msft : acpi_lps0_uuid_intel;
+	int rev = use_msft ? 0 : 1;
+	uint32_t mask = use_msft ?
+	    acpi_lps0_msft_mask : acpi_lps0_intel_mask;
+
+	if ((mask & (1U << func)) == 0)
+		return;
+	(void)acpi_lps0_dsm(uuid, rev, func, false);
+}
+
+static void
+acpi_lps0_enter(void)
+{
+	acpi_lps0_probe();
+	if (acpi_lps0_handle == NULL)
+		return;
+	if (acpi_lps0_msft_mask != 0) {
+		acpi_lps0_run(ACPI_LPS0_SCREEN_OFF, 1);
+		acpi_lps0_run(ACPI_LPS0_MS_ENTRY, 1);
+	} else if (acpi_lps0_intel_mask != 0) {
+		acpi_lps0_run(ACPI_LPS0_SCREEN_OFF, 0);
+		acpi_lps0_run(ACPI_LPS0_ENTRY, 0);
+	}
+	aprint_normal_dev(acpi_softc->sc_dev, "LPS0: entry handshake issued\n");
+}
+
+static void
+acpi_lps0_exit(void)
+{
+	if (acpi_lps0_handle == NULL)
+		return;
+	if (acpi_lps0_msft_mask != 0) {
+		acpi_lps0_run(ACPI_LPS0_MS_EXIT, 1);
+		acpi_lps0_run(ACPI_LPS0_SCREEN_ON, 1);
+	} else if (acpi_lps0_intel_mask != 0) {
+		acpi_lps0_run(ACPI_LPS0_EXIT, 0);
+		acpi_lps0_run(ACPI_LPS0_SCREEN_ON, 0);
+	}
+	aprint_normal_dev(acpi_softc->sc_dev, "LPS0: exit handshake issued\n");
+}
+
 void
 acpi_enter_freeze(void)
 {
@@ -2391,6 +2536,8 @@ acpi_enter_freeze(void)
 	sc->sc_sleepstate = ACPI_STATE_S3;
 	acpi_wakedev_commit(sc, ACPI_STATE_S3);
 
+	acpi_lps0_enter();
+
 	acpi_freeze_active = 1;
 	acpi_freeze_wake = 0;
 	{ int _i; for (_i = 0; _i < 3000 && acpi_freeze_wake == 0; _i++)
@@ -2398,6 +2545,8 @@ acpi_enter_freeze(void)
 	acpi_freeze_active = 0;
 	aprint_normal_dev(sc->sc_dev, "s2idle: waking (woke=%d)\n",
 	    acpi_freeze_wake);
+
+	acpi_lps0_exit();
 
 	acpi_wakedev_commit(sc, ACPI_STATE_S0);
 
