@@ -253,6 +253,7 @@ static int		sysctl_hw_acpi_sleepstate(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_sleepstates(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_freeze(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_wake(SYSCTLFN_PROTO);
+static int		sysctl_hw_acpi_lps0(SYSCTLFN_PROTO);
 static volatile int	acpi_freeze_active;
 static volatile int	acpi_freeze_wake;
 static kmutex_t		acpi_freeze_mtx;
@@ -1820,6 +1821,12 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 	    sysctl_hw_acpi_wake, 0, NULL, 0,
 	    CTL_CREATE, CTL_EOL);
 
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "lps0", SYSCTL_DESCR("LPS0 _DSM handshake (1=enter, 0=exit)"),
+	    sysctl_hw_acpi_lps0, 0, NULL, 0,
+	    CTL_CREATE, CTL_EOL);
+
 	err = sysctl_createv(clog, 0, &rnode, &rnode,
 	    CTLFLAG_PERMANENT, CTLTYPE_NODE,
 	    "stat", SYSCTL_DESCR("ACPI statistics"),
@@ -2688,6 +2695,32 @@ acpi_freeze_thread(void *arg)
 
 		acpi_enter_freeze();
 	}
+}
+
+static int
+sysctl_hw_acpi_lps0(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node;
+	int err, t;
+
+	if (acpi_softc == NULL)
+		return ENOSYS;
+
+	t = 0;
+	node = *rnode;
+	node.sysctl_data = &t;
+
+	err = sysctl_lookup(SYSCTLFN_CALL(&node));
+
+	if (err || newp == NULL)
+		return err;
+
+	if (t != 0)
+		acpi_lps0_enter();
+	else
+		acpi_lps0_exit();
+
+	return 0;
 }
 
 static int
