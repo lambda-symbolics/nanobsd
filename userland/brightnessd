@@ -1,0 +1,17 @@
+#!/bin/sh
+# brightnessd - lets non-root users (StumpWM keys as mag) change the backlight.
+# Reads "+N", "-N" or "N" lines from a world-writable FIFO and applies them as root.
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/bin
+fifo=/var/run/brightness.fifo
+state=/var/run/brightness.state
+rm -f "$fifo"; mkfifo -m 622 "$fifo" || exit 1
+/usr/local/bin/iblc get > "$state" 2>/dev/null; chmod 644 "$state"
+while :; do
+	while read -r cmd; do
+		case "$cmd" in
+		+[0-9]|+[0-9][0-9]|+100|-[0-9]|-[0-9][0-9]|-100|[0-9]|[0-9][0-9]|100)
+			/usr/local/bin/brightness "$cmd" > "$state" 2>/dev/null ;;
+		esac
+	done < "$fifo"
+	sleep 1
+done

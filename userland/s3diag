@@ -1,0 +1,27 @@
+#!/bin/sh
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin:$PATH; export PATH
+LOG=/root/s3log
+# fresh run marker
+echo "==== s3diag run $(date) ====" >> $LOG
+# verify S3 present, abort if not
+if ! sysctl -n hw.acpi.sleep.states | grep -q S3; then
+    echo "ABORT: S3 not in sleep.states" >> $LOG
+    echo "ABORT: S3 not available"; exit 1
+fi
+dmesg > /root/dmesg.pre 2>&1
+echo "PRE_SUSPEND $(date +%s) $(date)" >> $LOG
+sync; sync; sync
+sleep 1
+# THIS BLOCKS until resume:
+sysctl -w hw.acpi.sleep.state=3 >> $LOG 2>&1
+# --- everything below runs only after resume ---
+echo "RESUMED    $(date +%s) $(date)" >> $LOG
+sleep 3
+dmesg > /root/dmesg.post 2>&1
+echo "POST dmesg captured, wm/net state below" >> $LOG
+ifconfig iwx0 2>&1 | grep -iE 'status|inet ' >> $LOG
+echo "---- resume-time dmesg (new lines) ----" >> $LOG
+# lines in post not in pre = what happened during resume
+diff /root/dmesg.pre /root/dmesg.post | grep '^>' >> $LOG 2>&1
+echo "==== s3diag done ====" >> $LOG
+sync

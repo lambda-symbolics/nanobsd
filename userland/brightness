@@ -1,0 +1,21 @@
+#!/bin/sh
+# brightness - panel backlight via ACPI. Saves last value to $HOME/.brightness;
+# restore at session start with:  brightness "$(cat ~/.brightness 2>/dev/null || echo 20)"
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
+N15=hw.acpi.acpiout15.brightness; N16=hw.acpi.acpiout16.brightness
+STATE="${HOME:-/home/mag}/.brightness"
+cur=$(sysctl -n "$N15" 2>/dev/null); [ -z "$cur" ] && cur=100
+[ $# -eq 0 ] && { echo "$cur"; exit 0; }
+case "$1" in
+  +[0-9]*) new=$((cur + ${1#+})) ;;
+  -[0-9]*) new=$((cur - ${1#-})) ;;
+  [0-9]*)  new=$1 ;;
+  *) echo "usage: brightness [N|+N|-N]" >&2; exit 1 ;;
+esac
+[ "$new" -lt 1 ] && new=1
+[ "$new" -gt 100 ] && new=100
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="doas"
+$SUDO /sbin/sysctl -w "$N15=$new" >/dev/null 2>&1
+$SUDO /sbin/sysctl -w "$N16=$new" >/dev/null 2>&1
+echo "$new" > "$STATE" 2>/dev/null
+echo "$new"

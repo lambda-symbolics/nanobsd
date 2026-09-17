@@ -1,0 +1,23 @@
+#!/bin/sh
+# screentemp [KELVIN] [-d]
+#   Set a static display colour temperature via the DRM CRTC gamma LUT
+#   (works with the framebuffer X server, which has no RANDR gamma).
+#   Default 4000K (warm/low-blue). 6500K = neutral/off. With -d it keeps
+#   reapplying every 60s so a DPMS screen-blank can't wash it back out.
+K=4000
+DAEMON=no
+for a in "$@"; do
+  case "$a" in
+    -d) DAEMON=yes ;;
+    [0-9]*) K="$a" ;;
+  esac
+done
+RS=/usr/pkg/bin/redshift
+# make sure the primary DRM node exists (persists on-disk, but be safe)
+[ -c /dev/dri/card0 ] || (cd /dev && sh MAKEDEV drm0 >/dev/null 2>&1)
+set_temp() { "$RS" -m randr -O "$K" -P >/dev/null 2>&1 || "$RS" -m drm -O "$K" -P >/dev/null 2>&1; }
+if [ "$DAEMON" = yes ]; then
+  while :; do set_temp; sleep 60; done
+else
+  set_temp
+fi
