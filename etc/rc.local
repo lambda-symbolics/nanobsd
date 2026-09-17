@@ -1,0 +1,30 @@
+#	$NetBSD: rc.local,v 1.32 2008/06/11 17:14:52 perry Exp $
+#	originally from: @(#)rc.local	8.3 (Berkeley) 4/28/94
+#
+# This file is (nearly) the last thing invoked by /etc/rc during a
+# normal boot, via /etc/rc.d/local.
+#
+# It is intended to be edited locally to add site-specific boot-time
+# actions, such as starting locally installed daemons.
+#
+# An alternative option is to create site-specific /etc/rc.d scripts.
+#
+
+echo -n 'Starting local daemons:'
+
+# Add your local daemons here, eg:
+#
+#if [ -x /path/to/daemon ]; then
+#	/path/to/daemon args
+#fi
+
+echo '.'
+
+# ensure DRM primary node exists for screentemp/gamma
+[ -c /dev/dri/card0 ] || ( cd /dev && sh MAKEDEV drm0 )
+
+# battery: WiFi power save (~1.5 W)
+ifconfig iwx0 powersave
+
+# camera off by default (privacy); use `webcam on` to enable
+/usr/local/bin/webcam off >/dev/null 2>&1
