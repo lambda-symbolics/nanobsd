@@ -28,3 +28,6 @@ ifconfig iwx0 powersave
 
 # camera off by default (privacy); use `webcam on` to enable
 /usr/local/bin/webcam off >/dev/null 2>&1
+
+# bluetooth off by default (no A2DP on NetBSD anyway); `bluetooth on` to enable
+/usr/local/bin/bluetooth off >/dev/null 2>&1
