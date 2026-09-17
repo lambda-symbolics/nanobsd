@@ -1,0 +1,12 @@
+#!/bin/sh
+# wifi-powersave on|off|status - toggle iwx WiFi power save (~1.5 W). Live only;
+# rc.local re-enables it at boot. Non-root uses doas.
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="doas"
+on(){ ifconfig iwx0 2>/dev/null | grep -qiE 'powersave[[:space:]]+on'; }
+case "${1:-status}" in
+  on)     $SUDO ifconfig iwx0 powersave 2>/dev/null;  on && echo "wifi-powersave: ON"  || echo "wifi-powersave: failed" ;;
+  off)    $SUDO ifconfig iwx0 -powersave 2>/dev/null; on && echo "wifi-powersave: failed" || echo "wifi-powersave: OFF" ;;
+  status) on && echo "wifi-powersave: ON" || echo "wifi-powersave: OFF" ;;
+  *) echo "usage: wifi-powersave [on|off|status]" >&2; exit 1 ;;
+esac
