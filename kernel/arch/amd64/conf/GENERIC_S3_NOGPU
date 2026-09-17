@@ -1,0 +1,8 @@
+# GENERIC_S3_NOGPU - bisection kernel: GENERIC_S3 (ACPI_FORCE_S3 -> \_S3 SSDT)
+# with the i915 GPU driver NOT attached, so the display falls back to the EFI
+# GOP framebuffer (genfb). Purpose: determine whether the S3 *resume* hang is
+# caused by i915's resume() handler (fixable) or by firmware-level S3 (dead).
+# NON-DEFAULT test kernel only.
+include "arch/amd64/conf/GENERIC"
+options 	ACPI_FORCE_S3
+no i915drmkms*

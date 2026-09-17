@@ -1,0 +1,5 @@
+# GENERIC_S3 - GENERIC (with i915 + iwx fixes in-tree) plus ACPI_FORCE_S3,
+# which injects a \_S3 SSDT at boot to re-enable S3 suspend-to-RAM on this
+# X1 Nano's Modern Standby firmware (\_S3 is gated behind If(S0ID==0)).
+include "arch/amd64/conf/GENERIC"
+options 	ACPI_FORCE_S3
