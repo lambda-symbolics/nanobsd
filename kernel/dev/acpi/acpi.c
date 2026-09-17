@@ -2310,42 +2310,76 @@ out:
 
 #endif	/* ACPI_ACTIVATE_DEV */
 
+
 /*
- * LISPBSD s2idle (freeze): reuse the working pmf suspend/resume halves of the
- * S3 path but skip the firmware transition (acpi_md_sleep), which never resumes
- * on this Modern-Standby platform.  Devices go to D3 (display/GPU/WiFi off), the
- * calling thread polls in a low-power sleep so CPUs idle deep, and a wake source
- * (power button; see acpi_button.c) clears the flag to resume.
+ * LISPBSD s2idle (freeze): reuse pmf per-device suspend/resume but SKIP the
+ * storage + PCI-topology so a fault can still write a crash dump (and syslog),
+ * and log every device by name as it suspends -- so a panic gives us both a
+ * backtrace and the exact culprit driver in the msgbuf.  Skips the firmware
+ * S3 transition (acpi_md_sleep), which never resumes on this platform.
  */
+static bool
+acpi_s2idle_keep(device_t dev)
+{
+	const char *n = device_xname(dev);
+
+	/* keep the crash-dump path and bus topology powered */
+	return (strncmp(n, "nvme", 4) == 0 || strncmp(n, "ld", 2) == 0 ||
+	        strncmp(n, "dk", 2) == 0   || strncmp(n, "wd", 2) == 0 ||
+	        strncmp(n, "sd", 2) == 0   || strncmp(n, "ppb", 3) == 0 ||
+	        strncmp(n, "pci", 3) == 0  || strncmp(n, "cpu", 3) == 0 ||
+	        strncmp(n, "acpi", 4) == 0);
+}
+
 void
 acpi_enter_freeze(void)
 {
 	struct acpi_softc *sc = acpi_softc;
+	device_t curdev;
+	deviter_t di;
 
 	if (sc == NULL || sc->sc_sleepstate != ACPI_STATE_S0)
 		return;
 
-	aprint_normal_dev(sc->sc_dev, "s2idle: freezing (device suspend)\n");
+	aprint_normal_dev(sc->sc_dev,
+	    "s2idle: freezing (selective suspend, dump path kept alive)\n");
 
-	if (pmf_system_suspend(PMF_Q_NONE) != true) {
-		aprint_error_dev(sc->sc_dev, "s2idle: device suspend failed\n");
-		(void)pmf_system_resume(PMF_Q_NONE);
-		return;
+	KERNEL_LOCK(1, NULL);
+	for (curdev = deviter_first(&di, DEVITER_F_LEAVES_FIRST);
+	     curdev != NULL; curdev = deviter_next(&di)) {
+		if (!device_is_active(curdev) || acpi_s2idle_keep(curdev))
+			continue;
+		aprint_normal("s2idle: suspend %s\n", device_xname(curdev));
+		(void)pmf_device_suspend(curdev, PMF_Q_NONE);
 	}
+	deviter_release(&di);
+	KERNEL_UNLOCK_ONE(NULL);
 
 	sc->sc_sleepstate = ACPI_STATE_S3;
 	acpi_wakedev_commit(sc, ACPI_STATE_S3);
 
 	acpi_freeze_active = 1;
 	acpi_freeze_wake = 0;
-	while (acpi_freeze_wake == 0)
-		kpause("s2idle", false, MAX(1, hz / 10), NULL);
+	{ int _i; for (_i = 0; _i < 200 && acpi_freeze_wake == 0; _i++)
+		kpause("s2idle", false, MAX(1, hz / 10), NULL); }
 	acpi_freeze_active = 0;
+	aprint_normal_dev(sc->sc_dev, "s2idle: waking (woke=%d)\n",
+	    acpi_freeze_wake);
 
 	acpi_wakedev_commit(sc, ACPI_STATE_S0);
-	(void)pmf_system_resume(PMF_Q_NONE);
-	sc->sc_sleepstate = ACPI_STATE_S0;
 
+	KERNEL_LOCK(1, NULL);
+	for (curdev = deviter_first(&di, DEVITER_F_ROOT_FIRST);
+	     curdev != NULL; curdev = deviter_next(&di)) {
+		if (!device_is_active(curdev) || acpi_s2idle_keep(curdev))
+			continue;
+		aprint_normal("s2idle: resume %s\n", device_xname(curdev));
+		(void)pmf_device_resume(curdev, PMF_Q_NONE);
+	}
+	deviter_release(&di);
+	KERNEL_UNLOCK_ONE(NULL);
+
+	sc->sc_sleepstate = ACPI_STATE_S0;
 	aprint_normal_dev(sc->sc_dev, "s2idle: resumed\n");
 }
 
