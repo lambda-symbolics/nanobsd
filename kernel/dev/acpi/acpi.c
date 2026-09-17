@@ -132,6 +132,11 @@ __KERNEL_RCSID(0, "$NetBSD: acpi.c,v 1.303.2.1 2026/06/27 10:46:19 martin Exp $"
 
 #include "ioconf.h"
 
+#include "wsdisplay.h"
+#if NWSDISPLAY > 0
+#include <dev/wscons/wsdisplayvar.h>
+#endif
+
 #ifdef ACPI_FORCE_S3
 /*
  * LISPBSD: minimal SSDT injected at boot to re-enable S3 (suspend-to-RAM)
@@ -2347,6 +2352,14 @@ acpi_enter_freeze(void)
 	aprint_normal_dev(sc->sc_dev,
 	    "s2idle: freezing (selective suspend, dump path kept alive)\n");
 
+#if NWSDISPLAY > 0
+	if (wsdisplay_handlex(0)) {
+		aprint_normal_dev(sc->sc_dev,
+		    "s2idle: X server detach failed, aborting freeze\n");
+		return;
+	}
+#endif
+
 	KERNEL_LOCK(1, NULL);
 	for (curdev = deviter_first(&di, DEVITER_F_LEAVES_FIRST);
 	     curdev != NULL; curdev = deviter_next(&di)) {
@@ -2381,6 +2394,10 @@ acpi_enter_freeze(void)
 	}
 	deviter_release(&di);
 	KERNEL_UNLOCK_ONE(NULL);
+
+#if NWSDISPLAY > 0
+	wsdisplay_handlex(1);
+#endif
 
 	sc->sc_sleepstate = ACPI_STATE_S0;
 	aprint_normal_dev(sc->sc_dev, "s2idle: resumed\n");
