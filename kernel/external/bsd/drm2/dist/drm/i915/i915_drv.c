@@ -1738,8 +1738,12 @@ static int vlv_resume_prepare(struct drm_i915_private *dev_priv,
 static int vlv_suspend_complete(struct drm_i915_private *dev_priv);
 #endif
 
+int i915_lispbsd_s0idle = 0;	/* LISPBSD: force S0-idle suspend mode */
+
 static bool suspend_to_idle(struct drm_i915_private *dev_priv)
 {
+	if (i915_lispbsd_s0idle)
+		return true;
 #if IS_ENABLED(CONFIG_ACPI_SLEEP)
 	if (acpi_target_system_state() < ACPI_STATE_S3)
 		return true;

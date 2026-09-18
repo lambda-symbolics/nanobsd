@@ -288,6 +288,8 @@ static suspend_state_t pm_suspend_target(void)
 }
 #endif
 
+extern int i915_lispbsd_s0idle;
+
 void intel_gt_suspend_late(struct intel_gt *gt)
 {
 	intel_wakeref_t wakeref;
@@ -299,6 +301,15 @@ void intel_gt_suspend_late(struct intel_gt *gt)
 		return;
 
 	GEM_BUG_ON(gt->awake);
+
+	if (i915_lispbsd_s0idle) {
+		DRM_INFO("LISPBSD: gt_suspend_late S0-idle: rc6.enabled=%d PG_ENABLE=0x%08x RC_CONTROL=0x%08x\n",
+		    gt->rc6.enabled,
+		    intel_uncore_read(gt->uncore, GEN9_PG_ENABLE),
+		    intel_uncore_read(gt->uncore, GEN6_RC_CONTROL));
+		GT_TRACE(gt, "S0-idle: RC6 preserved\n");
+		return;
+	}
 
 #ifndef __NetBSD__
 	/*

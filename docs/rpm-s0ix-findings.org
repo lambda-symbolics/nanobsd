@@ -511,3 +511,26 @@ wide quiet windows; package residency needs OVERLAPPING per-CPU idle, which an
 average doesn't show.
 Next build = stage 3 (callout-wheel deferral + the 3 timekeeping fixes) -- deep,
 delicate; Astra has now specified the exact bugs. Then re-measure PC10.
+
+* UPDATE 19 (2026-09-18 ~16:30): ASTRA WAS RIGHT — RC6-disable pinned pc9, not display
+Implemented Astra's S0-idle GT exemption: new global i915_lispbsd_s0idle
+(sysctl hw.i915s0idle), suspend_to_idle() honors it, and intel_gt_suspend_late()
+takes an early return (preserving RC6/RPS/LLC, skipping gt_sanitize) when set --
+with logging of rc6.enabled + GEN9_PG_ENABLE + GEN6_RC_CONTROL while in D0.
+TEST (hw.i915s0idle=1 + drvctl -S iwx0 + drvctl -S i915drmkms0[GPU->D3] +
+LPS0 + s0freeze):
+  log: gt_suspend_late S0-idle: rc6.enabled=1 PG_ENABLE=0x00000007
+       RC_CONTROL=0x88040000  (RC6/PG PRESERVED, branch ran)
+  s0freeze done: c7core~99% pc9=93% pc10=0 slp_s0=0
+=> With RC6 PRESERVED, GPU-D3 NO LONGER PINS the package: pc9 recovered 0%->93%.
+UPDATE 16's "GPU-D3 pins via display SA" was CONFOUNDED by intel_rc6_disable()
+in the non-exempt GT suspend path (Astra's diagnosis exactly). X survived.
+DECISIVE CONSEQUENCE: we now hold the deepest device state possible -- GPU D3
+(GFX0=D3 SATISFIED) + WiFi D3 + DC9 + RC6 on + LPS0 handshake + userspace frozen
++ cores 99% idle + pc9=93% -- and PC10/SLP_S0 are STILL 0. Therefore GFX0=D3 is
+NOT the PC10 gate: CANDIDATE (b) REFUTED. The SOLE remaining blocker is
+CANDIDATE (a): idle gaps too short (~14ms, callout_next_ticks-capped) < PC10
+entry latency. Stage 3 (defer the callout wheel to extend gaps, + Astra's 3
+lapic_oneshot/callout timekeeping fixes) is now the single, unambiguous path to
+PC10 -> SLP_S0 -> LED. Every device/GPU/RC6/display/userspace prerequisite is
+now achievable and yields pc9=93%.

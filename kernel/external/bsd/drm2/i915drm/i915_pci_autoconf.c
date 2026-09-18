@@ -79,6 +79,7 @@ static void	i915drmkms_task_work(struct work *, void *);
 /* LISPBSD: transparent i915 runtime PM, triggered via hw.i915rpm sysctl. */
 int i915_lispbsd_rpm_suspend(struct drm_device *);
 int i915_lispbsd_rpm_resume(struct drm_device *);
+extern int i915_lispbsd_s0idle;
 
 static struct i915drmkms_softc *lispbsd_i915_sc;
 static int lispbsd_i915rpm;	/* 0 active, 1 rpm-suspended, 2 rpm+D3 */
@@ -257,6 +258,12 @@ i915drmkms_attach_real(device_t self)
 	    CTLFLAG_READWRITE, CTLTYPE_INT, "i915rpm",
 	    SYSCTL_DESCR("LISPBSD i915 runtime PM (0=on 1=disp-off 2=+D3)"),
 	    i915drmkms_sysctl_rpm, 0, NULL, 0,
+	    CTL_HW, CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(NULL, 0, NULL, NULL,
+	    CTLFLAG_READWRITE, CTLTYPE_INT, "i915s0idle",
+	    SYSCTL_DESCR("LISPBSD force i915 S0-idle suspend (preserve RC6)"),
+	    NULL, 0, &i915_lispbsd_s0idle, 0,
 	    CTL_HW, CTL_CREATE, CTL_EOL);
 
 	/*
