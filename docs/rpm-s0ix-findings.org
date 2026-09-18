@@ -202,3 +202,27 @@ and not a kernel busy-spin (didn't log core C7 this run).
 NEXT: stage 2 — call the i915 system-suspend lifecycle (drm_suspend_ioctl,
 i915_drm_prepare/suspend/suspend_late) with an S0-idle target inside the frozen
 window, then resume-restore before handlex(1). Measure residency again.
+
+* UPDATE 6 (2026-09-18 ~12:20): BREAKTHROUGH — freezer+display-off => pc9=93%
+Made handlex conditional (s0freeze=2 skips it) and added core-C7 logging.
+Test: userland `xset dpms force off` (panel off, X alive) then s0freeze=2
+(freeze userspace, NO handlex so console doesn't re-light the panel, ticks ON):
+  RESULT (kernel #56, 10s hold): c7core=99%  pc9=93%  pc10=0  slp_s0=0.
+Interpretation:
+- The freezer is clean (c7=99%, no busy-spin). Earlier pc9=0 WAS the handlex->
+  console->panel-on path; skipping handlex + DPMS-off fixes it.
+- Cores 99% idle, package 93% in PC9 -- best state yet, X survives, reversible.
+- pc10 STILL 0. With cores fully idle and display off, the ONLY remaining
+  wakeup is the 100Hz LAPIC periodic tick (hardclock every 10ms) -> the package
+  cannot hold CC10 long enough for PC10. This precisely confirms Astra stage 3:
+  tick suppression is the specific PC10 blocker (now demonstrated, not assumed).
+NEXT = stage 3: slow or suspend the LAPIC periodic tick during the frozen
+window. Open question for Astra: on TGL does the LAPIC timer deadline still
+wake a core from CC10 (normal tickless idle relies on this), so simply LOWERING
+the tick rate (e.g. reprogram LAPIC initial count to ~2Hz) during the hold
+would open >100ms idle gaps and reach PC10 with NO hardware-wake-from-C10 risk
+and kpause still functioning -- vs. fully masking LVT_TIMER (Astra's approach)
+which needs an external wake (RTC/HPET) that survives C10 and risks a hard hang
+if the wake fails. Prefer the low-risk slow-the-tick variant for the first PC10
+test. Timekeeping: TSC timecounter (q=3000) is tick-independent so wall clock is
+fine; only callout latency grows during the short window.
