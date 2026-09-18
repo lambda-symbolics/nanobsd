@@ -251,3 +251,14 @@ NOT kernel callouts. Options to explore with Astra:
 State banked: stages 1+2 reach pc9=93% cleanly (freezer+display-off, X
 survives, reversible). PC10/SLP_S0/LED remain, gated by callout+tick quiescence
 (delicate timekeeping work — recommend Astra guidance before building).
+
+* UPDATE 8 (2026-09-18 ~12:45): confirmed PC10 cap = callouts (zero-risk probe)
+Tried raising cidle maxskip to 2000 during a frozen hold: REJECTED (code-caps
+maxskip at 100). Ran s0freeze=2 anyway: pc9=94% pc10=0, tlstats woke_early=266k
+vs deep=5.7k. So even the 1s skip cap is never reached -- callouts wake each CPU
+within a few ms. CONCLUSION (zero-risk, definitive): the pc9->pc10 cap is the
+CALLOUT WHEEL (per-CPU scheduler/softclock/etc.), not the raw tick nor maxskip.
+Stage 3 must DEFER/QUIESCE callouts (and the tick) across the frozen window and
+fix timekeeping/watchdog on resume -- delicate, needs the kern_tc.c/callout
+handling Astra scoped. This is the last mile to PC10/SLP_S0/LED; recommend Astra
+guidance before implementing (hard-hang/timekeeping risk on the daily machine).
