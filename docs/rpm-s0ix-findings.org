@@ -1038,3 +1038,39 @@ transition; the lid just requests it.
      tick; event-driven hold + hardclock suppression to push pc10 toward ~90%.
   2. SLP_S0 platform residency (true modern-standby state) -- still 0; the ~1 W
      floor almost certainly needs it.
+
+* UPDATE 32 (2026-09-19 ~00:30): coordinator instrumented; SLP_S0 wall = w4(VNN)+w5(timer)
+Kernel #67/#68 add in-coordinator instrumentation (safe, measurement-only) so we
+read the REAL integrated freeze, not a diagnostic approximation.  Laptop now on
+AC, so battery-discharge power is dead -> pivoted to RAPL + residency.
+
+** C1/C3 auto-demote: firmware-LOCKED (dead end)
+  PKG_CST_CFG (MSR 0xe2) = 0x74008008: lock=1, C1AD=1, C3AD=0.  The config-lock
+  bit is set, so clearing auto-demote is a no-op (Astra: "if locked, move on").
+
+** Real integrated freeze (#68, iwx suspended), coordinator dmesg
+  hold pc10=48% slp_s0 d=0
+  PMClatch w0=b57c0074 w1=c43de3ef w2=00001eef w3=00001040 w4=3d17fa6d w5=000aaaaa
+  rapl_dE=10911677 esu=14  => ~666 J / ~300 s = ~2.2 W PACKAGE (of ~3.3 W total)
+  So the SoC package itself draws ~2.2 W frozen; the rest (~1.1 W) is DRAM/VRM/
+  board.  1 W total needs BOTH package down (SLP_S0/deeper) AND platform rails.
+
+** SLP_S0 gate decode (mode0 latch, req & ~status)
+  - w0 USB2PLL_OFF (bit18): now MET -- suspending iwx/CNVi cleared it (was the
+    stubborn w0 blocker; iwx-up probe had it unmet at 0x35780074 -> 0xb57c0074).
+  - w4 bits 19,21 (vnn_misc): still UNMET (0x3d17fa6d).  VNN-rail / voltage --
+    likely PMIC/firmware, not OS-clearable.
+  - w5 = 0x000aaaaa (Int_Timer_SS_Wake polarity): timer still armed as a wake.
+    This is what a suspend-time clock-freeze (tick_freeze) would target.
+  Honest read: even a perfect clock-freeze clears at most w5; if w4(VNN) is
+  firmware-gated, SLP_S0 stays 0.  Need Astra on whether w4 b19/b21 are OS-reachable.
+
+** Constraint tonight: user asleep, laptop on AC
+  A full clock-freeze that stops all timers has NO auto-thaw fallback -> a wake
+  failure hangs the box until a morning hard power-cycle.  So the risky tick_freeze
+  test is deferred to when the user is present (can SCI-wake / recover).  Pursuing
+  only SAFE levers (auto-thaw intact): S0 wake policy, event-driven hold.
+
+** Reboot note
+  #66/#67/#68 all boot fine; the earlier "blank+fan" hang was a flaky software-
+  reboot path, not a boot regression (hard-cycle boots the same kernel).

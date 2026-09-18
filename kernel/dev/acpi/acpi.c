@@ -2801,7 +2801,39 @@ acpi_lps0_exit(void)
  */
 #if defined(__x86_64__) || defined(__i386__)
 #include <machine/cpufunc.h>
+#include <sys/xcall.h>
 static uint64_t acpi_s0_rdmsr(u_int m) { return rdmsr(m); }
+
+/*
+ * C1/C3 auto-demotion: aggressive package auto-demote can keep the package out
+ * of its deepest C-state during s2idle.  Linux's Tiger Lake PMC suspend path
+ * clears these bits on every online CPU and restores them on resume.
+ * MSR_PKG_CST_CONFIG_CONTROL (0xe2): bit15 = config lock (writes ignored when
+ * set), bit26 = C1 auto-demote enable, bit25 = C3 auto-demote enable.
+ */
+#define MSR_PKG_CST_CONFIG_CONTROL	0xe2
+#define PKG_CST_CFG_LOCK		(1ULL << 15)
+#define NHM_C1_AUTO_DEMOTE		(1ULL << 26)
+#define NHM_C3_AUTO_DEMOTE		(1ULL << 25)
+static uint64_t acpi_cstcfg_saved[MAXCPUS];
+static void
+acpi_cstcfg_xc(void *disable, void *unused __unused)
+{
+	uint64_t v = rdmsr(MSR_PKG_CST_CONFIG_CONTROL);
+	u_int idx = cpu_index(curcpu());
+
+	if (idx >= MAXCPUS)
+		return;
+	if (disable != NULL) {
+		acpi_cstcfg_saved[idx] = v;
+		if ((v & PKG_CST_CFG_LOCK) == 0)
+			wrmsr(MSR_PKG_CST_CONFIG_CONTROL,
+			    v & ~(NHM_C1_AUTO_DEMOTE | NHM_C3_AUTO_DEMOTE));
+	} else if ((acpi_cstcfg_saved[idx] & PKG_CST_CFG_LOCK) == 0) {
+		wrmsr(MSR_PKG_CST_CONFIG_CONTROL, acpi_cstcfg_saved[idx]);
+	}
+}
+#define ACPI_S2IDLE_CSTCFG	1
 #else
 static uint64_t acpi_s0_rdmsr(u_int m) { (void)m; return 0; }
 #endif
@@ -3081,6 +3113,9 @@ acpi_enter_freeze(void)
 	deviter_t di;
 	extern int i915_lispbsd_s0idle;
 	int s0idle_save;
+	uint64_t h_tsc0 = 0, h_pc10_0 = 0, h_s0_0 = 0, h_rapl0 = 0;
+	UINT64 h_latchsave = 0, h_etr3 = 0;
+	int h_s0r = -1, h_latch_armed = 0;
 
 	if (sc == NULL || sc->sc_sleepstate != ACPI_STATE_S0)
 		return;
@@ -3143,12 +3178,74 @@ acpi_enter_freeze(void)
 
 	acpi_lps0_enter();
 
+#ifdef ACPI_S2IDLE_CSTCFG
+	{
+		uint64_t cst = rdmsr(MSR_PKG_CST_CONFIG_CONTROL);
+		aprint_normal_dev(sc->sc_dev,
+		    "s2idle: PKG_CST_CFG 0x%jx (lock=%d C1AD=%d C3AD=%d)"
+		    " -> clearing auto-demote\n", (uintmax_t)cst,
+		    (int)!!(cst & PKG_CST_CFG_LOCK),
+		    (int)!!(cst & NHM_C1_AUTO_DEMOTE),
+		    (int)!!(cst & NHM_C3_AUTO_DEMOTE));
+	}
+	xc_wait(xc_broadcast(0, acpi_cstcfg_xc, (void *)1, NULL));
+#endif
+	h_tsc0 = acpi_s0_rdmsr(0x10);		/* TSC */
+	h_pc10_0 = acpi_s0_rdmsr(0x632);	/* PC10 residency */
+	h_s0r = acpi_slp_s0_read(&h_s0_0);	/* SLP_S0 residency */
+	h_rapl0 = (uint32_t)acpi_s0_rdmsr(0x611);	/* RAPL pkg energy */
+	/* Arm the C10 PMC latch to capture PMC status at deepest entry. */
+	if (ACPI_SUCCESS(AcpiOsReadMemory(0xfe001c34, &h_latchsave, 32))) {
+		if (ACPI_SUCCESS(AcpiOsWriteMemory(0xfe001c34,
+		    h_latchsave & ~(1U << 31), 32)))
+			h_latch_armed = 1;
+		if (ACPI_SUCCESS(AcpiOsReadMemory(0xfe001048, &h_etr3, 32)))
+			(void)AcpiOsWriteMemory(0xfe001048,
+			    h_etr3 | (1U << 28), 32);
+	}
+
 	/* Enter the hold only if no wake arrived during preparation. */
 	{ int _i; for (_i = 0; _i < 3000 && acpi_freeze_wake == 0; _i++)
 		kpause("s2idle", false, MAX(1, hz / 10), NULL); }
 	acpi_freeze_active = 0;
-	aprint_normal_dev(sc->sc_dev, "s2idle: waking (woke=%d)\n",
-	    acpi_freeze_wake);
+
+	{
+		uint64_t tsc1 = acpi_s0_rdmsr(0x10);
+		uint64_t pc10_1 = acpi_s0_rdmsr(0x632);
+		uint64_t s0_1 = 0, dt = tsc1 - h_tsc0;
+
+		(void)acpi_slp_s0_read(&s0_1);
+		if (dt == 0)
+			dt = 1;
+		aprint_normal_dev(sc->sc_dev,
+		    "s2idle: waking (woke=%d) hold pc10=%ju%% slp_s0 d=%ju\n",
+		    acpi_freeze_wake,
+		    (uintmax_t)((pc10_1 - h_pc10_0) * 100 / dt),
+		    (uintmax_t)(h_s0r == 0 ? (uint32_t)(s0_1 - h_s0_0) : 0));
+	}
+	{
+		UINT64 w[6];
+		unsigned pi;
+		uint32_t de = (uint32_t)((uint32_t)acpi_s0_rdmsr(0x611) -
+		    (uint32_t)h_rapl0);
+		uint32_t esu = (uint32_t)((acpi_s0_rdmsr(0x606) >> 8) & 0x1f);
+
+		for (pi = 0; pi < 6; pi++) {
+			w[pi] = 0;
+			(void)AcpiOsReadMemory(0xfe001c3c + pi * 4, &w[pi], 32);
+		}
+		aprint_normal_dev(sc->sc_dev,
+		    "s2idle: PMClatch %08x %08x %08x %08x %08x %08x "
+		    "rapl_dE=%u esu=%u armed=%d\n",
+		    (uint32_t)w[0], (uint32_t)w[1], (uint32_t)w[2],
+		    (uint32_t)w[3], (uint32_t)w[4], (uint32_t)w[5],
+		    de, esu, h_latch_armed);
+		if (h_latch_armed)
+			(void)AcpiOsWriteMemory(0xfe001c34, h_latchsave, 32);
+	}
+#ifdef ACPI_S2IDLE_CSTCFG
+	xc_wait(xc_broadcast(0, acpi_cstcfg_xc, NULL, NULL));
+#endif
 
 	acpi_lps0_exit();
 
