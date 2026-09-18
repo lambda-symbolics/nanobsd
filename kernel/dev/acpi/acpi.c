@@ -2388,6 +2388,7 @@ static const uint8_t acpi_lps0_uuid_msft[16] = {
 #define ACPI_LPS0_EXIT		6
 #define ACPI_LPS0_MS_ENTRY	7
 #define ACPI_LPS0_MS_EXIT	8
+#define ACPI_LPS0_MS_DISPLAY_ON	9
 
 static ACPI_HANDLE	acpi_lps0_handle;
 static uint32_t		acpi_lps0_intel_mask;
@@ -2434,8 +2435,16 @@ acpi_lps0_dsm(const uint8_t *uuid, int rev, int func, bool query)
 
 	rv = AcpiEvaluateObject(acpi_lps0_handle, __UNCONST("_DSM"), &list,
 	    query ? &buf : NULL);
-	if (ACPI_FAILURE(rv))
+	if (!query || ACPI_FAILURE(rv))
+		aprint_normal_dev(acpi_softc->sc_dev,
+		    "LPS0: %s _DSM rev %d function %d: %s\n",
+		    uuid == acpi_lps0_uuid_msft ? "Microsoft" : "Intel",
+		    rev, func, AcpiFormatException(rv));
+	if (ACPI_FAILURE(rv)) {
+		if (buf.Pointer != NULL)
+			ACPI_FREE(buf.Pointer);
 		return 0;
+	}
 
 	if (query && buf.Pointer != NULL) {
 		ret = buf.Pointer;
@@ -2551,14 +2560,15 @@ acpi_lps0_enter(void)
 	acpi_lps0_probe();
 	if (acpi_lps0_handle == NULL)
 		return;
-	if (acpi_lps0_msft_mask != 0) {
-		acpi_lps0_run(ACPI_LPS0_SCREEN_OFF, 1);
-		acpi_lps0_run(ACPI_LPS0_MS_ENTRY, 1);
-	} else if (acpi_lps0_intel_mask != 0) {
-		acpi_lps0_run(ACPI_LPS0_SCREEN_OFF, 0);
-		acpi_lps0_run(ACPI_LPS0_ENTRY, 0);
-	}
-	aprint_normal_dev(acpi_softc->sc_dev, "LPS0: entry handshake issued\n");
+
+	/* Both UUIDs may contribute functions; acpi_lps0_run checks each bit. */
+	acpi_lps0_run(ACPI_LPS0_SCREEN_OFF, 0);
+	acpi_lps0_run(ACPI_LPS0_SCREEN_OFF, 1);
+	acpi_lps0_run(ACPI_LPS0_MS_ENTRY, 1);
+	acpi_lps0_run(ACPI_LPS0_ENTRY, 1);
+	acpi_lps0_run(ACPI_LPS0_ENTRY, 0);
+	aprint_normal_dev(acpi_softc->sc_dev,
+	    "LPS0: entry notifications attempted\n");
 }
 
 static void
@@ -2566,14 +2576,15 @@ acpi_lps0_exit(void)
 {
 	if (acpi_lps0_handle == NULL)
 		return;
-	if (acpi_lps0_msft_mask != 0) {
-		acpi_lps0_run(ACPI_LPS0_MS_EXIT, 1);
-		acpi_lps0_run(ACPI_LPS0_SCREEN_ON, 1);
-	} else if (acpi_lps0_intel_mask != 0) {
-		acpi_lps0_run(ACPI_LPS0_EXIT, 0);
-		acpi_lps0_run(ACPI_LPS0_SCREEN_ON, 0);
-	}
-	aprint_normal_dev(acpi_softc->sc_dev, "LPS0: exit handshake issued\n");
+
+	acpi_lps0_run(ACPI_LPS0_EXIT, 0);
+	acpi_lps0_run(ACPI_LPS0_EXIT, 1);
+	acpi_lps0_run(ACPI_LPS0_MS_DISPLAY_ON, 1);
+	acpi_lps0_run(ACPI_LPS0_MS_EXIT, 1);
+	acpi_lps0_run(ACPI_LPS0_SCREEN_ON, 1);
+	acpi_lps0_run(ACPI_LPS0_SCREEN_ON, 0);
+	aprint_normal_dev(acpi_softc->sc_dev,
+	    "LPS0: exit notifications attempted\n");
 }
 
 void
