@@ -160,3 +160,25 @@ Implications:
 - Current clean baselines: screen-off + net-up(powersave) = pc9~83%, pc10=0,
   SLP_S0=0. Best reachable idle is still only PC9; PC10/SLP_S0 need the full
   s2idle transition (freeze userspace + suspend tick + CLEAN network quiesce).
+
+* UPDATE 4 (2026-09-18 ~11:30): crude userspace-freeze ALSO spins -> dead end
+Tested SIGSTOP of the desktop (pkill -STOP -u mag) + screen-off, network UP
+(no ifconfig down): core C7 -> 0%, pc8/9/10 = 0, SLP_S0 = 0. So freezing the
+compositor makes the (unstopped, likely root) Xorg busy-spin waiting on the
+frozen client. Combined with UPDATE 3 (iwx0 down spins), the conclusion is:
+  *** Every crude quiesce method triggers a CPU busy-spin and makes idle WORSE.
+      The best reachable state is plain screen-off with everything running
+      normally: pc9~83%, pc10=0, SLP_S0=0. ***
+Also: suspendsched() is NOT reversible (sets SSTOP + L_WREBOOT for reboot; no
+resumesched), so the Linux-freezer approach is unavailable as-is.
+
+Therefore reaching PC10/SLP_S0 requires a PROPER, coordinated s2idle transition
+that quiesces cleanly without triggering these driver/X busy-waits:
+  - a reversible userspace freeze (needs building; suspendsched is one-way),
+  - clean device quiesce via pmf_device_suspend (NOT ifconfig down / SIGSTOP),
+    and X handed off cleanly (wsdisplay_handlex already exists in the freeze),
+  - per-CPU tick suspend during the window (tickless cidle is the basis),
+  - a single wake source (lid/power GPE) + a one-shot-timer safety timeout.
+This is a real NetBSD s2idle framework, not a tweak. Measurement
+(hw.acpi.sleep.slp_s0) is in place to validate any attempt. Holding for
+architectural guidance before building it on the daily machine.
