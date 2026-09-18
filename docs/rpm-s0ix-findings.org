@@ -684,3 +684,49 @@ wells released). NetBSD drives neither PHY power state.
    (the LED) be approached via a different mechanism? The live-status method is
    blind (sampling CPU awake); should the coordinator instead read the LATCHED
    status (0x1c3c) + per-mode residency (0x1c80) so we measure real LPM entry?
+
+* UPDATE 24 (2026-09-18 ~17:45): ASPM L1.2 verified; USB2 devices block USB2PLL; iwx-D3 test
+** ASPM / L1 PM Substates (goal 1) — VERIFIED via config-space walk
+  - NVMe PCIe link (root port dev6): L1SS ext cap @0x200, Ctl1=0x40692d1f ->
+    L1.2-ASPM (bit2) = 1. *** ASPM L1.2 ENABLED on the NVMe link. ***
+  - TB PCIe root ports (dev7 f0/f2): Link Control=0x0002 (ASPM L1 Entry Enabled);
+    no L1SS ext cap exposed at the root port (TB-link L1.2 handled by the TB
+    controller firmware, not the PCH root port).
+  - WiFi AX201 (dev20 f3): CNVi device -- NOT a PCIe endpoint (no link, no L1SS).
+    Classic ASPM L1.2 is N/A; its low-power state is PCI D3 (works via drvctl -S).
+  => Goal-1 "link in ASPM L1.2": enabled on all real PCIe links (L1 everywhere,
+     L1.2 confirmed on NVMe). WiFi/TB reach D3.
+
+** USB2PLL root cause: three non-detachable active USB2 devices
+usbdevs: xhci1 USB2 bus (usb3) has ACTIVE devices: Synaptics fingerprint
+(06cb:00bd, ugen0), Chicony Integrated Camera (04f2:b6ea, uvideo0/1), Intel
+Bluetooth (8087:0026, ubt0). In U0 (active) the USB2 ports never reach U3, so
+the PMC keeps USB2PLL on even with xHCI in D3 (xHCI_PG/xHCI0_D3 SET but
+USB2PLL_OFF stays 0). Linux gates USB2PLL via USB autosuspend; NetBSD has none.
+STAGE B: drvctl -d uvideo0/uvideo1/ubt0 -> "Device not configured" (marked
+non-detachable); only ugen0 detached. Camera+BT stayed -> word0 unchanged.
+
+** STAGE C: full quiesce INCLUDING iwx D3 (detached self-restoring script)
+Ran on WiFi-only via a nohup script that suspends iwx (drops ssh), freezes,
+then restores iwx + wpa_supplicant/dhcpcd. Reconnected cleanly afterward.
+  s0freeze done: c7core~99% pc9=0% pc10=53% slp_s0=ok d=0
+  PMC status 25580074 807c63ef 00001fef 00001040 3d175a2c 000aaaaa
+=> iwx D3 cleared word4 bit21 (3d375a2c->3d175a2c, a CNVi/WiFi vnn_misc bit) and
+   gave the best PC10 (53%). But slp_s0 STILL 0; word0 (PLLs) UNCHANGED.
+
+** EXHAUSTIVE NEGATIVE RESULT for SLP_S0 / the LED (goal 3)
+Maximal OS-level quiesce achieved: ALL devices D3 (GPU+RC6-on, xHCI, iwx, TB-DMA,
+ISH, LPSS I2C, HDaudio) + LPS0 _DSM ENTRY (AE_OK) + userspace frozen + 99% core
+idle + PC10=53%. The PMC STILL never enters any LPM mode (per-mode residency 0,
+slp_s0 counter 0). Remaining blockers, now fully attributed:
+  - word0 USB2PLL_OFF(b18): blocked by non-autosuspendable USB2 devices
+    (camera/BT/fingerprint). Needs USB selective-suspend in the kernel.
+  - word0 OPIOPLL_OFF(b21): blocked by display OPIO -- DC9 armed (U17) but not
+    ENTERED. Needs i915 display power-well release at suspend_late (DC9 entry).
+  - word4 CPU_C10_REQ_STS_0(b0): live-status is blind (sampling CPU awake);
+    needs latched-status (0x1c3c) readout to even measure, + sustained all-core
+    C10.
+All three are real kernel-subsystem development (USB PM, i915 display-power, PMC
+latched telemetry) and must ALL land before SLP_S0# asserts -> EC slow-blinks.
+This is architectural, not a config/tick tweak. forceskip, GFX0-D3, and the LPS0
+notification are all refuted as sufficient.
