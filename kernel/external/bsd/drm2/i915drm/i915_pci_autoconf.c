@@ -38,6 +38,7 @@ __KERNEL_RCSID(0, "$NetBSD: i915_pci_autoconf.c,v 1.14 2022/10/15 15:20:06 riast
 #include <sys/systm.h>
 #include <sys/queue.h>
 #include <sys/workqueue.h>
+#include <sys/sysctl.h>
 
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcivar.h>
@@ -74,6 +75,56 @@ static bool	i915drmkms_suspend(device_t, const pmf_qual_t *);
 static bool	i915drmkms_resume(device_t, const pmf_qual_t *);
 
 static void	i915drmkms_task_work(struct work *, void *);
+
+/* LISPBSD: transparent i915 runtime PM, triggered via hw.i915rpm sysctl. */
+int i915_lispbsd_rpm_suspend(struct drm_device *);
+int i915_lispbsd_rpm_resume(struct drm_device *);
+
+static struct i915drmkms_softc *lispbsd_i915_sc;
+static int lispbsd_i915rpm;	/* 0 active, 1 rpm-suspended, 2 rpm+D3 */
+
+static int
+i915drmkms_sysctl_rpm(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	struct i915drmkms_softc *sc = lispbsd_i915_sc;
+	int val = lispbsd_i915rpm;
+	int error;
+
+	node.sysctl_data = &val;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error || newp == NULL)
+		return error;
+	if (val < 0 || val > 2)
+		return EINVAL;
+	if (sc == NULL || sc->sc_drm_dev == NULL)
+		return ENXIO;
+	if (val == lispbsd_i915rpm)
+		return 0;
+
+	/* leaving D3 -> restore D0 first */
+	if (lispbsd_i915rpm == 2 && val < 2)
+		pci_set_powerstate(sc->sc_pa.pa_pc, sc->sc_pa.pa_tag,
+		    PCI_PMCSR_STATE_D0);
+	/* entering runtime suspend from active */
+	if (lispbsd_i915rpm == 0 && val >= 1) {
+		error = i915_lispbsd_rpm_suspend(sc->sc_drm_dev);
+		if (error)
+			return -error;
+	}
+	/* entering D3 */
+	if (val == 2 && lispbsd_i915rpm < 2)
+		pci_set_powerstate(sc->sc_pa.pa_pc, sc->sc_pa.pa_tag,
+		    PCI_PMCSR_STATE_D3);
+	/* returning to active */
+	if (val == 0 && lispbsd_i915rpm >= 1) {
+		error = i915_lispbsd_rpm_resume(sc->sc_drm_dev);
+		if (error)
+			return -error;
+	}
+	lispbsd_i915rpm = val;
+	return 0;
+}
 
 CFATTACH_DECL_NEW(i915drmkms, sizeof(struct i915drmkms_softc),
     i915drmkms_match, i915drmkms_attach, i915drmkms_detach, NULL);
@@ -199,6 +250,14 @@ i915drmkms_attach_real(device_t self)
 		return;
 	}
 	sc->sc_drm_dev = pci_get_drvdata(&sc->sc_pci_dev);
+
+	/* LISPBSD: expose runtime-PM trigger and remember our softc. */
+	lispbsd_i915_sc = sc;
+	sysctl_createv(NULL, 0, NULL, NULL,
+	    CTLFLAG_READWRITE, CTLTYPE_INT, "i915rpm",
+	    SYSCTL_DESCR("LISPBSD i915 runtime PM (0=on 1=disp-off 2=+D3)"),
+	    i915drmkms_sysctl_rpm, 0, NULL, 0,
+	    CTL_HW, CTL_CREATE, CTL_EOL);
 
 	/*
 	 * Now that the drm driver is attached, we can safely suspend
