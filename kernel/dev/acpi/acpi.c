@@ -2846,7 +2846,22 @@ acpi_s0_freeze_test(void)
 	uint64_t latch_save = 0, etr3 = 0, tmp = 0;
 	uint64_t rmode0[8], rmode1[8];
 	int latch_armed = 0;
+	int io_ok = 1;			/* all latch/resid accesses succeeded */
 	unsigned pi;
+	ACPI_STATISTICS st0, st1;
+	ACPI_STATUS str0, str1;
+	static const struct { uint32_t off; const char *nm; } ltrtab[] = {
+		{ 0x1b50, "CUR_PLT" }, { 0x1b54, "CUR_ASLT" }, { 0x1b0c, "IGNORE" },
+		{ 0x1b60, "SPA" }, { 0x1b64, "SPB" }, { 0x1b68, "SATA" },
+		{ 0x1b6c, "GBE" }, { 0x1b70, "XHCI" }, { 0x1b78, "ME" },
+		{ 0x1b7c, "EVA" }, { 0x1b80, "SPC" }, { 0x1b84, "AZ" },
+		{ 0x1b8c, "LPSS" }, { 0x1b90, "CAM" }, { 0x1b94, "SPD" },
+		{ 0x1b98, "SPE" }, { 0x1b9c, "ESPI" }, { 0x1ba0, "SCC" },
+		{ 0x1ba4, "ISH" }, { 0x1bf0, "CNV" }, { 0x1bf4, "EMMC" },
+		{ 0x1bf8, "UFSX2" }, { 0x1c04, "THC0" }, { 0x1c08, "THC1" },
+	};
+	uint64_t ltrv[24];
+	unsigned li;
 
 	if (sc == NULL)
 		return;
@@ -2880,9 +2895,13 @@ acpi_s0_freeze_test(void)
 	/* per-mode residency (8 modes) before the hold */
 	for (pi = 0; pi < 8; pi++) {
 		UINT64 v = 0;
-		(void)AcpiOsReadMemory(0xfe001c80 + pi * 4, &v, 32);
+		if (ACPI_FAILURE(AcpiOsReadMemory(0xfe001c80 + pi * 4, &v, 32)))
+			io_ok = 0;
 		rmode0[pi] = v;
 	}
+	/* SCI/GPE dispatch counters before the hold (Astra: pending-wake check) */
+	memset(&st0, 0, sizeof(st0));
+	str0 = AcpiGetStatistics(&st0);
 
 	t0 = acpi_s0_rdmsr(0x10);	/* IA32_TSC */
 	p9a = acpi_s0_rdmsr(0x631); p10a = acpi_s0_rdmsr(0x632);
@@ -2912,12 +2931,25 @@ acpi_s0_freeze_test(void)
 	/* per-mode residency (8 modes) after the hold */
 	for (pi = 0; pi < 8; pi++) {
 		UINT64 v = 0;
-		(void)AcpiOsReadMemory(0xfe001c80 + pi * 4, &v, 32);
+		if (ACPI_FAILURE(AcpiOsReadMemory(0xfe001c80 + pi * 4, &v, 32)))
+			io_ok = 0;
 		rmode1[pi] = v;
 	}
+	/* SCI/GPE dispatch counters after the hold */
+	memset(&st1, 0, sizeof(st1));
+	str1 = AcpiGetStatistics(&st1);
+	/* LTR snapshot (devices quiesced, before restore) */
+	for (li = 0; li < __arraycount(ltrtab); li++) {
+		UINT64 v = 0;
+		if (ACPI_FAILURE(AcpiOsReadMemory(0xfe000000 + ltrtab[li].off,
+		    &v, 32)))
+			io_ok = 0;
+		ltrv[li] = v;
+	}
 	/* restore the latch select */
-	if (latch_armed)
-		(void)AcpiOsWriteMemory(0xfe001c34, latch_save, 32);
+	if (latch_armed &&
+	    ACPI_FAILURE(AcpiOsWriteMemory(0xfe001c34, latch_save, 32)))
+		io_ok = 0;
 
 	acpi_s0_freeze_userspace(false);
 
@@ -2951,11 +2983,36 @@ acpi_s0_freeze_test(void)
 	    latch_ok[5], latch_armed, (uint32_t)latch_save, (uint32_t)tmp,
 	    (uint32_t)etr3);
 	aprint_normal_dev(sc->sc_dev,
-	    "s0freeze: mode resid d %08x %08x %08x %08x %08x %08x %08x %08x\n",
+	    "s0freeze: mode resid d %08x %08x %08x %08x %08x %08x %08x %08x (io_ok=%d)\n",
 	    (uint32_t)(rmode1[0] - rmode0[0]), (uint32_t)(rmode1[1] - rmode0[1]),
 	    (uint32_t)(rmode1[2] - rmode0[2]), (uint32_t)(rmode1[3] - rmode0[3]),
 	    (uint32_t)(rmode1[4] - rmode0[4]), (uint32_t)(rmode1[5] - rmode0[5]),
-	    (uint32_t)(rmode1[6] - rmode0[6]), (uint32_t)(rmode1[7] - rmode0[7]));
+	    (uint32_t)(rmode1[6] - rmode0[6]), (uint32_t)(rmode1[7] - rmode0[7]),
+	    io_ok);
+	/* SCI/GPE dispatch deltas during the hold (pending-wake evidence) */
+	if (ACPI_SUCCESS(str0) && ACPI_SUCCESS(str1))
+		aprint_normal_dev(sc->sc_dev,
+		    "s0freeze: SCI d=%u GPE d=%u (sci %u->%u gpe %u->%u)\n",
+		    st1.SciCount - st0.SciCount, st1.GpeCount - st0.GpeCount,
+		    st0.SciCount, st1.SciCount, st0.GpeCount, st1.GpeCount);
+	else
+		aprint_normal_dev(sc->sc_dev, "s0freeze: SCI/GPE stats UNAVAIL\n");
+	/* LTR snapshot: raw per-agent (value bits[9:0], scale [12:10], req bit15
+	 * snoop / bit31 nonsnoop).  A req bit set with a small value blocks S0ix. */
+	for (li = 0; li < __arraycount(ltrtab); li += 6)
+		aprint_normal_dev(sc->sc_dev,
+		    "s0freeze: LTR %s=%08x %s=%08x %s=%08x %s=%08x %s=%08x %s=%08x\n",
+		    ltrtab[li].nm, (uint32_t)ltrv[li],
+		    li + 1 < __arraycount(ltrtab) ? ltrtab[li+1].nm : "-",
+		    li + 1 < __arraycount(ltrtab) ? (uint32_t)ltrv[li+1] : 0,
+		    li + 2 < __arraycount(ltrtab) ? ltrtab[li+2].nm : "-",
+		    li + 2 < __arraycount(ltrtab) ? (uint32_t)ltrv[li+2] : 0,
+		    li + 3 < __arraycount(ltrtab) ? ltrtab[li+3].nm : "-",
+		    li + 3 < __arraycount(ltrtab) ? (uint32_t)ltrv[li+3] : 0,
+		    li + 4 < __arraycount(ltrtab) ? ltrtab[li+4].nm : "-",
+		    li + 4 < __arraycount(ltrtab) ? (uint32_t)ltrv[li+4] : 0,
+		    li + 5 < __arraycount(ltrtab) ? ltrtab[li+5].nm : "-",
+		    li + 5 < __arraycount(ltrtab) ? (uint32_t)ltrv[li+5] : 0);
 }
 
 static int

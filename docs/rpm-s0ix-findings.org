@@ -834,3 +834,48 @@ a sustained window that the kpause-based coordinator (one CPU wakes to sample)
 never provides; (d) a platform/firmware quirk. Most valuable cross-check: does
 Linux actually reach SLP_S0 on THIS exact machine (X1 Nano, TGL-UP4)? If not,
 the LED may be unreachable here regardless of OS.
+
+* UPDATE 27 (2026-09-18 ~19:10): LTR + SCI/GPE captured — both of Astra's new suspects NEGATIVE
+Per Astra: added read-only LTR snapshot (cnp_ltr_show_map offsets @ PMC base
+0xfe000000) + SCI/GPE dispatch deltas (AcpiGetStatistics) + fixed all discarded
+return values (io_ok=1 now verifies every latch/resid/LTR access). Kernel #63.
+Full deep quiesce (GPU/xHCI/IP D3 + TRP1/TRP2/GNA0/HECI D3 + LPS0 ENTRY), iwx up:
+  done: c7core~99% pc9=0% pc10=45% slp_s0=0
+  latch 35780074 847de3ef 00001fef 00001040 3d17fa2d 000aaaaa
+  mode resid d = all 0 (io_ok=1)
+  SCI d=0 GPE d=0 (263->263 both)
+  LTR CUR_PLT=00040201 CUR_ASLT=07ffffff IGNORE=00000000
+      XHCI=000009e8 ME=08000800  (all other agents = 0)
+
+** SCI/GPE: no pending wake (Astra hypothesis a = NEGATIVE)
+Zero SCI and zero GPE dispatches during the entire 10s frozen hold. There is NO
+constantly-firing or pending wake event keeping the PMC from arming S0ix.
+
+** LTR: no agent imposes a latency constraint (Astra prime suspect = NEGATIVE)
+Decoded per Linux core.c: LTR_REQ_SNOOP=bit15, LTR_REQ_NONSNOOP=bit31; a value
+matters only if its req bit is set. XHCI=0x000009e8 (bit15=0,bit31=0) and
+ME=0x08000800 (bit15=0,bit31=0) BOTH have req bits CLEAR -> no requirement.
+CUR_PLT=0x00040201 req bits clear -> platform honors NO latency constraint.
+IGNORE=0. So LTR is NOT blocking S0ix; the ignore-mask remedy is unnecessary
+(no agent is advertising a tight tolerance to ignore).
+
+** State of the investigation: every OS-observable precondition is satisfied
+Eliminated, with evidence: device D3 (all enabled LPS0 constraints incl
+TRP/GNA/HECI; w2 d3_status MET), power-gating (w1 MET), vnn_req (w3 MET),
+OPIOPLL_OFF + CPU_C10_REQ (MET in C10 latch), idle-gap depth (forceskip inert),
+LPS0 handshake (funcs AE_OK), pending wakes (SCI/GPE=0), LTR constraints (no req
+bits). PC10 reached (45-53%). Yet the PMC never arms an LPM mode (per-mode
+residency + LPIT SLP_S0 both 0). The only latch-unmet bits are S0ix's own
+consequences (USB2PLL_OFF + reserved w0 1,9,30; reserved w4 19,21; w5 Int_Timer
+polarity -- which Intel's S0ixSelftestTool substate_triage() explicitly EXCLUDES
+from blocker reporting).
+
+** Decisive next step (needs a Linux boot on THIS unit)
+No OS-observable NetBSD-side precondition remains unmet. The remaining question is
+whether the platform/firmware permits SLP_S0# at all on this exact X1 Nano
+(TGL-UP4) under its current firmware. Astra's recommendation stands: boot Linux
+and run Intel's s0ix-selftest-tool.sh -s (it targets exactly the "PC10 present,
+SLP_S0 absent" case). If Linux also cannot reach SLP_S0 here, the LED is
+firmware-gated and unreachable from any OS without a BIOS/firmware change; if
+Linux CAN, it isolates a specific driver action invisible in these registers,
+which we then port. This is the highest-value experiment and requires the user.
