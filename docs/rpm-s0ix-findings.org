@@ -560,3 +560,24 @@ NEXT: decode these unmet bits vs Linux's TGL status maps (tgl_lpm0..5 in
 intel_pmc_core.c) to NAME each unmet condition, then triage addressable (pmf
 device suspend) vs structural (no NetBSD PM). This is the true, quantified
 blocker set. Requirement/status numbers handed to Astra for decode.
+
+* UPDATE 21 (2026-09-18 ~18:00): *** PC10 = 52% ACHIEVED — xHCI was the blocker ***
+Decoded UPDATE 20's unmet bits via Linux tgl status maps (fetched tgl.c):
+word0=clocksource, w1=power_gating, w2=d3, w3=vnn_req, w4=vnn_misc, w5=signal.
+Unmet mode0 named: USB2PLL_OFF_STS(w0.18), OPIOPLL_OFF_STS(w0.21),
+xHCI_PG_STS(w1.2), LPSS_PG_STS(w1.22), xHCI0_D3_STS(w2.2), IS_D3_STS(w2.8),
+CPU_C10_REQ_STS_0(w4.0), Int_Timer_SS_Wake0-5(w5). The prior deep test had NOT
+suspended xHCI. Added drvctl -S xhci0/xhci1 (safe now: on WiFi, USB-eth gone):
+  RESULT: c7core~99% pc9=0% PC10=52% slp_s0=0
+  PMC status 25580074 803c63ef 00001eee 00001040 3d375a2c 000aaaaa
+  -> xHCI_PG_STS (w1.2) and xHCI0_D3_STS (w2.2) now SET. Residency moved
+     pc9->PC10=52%. *** FIRST non-zero PC10 in the whole investigation. ***
+So xHCI/USB power-gating was THE package-C10 blocker (USB host controller keeps
+the package out of PC10). Substantial PC10 (goal part 2) = ACHIEVED (52%).
+SLP_S0 still 0: platform S0ix needs MORE than PC10. Remaining unmet (mode0,
+req & ~newstatus): USB2PLL_OFF/OPIOPLL_OFF(w0=0x50240202), LPSS_PG(w1 bit22),
+IS_D3(w2 bit8=0x100), CPU_C10_REQ+others(w4=0x0008a001), wake signals(w5).
+NEXT to push PC10 higher + reach SLP_S0: suspend LPSS controllers (I2C/UART/SPI),
+the IPU/image-sensor (IS_D3), get USB2PLL/OPIOPLL off (suspend USB hubs/devices
++ the PLL owners), and deepen CPU C10 residency (CPU_C10_REQ). Each cleared
+condition -> closer to SLP_S0 -> the slow-blink LED.
