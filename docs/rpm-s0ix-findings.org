@@ -534,3 +534,29 @@ entry latency. Stage 3 (defer the callout wheel to extend gaps, + Astra's 3
 lapic_oneshot/callout timekeeping fixes) is now the single, unambiguous path to
 PC10 -> SLP_S0 -> LED. Every device/GPU/RC6/display/userspace prerequisite is
 now achievable and yields pc9=93%.
+
+* UPDATE 20 (2026-09-18 ~17:30): PMC requirements vs status — SLP_S0 needs BROAD IP quiescence
+Added PMC diagnostics: hw.acpi.sleep.pmcreqs dumps _DSM func1 requirements (UUID
+57a6512e-3979-4e9d-9708-ff13b2508972 on the LPS0 handle); s0freeze coordinator
+reads the 6 PMC LPM live-status words (0xfe001c5c) mid-freeze. Enabled modes
+(0xfe001c78)=0x9 => modes 0 and 3. Per-mode residency (0xfe001c80..)=ALL ZERO.
+
+REQUIREMENTS (_DSM func1), mode0 & mode3:
+  mode0 req[0..5]: 757c0236 807c01ef 0000112c 00000000 183fe805 aaa00000
+  mode3 req[18..23]: f7fe027e e87c01ef 0000112d 00000000 383fe8c5 aaa00000
+DEEP-STATE STATUS (iwx D3 + GPU D3 + LPS0 + userspace frozen + cores 99% idle,
+captured mid-freeze; pc9=97% pc10=0 slp_s0=0):
+  25580074 803c63eb 00001eea 00001040 39375a2c 000aaaaa
+  (vs screen-on 25580074 803c63eb 00001eea 00001040 39b71a2c 000aaaaa -- only
+   word4 differs: quiescing barely moves the PMC status!)
+UNMET mode0 (req & ~status): w0=0x50240202 w1=0x00400004 w2=0x00000104 w3=0
+  w4=0x0008a001 w5=0xaaa00000  (5 of 6 words still unmet in our deepest state).
+CONCLUSION: SLP_S0/PC10 is NOT a single blocker (tick/callout/GPU). The PMC
+requires a BROAD set of IP/PLL/clock/device-D3 conditions per mode; most stay
+UNMET regardless of GPU/WiFi/display/CPU quiescing because NetBSD does not
+power-manage those IPs (audio/ISH/sensors/camera/CNVi/fabric+PLL etc.). word5
+0xaaa00000 unmet = per-IP power-gate reqs; word0/1/4 = PLL/clock/fabric.
+NEXT: decode these unmet bits vs Linux's TGL status maps (tgl_lpm0..5 in
+intel_pmc_core.c) to NAME each unmet condition, then triage addressable (pmf
+device suspend) vs structural (no NetBSD PM). This is the true, quantified
+blocker set. Requirement/status numbers handed to Astra for decode.

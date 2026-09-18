@@ -259,6 +259,7 @@ static int		sysctl_hw_acpi_s0freeze(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_wake(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_lps0(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_slp_s0(SYSCTLFN_PROTO);
+static int		sysctl_hw_acpi_pmcreqs(SYSCTLFN_PROTO);
 static volatile int	acpi_freeze_active;
 static volatile int	acpi_freeze_wake;
 static kmutex_t		acpi_freeze_mtx;
@@ -1844,6 +1845,12 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 	    sysctl_hw_acpi_slp_s0, 0, NULL, 0,
 	    CTL_CREATE, CTL_EOL);
 
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "pmcreqs", SYSCTL_DESCR("dump TGL PMC LPM requirements (_DSM func1)"),
+	    sysctl_hw_acpi_pmcreqs, 0, NULL, 0,
+	    CTL_CREATE, CTL_EOL);
+
 	err = sysctl_createv(clog, 0, &rnode, &rnode,
 	    CTLFLAG_PERMANENT, CTLTYPE_NODE,
 	    "stat", SYSCTL_DESCR("ACPI statistics"),
@@ -2577,6 +2584,86 @@ acpi_lps0_dsm(const uint8_t *uuid, int rev, int func, bool query)
 	return mask;
 }
 
+/* ---- Tiger Lake PMC low-power-mode REQUIREMENTS (_DSM func 1) ---- */
+static const uint8_t acpi_pmc_uuid[16] = {
+	0x2e, 0x51, 0xa6, 0x57, 0x79, 0x39, 0x9d, 0x4e,
+	0x97, 0x08, 0xff, 0x13, 0xb2, 0x50, 0x89, 0x72
+};
+
+static void
+acpi_pmc_reqs_dump(void)
+{
+	ACPI_OBJECT_LIST list;
+	ACPI_OBJECT args[4];
+	ACPI_BUFFER buf = { ACPI_ALLOCATE_BUFFER, NULL };
+	ACPI_OBJECT *ret;
+	ACPI_STATUS rv;
+
+	if (acpi_lps0_handle == NULL) {
+		aprint_normal_dev(acpi_softc->sc_dev, "PMC reqs: no LPS0 handle\n");
+		return;
+	}
+	args[0].Type = ACPI_TYPE_BUFFER;
+	args[0].Buffer.Length = 16;
+	args[0].Buffer.Pointer = __UNCONST(acpi_pmc_uuid);
+	args[1].Type = ACPI_TYPE_INTEGER;
+	args[1].Integer.Value = 0;
+	args[2].Type = ACPI_TYPE_INTEGER;
+	args[2].Integer.Value = 1;
+	args[3].Type = ACPI_TYPE_PACKAGE;
+	args[3].Package.Count = 0;
+	args[3].Package.Elements = NULL;
+	list.Count = 4;
+	list.Pointer = args;
+
+	rv = AcpiEvaluateObject(acpi_lps0_handle, __UNCONST("_DSM"), &list, &buf);
+	if (ACPI_FAILURE(rv)) {
+		aprint_normal_dev(acpi_softc->sc_dev,
+		    "PMC reqs _DSM(func1): %s\n", AcpiFormatException(rv));
+		if (buf.Pointer != NULL)
+			ACPI_FREE(buf.Pointer);
+		return;
+	}
+	ret = buf.Pointer;
+	if (ret != NULL && ret->Type == ACPI_TYPE_BUFFER) {
+		uint32_t i;
+		aprint_normal_dev(acpi_softc->sc_dev,
+		    "PMC reqs (%u bytes):\n", ret->Buffer.Length);
+		for (i = 0; i + 4 <= ret->Buffer.Length; i += 4) {
+			uint32_t w = (uint32_t)ret->Buffer.Pointer[i] |
+			    ((uint32_t)ret->Buffer.Pointer[i + 1] << 8) |
+			    ((uint32_t)ret->Buffer.Pointer[i + 2] << 16) |
+			    ((uint32_t)ret->Buffer.Pointer[i + 3] << 24);
+			aprint_normal("  req[%u]=0x%08x\n", i / 4, w);
+		}
+	} else {
+		aprint_normal_dev(acpi_softc->sc_dev,
+		    "PMC reqs: unexpected type %d\n",
+		    ret != NULL ? ret->Type : -1);
+	}
+	if (buf.Pointer != NULL)
+		ACPI_FREE(buf.Pointer);
+}
+
+static int
+sysctl_hw_acpi_pmcreqs(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node;
+	int err, t;
+
+	if (acpi_softc == NULL)
+		return ENOSYS;
+	t = 0;
+	node = *rnode;
+	node.sysctl_data = &t;
+	err = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (err || newp == NULL)
+		return err;
+	if (t != 0)
+		acpi_pmc_reqs_dump();
+	return 0;
+}
+
 static void
 acpi_lps0_dump_obj(ACPI_OBJECT *o, int depth)
 {
@@ -2754,6 +2841,8 @@ acpi_s0_freeze_test(void)
 	struct acpi_softc *sc = acpi_softc;
 	uint64_t t0, t1, p9a, p9b, p10a, p10b, c7a = 0, c7b = 0, s0a = 0, s0b = 0, dt;
 	int r0 = -1, r1 = -1;
+	uint64_t pmc[6];
+	unsigned pi;
 
 	if (sc == NULL)
 		return;
@@ -2781,6 +2870,11 @@ acpi_s0_freeze_test(void)
 	p9b = acpi_s0_rdmsr(0x631); p10b = acpi_s0_rdmsr(0x632);
 	c7b = acpi_s0_rdmsr(0x3fe);
 	r1 = acpi_slp_s0_read(&s0b);
+	for (pi = 0; pi < 6; pi++) {
+		UINT64 v = 0;
+		(void)AcpiOsReadMemory(0xfe001c5c + pi * 4, &v, 32);
+		pmc[pi] = v;
+	}
 
 	acpi_s0_freeze_userspace(false);
 
@@ -2801,6 +2895,10 @@ acpi_s0_freeze_test(void)
 	    (r0 == 0 && r1 == 0) ? "ok" : "UNAVAIL",
 	    (uintmax_t)s0a, (uintmax_t)s0b,
 	    (uintmax_t)((uint32_t)(s0b - s0a)));
+	aprint_normal_dev(sc->sc_dev,
+	    "s0freeze: PMC status %08x %08x %08x %08x %08x %08x\n",
+	    (uint32_t)pmc[0], (uint32_t)pmc[1], (uint32_t)pmc[2],
+	    (uint32_t)pmc[3], (uint32_t)pmc[4], (uint32_t)pmc[5]);
 }
 
 static int
