@@ -96,3 +96,51 @@ S0ix so the EC slow-blinks the power/lid LEDs, at ~1W.
    quiescence so rpm=2 can be held (kill execlists tasklet + flush GT work +
    mask GT irq before PMCSR D3), or decide rpm=1 is sufficient once SLP_S0 is
    actually asserted.
+
+* UPDATE 2 (2026-09-18 ~11:00): SLP_S0 measured; blocker confirmed
+Added hw.acpi.sleep.slp_s0 sysctl. LPIT (phys 0x9104B000) has 3 native-Cstate
+descriptors: [0] ResidencyCounter = FFH/MSR 0x632 (= package PC10);
+[1] ResidencyCounter = SystemMemory MMIO 0xfe00193c, 32-bit, freq=8197 (= the
+PMC SLP_S0 platform residency); [2] another. sysctl now selects the
+SystemMemory (PMC) counter.
+
+Measured deltas over quiet windows (kernel #54):
+- screen-off ONLY (net up):                 pc9=83% pc10=0 SLP_S0=0
+- screen-off + lps0 ONLY (net up):          pc9=83% pc10=0 SLP_S0=0
+- screen-off + rpm=1 + all-periph-D3 +
+  iwx-down + lps0 (net down, 30s):          pc9~0 pc10=0 SLP_S0=0
+
+Conclusions (now measured, not hypothesised):
+1. SLP_S0 platform residency is 0 in EVERY configuration -> the platform never
+   enters S0ix. The corrected LPS0 handshake (all _DSM funcs AE_OK) is
+   necessary but NOT sufficient. This is why the LED never slow-blinks.
+2. PC10 is also 0 everywhere; best deep state reachable is PC9 (~83%) via plain
+   screen-off. The periodic tick + background activity cap it at PC9.
+3. rpm=1 + peripheral-D3 recipe is COUNTERPRODUCTIVE: pc9 83% -> ~0. Confirms
+   Astra: intel_gt_runtime_suspend is a stub (no real GT idle) so it leaves
+   activity; and/or the peripheral-D3 churn. Do NOT use this recipe.
+
+* QUESTIONS FOR NEXT ROUND (S0-idle suspend transition on NetBSD)
+The demonstrable blocker is: no real S0-idle suspend path. NetBSD has no Linux
+s2idle framework. To reach SLP_S0 we need, while the machine is "frozen":
+  (a) freeze/quiesce userspace (no user threads running),
+  (b) suspend periodic timekeeping / the hardclock tick (so CPUs aren't woken
+      100x/s) and switch to a single wake source,
+  (c) REAL GT idle (intel_gt_suspend_prepare/wait_for_suspend, not the stub),
+      honoring the PM_SUSPEND_TO_IDLE exemption in intel_gt_suspend_late,
+  (d) all CPUs in the deepest mwait (C10) waiting only on wake IRQs,
+  (e) then the SoC/PMC can gate to SLP_S0 and the EC slow-blinks the LED.
+Specific asks:
+  - Best NetBSD primitive to freeze userspace for s2idle? (there is an existing
+    acpi_enter_freeze that kpause-loops but does NOT freeze userspace or stop
+    timekeeping — is extending it the right path, or a dedicated cpu_idle deep
+    loop across all CPUs?)
+  - How to suspend the hardclock/timecounter tick cleanly for the freeze window
+    on NetBSD (tickless cidle exists in modules/cidle) and resume TSC-corrected?
+  - Minimal correct GT quiesce sequence to call from a NetBSD s0-idle path
+    (wait_for_suspend + which of the suspend_late steps to KEEP vs skip so X
+    survives), given the fake pm_runtime wakerefs.
+  - Is holding GPU in PCI D3 even required for SLP_S0, or does real GT RC6 +
+    display DC9 suffice (given rpm=2 PCI-D3 races/faults without wakerefs)?
+Measurement is now in place (hw.acpi.sleep.slp_s0), so any proposed transition
+can be validated by SLP_S0 delta over a quiet window.
