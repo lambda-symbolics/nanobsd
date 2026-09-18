@@ -254,6 +254,7 @@ static int		sysctl_hw_acpi_sleepstates(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_freeze(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_wake(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_lps0(SYSCTLFN_PROTO);
+static int		sysctl_hw_acpi_slp_s0(SYSCTLFN_PROTO);
 static volatile int	acpi_freeze_active;
 static volatile int	acpi_freeze_wake;
 static kmutex_t		acpi_freeze_mtx;
@@ -1827,6 +1828,12 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 	    sysctl_hw_acpi_lps0, 0, NULL, 0,
 	    CTL_CREATE, CTL_EOL);
 
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING,
+	    "slp_s0", SYSCTL_DESCR("SLP_S0 platform residency (LPIT counter)"),
+	    sysctl_hw_acpi_slp_s0, 0, NULL, 0,
+	    CTL_CREATE, CTL_EOL);
+
 	err = sysctl_createv(clog, 0, &rnode, &rnode,
 	    CTLFLAG_PERMANENT, CTLTYPE_NODE,
 	    "stat", SYSCTL_DESCR("ACPI statistics"),
@@ -2371,6 +2378,103 @@ acpi_s2idle_keep(device_t dev)
 		return false;	/* do NOT keep -> allow suspend */
 
 	return true;		/* keep alive */
+}
+
+/* ---- SLP_S0 platform low-power-idle residency (LPIT) ---- */
+static ACPI_GENERIC_ADDRESS acpi_slp_s0_gas;
+static uint64_t		acpi_slp_s0_freq;
+static bool		acpi_slp_s0_ok;
+static bool		acpi_slp_s0_probed;
+
+static void
+acpi_slp_s0_probe(void)
+{
+	ACPI_TABLE_HEADER *hdr;
+	ACPI_STATUS rv;
+	char *p, *end;
+
+	if (acpi_slp_s0_probed)
+		return;
+	acpi_slp_s0_probed = true;
+
+	rv = AcpiGetTable(ACPI_SIG_LPIT, 1, &hdr);
+	if (ACPI_FAILURE(rv))
+		return;
+
+	p = (char *)hdr + sizeof(ACPI_TABLE_HEADER);
+	end = (char *)hdr + hdr->Length;
+	while (p + sizeof(ACPI_LPIT_HEADER) <= end) {
+		ACPI_LPIT_HEADER *lh = (ACPI_LPIT_HEADER *)p;
+
+		if (lh->Length < sizeof(ACPI_LPIT_HEADER) ||
+		    p + lh->Length > end)
+			break;
+		if (lh->Type == ACPI_LPIT_TYPE_NATIVE_CSTATE &&
+		    (lh->Flags & ACPI_LPIT_NO_COUNTER) == 0 &&
+		    lh->Length >= sizeof(ACPI_LPIT_NATIVE)) {
+			ACPI_LPIT_NATIVE *ln = (ACPI_LPIT_NATIVE *)p;
+
+			acpi_slp_s0_gas = ln->ResidencyCounter;
+			acpi_slp_s0_freq = ln->CounterFrequency;
+			acpi_slp_s0_ok = true;
+			break;	/* first native C-state LPI == SLP_S0 */
+		}
+		p += lh->Length;
+	}
+}
+
+static int
+acpi_slp_s0_read(uint64_t *valp)
+{
+	ACPI_STATUS rv;
+	UINT64 v = 0;
+	UINT32 w = acpi_slp_s0_gas.BitWidth ? acpi_slp_s0_gas.BitWidth : 32;
+
+	if (!acpi_slp_s0_ok)
+		return ENODEV;
+
+	switch (acpi_slp_s0_gas.SpaceId) {
+	case ACPI_ADR_SPACE_SYSTEM_MEMORY:
+		rv = AcpiOsReadMemory(acpi_slp_s0_gas.Address, &v, w);
+		break;
+	case ACPI_ADR_SPACE_SYSTEM_IO: {
+		UINT32 v32 = 0;
+		rv = AcpiOsReadPort(acpi_slp_s0_gas.Address, &v32, w);
+		v = v32;
+		break;
+	}
+	default:
+		return ENODEV;
+	}
+	if (ACPI_FAILURE(rv))
+		return EIO;
+	*valp = v;
+	return 0;
+}
+
+static int
+sysctl_hw_acpi_slp_s0(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node;
+	char buf[160];
+	uint64_t val = 0;
+
+	acpi_slp_s0_probe();
+	if (acpi_slp_s0_ok && acpi_slp_s0_read(&val) == 0)
+		snprintf(buf, sizeof(buf),
+		    "residency=%llu freq=%llu spaceid=%u addr=0x%llx width=%u",
+		    (unsigned long long)val,
+		    (unsigned long long)acpi_slp_s0_freq,
+		    acpi_slp_s0_gas.SpaceId,
+		    (unsigned long long)acpi_slp_s0_gas.Address,
+		    acpi_slp_s0_gas.BitWidth);
+	else
+		snprintf(buf, sizeof(buf),
+		    "unavailable (LPIT residency counter not found)");
+
+	node = *rnode;
+	node.sysctl_data = buf;
+	return sysctl_lookup(SYSCTLFN_CALL(&node));
 }
 
 /* ---- LPS0 / Low Power S0 Idle (Modern Standby) _DSM handshake ---- */
