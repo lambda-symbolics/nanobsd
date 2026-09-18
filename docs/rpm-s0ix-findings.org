@@ -379,3 +379,36 @@ idle-duration instrumentation (per-CPU: requested skip incl skip<minskip,
 full-width TSC around each MWAIT, pending vectors after MWAIT) to see the actual
 sleep-gap distribution and whether long sleeps still miss PC10. That is the
 next build (LOW risk -- logging only, no behavior change).
+
+* UPDATE 14 (2026-09-18 ~14:40): iwx suspend is CLEAN (correcting U11); full elimination
+CORRECTION to UPDATE 11: iwx does NOT continuously spin. `drvctl -S iwx0`
+(pmf_device_suspend -> pmf_class_network_suspend -> if_stop -> iwx_stop ->
+iwx_stop_locked, per Astra) COMPLETES cleanly (exit 0), drives iwx to D3, and
+iwx interrupts drop to 0. With iwx suspended, top/vmstat show 99.8% IDLE, no
+spinning process. The earlier c7=0/pc9=0 "spin" (U11, and the ifconfig-down
+result U3) was a MEASUREMENT ARTIFACT of the shell-based residency delta taken
+immediately after a device power change -- NOT a real spin. (ifconfig-down may
+still differ, but the clean path is drvctl -S / pmf.)
+So the clean WiFi-quiesce path EXISTS (drvctl -S iwx0), contradicting U3/U11.
+Re-ran the full clean quiesce via #57's fixed coordinator (all SLP_S0 reads
+verified "ok", not false zeros):
+  freeze + DC9 + clean-iwx-D3:                    pc9=95% pc10=0 slp_s0=0
+  freeze + DC9 + clean-iwx-D3 + LPS0 handshake:   pc9=95% pc10=0 slp_s0=0
+So with userspace frozen, display DC9, GT parked, iwx cleanly D3 (0 IRQ),
+cores 99% idle (top-verified), AND the LPS0 entry handshake issued -> STILL
+pc9=95%, PC10=0, SLP_S0=0. Every device/userspace/display/network variable is
+now eliminated with trustworthy measurement.
+REMAINING two candidates for the PC9->PC10/SLP_S0 gate:
+  (a) callout wheel: idle gaps shorter than PC10 entry latency (cores idle in
+      short bursts capped by kernel callouts). Needs in-kernel per-CPU idle-
+      duration instrumentation to confirm (Astra's plan; LOW risk).
+  (b) hardware/LPI coupling: the GPU is still in PCI D0 in ALL these tests
+      (rpm=1/DC9 does display-power-suspend + GT-park but NOT PCI D3). The LPI
+      _DSM constraints require GFX0=D3 for the SLP_S0 platform commit. If PC10
+      is coupled to SLP_S0 here, it cannot assert with GPU in D0. GPU PCI-D3
+      (rpm=2) faults without proper GT quiescence (intel_gt_suspend_prepare) --
+      Astra's i915 S0 lifecycle work.
+NEXT (two low/medium-risk builds, both measure-only-first):
+  1. in-kernel idle-duration instrumentation in cidle (LOW risk) -> resolves (a).
+  2. proper i915 S0 lifecycle (i915_drm_prepare/suspend/suspend_late with S0
+     target + intel_gt_suspend_prepare) so GPU reaches D3 cleanly -> tests (b).
