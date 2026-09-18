@@ -144,3 +144,19 @@ Specific asks:
     display DC9 suffice (given rpm=2 PCI-D3 races/faults without wakerefs)?
 Measurement is now in place (hw.acpi.sleep.slp_s0), so any proposed transition
 can be validated by SLP_S0 delta over a quiet window.
+
+* UPDATE 3 (2026-09-18 ~11:20): `ifconfig iwx0 down` SPINS THE CPU
+Isolated cleanly (downed iwx while staying connected over USB ethernet): with
+iwx0 DOWN and nothing else changed, core C7 residency = 0% and package pc6..pc9
+all 0% over 15s — i.e. a CPU is busy-spinning 100%. The NetBSD iwx(4) driver's
+stop/down path spins. This CORRECTS earlier attribution: the pc9 83%->~0
+regression in the "full recipe" was iwx0 down, NOT rpm=1 or peripheral-D3.
+Implications:
+- NEVER use `ifconfig iwx0 down` in a power/s2idle path; it is actively harmful.
+- Quiesce WiFi some other way for s2idle: PMCSR D3 the iwx PCI device directly
+  (pcictl config write) or a proper pmf_device_suspend, WITHOUT the ifconfig
+  down-path spin. (The old pc10max recipe used iwx0 down; suspect its ~47% pc10
+  was measured on a kernel where iwx behaved differently, or was intermittent.)
+- Current clean baselines: screen-off + net-up(powersave) = pc9~83%, pc10=0,
+  SLP_S0=0. Best reachable idle is still only PC9; PC10/SLP_S0 need the full
+  s2idle transition (freeze userspace + suspend tick + CLEAN network quiesce).
