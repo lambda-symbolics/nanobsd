@@ -412,3 +412,26 @@ NEXT (two low/medium-risk builds, both measure-only-first):
   1. in-kernel idle-duration instrumentation in cidle (LOW risk) -> resolves (a).
   2. proper i915 S0 lifecycle (i915_drm_prepare/suspend/suspend_late with S0
      target + intel_gt_suspend_prepare) so GPU reaches D3 cleanly -> tests (b).
+
+* UPDATE 15 (2026-09-18 ~14:55): idle-gap depth evidence (existing tlstats delta)
+Clean tlstats delta over 15s screen-off idle (NOT frozen; zero-risk, no build):
+  entries=7871 ticks_skipped=11436 deep=174 woke_early=7697
+  => avg requested skip ~1.45 ticks (~14ms); deep(long) skips only 2%;
+     98% of idle entries WOKE EARLY (before their skip target).
+Aggregate ~525 idle-entries/s across 8 CPUs vs only ~114 IRQ/s -> most wakes are
+NOT hardware interrupts. Candidates for the early wakes: callout_next_ticks()
+capping the requested skip to ~14ms, AND MWAIT monitor-address writes /
+scheduler activity waking even earlier (this run had userspace running). This
+SUPPORTS candidate (a) short-idle-gaps as the PC9->PC10 gate, but per Astra is
+not proof: woke_early does not identify the source, and the frozen case (which
+still gave pc9=95%/pc10=0) removes userspace but not kernel callouts/threads.
+Net after this session's full sweep: PC10/SLP_S0 gated by EITHER (a) short idle
+gaps (callout + monitor-write wakes; ~14ms avg, need <PC10-entry-latency) OR
+(b) GFX0=D3 hardware/LPI coupling (GPU still D0 in all tests). Both remaining
+resolutions require a build:
+  1. in-kernel per-CPU MWAIT duration + wake-source (pending vectors,
+     ci_want_resched) instrumentation in cidle -> proves/refutes (a). LOW risk.
+  2. proper i915 S0 lifecycle (intel_gt_suspend_prepare + GPU D3) -> tests (b).
+     MEDIUM risk (GT quiescence; prior naive GPU-D3 faulted).
+Everything device/userspace/display-side is exhausted and measured; the finish
+line needs one of these two instrumented builds. iwx suspend is CLEAN (U14).
