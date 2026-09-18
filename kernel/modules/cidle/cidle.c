@@ -66,6 +66,7 @@ static int		cidle_active;
 static volatile int	cidle_tickless = 0;	/* default off: enable via sysctl */
 static volatile int	cidle_maxskip = 100;	/* cap ~1s at hz=100 (well under 15s heartbeat) */
 static volatile int	cidle_minskip = 4;	/* skip only if >=4 ticks (40ms) to gain */
+static volatile int	cidle_forceskip = 0;	/* >0: force this skip (ignore callouts), still capped by maxskip */
 static void		(*cidle_prev_func)(void);
 static char		cidle_prev_text[16];
 static uint32_t		cidle_cpuid5_edx;
@@ -158,8 +159,10 @@ cidle_idle_tickless(struct cpu_info *ci)
 	}
 
 	skip = callout_next_ticks();
+	if (cidle_forceskip > 0)
+		skip = cidle_forceskip;	/* force sustained deep idle; callouts fire late but are replayed */
 	if (skip > cidle_maxskip)
-		skip = cidle_maxskip;
+		skip = cidle_maxskip;	/* heartbeat safety: maxskip <= 1400 (< 15s) */
 
 	if (skip < cidle_minskip) {
 		/*
@@ -338,6 +341,24 @@ cidle_sysctl_minskip(SYSCTLFN_ARGS)
 	return error;
 }
 
+static int
+cidle_sysctl_forceskip(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	int error, val;
+
+	val = cidle_forceskip;
+	node.sysctl_data = &val;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error == 0 && newp != NULL) {
+		if (val < 0 || val > 1400)	/* 0 = off; capped like maxskip */
+			error = EINVAL;
+		else
+			cidle_forceskip = val;
+	}
+	return error;
+}
+
 static void
 cidle_sysctl_setup(void)
 {
@@ -368,6 +389,10 @@ cidle_sysctl_setup(void)
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "minskip",
 	    SYSCTL_DESCR("minimum ticks worth stopping the tick for"),
 	    cidle_sysctl_minskip, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+	sysctl_createv(&cidle_sysctl_log, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "forceskip",
+	    SYSCTL_DESCR("0=off; >0 forces this idle skip (ignore callouts) for sustained C10"),
+	    cidle_sysctl_forceskip, 0, NULL, 0, CTL_CREATE, CTL_EOL);
 	sysctl_createv(&cidle_sysctl_log, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING, "tlstats",
 	    SYSCTL_DESCR("tickless idle counters"),

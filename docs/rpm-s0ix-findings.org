@@ -603,3 +603,84 @@ REMAINING unmet for mode0 / SLP_S0:
 STATUS: PC10 substantial (~50%) ACHIEVED. SLP_S0 now blocked by only PLLs (w0),
 CPU_C10_REQ/deep-idle (w4), and wake-timer signals (w5) -- most requirement
 words cleared. The PLL + CPU_C10_REQ items are the crux for SLP_S0->LED.
+
+* UPDATE 23 (2026-09-18 ~17:30): forceskip REFUTED; live-status is blind; the wall is the PLLs
+Built machdep.cidle.forceskip (cidle.c): >0 forces the idle skip (ignoring
+callout_next_ticks), still capped by maxskip (<=1400, heartbeat-safe). Goal was
+sustained all-core C10 -> assert CPU_C10_REQ_STS_0 (w4.0) + turn off the PLLs.
+Live-swapped the module (modunload/modload from /stand) -- no reboot.
+
+NOTE: machine is now on WiFi ONLY (192.168.1.254; USB-eth gone, user relocated).
+So iwx0 CANNOT be suspended in a link-attached test (it is the only link).
+Tests below keep iwx UP; a self-restoring detached run is needed to add iwx D3.
+
+** forceskip alone (no freeze): inert on the package
+tickless=1 forceskip=200 (2s), normal userspace: entries=3688 but deep=0,
+ALL woke_early; c7core moved, but pc10 did NOT move at all. Live userspace
+interrupts wake every idle attempt within ~13ms -> long gaps never happen
+without the freeze. Confirms the freeze (userspace quiesce) is prerequisite.
+
+** STAGE A: full U22 device-D3 set (minus iwx) + forceskip=500 during the hold
+  s0freeze done: c7core~99% pc9=0% pc10=46% slp_s0=ok d=0
+  PMC status 25580074 807c63ef 00001fef 00001040 3d375a2c 000aaaaa
+=> BYTE-FOR-BYTE IDENTICAL to U22 (word4=3d375a2c unchanged). forceskip did
+   NOTHING: CPU_C10_REQ_STS_0 still unmet, PLLs still on, pc10 unchanged.
+   The "longer idle gaps -> CPU_C10_REQ / SLP_S0" hypothesis is REFUTED.
+
+** WHY forceskip can't work here: the live status is sampled by an AWAKE CPU
+CPU_C10_REQ_STS_0 (w4.0) = "this CPU is currently requesting C10". The s0freeze
+coordinator reads the LIVE LPM status (0xfe001c5c) right after waking from
+kpause -- so the sampling CPU is BY DEFINITION awake and its C10 request is
+deasserted. w4.0 can NEVER read satisfied from the sampling CPU. The live-status
+method is fundamentally blind to the deepest state. (The LATCHED status at
+0x1c3c, captured at LPM entry, is the correct register -- but per-mode residency
+at 0x1c80 was ALL ZERO in U20, i.e. the PMC NEVER records entry into any LPM
+mode. Ground truth = no LPM entry ever, consistent with slp_s0 counter = 0.)
+
+** STAGE A2: LPS0 ENTRY handshake wrapped around the freeze (was MISSING before)
+Discovered the diagnostic s0freeze coordinator NEVER calls acpi_lps0_enter().
+The full ENTRY handshake (SCREEN_OFF f3 + MS_ENTRY f7 + ENTRY f5, both UUIDs,
+mask-gated: intel=0x7f msft=0x1f9) only runs via hw.acpi.sleep.lps0=1 or the
+hw.acpi.sleep.freeze path. Ran: lps0=1 (ENTRY) -> s0freeze -> lps0=0 (EXIT):
+  LPS0: Microsoft/Intel _DSM func 5: AE_OK  (ENTRY methods executed)
+  s0freeze done: c7core~99% pc9=0% pc10=46% slp_s0=ok d=0
+  PMC status 25580074 807c63ef 00001fef 00001040 3d375a2c 000aaaaa (IDENTICAL)
+=> The ENTRY notifications execute (AE_OK) but change NOTHING in status/residency.
+   S0ix entry is gated by HARDWARE IP requirements, not by the OS notification.
+
+** THE WALL (sample-independent, unmoved by everything tried)
+word0 (clocksource) = 0x25580074, unchanged across every test:
+  USB2PLL_OFF (bit18) = 0  -> USB2 PHY PLL never off
+  OPIOPLL_OFF (bit21) = 0  -> OPIO (display/TypeC I/O) PLL never off
+These are NOT sampling artifacts (they don't depend on the CPU being awake).
+The PMC turns these PLLs off only when the underlying PHYs are fully powered
+down: USB2PLL needs all USB2 activity ceased + PCH USB2 PHY power-gated (xHCI
+D3 alone is insufficient -- xHCI_PG/xHCI_D3 are SET but USB2PLL stays on);
+OPIOPLL needs the display OPIO fully off = DC9 actually ENTERED (U17: DC9 is
+ARMED, DC_STATE_EN bit3=1, but likely never ENTERED -- needs all display power
+wells released). NetBSD drives neither PHY power state.
+
+** ASSESSMENT (systematic-debugging Phase 4.5: this is architectural, not a bug)
+- Goal 2 (substantial PC10): ACHIEVED, ~46-52%.
+- Goal 1 (WiFi/TB in D3, ASPM L1.2): WiFi D3 (drvctl -S iwx0) + TB-DMA D3
+  (PMCSR) both demonstrated; link ASPM state still to be re-verified.
+- Goal 3 (SLP_S0 / slow-blink LED): BLOCKED at the hardware PLL layer. The PMC
+  never enters any LPM mode (residency=0), so SLP_S0# never asserts and the EC
+  never slow-blinks. Three independent hypotheses now refuted: (b) GFX0=D3 gate
+  (U19), (a) idle-gap length / CPU_C10_REQ via forceskip (U23), and the LPS0
+  ENTRY notification (U23). The residual blockers are PHY-level PLL power-gating
+  that requires per-IP PM NetBSD does not implement.
+
+** QUESTIONS FOR ASTRA
+1. USB2PLL_OFF: with xHCI0/xHCI1 in D3 and xHCI_PG/xHCI0_D3 SET, what still
+   holds the PCH USB2 PHY PLL on? Is there a PMC register (USB2 PHY power-gate)
+   or an ACPI/_PS3 path that forces it? Any internal USB2 devices (BT/camera/
+   fingerprint) on the root hubs keeping USB2 alive that we must D3 first?
+2. OPIOPLL_OFF: does this require DC9 to actually ENTER (not just arm)? If so,
+   the i915 display-power-domain release (power wells PW1/PW2/combo-PHY,
+   CDCLK/DPLL) at suspend_late is the target -- is that worth pursuing on the
+   NetBSD i915, or structurally out of reach?
+3. Is SLP_S0# reachable AT ALL without full per-IP PHY PM, or should goal 3
+   (the LED) be approached via a different mechanism? The live-status method is
+   blind (sampling CPU awake); should the coordinator instead read the LATCHED
+   status (0x1c3c) + per-mode residency (0x1c80) so we measure real LPM entry?
