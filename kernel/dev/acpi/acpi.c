@@ -115,6 +115,9 @@ __KERNEL_RCSID(0, "$NetBSD: acpi.c,v 1.303.2.1 2026/06/27 10:46:19 martin Exp $"
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/kthread.h>
+#include <sys/proc.h>
+#include <sys/lwp.h>
+#include <sys/cpu.h>
 #include <sys/condvar.h>
 #include <sys/rndsource.h>
 #include <sys/sysctl.h>
@@ -252,6 +255,7 @@ static int		sysctl_hw_acpi_fixedstats(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_sleepstate(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_sleepstates(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_freeze(SYSCTLFN_PROTO);
+static int		sysctl_hw_acpi_s0freeze(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_wake(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_lps0(SYSCTLFN_PROTO);
 static int		sysctl_hw_acpi_slp_s0(SYSCTLFN_PROTO);
@@ -1818,6 +1822,12 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 
 	(void)sysctl_createv(NULL, 0, &snode, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "s0freeze", SYSCTL_DESCR("s2idle stage1 freeze-userspace test (write 1)"),
+	    sysctl_hw_acpi_s0freeze, 0, NULL, 0,
+	    CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
 	    "wake", SYSCTL_DESCR("Wake from s2idle freeze (write 1)"),
 	    sysctl_hw_acpi_wake, 0, NULL, 0,
 	    CTL_CREATE, CTL_EOL);
@@ -2694,6 +2704,132 @@ acpi_lps0_exit(void)
 	    "LPS0: exit notifications attempted\n");
 }
 
+/*
+ * LISPBSD s2idle stage 1 (Astra design): reversible userspace freezer.
+ * Suspend all non-system user LWPs via lwp_suspend() (reversible, unlike
+ * suspendsched which sets LW_WREBOOT), hold with ticks still running, then
+ * thaw via lwp_continue().  NO device-power changes here -- this validates
+ * the freeze/thaw cycle and measures the idle gain from quiescing userspace.
+ * Coordinator runs in the PK_SYSTEM acpi s2idle kthread (never self-frozen).
+ */
+#if defined(__x86_64__) || defined(__i386__)
+#include <machine/cpufunc.h>
+static uint64_t acpi_s0_rdmsr(u_int m) { return rdmsr(m); }
+#else
+static uint64_t acpi_s0_rdmsr(u_int m) { (void)m; return 0; }
+#endif
+
+static int acpi_freeze_mode;	/* 0 = S3-style freeze, 1 = s0 freezer test */
+
+static void
+acpi_s0_freeze_userspace(bool freeze)
+{
+	struct proc *p;
+	struct lwp *l;
+
+	mutex_enter(&proc_lock);
+	PROCLIST_FOREACH(p, &allproc) {
+		mutex_enter(p->p_lock);
+		if ((p->p_flag & PK_SYSTEM) != 0) {
+			mutex_exit(p->p_lock);
+			continue;
+		}
+		LIST_FOREACH(l, &p->p_lwps, l_sibling) {
+			if (l == curlwp)
+				continue;
+			lwp_lock(l);
+			if (freeze)
+				(void)lwp_suspend(curlwp, l);	/* unlocks l */
+			else
+				lwp_continue(l);		/* unlocks l */
+		}
+		mutex_exit(p->p_lock);
+	}
+	mutex_exit(&proc_lock);
+}
+
+static void
+acpi_s0_freeze_test(void)
+{
+	struct acpi_softc *sc = acpi_softc;
+	uint64_t t0, t1, p9a, p9b, p10a, p10b, s0a = 0, s0b = 0, dt;
+
+	if (sc == NULL)
+		return;
+	aprint_normal_dev(sc->sc_dev,
+	    "s0freeze: begin (freeze userspace, no dev changes, ticks on)\n");
+
+#if NWSDISPLAY > 0
+	(void)wsdisplay_handlex(0);
+#endif
+
+	acpi_s0_freeze_userspace(true);
+	kpause("s0qui", false, MAX(1, hz), NULL);	/* settle to LSSUSPENDED */
+
+	t0 = acpi_s0_rdmsr(0x10);	/* IA32_TSC */
+	p9a = acpi_s0_rdmsr(0x631); p10a = acpi_s0_rdmsr(0x632);
+	(void)acpi_slp_s0_read(&s0a);
+
+	kpause("s0hold", false, MAX(1, hz * 10), NULL);	/* 10s hold, ticks on */
+
+	t1 = acpi_s0_rdmsr(0x10);
+	p9b = acpi_s0_rdmsr(0x631); p10b = acpi_s0_rdmsr(0x632);
+	(void)acpi_slp_s0_read(&s0b);
+
+	acpi_s0_freeze_userspace(false);
+
+#if NWSDISPLAY > 0
+	wsdisplay_handlex(1);
+#endif
+
+	dt = t1 - t0;
+	if (dt == 0)
+		dt = 1;
+	aprint_normal_dev(sc->sc_dev,
+	    "s0freeze: done tsc=%ju pc9=%ju%% pc10=%ju%% slp_s0_delta=%ju\n",
+	    (uintmax_t)dt,
+	    (uintmax_t)((p9b - p9a) * 100 / dt),
+	    (uintmax_t)((p10b - p10a) * 100 / dt),
+	    (uintmax_t)(s0b - s0a));
+}
+
+static int
+sysctl_hw_acpi_s0freeze(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node;
+	int err, t;
+
+	if (acpi_softc == NULL)
+		return ENOSYS;
+	t = 0;
+	node = *rnode;
+	node.sysctl_data = &t;
+	err = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (err || newp == NULL)
+		return err;
+	if (t != 0) {
+		acpi_freeze_mode = 1;
+		if (acpi_freeze_thread_started == 0) {
+			mutex_init(&acpi_freeze_mtx, MUTEX_DEFAULT, IPL_NONE);
+			cv_init(&acpi_freeze_cv, "s2idlrq");
+			if (kthread_create(PRI_NONE, KTHREAD_MPSAFE, NULL,
+			    acpi_freeze_thread, NULL, NULL, "s2idle") == 0)
+				acpi_freeze_thread_started = 1;
+			else {
+				cv_destroy(&acpi_freeze_cv);
+				mutex_destroy(&acpi_freeze_mtx);
+			}
+		}
+		if (acpi_freeze_thread_started != 0) {
+			mutex_enter(&acpi_freeze_mtx);
+			acpi_freeze_req = 1;
+			cv_signal(&acpi_freeze_cv);
+			mutex_exit(&acpi_freeze_mtx);
+		}
+	}
+	return 0;
+}
+
 void
 acpi_enter_freeze(void)
 {
@@ -2811,7 +2947,10 @@ acpi_freeze_thread(void *arg)
 		acpi_freeze_req = 0;
 		mutex_exit(&acpi_freeze_mtx);
 
-		acpi_enter_freeze();
+		if (acpi_freeze_mode)
+			acpi_s0_freeze_test();
+		else
+			acpi_enter_freeze();
 	}
 }
 
@@ -2860,6 +2999,7 @@ sysctl_hw_acpi_freeze(SYSCTLFN_ARGS)
 		return err;
 
 	if (t != 0) {
+		acpi_freeze_mode = 0;
 		if (acpi_freeze_thread_started == 0) {
 			mutex_init(&acpi_freeze_mtx, MUTEX_DEFAULT, IPL_NONE);
 			cv_init(&acpi_freeze_cv, "s2idlrq");
