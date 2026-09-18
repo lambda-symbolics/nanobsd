@@ -2414,10 +2414,13 @@ acpi_slp_s0_probe(void)
 		    lh->Length >= sizeof(ACPI_LPIT_NATIVE)) {
 			ACPI_LPIT_NATIVE *ln = (ACPI_LPIT_NATIVE *)p;
 
-			acpi_slp_s0_gas = ln->ResidencyCounter;
-			acpi_slp_s0_freq = ln->CounterFrequency;
-			acpi_slp_s0_ok = true;
-			break;	/* first native C-state LPI == SLP_S0 */
+			if (ln->ResidencyCounter.SpaceId ==
+			    ACPI_ADR_SPACE_SYSTEM_MEMORY) {
+				acpi_slp_s0_gas = ln->ResidencyCounter;
+				acpi_slp_s0_freq = ln->CounterFrequency;
+				acpi_slp_s0_ok = true;
+				break; /* SystemMemory = SLP_S0 (PMC) */
+			}
 		}
 		p += lh->Length;
 	}
