@@ -3079,28 +3079,61 @@ acpi_enter_freeze(void)
 	struct acpi_softc *sc = acpi_softc;
 	device_t curdev, parent;
 	deviter_t di;
+	extern int i915_lispbsd_s0idle;
+	int s0idle_save;
 
 	if (sc == NULL || sc->sc_sleepstate != ACPI_STATE_S0)
 		return;
 
 	aprint_normal_dev(sc->sc_dev,
-	    "s2idle: freezing (selective suspend, dump path kept alive)\n");
+	    "s2idle: freezing (S0-idle, selective suspend)\n");
+
+	/*
+	 * Arm the wake latch BEFORE any preparation, so a lid-open or button
+	 * press during the (slow) suspend prep is preserved and seen before
+	 * we enter the hold, instead of racing acpi_freeze_active/wake.
+	 */
+	acpi_freeze_wake = 0;
+	acpi_freeze_active = 1;
 
 #if NWSDISPLAY > 0
 	if (wsdisplay_handlex(0)) {
 		aprint_normal_dev(sc->sc_dev,
 		    "s2idle: X server detach failed, aborting freeze\n");
+		acpi_freeze_active = 0;
 		return;
 	}
 #endif
+
+	/*
+	 * Freeze userspace right after the X handoff and BEFORE suspending
+	 * devices, so no user thread can race device shutdown.  Thawed after
+	 * device resume, below.
+	 */
+	acpi_s0_freeze_userspace(true);
+	kpause("s2qui", false, MAX(1, hz), NULL);	/* settle to LSSUSPENDED */
+
+	/*
+	 * Preserve GPU RC6 across the i915 suspend: otherwise the i915 S3
+	 * path runs intel_rc6_disable() and pins the package out of deep
+	 * C-states (measured pc10 0% without this vs ~45% with it, 3.0 W
+	 * frozen).  Latched here as part of the transaction, restored on
+	 * resume -- no longer dependent on a manual hw.i915s0idle sysctl.
+	 */
+	s0idle_save = i915_lispbsd_s0idle;
+	i915_lispbsd_s0idle = 1;
 
 	KERNEL_LOCK(1, NULL);
 	for (curdev = deviter_first(&di, DEVITER_F_LEAVES_FIRST);
 	     curdev != NULL; curdev = deviter_next(&di)) {
 		if (!device_is_active(curdev) || acpi_s2idle_keep(curdev))
 			continue;
-		aprint_normal("s2idle: suspend %s\n", device_xname(curdev));
-		(void)pmf_device_suspend(curdev, PMF_Q_NONE);
+		if (pmf_device_suspend(curdev, PMF_Q_NONE))
+			aprint_normal("s2idle: suspend %s\n",
+			    device_xname(curdev));
+		else
+			aprint_normal("s2idle: suspend %s FAILED\n",
+			    device_xname(curdev));
 	}
 	deviter_release(&di);
 	KERNEL_UNLOCK_ONE(NULL);
@@ -3110,18 +3143,7 @@ acpi_enter_freeze(void)
 
 	acpi_lps0_enter();
 
-	/*
-	 * Freeze userspace so ALL cores stay simultaneously idle and the
-	 * package can reach deep C-states (PC8/9/10).  Without this the real
-	 * suspend keeps the package pinned at PC0 (~4.4 W measured); the
-	 * diagnostic path (acpi_s0_freeze_test) proves that with userspace
-	 * frozen the package reaches PC10 42-53%.  Thawed after device resume.
-	 */
-	acpi_s0_freeze_userspace(true);
-	kpause("s2qui", false, MAX(1, hz), NULL);	/* settle to LSSUSPENDED */
-
-	acpi_freeze_active = 1;
-	acpi_freeze_wake = 0;
+	/* Enter the hold only if no wake arrived during preparation. */
 	{ int _i; for (_i = 0; _i < 3000 && acpi_freeze_wake == 0; _i++)
 		kpause("s2idle", false, MAX(1, hz / 10), NULL); }
 	acpi_freeze_active = 0;
@@ -3142,11 +3164,17 @@ acpi_enter_freeze(void)
 		parent = device_parent(curdev);
 		if (parent != NULL && !device_is_active(parent))
 			continue;
-		aprint_normal("s2idle: resume %s\n", device_xname(curdev));
-		(void)pmf_device_resume(curdev, PMF_Q_NONE);
+		if (pmf_device_resume(curdev, PMF_Q_NONE))
+			aprint_normal("s2idle: resume %s\n",
+			    device_xname(curdev));
+		else
+			aprint_normal("s2idle: resume %s FAILED\n",
+			    device_xname(curdev));
 	}
 	deviter_release(&di);
 	KERNEL_UNLOCK_ONE(NULL);
+
+	i915_lispbsd_s0idle = s0idle_save;	/* restore RC6-preserve latch */
 
 	acpi_s0_freeze_userspace(false);	/* thaw userspace once devices are back */
 

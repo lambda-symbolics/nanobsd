@@ -1,33 +1,28 @@
 #!/bin/sh
-# True S0ix (PC10) suspend for the X1 Nano, via RAW PMCSR D3 (NOT drvctl -S,
-# which disables PCIe ASPM and pins the package at PC0). Puts all LPI-constrained
-# devices in D3 while their links stay in ASPM L1.2, + display off + LPS0
-# MS_ENTRY handshake -> platform reaches deep PC10, EC slow-blinks the LED.
-# Reaches ~47% PC10 / ~2.4 W. Does NOT touch dev6 (PEG bridge -> NVMe/root).
+# s2idle deep suspend for the X1 Nano. The KERNEL coordinator owns the whole
+# transition: hw.acpi.sleep.freeze=1 triggers acpi_enter_freeze(), which detaches
+# X, freezes userspace, pmf-suspends xHCI/i915/iwx (preserving GPU RC6 via the
+# i915s0idle latch so the package can reach deep C-states), sends the LPS0 _DSM
+# ENTRY (EC slow-blink LED), and holds until lid-open wakes it IN-KERNEL
+# (acpilid_status_changed -> acpi_freeze_wakeup). This script only manages the
+# panel backlight, which is outside the coordinator.
 export PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin
-XA=$(ps auxww 2>/dev/null | grep -o '\-auth [^ ]*' | head -1 | awk '{print $2}')
 BR=/var/run/s0ix.brightness
-dpms(){ DISPLAY=:0 XAUTHORITY="$XA" xset dpms force "$1" 2>/dev/null; }
-# device list: dev func pmcsr-offset
-DEVS="8:0:0xe0 13:2:0x84 13:3:0x84 22:0:0x54 20:3:0xcc 13:0:0x74 20:0:0x74 7:0:0xa4 7:2:0xa4"
-setpm(){ for e in $DEVS; do d=${e%%:*}; r=${e##*:}; f=${e#*:}; f=${f%%:*}; pcictl pci0 write -d $d -f $f $r $1 2>/dev/null; done; }
 case "$1" in
 suspend)
 	sysctl -n hw.acpi.acpiout15.brightness > $BR 2>/dev/null
-	dpms off
-	ifconfig iwx0 down 2>/dev/null
-	setpm 0x3
-	sysctl -w hw.acpi.sleep.lps0=1 >/dev/null 2>&1
-	logger -t s0ix "suspend: LPI devices D3 (raw PMCSR), display off, LPS0 entry"
+	sysctl -w hw.acpi.acpiout15.brightness=0 >/dev/null 2>&1
+	sysctl -w hw.acpi.acpiout16.brightness=0 >/dev/null 2>&1
+	sysctl -w hw.acpi.sleep.freeze=1 >/dev/null 2>&1
+	logger -t s0ix "suspend: requested kernel s2idle freeze"
 	;;
 resume)
-	sysctl -w hw.acpi.sleep.lps0=0 >/dev/null 2>&1
-	setpm 0x0
-	ifconfig iwx0 up 2>/dev/null; ifconfig iwx0 powersave 2>/dev/null
-	dpms on
 	b=$(cat $BR 2>/dev/null)
-	[ -n "$b" ] && { sysctl -w hw.acpi.acpiout15.brightness="$b" >/dev/null 2>&1; sysctl -w hw.acpi.acpiout16.brightness="$b" >/dev/null 2>&1; }
-	logger -t s0ix "resume: LPI devices D0, display on"
+	[ -n "$b" ] && {
+		sysctl -w hw.acpi.acpiout15.brightness="$b" >/dev/null 2>&1
+		sysctl -w hw.acpi.acpiout16.brightness="$b" >/dev/null 2>&1
+	}
+	logger -t s0ix "resume: restored brightness $b"
 	;;
 *) echo "usage: s0ix suspend|resume" >&2; exit 1 ;;
 esac

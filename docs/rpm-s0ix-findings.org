@@ -995,3 +995,46 @@ Result over a 321 s frozen hold: pc10 ~45%, pc3 ~45%, AVG 3.03 W.
     part from U23-28.  ~1 W almost certainly needs it; no S3 (firmware) and no S4
     (NetBSD) exist as alternatives.
 NEXT: tickless frozen hold; then re-attack the SLP_S0 platform bits.
+
+* UPDATE 31 (2026-09-18 ~21:40): recipe integrated into ONE coordinator (kernel #66)
+Per Astra: the successful manual recipe and the committed lid path were different
+code.  Unified them so the KERNEL coordinator (acpi_enter_freeze) owns the whole
+transition; the lid just requests it.
+
+** acpi_enter_freeze() changes (kernel/dev/acpi/acpi.c)
+  - Latches i915_lispbsd_s0idle=1 itself before suspending the GPU (preserves RC6
+    so the package can reach deep C-states), restores it on resume.  No longer
+    depends on a manual hw.i915s0idle sysctl -- that was why frz2 got pc10 0%.
+  - Freeze userspace AFTER wsdisplay_handlex(0) but BEFORE the device-suspend loop
+    (was after suspend+wakedev+LPS0), so no user thread races device shutdown.
+  - Arms the wake latch (active=1, wake=0) BEFORE preparation and only enters the
+    hold if no wake arrived during prep -- closes the lost-wakeup window.
+  - Logs pmf suspend/resume failures.
+  (Deferred, noted for Astra: S0 wake policy instead of S3; full pmf unwind/rollback;
+   bounded acknowledged freeze quiescence; event-driven hold -- next iteration.)
+
+** Lid-open wakes the freeze IN-KERNEL (kernel/dev/acpi/acpi_lid.c)
+  acpilid_status_changed() now calls acpi_freeze_wakeup() on lid-open before the
+  pswitch event (userspace/powerd is frozen and cannot initiate resume; the
+  power-button path already had this hook).  RELEASED is still delivered so powerd
+  runs the lid-open restore once userspace thaws.
+
+** userland/s0ix
+  Gutted to backlight save/set-0 + hw.acpi.sleep.freeze=1 on suspend, backlight
+  restore on resume.  No raw PCI D3, no fragile xset (Astra: raw pokes are inert
+  for package residency; the config PATH lacked X11 so dpms silently no-op'd).
+
+** Measured (kernel #66, s0ix suspend, ZERO manual setup)
+  charge-delta 326 s: 3.313 W; package pc10 ~42%, pc3 ~46% (~88% deep).  Resume
+  clean.  Reproduces the 3.03 W manual recipe through the single coordinator.
+
+** Note: soft reboot is flaky on this box
+  A hung software reboot (blank-but-lit screen, fan on) is a reboot-path failure,
+  NOT a boot regression -- a hard power-cycle boots the same kernel fine.  Test
+  kernels should get their own boot.cfg entry so the default always stays good.
+
+** Still 3x the ~1 W target -- NEXT
+  1. Tickless during the hold: pc10 ~42% is capped by hardclock waking cores every
+     tick; event-driven hold + hardclock suppression to push pc10 toward ~90%.
+  2. SLP_S0 platform residency (true modern-standby state) -- still 0; the ~1 W
+     floor almost certainly needs it.
