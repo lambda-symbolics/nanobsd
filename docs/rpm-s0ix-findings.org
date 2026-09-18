@@ -461,3 +461,24 @@ so the SA is actually gated in the S0-idle case. That is deep i915 driver work
 This session's net: every non-i915 blocker eliminated and measured; the
 remaining, decisive blocker is the i915 SA power-down in the suspend path.
 Candidate (a) short-gaps may also contribute but is moot while (b) pins pc9=0.
+
+* UPDATE 17 (2026-09-18 ~15:30): DC9 IS armed; SA pin is deeper (power-well/entry)
+Instrumented intel_display_power_suspend_late() to log DC_STATE_EN around
+bxt_enable_dc9() (kernel #58). Via drvctl -S i915drmkms0 (full clean lifecycle):
+  DC_STATE_EN before=0x00000000, after=0x00000008  (bit3 = DC9 enabled/armed).
+So the display-power-suspend path DOES arm DC9 correctly. GPU reaches PCI D3, X
+survives. Yet the package pins at pc9=0 with GPU-D3 (UPDATE 16). Therefore the
+SA pin is NOT "DC9 never armed". It is one of:
+  - DC9 armed but NOT ENTERED: the DMC can only transition to DC9 when the
+    display is fully powered down; a residual display power well (PW1/PW2/the
+    combo-PHY) or the CDCLK/DPLL still held would block the actual DC9 entry
+    and keep the SA clocked. intel_power_domains_suspend() (called just before
+    suspend_late) is responsible for releasing those wells.
+  - or a non-display SA/GT pin from the D3 transition (PCIe link not in L1,
+    GT/ring not fully gated).
+NEXT diagnostic (for Astra / next build): log the actual DC-state STATUS (did
+DC9 enter?) and the power-well status registers (HSW_PWR_WELL_CTL*/the ICL
+PWR_WELL_CTL_AUX etc.) at suspend, while the GPU is still D0. That pinpoints
+which well/PLL is stuck. This is deep i915 display-power-domain work -- the
+precise, now-narrowed target for reaching PC10/SLP_S0/LED. Instrumented file
+(intel_display_power.c) pushed.
