@@ -283,3 +283,25 @@ ASPM link) and the TB links are empty with LTR off, so ASPM-L1.2 on those links
 is N/A / moot. The real power gate is PLATFORM S0ix (SLP_S0), which needs the
 s2idle transition (stages 1-3), NOT device-link ASPM. Device D3 alone (incl.
 WiFi/TB) does not produce PC10/SLP_S0/LED here -- established across many tests.
+
+* UPDATE 10 (2026-09-18 ~13:15): pc10 blocker isolated by ELIMINATION = tick/callout only
+Ran freeze(stage1) + display DC9 (hw.i915rpm=1, intel_display_power_suspend) +
+WiFi PMCSR-D3 + userspace frozen, all together (bounded, auto-thaw, X survives):
+  RESULT: c7core=99% pc9=94% pc10=0 slp_s0=0.
+Also freeze + WiFi-D3 alone (display DPMS-off): pc9=95% pc10=0.
+So with EVERY other variable quiesced -- userspace frozen, display in DC9 (wells
+off, not just DPMS), GT parked, GPU/WiFi handled, cores 99% in C7 -- the package
+still tops out at PC9 and never PC10. This ELIMINATES display state, device
+D-states, and idle depth as the pc9->pc10 gate. The ONLY remaining variable is
+the frequency of brief wakes (the ~ms-scale LAPIC tick + callout activity):
+PC9 commits with its short entry latency; PC10's longer entry latency never
+elapses between the frequent wakes. => Stage 3 (reduce/suspend the tick+callout
+wakes during the frozen window) is now the SOLE remaining blocker, proven by
+elimination, for PC10 -> SLP_S0 -> LED.
+Note on hang-safety for stage 3: the LAPIC timer-deadline wake already fires the
+cores out of PC9 every cycle; the same armed-deadline mechanism wakes a core
+from PC10 too (standard tickless contract), so LOWERING the effective wake rate
+(fewer callouts / slower tick) should let PC10 commit while STILL waking at the
+deadline -- i.e. a slow-the-wakes approach need not risk a no-wake hang, unlike
+fully masking LVT_TIMER. The delicacy is callout-wheel quiescence + heartbeat +
+timekeeping accounting. Recommend Astra design; ready to implement + measure.
