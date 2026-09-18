@@ -786,3 +786,51 @@ instrument xhci_suspend() per-port PORTSC/U3 readback to confirm the deployed
 kernel's sequence (lower priority now that USB2PLL is shown device-independent).
 en readback at 0xfe001c34 = 0 (write-only or aliased) but latching demonstrably
 works (latch != live, sensible values); etr3 pre-write = 0x81000000.
+
+* UPDATE 26 (2026-09-18 ~18:40): LPS0 device constraints satisfied; remaining unmet = S0ix's own state
+Decoded the undecoded latch bits and pursued the LPS0 device-constraint path.
+
+** Undecoded bits are RESERVED in Linux's own TGL map
+Fetched Linux drivers/platform/x86/intel/pmc/tgl.c. The unmet-at-latch bits are
+literally unmapped/reserved upstream: clocksource(w0) bits 1,9,30 = reserved;
+vnn_misc(w4) bits 13,15,19,21 = reserved. Named ones: w0.18 USB2PLL_OFF, w0.21
+OPIOPLL_OFF, w4.0 CPU_C10_REQ_STS_0, w5.{21,23,25,27,29,31} Int_Timer_SS_Wake0-5
+_Pol_STS. So even Linux does not name what remains -- they are not OS knobs.
+
+** LPS0 _DSM GET_DEVICE_CONSTRAINTS: enabled devices + required D-state
+From boot dmesg (Intel LPS0 uuid func1). enabled=1 devices and min D-state:
+  PR00-07=D0; GFX0=D3; I2C0=D3; XHCI=D3; TDM0/TDM1=D3; HDAS/HECI/PEG0=129;
+  CNVW(WiFi)=D0; PEG0.PEGP(NVMe)=D3; TXHC=D3; TRP1/TRP2=D3; GNA0=D3.
+Coverage gaps we had NOT been suspending: TRP1(dev7f0), TRP2(dev7f2),
+GNA0(dev8f0), HECI(dev22f0). Added all four via PMCSR-D3 (readback confirmed
+D3) + existing set, iwx up (minD=0 satisfied). Re-ran with C10 latch:
+  PMC latch 35780074 847de3ef 00001fef 00001040 3d17fa2d 000aaaaa (UNCHANGED)
+  mode resid delta = 0, slp_s0 = 0.
+=> Satisfying the missing device constraints changed NOTHING.
+
+** The decisive structural insight: unmet words ARE the S0ix state itself
+PMC status words at C10 (latched), vs mode-0 requirements:
+  w1 power_gating: MET.  w2 d3_status: MET.  w3 vnn_req: MET.
+  => Every device/power-gate/vnn requirement the PMC TRACKS is already satisfied.
+  Remaining unmet: w0 clocksource (PLLs off), w4 vnn_misc (reserved), w5 signal
+  (wake-timer polarity armed). These describe BEING in S0ix (PLLs powered off,
+  wake sources armed) -- they are set BY S0ix entry, not preconditions for it.
+CONCLUSION: req & ~status cannot reveal the gate, because the only unmet bits are
+S0ix's own consequences. All OS-addressable preconditions (LPS0 handshake, device
+D3 incl every enabled constraint except boot NVMe, PC10=45-53%, cores in C10 with
+CPU_C10_REQ asserted per latch) are satisfied, yet the PMC never arms an LPM mode
+(per-mode residency stays 0). NVMe(PEGP) D3 is the one untested constraint but is
+almost certainly NOT the gate: w2 d3_status is already fully MET, so the PMC's
+tracked D3 set is complete; D3'ing the boot disk risks wedging for no expected
+signal change.
+
+** Question for Astra (the real frontier)
+Given d3/pg/vnn all MET, LPS0 ENTRY sent, PC10 reached, and CPU_C10_REQ latched:
+what COMMITS TGL S0ix entry beyond this? Candidates: (a) a pending wake/SCI that
+keeps the PMC from arming (does a constantly-firing GPE/SCI or an unmasked wake
+source block it? how to observe from the OS?); (b) a PMC "enter/arm" write we're
+missing; (c) the CPUs must ALL be in package-visible mwait-C10 simultaneously for
+a sustained window that the kpause-based coordinator (one CPU wakes to sample)
+never provides; (d) a platform/firmware quirk. Most valuable cross-check: does
+Linux actually reach SLP_S0 on THIS exact machine (X1 Nano, TGL-UP4)? If not,
+the LED may be unreachable here regardless of OS.
