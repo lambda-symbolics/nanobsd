@@ -879,3 +879,30 @@ SLP_S0 absent" case). If Linux also cannot reach SLP_S0 here, the LED is
 firmware-gated and unreachable from any OS without a BIOS/firmware change; if
 Linux CAN, it isolates a specific driver action invisible in these registers,
 which we then port. This is the highest-value experiment and requires the user.
+
+* UPDATE 28 (2026-09-18 ~19:35): LTR-ignore-all sledgehammer = NO effect (LTR closed)
+Added coordinator mode 3 (kernel #64): force LTR_IGNORE @0xfe001b0c = 0x7fffff
+(all 23 TGL IPs) before the hold, restore after -- the exact remedy Intel's
+S0ixSelftestTool applies when an LTR gates S0ix.
+  s0freeze mode 3: LTR_IGNORE forced 0x7fffff (was 00000000)
+  done: pc10=42% slp_s0=0; latch 35780074 847de3ef 00001fef 00001040 3d17fa2d
+        000aaaaa; mode resid d = all 0 (io_ok=1); SCI d=0 GPE d=0
+=> Ignoring EVERY per-IP LTR changes NOTHING. Definitively confirms LTR is not
+the gate (corroborates the req-bit decode in U27). 
+
+** OS-side hypothesis space is now exhausted
+Every lever tried and eliminated with evidence:
+  device D3 (all LPS0 constraints incl TRP/GNA/HECI; w2 MET), power-gating (w1),
+  vnn_req (w3), OPIOPLL_OFF + CPU_C10_REQ (MET in C10 latch), idle-gap depth
+  (forceskip inert), LPS0 handshake (funcs AE_OK), pending wakes (SCI/GPE=0),
+  LTR constraints (no req bits AND ignore-all no-op). PC10 = 42-53% reached.
+The PMC never arms an LPM mode (per-mode residency + LPIT SLP_S0 both 0). The
+only latch-unmet bits are S0ix's own consequences.
+CONCLUSION: no remaining OS-observable NetBSD-side precondition is unmet. Reaching
+SLP_S0# (hence the EC slow-blink LED) is now gated by either (a) platform/firmware
+not permitting SLP_S0# on this exact unit under its current BIOS (modern-standby
+/ "Sleep State" config), or (b) a Linux-driver action invisible in every PMC/ACPI
+register we can read. The one decisive experiment left requires a Linux boot on
+this machine: run Intel's s0ix-selftest-tool.sh -s (it targets exactly the
+"PC10 present, SLP_S0 absent" case). That result partitions (a) vs (b) and is the
+only way forward for goal 3.

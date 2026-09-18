@@ -2862,6 +2862,8 @@ acpi_s0_freeze_test(void)
 	};
 	uint64_t ltrv[24];
 	unsigned li;
+	uint64_t ltr_ign_save = 0;
+	int ltr_ign_done = 0;
 
 	if (sc == NULL)
 		return;
@@ -2902,6 +2904,17 @@ acpi_s0_freeze_test(void)
 	/* SCI/GPE dispatch counters before the hold (Astra: pending-wake check) */
 	memset(&st0, 0, sizeof(st0));
 	str0 = AcpiGetStatistics(&st0);
+
+	/*
+	 * mode 3: ignore ALL per-IP LTRs (Intel S0ixSelftestTool remedy) to test
+	 * whether any latency-tolerance report is gating S0ix.  LTR_IGNORE @0x1b0c,
+	 * low 23 bits = TGL_NUM_IP_IGN_ALLOWED.  Saved and restored below.
+	 */
+	if (acpi_freeze_mode == 3) {
+		if (ACPI_SUCCESS(AcpiOsReadMemory(0xfe001b0c, &ltr_ign_save, 32)) &&
+		    ACPI_SUCCESS(AcpiOsWriteMemory(0xfe001b0c, 0x007fffff, 32)))
+			ltr_ign_done = 1;
+	}
 
 	t0 = acpi_s0_rdmsr(0x10);	/* IA32_TSC */
 	p9a = acpi_s0_rdmsr(0x631); p10a = acpi_s0_rdmsr(0x632);
@@ -2950,6 +2963,10 @@ acpi_s0_freeze_test(void)
 	if (latch_armed &&
 	    ACPI_FAILURE(AcpiOsWriteMemory(0xfe001c34, latch_save, 32)))
 		io_ok = 0;
+	/* restore the LTR ignore mask */
+	if (ltr_ign_done &&
+	    ACPI_FAILURE(AcpiOsWriteMemory(0xfe001b0c, ltr_ign_save, 32)))
+		io_ok = 0;
 
 	acpi_s0_freeze_userspace(false);
 
@@ -2997,6 +3014,10 @@ acpi_s0_freeze_test(void)
 		    st0.SciCount, st1.SciCount, st0.GpeCount, st1.GpeCount);
 	else
 		aprint_normal_dev(sc->sc_dev, "s0freeze: SCI/GPE stats UNAVAIL\n");
+	if (ltr_ign_done)
+		aprint_normal_dev(sc->sc_dev,
+		    "s0freeze: LTR_IGNORE forced 0x7fffff (was %08x)\n",
+		    (uint32_t)ltr_ign_save);
 	/* LTR snapshot: raw per-agent (value bits[9:0], scale [12:10], req bit15
 	 * snoop / bit31 nonsnoop).  A req bit set with a small value blocks S0ix. */
 	for (li = 0; li < __arraycount(ltrtab); li += 6)
