@@ -3110,6 +3110,16 @@ acpi_enter_freeze(void)
 
 	acpi_lps0_enter();
 
+	/*
+	 * Freeze userspace so ALL cores stay simultaneously idle and the
+	 * package can reach deep C-states (PC8/9/10).  Without this the real
+	 * suspend keeps the package pinned at PC0 (~4.4 W measured); the
+	 * diagnostic path (acpi_s0_freeze_test) proves that with userspace
+	 * frozen the package reaches PC10 42-53%.  Thawed after device resume.
+	 */
+	acpi_s0_freeze_userspace(true);
+	kpause("s2qui", false, MAX(1, hz), NULL);	/* settle to LSSUSPENDED */
+
 	acpi_freeze_active = 1;
 	acpi_freeze_wake = 0;
 	{ int _i; for (_i = 0; _i < 3000 && acpi_freeze_wake == 0; _i++)
@@ -3137,6 +3147,8 @@ acpi_enter_freeze(void)
 	}
 	deviter_release(&di);
 	KERNEL_UNLOCK_ONE(NULL);
+
+	acpi_s0_freeze_userspace(false);	/* thaw userspace once devices are back */
 
 #if NWSDISPLAY > 0
 	wsdisplay_handlex(1);
