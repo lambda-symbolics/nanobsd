@@ -730,3 +730,59 @@ All three are real kernel-subsystem development (USB PM, i915 display-power, PMC
 latched telemetry) and must ALL land before SLP_S0# asserts -> EC slow-blinks.
 This is architectural, not a config/tick tweak. forceskip, GFX0-D3, and the LPS0
 notification are all refuted as sufficient.
+
+* UPDATE 25 (2026-09-18 ~18:15): *** C10-LATCHED CAPTURE — OPIOPLL & CPU_C10_REQ were FALSE blockers ***
+Implemented Astra's C10-triggered PMC latch in the s0freeze coordinator (kernel
+GENERIC #62, acpi.c): before the hold save 0xfe001c34 and clear bit31 (C10
+trigger), set ETR3 (0xfe001048) bit28 to clear old capture; after the hold read
+the 6 LATCHED words (0xfe001c3c) + 6 LIVE words (0xfe001c5c) separately, check
+every access, restore the latch select; also per-mode residency deltas (0x1c80).
+This RETRACTS the U24 "three kernel subsystems" conclusion (Astra was right to
+push back) and the U24 USB2PLL/OPIOPLL attributions.
+
+Deep quiesce (GPU+RC6 D3, xHCI D3, IP PMCSR-D3, LPS0 ENTRY, iwx UP), pc10=44%:
+  PMC live   25580074 807c63ef 00001fef 00001040 3d375a2c 000aaaaa (ok 111111)
+  PMC latch  35780074 847de3ef 00001fef 00001040 3d17fa2d 000aaaaa (ok 111111)
+  mode resid delta = all 0 (still no LPM entry)
+
+The LATCHED status (captured AT C10 entry) differs from LIVE in words 0,1,4 --
+proving the live sample was blind, exactly as diagnosed:
+  - w0 bit21 OPIOPLL_OFF: latch=1 (MET at C10). *** OPIOPLL is NOT a blocker;
+    the U24 "OPIOPLL needs DC9 entry" hypothesis is REFUTED. ***
+  - w4 bit0 CPU_C10_REQ_STS_0: latch=1 (MET at C10). *** CPU_C10_REQ is NOT a
+    blocker; forceskip was chasing a live-sample ghost, as suspected. ***
+  - w1 (power_gating): latch=847de3ef vs live 807c63ef -- more IPs gated at C10.
+
+Mode-0 requirements vs LATCHED status (req & ~latch) -- the TRUE remaining gate:
+  w0 = 0x40040202  -> bits 1, 9, 18(USB2PLL_OFF), 30
+  w1 = 0  MET
+  w2 = 0  MET
+  w3 = 0  MET
+  w4 = 0x00280000  -> bits 19, 21
+  w5 = 0xaaa00000  -> Int_Timer_SS_Wake0..5_Pol_STS (bits 21,23,25,27,29,31)
+
+** USB2PLL_OFF is an S0ix CONSEQUENCE, not a device/port state
+Detached the ENTIRE USB2 hub (uhub3) -> camera+BT+fingerprint all removed
+(usbdevs: 0 USB2 devices), xHCI0/1 in D3. Re-ran with C10 latch:
+  PMC latch 35780074 847ce3ef ... -> w0 bit18 (USB2PLL_OFF) STILL 0.
+So USB2PLL stays on even with ZERO USB2 devices and ports disconnected. It is
+NOT held by device U0 state; like SLP_S0 itself it is gated behind actual S0ix
+entry. (This also matches Astra's note that netbsd-11 xhci_suspend() already
+drives ports to U3 -- the devices were never the issue.)
+
+** Corrected blocker picture (C10-verified)
+At real C10 entry, mode-0 requirements are almost met: w1/w2/w3 fully met,
+OPIOPLL off, CPU_C10_REQ asserted. The residual unmet-at-C10 bits are narrow:
+  - w0 bits 1, 9, 30 (undecoded in the TGL map) + bit18 USB2PLL_OFF (S0ix
+    consequence)
+  - w4 bits 19, 21 (undecoded; bit21 was the CNVi/WiFi bit, cleared by iwx D3)
+  - w5 0xaaa00000 wake-signal polarity (Astra: possibly benign or wake-setup-
+    satisfiable)
+This is NOT "three subsystems required". It is a small, quantified set of
+firmware/PMC-level conditions. NEXT: (1) decode w0 bits 1,9,30 and w4 bits 19,21
+against Linux's full TGL/CNP PMC maps (cnp.c/core.c, not just tgl.c); (2)
+determine whether w5 wake polarity is configurable or benign; (3) per Astra,
+instrument xhci_suspend() per-port PORTSC/U3 readback to confirm the deployed
+kernel's sequence (lower priority now that USB2PLL is shown device-independent).
+en readback at 0xfe001c34 = 0 (write-only or aliased) but latching demonstrably
+works (latch != live, sensible values); etr3 pre-write = 0x81000000.

@@ -2841,7 +2841,11 @@ acpi_s0_freeze_test(void)
 	struct acpi_softc *sc = acpi_softc;
 	uint64_t t0, t1, p9a, p9b, p10a, p10b, c7a = 0, c7b = 0, s0a = 0, s0b = 0, dt;
 	int r0 = -1, r1 = -1;
-	uint64_t pmc[6];
+	uint64_t pmc[6], latch[6];
+	int live_ok[6], latch_ok[6];
+	uint64_t latch_save = 0, etr3 = 0, tmp = 0;
+	uint64_t rmode0[8], rmode1[8];
+	int latch_armed = 0;
 	unsigned pi;
 
 	if (sc == NULL)
@@ -2859,6 +2863,27 @@ acpi_s0_freeze_test(void)
 	acpi_s0_freeze_userspace(true);
 	kpause("s0qui", false, MAX(1, hz), NULL);	/* settle to LSSUSPENDED */
 
+	/*
+	 * Astra: arm the PMC LPM status latch to capture on C10 entry (not on
+	 * a not-yet-reached S0ix substate).  Save the current latch select at
+	 * 0xfe001c34, clear bit31 (=> C10 trigger), and clear the previous
+	 * capture via ETR3 (0xfe001048) bit28.  Restore the select afterward.
+	 */
+	if (ACPI_SUCCESS(AcpiOsReadMemory(0xfe001c34, &latch_save, 32))) {
+		tmp = latch_save & ~(1U << 31);
+		if (ACPI_SUCCESS(AcpiOsWriteMemory(0xfe001c34, tmp, 32)))
+			latch_armed = 1;
+	}
+	if (ACPI_SUCCESS(AcpiOsReadMemory(0xfe001048, &etr3, 32)))
+		(void)AcpiOsWriteMemory(0xfe001048, etr3 | (1U << 28), 32);
+
+	/* per-mode residency (8 modes) before the hold */
+	for (pi = 0; pi < 8; pi++) {
+		UINT64 v = 0;
+		(void)AcpiOsReadMemory(0xfe001c80 + pi * 4, &v, 32);
+		rmode0[pi] = v;
+	}
+
 	t0 = acpi_s0_rdmsr(0x10);	/* IA32_TSC */
 	p9a = acpi_s0_rdmsr(0x631); p10a = acpi_s0_rdmsr(0x632);
 	c7a = acpi_s0_rdmsr(0x3fe);
@@ -2870,11 +2895,29 @@ acpi_s0_freeze_test(void)
 	p9b = acpi_s0_rdmsr(0x631); p10b = acpi_s0_rdmsr(0x632);
 	c7b = acpi_s0_rdmsr(0x3fe);
 	r1 = acpi_slp_s0_read(&s0b);
+	/* LIVE status (0xfe001c5c) -- taken while this CPU is awake */
 	for (pi = 0; pi < 6; pi++) {
 		UINT64 v = 0;
-		(void)AcpiOsReadMemory(0xfe001c5c + pi * 4, &v, 32);
+		ACPI_STATUS ls = AcpiOsReadMemory(0xfe001c5c + pi * 4, &v, 32);
 		pmc[pi] = v;
+		live_ok[pi] = ACPI_SUCCESS(ls);
 	}
+	/* LATCHED status (0xfe001c3c) -- captured at C10 entry during the hold */
+	for (pi = 0; pi < 6; pi++) {
+		UINT64 v = 0;
+		ACPI_STATUS ls = AcpiOsReadMemory(0xfe001c3c + pi * 4, &v, 32);
+		latch[pi] = v;
+		latch_ok[pi] = ACPI_SUCCESS(ls);
+	}
+	/* per-mode residency (8 modes) after the hold */
+	for (pi = 0; pi < 8; pi++) {
+		UINT64 v = 0;
+		(void)AcpiOsReadMemory(0xfe001c80 + pi * 4, &v, 32);
+		rmode1[pi] = v;
+	}
+	/* restore the latch select */
+	if (latch_armed)
+		(void)AcpiOsWriteMemory(0xfe001c34, latch_save, 32);
 
 	acpi_s0_freeze_userspace(false);
 
@@ -2896,9 +2939,23 @@ acpi_s0_freeze_test(void)
 	    (uintmax_t)s0a, (uintmax_t)s0b,
 	    (uintmax_t)((uint32_t)(s0b - s0a)));
 	aprint_normal_dev(sc->sc_dev,
-	    "s0freeze: PMC status %08x %08x %08x %08x %08x %08x\n",
+	    "s0freeze: PMC live   %08x %08x %08x %08x %08x %08x (ok %d%d%d%d%d%d)\n",
 	    (uint32_t)pmc[0], (uint32_t)pmc[1], (uint32_t)pmc[2],
-	    (uint32_t)pmc[3], (uint32_t)pmc[4], (uint32_t)pmc[5]);
+	    (uint32_t)pmc[3], (uint32_t)pmc[4], (uint32_t)pmc[5],
+	    live_ok[0], live_ok[1], live_ok[2], live_ok[3], live_ok[4], live_ok[5]);
+	aprint_normal_dev(sc->sc_dev,
+	    "s0freeze: PMC latch  %08x %08x %08x %08x %08x %08x (ok %d%d%d%d%d%d armed=%d en=%08x->%08x etr3=%08x)\n",
+	    (uint32_t)latch[0], (uint32_t)latch[1], (uint32_t)latch[2],
+	    (uint32_t)latch[3], (uint32_t)latch[4], (uint32_t)latch[5],
+	    latch_ok[0], latch_ok[1], latch_ok[2], latch_ok[3], latch_ok[4],
+	    latch_ok[5], latch_armed, (uint32_t)latch_save, (uint32_t)tmp,
+	    (uint32_t)etr3);
+	aprint_normal_dev(sc->sc_dev,
+	    "s0freeze: mode resid d %08x %08x %08x %08x %08x %08x %08x %08x\n",
+	    (uint32_t)(rmode1[0] - rmode0[0]), (uint32_t)(rmode1[1] - rmode0[1]),
+	    (uint32_t)(rmode1[2] - rmode0[2]), (uint32_t)(rmode1[3] - rmode0[3]),
+	    (uint32_t)(rmode1[4] - rmode0[4]), (uint32_t)(rmode1[5] - rmode0[5]),
+	    (uint32_t)(rmode1[6] - rmode0[6]), (uint32_t)(rmode1[7] - rmode0[7]));
 }
 
 static int
