@@ -325,3 +325,38 @@ Clean ceiling remains pc9=94% (network up, everything else quiesced, cores 99%
 idle). PC10/SLP_S0/LED need BOTH walls solved via proper device-suspend +
 s2idle callout/tick handling -- delicate, driver-level, recommend Astra design.
 This session established the complete, measured map of every blocker.
+
+* UPDATE 12 (2026-09-18 ~14:00): corrections per Astra review of 325f8fc/a8c55c3
+Astra's review was right; correcting earlier over-claims:
+- "callouts are DEFINITIVELY the pc10 blocker" is NOT established. The
+  woke_early counter records lapic_oneshot_done()'s pending-timer flag, NOT the
+  wake source or idle duration. Early wakes could be device IRQs, IPIs, or
+  monitor-address activity. The skip<minskip path increments no counter, and
+  tlstats aggregates across CPUs and outside the frozen window. So the cause of
+  pc9->pc10 failure is NOT yet identified -- it is one of {short callout
+  deadlines, early interrupts, or long-sleeps-that-still-miss-PC10}.
+- maxskip limit is 1400 (default 100), NOT code-capped at 100. My write of 2000
+  was rejected for exceeding 1400; it did not prove a 100 ceiling. maxskip is
+  settable up to 1400 (~14s at hz=100).
+- SLP_S0 freeze-test measurement was BUGGY (never called acpi_slp_s0_probe, and
+  ignored read errors -> could print false slp_s0=0 on a fresh boot). FIXED in
+  #57 (probe first, check both reads, report ok/UNAVAIL + raw a/b + wrap-safe
+  delta). RE-MEASURED freeze+DC9 on #57: slp_s0=ok a=0 b=0 d=0 -> SLP_S0 is
+  GENUINELY 0 (not a false zero). pc9=94% pc10=0 stand.
+- c7core=99% is UNRELIABLE: coordinator isn't CPU-bound, so the core-C7 MSR
+  (0x3fe, per-core) reads may hit different cores around kpause. (pc9/pc10 use
+  PACKAGE MSRs 0x631/0x632 which are core-independent, so those remain valid.)
+- The committed freeze test does NOT run any i915 suspend lifecycle / GT-idle /
+  LPS0 inside it; external DPMS-off + freezer is a baseline only. "stages 1+2"
+  overstated it. PC9 alone does not rule out hardware package-state constraints.
+NEXT (Astra's plan): instrument DPMS-off+s0freeze with per-CPU, in-window data:
+requested skip (incl skip<minskip), full-width TSC around each MWAIT (idle
+duration distribution), pending interrupt vectors + ci_want_resched right after
+MWAIT, interrupt-count deltas over the hold, and consistently-sampled/validated
+PMC + core counters. Print after thaw. This will actually identify the wake
+sources and separate short-sleeps vs early-wakes vs long-sleeps-missing-PC10 --
+BEFORE any timekeeping/callout-wheel surgery. Helper files (lapic.c,
+kern_timeout.c, kern_heartbeat.c, kern_clock.c) now pushed for review.
+Also TODO (Astra): freezer must track which LWPs it suspended (currently
+lwp_continue's ALL user LWPs on thaw, incl. pre-existing stops) and replace the
+fixed 1s settle with acknowledged quiescence.
