@@ -581,3 +581,25 @@ NEXT to push PC10 higher + reach SLP_S0: suspend LPSS controllers (I2C/UART/SPI)
 the IPU/image-sensor (IS_D3), get USB2PLL/OPIOPLL off (suspend USB hubs/devices
 + the PLL owners), and deepen CPU C10 residency (CPU_C10_REQ). Each cleared
 condition -> closer to SLP_S0 -> the slow-blink LED.
+
+* UPDATE 22 (2026-09-18 ~18:20): +LPSS/ISH/audio D3 -> words 1,2,3 met; PC10~49%
+Added PMCSR-D3 of driverless IPs (ISH 18:0, LPSS I2C 21:0/21:3, HDaudio 31:3,
+TB-DMA 13:2/13:3 @ off 0x84/0x54) to the xHCI+iwx+GPU-D3 freeze.
+  RESULT: c7core~99% pc9=0% PC10=49% slp_s0=0
+  PMC status 25580074 807c63ef 00001fef 00001040 3d375a2c 000aaaaa
+Newly MET vs deep2: LPSS_PG(w1.22 set: 803c->807c), IS_D3(w2.8 set: 1eee->1fef).
+Mode0 requirement words 1, 2, 3 now FULLY met (req&~status = 0). PC10 stays ~50%.
+REMAINING unmet for mode0 / SLP_S0:
+  w0 (clocksource, 0x50240202): USB2PLL_OFF(18), OPIOPLL_OFF(21) + bits 1,9,28,30
+     -- PLLs still ON. USB2PLL stays up despite xHCI D3 (shared PLL / USB2 PHY
+     not fully off); OPIOPLL tied to some active peripheral I/O. Likely need to
+     power down remaining USB2 PHY/PLL owners or the eSPI/SPI/UART LPSS bus.
+  w4 (vnn_misc, 0x0008a001): CPU_C10_REQ_STS_0(bit0) + bits 13,15,19 -- CPUs not
+     asserting sustained C10 request. Ties to idle-gap/tick depth: PC10=49%
+     (cycling) not sustained; sustained all-core C10 needs longer idle gaps
+     (stage 3 tick/callout) to set CPU_C10_REQ.
+  w5 (signal, 0xaaa00000): Int_Timer_SS_Wake0..5 polarity -- wake-source config
+     bits; may be requirement-satisfiable via wake setup, or benign.
+STATUS: PC10 substantial (~50%) ACHIEVED. SLP_S0 now blocked by only PLLs (w0),
+CPU_C10_REQ/deep-idle (w4), and wake-timer signals (w5) -- most requirement
+words cleared. The PLL + CPU_C10_REQ items are the crux for SLP_S0->LED.
