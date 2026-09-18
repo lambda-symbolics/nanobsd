@@ -262,3 +262,24 @@ Stage 3 must DEFER/QUIESCE callouts (and the tick) across the frozen window and
 fix timekeeping/watchdog on resume -- delicate, needs the kern_tc.c/callout
 handling Astra scoped. This is the last mile to PC10/SLP_S0/LED; recommend Astra
 guidance before implementing (hard-hang/timekeeping risk on the daily machine).
+
+* UPDATE 9 (2026-09-18 ~13:00): goal part (1) "WiFi/TB in D3 + ASPM L1.2" — mostly N/A here
+Validated the PCIe topology/ASPM directly (safe config reads, ethernet-connected):
+- WiFi = 00:20:3 Intel AX201, but it is CNVi (integrated), NOT a PCIe endpoint:
+  it has NO PCIe Link Control / ASPM registers at all (only a PMCSR D-state).
+  So "WiFi link in ASPM L1.2" is not applicable to this WiFi.
+- Thunderbolt = 00:07:0 / 00:07:2 PCIe root ports: ASPM L1 already enabled
+  (Active State PM Control = L1 Entry Enabled), BUT LTR Mechanism Enabled = OFF
+  on the port, and LTR is a hard prerequisite for ASPM L1.2 -> L1.2 cannot
+  engage. Also both TB links are EMPTY (nothing plugged in) so their ASPM state
+  is moot for power. TB DMA/USB4 HCI = 00:13:2 / 00:13:3.
+- NVMe PCIe link already has ASPM L1.2 enabled (endpoint L1SS control 0x4069000f,
+  from earlier). That is the one PCIe link where L1.2 is real and active.
+- All these devices CAN be forced to PMCSR D3 (pcictl config write) and that was
+  done in earlier peripheral-D3 tests; it did not move PC10 (callout wheel caps).
+CONCLUSION: goal part (1) as worded ("WiFi/TB in D3 with the link in ASPM L1.2")
+came from a Linux/desktop-PCIe mental model. On this TGL laptop WiFi is CNVi (no
+ASPM link) and the TB links are empty with LTR off, so ASPM-L1.2 on those links
+is N/A / moot. The real power gate is PLATFORM S0ix (SLP_S0), which needs the
+s2idle transition (stages 1-3), NOT device-link ASPM. Device D3 alone (incl.
+WiFi/TB) does not produce PC10/SLP_S0/LED here -- established across many tests.
