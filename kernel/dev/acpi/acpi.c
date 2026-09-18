@@ -2753,11 +2753,14 @@ acpi_s0_freeze_test(void)
 {
 	struct acpi_softc *sc = acpi_softc;
 	uint64_t t0, t1, p9a, p9b, p10a, p10b, c7a = 0, c7b = 0, s0a = 0, s0b = 0, dt;
+	int r0 = -1, r1 = -1;
 
 	if (sc == NULL)
 		return;
 	aprint_normal_dev(sc->sc_dev,
 	    "s0freeze: begin (freeze userspace, no dev changes, ticks on)\n");
+
+	acpi_slp_s0_probe();
 
 #if NWSDISPLAY > 0
 	if (acpi_freeze_mode == 1)
@@ -2770,14 +2773,14 @@ acpi_s0_freeze_test(void)
 	t0 = acpi_s0_rdmsr(0x10);	/* IA32_TSC */
 	p9a = acpi_s0_rdmsr(0x631); p10a = acpi_s0_rdmsr(0x632);
 	c7a = acpi_s0_rdmsr(0x3fe);
-	(void)acpi_slp_s0_read(&s0a);
+	r0 = acpi_slp_s0_read(&s0a);
 
 	kpause("s0hold", false, MAX(1, hz * 10), NULL);	/* 10s hold, ticks on */
 
 	t1 = acpi_s0_rdmsr(0x10);
 	p9b = acpi_s0_rdmsr(0x631); p10b = acpi_s0_rdmsr(0x632);
 	c7b = acpi_s0_rdmsr(0x3fe);
-	(void)acpi_slp_s0_read(&s0b);
+	r1 = acpi_slp_s0_read(&s0b);
 
 	acpi_s0_freeze_userspace(false);
 
@@ -2790,12 +2793,14 @@ acpi_s0_freeze_test(void)
 	if (dt == 0)
 		dt = 1;
 	aprint_normal_dev(sc->sc_dev,
-	    "s0freeze: done tsc=%ju c7core=%ju%% pc9=%ju%% pc10=%ju%% slp_s0_delta=%ju\n",
+	    "s0freeze: done tsc=%ju c7core~%ju%% pc9=%ju%% pc10=%ju%% slp_s0=%s a=%ju b=%ju d=%ju\n",
 	    (uintmax_t)dt,
 	    (uintmax_t)((c7b - c7a) * 100 / dt),
 	    (uintmax_t)((p9b - p9a) * 100 / dt),
 	    (uintmax_t)((p10b - p10a) * 100 / dt),
-	    (uintmax_t)(s0b - s0a));
+	    (r0 == 0 && r1 == 0) ? "ok" : "UNAVAIL",
+	    (uintmax_t)s0a, (uintmax_t)s0b,
+	    (uintmax_t)((uint32_t)(s0b - s0a)));
 }
 
 static int
