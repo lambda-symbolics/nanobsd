@@ -226,3 +226,28 @@ which needs an external wake (RTC/HPET) that survives C10 and risks a hard hang
 if the wake fails. Prefer the low-risk slow-the-tick variant for the first PC10
 test. Timekeeping: TSC timecounter (q=3000) is tick-independent so wall clock is
 fine; only callout latency grows during the short window.
+
+* UPDATE 7 (2026-09-18 ~12:35): correction — cidle IS tickless; PC10 blocker is callouts
+IMPORTANT: the cidle.c in the repo was STALE (6.5KB). The BUILT module on the
+machine (now synced, 13KB) IS tickless: cidle_idle_tickless() calls
+lapic_oneshot(skip)/lapic_oneshot_done() to STOP the periodic tick and sleep to
+the next callout, capped at maxskip=100 ticks (1s), then replays elapsed
+hardclock(). So Astra UPDATE-round assumption "cidle never changes timer
+programming" was based on the stale file -- please re-read the synced cidle.c.
+Runtime tlstats on #56: entries=199245 ticks_skipped=248508 deep=3974
+woke_early=195271. So tickless works but MOST idle periods WOKE EARLY -- the
+CPU is woken before its skip target by callouts/interrupts. cidle only skips to
+callout_next_ticks(), so the real PC10 cap is the NEAREST CALLOUT, not the raw
+100Hz tick. Even with userspace frozen + display off (pc9=93%), kernel callouts
+(scheduler, softclock, watchdog, TCP, etc.) keep firing -> gaps too short for
+PC10 (PC10 entry latency > the gap).
+=> Stage 3 is really "quiesce callouts AND the tick during the frozen window",
+not just mask the tick. This matches Astra's note to "handle callout and
+watchdog accounting explicitly." The freezer (stage1) suspends user LWPs but
+NOT kernel callouts. Options to explore with Astra:
+  - raise cidle maxskip and quiesce/defer non-essential callouts during freeze,
+  - or a dedicated s2idle idle path that masks LVT_TIMER + defers the callout
+    wheel + a hardware wake (RTC/HPET) + kern_tc.c TSC-wrap handling on resume.
+State banked: stages 1+2 reach pc9=93% cleanly (freezer+display-off, X
+survives, reversible). PC10/SLP_S0/LED remain, gated by callout+tick quiescence
+(delicate timekeeping work — recommend Astra guidance before building).
