@@ -360,3 +360,22 @@ kern_timeout.c, kern_heartbeat.c, kern_clock.c) now pushed for review.
 Also TODO (Astra): freezer must track which LWPs it suspended (currently
 lwp_continue's ALL user LWPs on thaw, incl. pre-existing stops) and replace the
 fixed 1s settle with acknowledged quiescence.
+
+* UPDATE 13 (2026-09-18 ~14:20): zero-risk wake-source probes (userland)
+Mapped interrupts (intrctl): msix0=nvme0 (per-CPU ioqueues), msix3=iwx0,
+msi2=xhci1, msi5=i915drmkms0, msi1=xhci0, msi4=hdaudio0.
+Measured over screen-off idle (clean vmstat -i delta, after I/O settled):
+~114 interrupts/s TOTAL across all CPUs (~14/s per CPU). Disk I/O = 0 during
+genuine idle (iostat; the initial 32 t/s was just the dpms command settling).
+(An earlier vmstat run showed ~900/s on nvme msix0 but that window caught a
+transient I/O burst / fragile parse -- the clean idle rate is ~114/s total.)
+INTERPRETATION: at ~14 IRQ/s per CPU, interrupts alone give ~70ms gaps -- that
+should be ample for PC10 entry, yet PC10=0. So the PC10 block is NOT simply "too
+many interrupts." It is either (a) the callout wheel capping cidle's skip to a
+few ms (tickless skips only to callout_next_ticks(), independent of the IRQ
+rate), or (b) a hardware package-state condition for PC10 not met even when
+idle. Userland cannot distinguish these -- confirms Astra: need the in-kernel
+idle-duration instrumentation (per-CPU: requested skip incl skip<minskip,
+full-width TSC around each MWAIT, pending vectors after MWAIT) to see the actual
+sleep-gap distribution and whether long sleeps still miss PC10. That is the
+next build (LOW risk -- logging only, no behavior change).
