@@ -954,3 +954,44 @@ more PC10 points; opt in only with a local touchpad/audio check after resume.
 The Linux s0ix-selftest-tool.sh -s cross-check remains the one decisive
 experiment to determine whether SLP_S0# residency is firmware-gated on this unit.
 Not required for the LED or the power win, both of which are delivered.
+
+* UPDATE 30 (2026-09-18 ~20:30): REAL power measured — 7.3W idle -> 3.03W suspended
+Measured battery draw (envstat discharge + charge-delta), correcting earlier
+guesses (the "~2.4 W" script comment and the bogus 5.3 W "suspend").
+
+** Power breakdown (all measured on battery)
+  - idle, panel on (screensaver, monitor on):     ~7.3 W
+  - panel off (WORKING dpms):                      ~4.7 W   => display ~2.5 W
+  - real s2idle freeze, WRONG recipe (#64/#65):    ~4.4 W   (package never deep)
+  - real s2idle freeze, CORRECT recipe (#65):      3.03 W   (charge-delta 321 s)
+CPU is 99.8% idle at 7.3 W: the draw is the PLATFORM floor, not CPU load.
+
+** Why the "production" s0ix script saved nothing (retract UPDATE 29's power claim)
+1. DPMS silently failed: PATH lacked X11 dir / XAUTHORITY discovery flaky in the
+   detached context -> bare xset no-op'd, panel stayed lit (the ~2.5 W I "lost").
+2. Raw PMCSR D3 pokes are INERT for package residency: writing the config-space
+   power bits does NOT trigger the controller's power-gating handshake, so the
+   PMC xHCI_PG/xHCI_D3 status bits never set and PC10 stays 0.  Confirmed: raw-D3
+   xHCI + freeze = pc10 0%; drvctl -S xhci + freeze = pc10 47%.  Astra was right:
+   use pmf/drvctl, not register pokes.
+3. No userspace freeze and no i915 RC6 preservation.
+
+** The real deep-idle recipe (reproduced on #65, pc10 ~45%)
+  - hw.i915s0idle=1 BEFORE suspending the GPU (preserves RC6; without it the i915
+    suspend runs intel_rc6_disable and PINS the package -> pc10 0).
+  - pmf-suspend xHCI + i915 + iwx (drvctl -S / pmf_device_suspend) -> sets the
+    PMC PG/D3 bits that actually gate the package.
+  - raw PMCSR D3 the truly-driverless IPs (ISH 18:0, GNA 8:0, TB-DMA 13:2/13:3,
+    HECI 22:0) -- they have no pmf driver so the suspend loop skips them.
+  - freeze userspace so ALL cores stay idle together (added to acpi_enter_freeze,
+    kernel #65 / commit 152c100).
+Result over a 321 s frozen hold: pc10 ~45%, pc3 ~45%, AVG 3.03 W.
+
+** Remaining gap to the ~1 W target
+  - PC10 is only ~45% because the freeze hold runs with ticks on; every tick wakes
+    the cores.  Needs TICKLESS during the frozen hold to push PC10 toward ~90%
+    (est. another ~0.5-1 W).
+  - SLP_S0 residency is still 0 (platform S0ix rails not gated) -- the unsolved
+    part from U23-28.  ~1 W almost certainly needs it; no S3 (firmware) and no S4
+    (NetBSD) exist as alternatives.
+NEXT: tickless frozen hold; then re-attack the SLP_S0 platform bits.
