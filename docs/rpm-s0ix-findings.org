@@ -482,3 +482,32 @@ PWR_WELL_CTL_AUX etc.) at suspend, while the GPU is still D0. That pinpoints
 which well/PLL is stuck. This is deep i915 display-power-domain work -- the
 precise, now-narrowed target for reaching PC10/SLP_S0/LED. Instrumented file
 (intel_display_power.c) pushed.
+
+* UPDATE 18 (2026-09-18 ~15:50): tickless=1 vs =0 -> gap length sets package depth
+Astra's requested test (DPMS-off + freezer + DC9, identical settings, TSC-based
+pc% so valid despite hardclock drift):
+  tickless=1: c7core~99% pc9=95% pc10=0
+  tickless=0: c7core~97% pc9=0%  pc10=0   (100Hz periodic tick running)
+=> Tick suppression is ESSENTIAL: with the normal 10ms tick the package cannot
+reach even PC9 (0%); suppressing the tick (gaps ~14ms) gives PC9=95%. Package
+C-state depth is clearly IDLE-GAP-LENGTH limited. Progression: 10ms gap->PC9=0;
+~14ms gap->PC9=95%; PC10 needs a longer gap than ~14ms (its entry latency).
+The ~14ms cap is callout_next_ticks() (nearest kernel callout), NOT maxskip.
+So reaching PC10 requires EXTENDING idle gaps by deferring the kernel callout
+wheel during the frozen window (stage 3), with Astra's accounting fixes:
+  (1) lapic_oneshot_done: preserve fractional elapsed + per-CPU clock epoch;
+      program remaining-to-deadline, not a fresh full period.
+  (2) entry protocol for an already-pending tick; compute elapsed independent
+      of IRR; retain the actual (unclamped) programmed count.
+  (3) callout_next_ticks/schedule: publish armed deadline under interlock +
+      notify target CPU on earlier remote callout; distinguish cc_todo future
+      entries from actually-due callbacks.
+OPEN: whether long-enough gaps alone reach PC10 (candidate a) OR PC10 also needs
+GFX0=D3 (candidate b) -- but GPU-D3 PINS the package (U16), so if (b) holds with
+the current i915, PC10 is blocked regardless of gaps. Test after stage 3: extend
+gaps with GPU-D0+DC9 and see if PC10 appears.
+Correction to U13 (per Astra): 114 IRQ/s / 8 CPUs does NOT imply 70ms package-
+wide quiet windows; package residency needs OVERLAPPING per-CPU idle, which an
+average doesn't show.
+Next build = stage 3 (callout-wheel deferral + the 3 timekeeping fixes) -- deep,
+delicate; Astra has now specified the exact bugs. Then re-measure PC10.
