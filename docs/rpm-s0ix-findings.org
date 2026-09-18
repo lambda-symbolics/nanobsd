@@ -305,3 +305,23 @@ from PC10 too (standard tickless contract), so LOWERING the effective wake rate
 deadline -- i.e. a slow-the-wakes approach need not risk a no-wake hang, unlike
 fully masking LVT_TIMER. The delicacy is callout-wheel quiescence + heartbeat +
 timekeeping accounting. Recommend Astra design; ready to implement + measure.
+
+* UPDATE 11 (2026-09-18 ~13:30): iwx can't be cleanly quiesced; network-quiesce backfires
+Tried the definitive network-vs-tick isolation: detached script quiesced ALL
+network (WiFi PMCSR-D3 + xhci D3) + display DC9 + freeze userspace, measured via
+kernel log (no live connection). RESULT: c7core=99% pc9=66% (DOWN from 94%!)
+pc10=0. WiFi PMCSR-D3-while-driver-up makes the fragile iwx driver busy-spin
+(same failure class as `ifconfig iwx0 down` in UPDATE 3, and the GPU-D3 MMIO
+fault) -> pc9 drops. So EVERY power-down path for iwx (ifconfig down, PMCSR D3)
+spins the CPU. Cannot cleanly remove WiFi interrupts this way.
+=> Two hard walls remain, both requiring careful driver-level suspend, not
+config pokes:
+  1. iwx WiFi: needs a proper pmf_device_suspend (driver .suspend hook), which
+     the freeze keep-list currently AVOIDS (keeps iwx up) because iwx is fragile
+     (also panics on reboot). A clean iwx suspend/resume is prerequisite to
+     removing WiFi wakeups.
+  2. callout/tick quiescence (stage 3) for the residual periodic wakes.
+Clean ceiling remains pc9=94% (network up, everything else quiesced, cores 99%
+idle). PC10/SLP_S0/LED need BOTH walls solved via proper device-suspend +
+s2idle callout/tick handling -- delicate, driver-level, recommend Astra design.
+This session established the complete, measured map of every blocker.
