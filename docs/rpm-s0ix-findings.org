@@ -435,3 +435,29 @@ resolutions require a build:
      MEDIUM risk (GT quiescence; prior naive GPU-D3 faulted).
 Everything device/userspace/display-side is exhausted and measured; the finish
 line needs one of these two instrumented builds. iwx suspend is CLEAN (U14).
+
+* UPDATE 16 (2026-09-18 ~15:10): CANDIDATE (b) TESTED — GPU-D3 PINS THE PACKAGE
+Ran the culmination via existing clean pmf paths (no build): drvctl -S iwx0
+(WiFi->D3, clean) + drvctl -S i915drmkms0 (FULL i915 lifecycle: i915_drm_prepare
+-> intel_gt_suspend_prepare -> suspend -> suspend_late -> PCI D3) + LPS0 entry
+handshake + s0freeze=2 (freeze userspace). X SURVIVED, GPU cleanly restored.
+RESULT: c7core=99% but pc9=0% pc10=0 slp_s0=0 (verified ok).
+=> With the GPU in D3 via the current i915 suspend, cores stay 99% idle (C7) but
+the PACKAGE cannot even reach PC9. Since cores ARE idle, the pin is on the
+UNCORE / system-agent side: the NetBSD TGL i915 suspend leaves display
+PHYs/PLLs/power-wells (SA-side) powered even in device-D3. This is the SAME wall
+identified at the project's start, now PROVEN by measurement.
+THE CATCH-22 (root of the whole goal):
+  - GPU D0 + DC9 (rpm=1): package reaches pc9=95%, but GFX0 != D3 so the LPI/
+    SLP_S0 platform commit is not satisfied -> no SLP_S0/PC10.
+  - GPU D3 (i915 suspend): GFX0=D3 satisfied, but the immature i915 suspend
+    leaves the SA/display power up -> package pinned at pc0-8, pc9=0 -> no PC10.
+Neither path yields PC10/SLP_S0. The finish line requires a FIXED i915 TGL
+suspend that puts the GPU in D3 AND cleanly powers down the display SA
+(PHYs/PLLs/power-wells) so the package can still reach deep C-states -- i.e.
+extend intel_display_power_suspend_late / the icl display-core uninit + DC9 path
+so the SA is actually gated in the S0-idle case. That is deep i915 driver work
+(the original immaturity wall), not a config/quiesce tweak.
+This session's net: every non-i915 blocker eliminated and measured; the
+remaining, decisive blocker is the i915 SA power-down in the suspend path.
+Candidate (a) short-gaps may also contribute but is moot while (b) pins pc9=0.
