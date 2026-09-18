@@ -182,3 +182,23 @@ that quiesces cleanly without triggering these driver/X busy-waits:
 This is a real NetBSD s2idle framework, not a tweak. Measurement
 (hw.acpi.sleep.slp_s0) is in place to validate any attempt. Holding for
 architectural guidance before building it on the daily machine.
+
+* UPDATE 5 (2026-09-18 ~12:00): STAGE 1 DONE — reversible freezer works
+Implemented Astra's stage-1 reversible freezer in acpi.c:
+- acpi_s0_freeze_userspace(bool): iterate allproc, skip PK_SYSTEM + curlwp,
+  lwp_suspend()/lwp_continue() each user LWP (mirrors suspendsched locking but
+  reversible). Coordinator acpi_s0_freeze_test() runs in the PK_SYSTEM s2idle
+  kthread: handlex(0) -> freeze -> kpause(1s settle) -> snapshot -> kpause(10s
+  hold, ticks ON) -> snapshot -> thaw -> handlex(1) -> log deltas.
+- sysctl hw.acpi.sleep.s0freeze=1 triggers it (mode flag on the freeze thread).
+RESULT (kernel #55): clean freeze/thaw, X SURVIVES, zero stuck procs, my ssh
+session stalled ~11s then resumed. Mechanism validated.
+BUT residency during the 10s hold: pc9=0 pc10=0 slp_s0=0 (WORSE than screen-off
+83%). Hypothesis: handlex(0) hands the panel to the wsdisplay console which
+re-enables scanout (display active) -> package can't idle. This is precisely
+what stage 2 (i915 S0 display-off lifecycle) must fix: turn the display off
+(DC9) in-kernel during the frozen window. Need to confirm it's display-scanout
+and not a kernel busy-spin (didn't log core C7 this run).
+NEXT: stage 2 — call the i915 system-suspend lifecycle (drm_suspend_ioctl,
+i915_drm_prepare/suspend/suspend_late) with an S0-idle target inside the frozen
+window, then resume-restore before handlex(1). Measure residency again.
