@@ -1,0 +1,98 @@
+#+TITLE: i915 runtime-PM + s0ix findings (2026-09-18 session)
+#+STARTUP: showall
+
+Notes for the next review round. Hardware: ThinkPad X1 Nano, TGL, NetBSD 11,
+kernel built from this tree (i915drmkms builtin). Goal: sustained platform
+S0ix so the EC slow-blinks the power/lid LEDs, at ~1W.
+
+* What was added this session
+- =hw.i915rpm= sysctl (kernel/external/bsd/drm2/i915drm/i915_pci_autoconf.c)
+  driving new functions =i915_lispbsd_rpm_suspend/resume= in i915_drv.c.
+  Values: 0=active, 1=runtime-suspend (no PCI D3), 2=runtime-suspend + PCI D3.
+- The functions replicate the essential parts of the upstream (Linux)
+  =intel_runtime_suspend/resume=, which are #ifndef __NetBSD__'d out because
+  NetBSD never wired the pm_runtime autosuspend timer. Unlike the system-suspend
+  path (i915_drm_suspend*, used by pmf/lid), they do NOT tear down the KMS
+  modeset, so X SURVIVES the transition. This is the key capability the freeze
+  path lacked (freeze D3'd the GPU but killed X and left display powered).
+
+* What works
+- =rpm=1= (GT parked -> RC6, display power wells released -> DC9 via
+  intel_display_power_suspend, NO PCI D3): STABLE, X survives, repeatable.
+- =rpm=2= (adds GPU PCI PMCSR D3): works for SHORT holds (a couple seconds,
+  GPU D0->D3->D0, X survives). This is new — the freeze path could never D3
+  the GPU and come back with X alive.
+
+* What breaks (the current wall)
+- Holding =rpm=2= (GPU in D3) for ~30s PANICS. Two panic signatures seen:
+  1. =panic: cpuN[.. lnxsyswq]: heart stopped beating= + "coretemp0:
+     workqueue busy: updates stopped" — heartbeat(9) watchdog; the shared
+     Linux workqueue (lnxsyswq) got stuck holding a lock, a softint spun on
+     _atomic_swap_32, watchdog fired.
+  2. =panic: trap= in =tasklet_softintr= — an i915 tasklet (interrupt
+     bottom-half, e.g. execlists submission) trapped, almost certainly
+     faulting on GPU MMIO after PCI D3 pulled the device out from under it.
+- Root cause: with the GPU PCI device in D3, MMIO is dead, but i915 still has
+  live async contexts (workqueues, tasklets, timers) that touch the GPU. Linux
+  prevents this with pervasive runtime-PM wakerefs (any access auto-resumes);
+  we have no such guard.
+- Attempted fix (already in this tree's rpm_suspend): before power-down call
+  =drm_kms_helper_poll_disable= + =intel_hpd_cancel_work= +
+  =intel_fbdev_set_suspend(SUSPENDED)=, and removed the erroneous
+  =intel_hpd_poll_init= (which was ENABLING connector polling -> MMIO).
+  Necessary but NOT sufficient: the tasklet-trap panic still happens. The
+  execlists/interrupt tasklet(s) still need to be quiesced/killed before D3
+  (likely intel_engine tasklet_disable/kill via a fuller GT park, or masking
+  the GT interrupt source), and any pending GT retire work flushed.
+
+* Residency data (all measured with machdep.cidle.residency = package Cx MSRs)
+- Screen off (DPMS) only, GPU D0: pc9 ~= 84%, pc10 = 0%. So DPMS-off alone
+  reaches pc9 but the driver still holds display power wells -> no pc10.
+- =rpm=1= + all peripherals PMCSR-D3 + iwx down + LPS0=1 (full s0ix recipe,
+  network dropped, 30s window): pc9 = 9%, pc10 = 0% — WORSE. Something in this
+  combination keeps the package ACTIVE (pc0-2 ~91%). Open question: is it the
+  (buggy) LPS0 handshake, a spinning i915 work item under rpm=1, or the
+  peripheral-D3 writes? Needs isolation.
+- Earlier sessions reported ~47% pc10 with GPU in plain D0 + peripherals D3 +
+  LPS0 + screen off. Not reproduced cleanly this session.
+
+* CRITICAL measurement gap (from Astra's review — agreed)
+- machdep.cidle.residency reads PACKAGE C10 (MSR 0x632). It does NOT read
+  platform SLP_S0 residency. The LED is gated by SLP_S0#, i.e. the PLATFORM
+  transition, not package PC10. High PC10 with SLP_S0=0 => platform never
+  entered S0ix => LED never blinks. This is fully consistent with everything
+  observed. Next diagnostic MUST add SLP_S0 residency (LPIT system-residency
+  counter, or TGL PMC), reported as before/after deltas alongside PC10, plus
+  the PMC latched low-power status to name the specific blocker.
+
+* LPS0 handshake bug (from Astra — confirmed by reading acpi.c here)
+- acpi_lps0_enter/exit use =if (msft_mask) {...} else if (intel_mask) {...}=,
+  so any nonzero Microsoft mask suppresses the Intel interface entirely, and
+  the msft branch omits func 5 (LPS0 ENTRY) / func 6 (LPS0 EXIT). Linux issues
+  functions from BOTH UUIDs, each gated on its capability bit. Patch pending
+  (nanobsd-lps0-handshake.patch) — not yet applied/built/tested here.
+- Also: _DSM errors are swallowed and the sysctl always reports success; the
+  "entry handshake issued" log proves nothing. Patch adds per-call logging.
+
+* s0ix command is not a real suspend (from Astra — confirmed)
+- The lid s0ix path turns off display, sets device power states, issues LPS0
+  notifications, then returns. It never freezes userspace or suspends
+  timekeeping. A real S0 path must quiesce userspace + device activity,
+  suspend periodic timekeeping, and idle CPUs deep while waiting on wake IRQs.
+
+* Infra bug fixed this session (durable)
+- NetBSD boot.cfg treats =#= as a comment char ANYWHERE on a line, so any
+  =menu== whose LABEL contains =#= is truncated and DROPPED from the menu.
+  This silently ate kernel entries and shifted default= indices. NEVER put =#=
+  in a boot.cfg menu label. =default== is 0-indexed over the DISPLAYED list.
+  Reliable index-proof boot: at the =boot>= prompt, =boot netbsd.i915.rpm=.
+
+* Suggested next steps (for review)
+1. Apply + build + hw-test the LPS0 handshake patch; capture per-function
+   ACPICA status + LED behaviour with power settings otherwise unchanged.
+2. Add SLP_S0 residency (LPIT/PMC) to the residency sysctl; always report
+   PC10 and SLP_S0 deltas over the same quiet window.
+3. Only then resume GPU-D3 work, and first solve the tasklet/workqueue
+   quiescence so rpm=2 can be held (kill execlists tasklet + flush GT work +
+   mask GT irq before PMCSR D3), or decide rpm=1 is sufficient once SLP_S0 is
+   actually asserted.
