@@ -1074,3 +1074,43 @@ AC, so battery-discharge power is dead -> pivoted to RAPL + residency.
 ** Reboot note
   #66/#67/#68 all boot fine; the earlier "blank+fan" hang was a flaky software-
   reboot path, not a boot regression (hard-cycle boots the same kernel).
+
+* UPDATE 33 (2026-09-19 ~01:30): SLP_S0 gates DECODED (device/PHY, not firmware) + machine stranded
+Decoded the real-freeze PMC latch against the upstream Linux TGL PMC bit-name maps
+(drivers/platform/x86/intel/pmc/tgl.c: tgl_vnn_misc_status_map [word4],
+tgl_signal_status_map [word5]).  IMPORTANT: w4 bits 19/21 are NOT defined -> they
+are reserved, NOT gates.  The earlier "w4 firmware/VNN wall" was a misread.
+
+** Remaining SLP_S0 gates on the real freeze (w4=0x3d17fa6d, w5=0x000aaaaa)
+Assuming REQ_STS 1=met (as the clocksource *_OFF_STS bits behave; polarity to be
+confirmed on-box via the PMC requirement register / Linux substate_requirements):
+  UNMET vnn_misc (word4): bit7 ISH_REQ, bit10 USB2_SUS_PG_Sys_REQ, bit22 MPHY_SUS_REQ
+  UNMET signal   (word5): Int_Timer_SS_Wake (0xaaaaa)
+  (w0 USB2PLL_OFF already MET once iwx/CNVi is suspended.)
+These are ALL OS/device-reachable, not PMIC/firmware rails:
+  - bit7  ISH_REQ  : Integrated Sensor Hub not fully off -> needs proper ISH D3/PG
+    (raw PMCSR poke to 18:0 was insufficient; likely needs its ACPI _PS3/power res).
+  - bit10 USB2_SUS_PG : USB2 not system-power-gated -> suspend the USB2 hub/ports,
+    not just xHCI (ties to USB2PLL).
+  - bit22 MPHY_SUS : ModPHY not suspended -> the boot NVMe / its PCIe lane keeps the
+    ModPHY up.  Needs the NVMe link in deep L1.2/L2 AND NVMe APST, without D3'ing the
+    boot disk.  (Astra called this out: no NVMe D3 bit in the PCH map.)
+  - w5 Int_Timer : suspend-time clock-freeze (tick_freeze) -- deferred, risky.
+=> ~1 W via SLP_S0 is PLAUSIBLE (device work), not firmware-blocked.  Next targets in
+   priority: MPHY (NVMe/PCIe deep-L + APST) and ISH power-resource, then USB2 PG, then
+   the clock-freeze for the timer signal.
+
+** Power so far (kernel #68, real integrated freeze)
+  total ~3.3 W, RAPL package ~2.2 W, PC10 ~48%.  Package-power headroom is in raising
+  PC10 (needs the timer/clock work) and the above device gates.
+
+** !!! MACHINE STRANDED (needs a morning hard power-cycle) !!!
+The #69 install rebooted and the flaky software-reboot path HUNG (blank+lit, fan on,
+no network) -- the same reboot-path failure seen earlier, NOT a boot regression.
+User is asleep, laptop on AC (won't drain).  RECOVERY: hold power ~10s to force off,
+power on; the default kernel boots fine.  #69 only changed the coordinator hold
+interval (hz/10 -> 1s, for higher PC10); it is otherwise #68.  Kernels available:
+/netbsd.i915.rpm(=#69), .68 .67 .66 .65, and stock /netbsd.
+LESSON: autonomous kernel-change->reboot cycles are unsafe on this box (reboot hangs
+~half the time, needs a human hard-cycle).  Do kernel iteration only with the user
+present; overnight = analysis/prep only.
