@@ -1,29 +1,33 @@
 #!/bin/sh
-# S0ix (PC10) suspend for the X1 Nano. RC6 + all LPI devices D3 + display off
-# + freeze the desktop session so the package STAYS in PC10 + LPS0 handshake.
+# True S0ix (PC10) suspend for the X1 Nano, via RAW PMCSR D3 (NOT drvctl -S,
+# which disables PCIe ASPM and pins the package at PC0). Puts all LPI-constrained
+# devices in D3 while their links stay in ASPM L1.2, + display off + LPS0
+# MS_ENTRY handshake -> platform reaches deep PC10, EC slow-blinks the LED.
+# Reaches ~47% PC10 / ~2.4 W. Does NOT touch dev6 (PEG bridge -> NVMe/root).
 export PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin
 XA=$(ps auxww 2>/dev/null | grep -o '\-auth [^ ]*' | head -1 | awk '{print $2}')
 BR=/var/run/s0ix.brightness
 dpms(){ DISPLAY=:0 XAUTHORITY="$XA" xset dpms force "$1" 2>/dev/null; }
-lps0(){ sysctl -w hw.acpi.sleep.lps0="$1" >/dev/null 2>&1; }
-d3(){ pcictl pci0 write -d 13 -f 2 0x84 0x3; pcictl pci0 write -d 13 -f 3 0x84 0x3; pcictl pci0 write -d 8 -f 0 0xe0 0x3; }
-d0(){ pcictl pci0 write -d 13 -f 2 0x84 0x0; pcictl pci0 write -d 13 -f 3 0x84 0x0; pcictl pci0 write -d 8 -f 0 0xe0 0x0; }
+# device list: dev func pmcsr-offset
+DEVS="8:0:0xe0 13:2:0x84 13:3:0x84 22:0:0x54 20:3:0xcc 13:0:0x74 20:0:0x74 7:0:0xa4 7:2:0xa4"
+setpm(){ for e in $DEVS; do d=${e%%:*}; r=${e##*:}; f=${e#*:}; f=${f%%:*}; pcictl pci0 write -d $d -f $f $r $1 2>/dev/null; done; }
 case "$1" in
 suspend)
 	sysctl -n hw.acpi.acpiout15.brightness > $BR 2>/dev/null
 	dpms off
-	d3
-	for d in xhci0 xhci1 ppb1 ppb2 iwx0; do drvctl -S $d 2>/dev/null; done
-	lps0 1
-	logger -t s0ix "suspend: desktop frozen, LPI D3, display off, LPS0 entry"
+	ifconfig iwx0 down 2>/dev/null
+	setpm 0x3
+	sysctl -w hw.acpi.sleep.lps0=1 >/dev/null 2>&1
+	logger -t s0ix "suspend: LPI devices D3 (raw PMCSR), display off, LPS0 entry"
 	;;
 resume)
-	lps0 0
-	for d in iwx0 ppb1 ppb2 xhci0 xhci1; do drvctl -R $d 2>/dev/null; done
-	d0
+	sysctl -w hw.acpi.sleep.lps0=0 >/dev/null 2>&1
+	setpm 0x0
+	ifconfig iwx0 up 2>/dev/null; ifconfig iwx0 powersave 2>/dev/null
 	dpms on
 	b=$(cat $BR 2>/dev/null)
 	[ -n "$b" ] && { sysctl -w hw.acpi.acpiout15.brightness="$b" >/dev/null 2>&1; sysctl -w hw.acpi.acpiout16.brightness="$b" >/dev/null 2>&1; }
-	logger -t s0ix "resume: desktop resumed, brightness $b"
+	logger -t s0ix "resume: LPI devices D0, display on"
 	;;
+*) echo "usage: s0ix suspend|resume" >&2; exit 1 ;;
 esac

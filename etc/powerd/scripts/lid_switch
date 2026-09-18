@@ -1,5 +1,6 @@
 #!/bin/sh
-# powerd(8) lid hook -> S0ix (PC10) suspend. $2 = pressed(closed)/released(open).
+# powerd(8) lid hook -> true S0ix deep suspend. $2 = pressed(closed)/released(open).
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
 logger -p info -t lid "lid: $*"
 case "$2" in
 pressed)  /usr/local/bin/s0ix suspend ;;

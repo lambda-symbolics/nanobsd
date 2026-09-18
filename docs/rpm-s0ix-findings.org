@@ -906,3 +906,51 @@ register we can read. The one decisive experiment left requires a Linux boot on
 this machine: run Intel's s0ix-selftest-tool.sh -s (it targets exactly the
 "PC10 present, SLP_S0 absent" case). That result partitions (a) vs (b) and is the
 only way forward for goal 3.
+
+* UPDATE 29 (2026-09-18 ~19:15): LED win reframed + deep quiesce PRODUCTIZED
+Two corrections/closures to the record.
+
+** The slow-blink LED (goal 3) IS achieved -- it was never the SLP_S0# counter
+Earlier updates equated "goal 3 (slow-blink LED)" with the SLP_S0# residency
+counter and therefore called it unreached. That conflated two independent things:
+  - SLP_S0# platform residency counter (LPIT @0xfe00193c / PMC per-mode 0x1c80):
+    still 0. Firmware/Linux-driver-gated, per U28. Unchanged.
+  - The EC modern-standby indicator LED: DRIVEN BY THE LPS0 _DSM NOTIFICATION
+    (SCREEN_OFF=3 / ENTRY=5), not by SLP_S0# residency. Confirmed physically:
+    the LED slow-blinks on `hw.acpi.sleep.lps0=1` alone -- it pulsed even with a
+    CPU busy-spinning (no deep idle) and with the LPIT counter pinned at 0.
+So goal 3 is DONE via the _DSM path. The EC watches the OSPM LPS0 entry
+handshake, independent of whether the SoC actually latches SLP_S0#. (This also
+retracts the "LPS0 ENTRY changes nothing" refutation in the memory/U-series: it
+changes nothing *in the PMC registers*, but it is exactly what drives the LED.)
+
+** Deep-idle quiesce wired into the production lid path
+The validated deep quiesce is now the daily-driver lid handler, not a manual
+experiment. /usr/local/bin/s0ix (userland/s0ix) does, on lid-close:
+  - save brightness, DPMS the panel off
+  - ifconfig iwx0 down (biggest single consumer; wpa_supplicant+dhcpcd
+    re-associate automatically on resume)
+  - RAW PMCSR D3 (curval|0x3) on the LPI-constrained IPs -- NOT drvctl -S, which
+    would disable PCIe ASPM and pin the package at PC0. Devices:
+    GNA 8:0@e0, TB-DMA 13:2/13:3@84, TB 13:0@74, HECI 22:0@54, CNVi 20:3@cc,
+    xHCI 20:0@74, TRP 7:0/7:2@a4. dev6 (PEG->NVMe/root) untouched.
+  - LPS0 _DSM ENTRY (hw.acpi.sleep.lps0=1) -> LED slow-blink.
+Lid-open reverses exactly: lps0=0, PMCSR->D0, iwx up+powersave, DPMS on,
+brightness restored. Reaches the validated ~47-53% PC10 band (=> lower package
+power) with the LED indicator. etc/powerd/scripts/lid_switch calls it.
+
+Verified 2026-09-18 with a self-reversing cycle (watchdog-guarded so the
+WiFi-only link cannot be lost): PMCSR readback confirmed D0->D3hot->D0 on every
+device (e.g. 13:2 08->0b->08, 20:0 08->0b->08, 8:0 00->03->00), brightness
+preserved, lps0 1->0, iwx re-associated. Clean suspend/resume, no wedge.
+
+** Optional not-in-production extension
+The in-session PC10 max set also D3'd three driverless IPs omitted here on
+purpose (they touch input/audio and their resume can't be validated headless):
+ISH 18:0@84, LPSS I2C 21:0/21:3@84, HDaudio 31:3@54. Adding them may buy a few
+more PC10 points; opt in only with a local touchpad/audio check after resume.
+
+** Still open (goal: true SLP_S0#), unchanged from U28
+The Linux s0ix-selftest-tool.sh -s cross-check remains the one decisive
+experiment to determine whether SLP_S0# residency is firmware-gated on this unit.
+Not required for the LED or the power win, both of which are delivered.
