@@ -20,15 +20,19 @@
       (and (integerp pid) (plusp pid) pid))))
 
 (defun lpsched-send-fgpid (pid)
-  "Send \"fgpid PID\" to lpschedd; 0 means nothing is focused."
+  "Send \"fgpid PID\" to lpschedd; 0 means nothing is focused.
+Connect the datagram socket then send: SOCKET-SEND's :ADDRESS wants an
+address *list*, and a bare path string makes it signal VALUES-LIST."
   (when (find-package :sb-bsd-sockets)
     (ignore-errors
       (let ((sock (make-instance (intern "LOCAL-SOCKET" :sb-bsd-sockets)
                                  :type :datagram)))
         (unwind-protect
-             (funcall (intern "SOCKET-SEND" :sb-bsd-sockets)
-                      sock (format nil "fgpid ~D~%" pid) nil
-                      :address *lpsched-sock-path*)
+             (progn
+               (funcall (intern "SOCKET-CONNECT" :sb-bsd-sockets)
+                        sock *lpsched-sock-path*)
+               (funcall (intern "SOCKET-SEND" :sb-bsd-sockets)
+                        sock (format nil "fgpid ~D~%" pid) nil))
           (funcall (intern "SOCKET-CLOSE" :sb-bsd-sockets) sock))))))
 
 (defun lpsched-focus-hook (new-window old-window)
