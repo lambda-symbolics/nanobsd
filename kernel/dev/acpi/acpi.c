@@ -2415,6 +2415,7 @@ acpi_s2idle_keep(device_t dev)
 	    strncmp(n, "wsdisplay", 9) == 0 ||
 	    strncmp(n, "iwx", 3) == 0 ||
 	    strncmp(n, "xhci", 4) == 0 ||
+	    strncmp(n, "hpet", 4) == 0 ||
 	    strncmp(n, "uhub", 4) == 0 ||
 	    strncmp(n, "ugen", 4) == 0 ||
 	    strncmp(n, "uhidev", 6) == 0 ||

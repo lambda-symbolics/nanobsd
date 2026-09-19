@@ -1454,3 +1454,97 @@ was approximately 64% over the window. Picom was running throughout this
 measurement. DPMS and the screensaver were disabled for the sample; DPMS300
 was restored afterward. Logs: al87-idle-pre/post. Kernel 87 is the default;
 85 and 86 are saved modified-kernel backups, and the vanilla kernel is untouched.
+
+
+* UPDATE 46 (2026-09-19): distinguish PCI state, clock requests and SLP_S0
+The Intel 500 Series On-Package PCH datasheet, volume 2, documents the SLP_S0
+counter at PWRM+0x193c with 122 us units. The LPIT address and frequency match.
+Reference: https://cdrdv2-public.intel.com/631120/631120-002.pdf
+
+Awake register observations: CPPMVRIC 0x1b1c=0x0100801e, CIR34C
+0x1b4c=0x1e000000, PM_CFG 0x1818=0x2b480304, LPM_EN=0x9. CPPMVRIC bit15
+selects legacy qualification while set. These awake values do not prove that
+firmware leaves the same policy in force throughout a suspend. Linux's TGL
+status-name tables omit several raw bits; the earlier claim of exactly three
+remaining ISH/USB2/MPHY gates was too strong.
+
+Controlled kernel87 tests, with hardware settings restored after each hold:
+- HPET config1->0 changed latch word4 bit19 to1, but SLP_S0 stayed zero.
+- ISH's ACPI power backend reported D3 while its PCI PMCSR was D0. Actual PCI
+  D3 plus HPET-off made no additional difference. ISH firmware was waiting for
+  its host, with its DMA-permission register already zero.
+- xHCI USB2PMCTRL at BAR+0x81c4 was0x290a. Changing its D3 PHY-gating policy
+  from2 to3, combined with HPET-off, made no additional difference.
+- Stopping HDA rings and asserting link reset, or quieting PIT0, also failed
+  to produce SLP_S0 with HPET-off. Timed GPIO controls0x1210/0x1310 were zero.
+- The current AML verified GNVS at0x94d7f000; S0ID=1 and OSYS=0x7df.
+
+Logs: al87-hpet-off, al87-hpet-ish-off, al87-usb2-policy3-hpet-off,
+al87-hda-reset-hpet-off, al87-pit-hpet-off. No qualification-disable masks
+were changed in these tests.
+
+* UPDATE 47 (2026-09-19): HDA clock gating permits genuine SLP_S0
+NetBSD hdaudio_pci_init clears CGCTL.MISCBDCGE (PCI offset0x48, bit6) and
+never restores it. Linux clears it around Skylake-family initialization and
+sets it afterward; see sound/hda/controllers/intel.c, hda_intel_init_chip:
+https://github.com/torvalds/linux/blob/master/sound/hda/controllers/intel.c
+
+On kernel87, setting0x48 from0x00fb09bf to0x00fb09ff with HPET stopped produced
+149969 LPIT ticks during20s:18.30s of genuine SLP_S0. PC10 was95%.
+The successful latch was f57c0274 c47fe3ef 00001fef 00001000 3d1ffa6d 000aaaaa.
+Log: al87-hda-cg-hpet-off.
+
+Kernel90 enables MISCBDCGE in the HDA suspend callback after its children are
+quiescent and before the PCI bus enters D3. The existing resume initialization
+clears it before codec restoration. The change is scoped to Intel a0c8.
+It also trialled an HPET suspend callback guarded by timecounter ownership,
+TSC-based DELAY, legacy routing and comparator interrupt enables, with exact
+configuration restoration.
+
+With X running, kernel90 repeat holds produced150883 and152438 SLP_S0 ticks
+in20s, then456325 in60s. RC6 advanced after resume and software wakerefs were
+zero. Logs: al90-cycle3/4/5. Early89/90 console-only tests were confounded:
+X had not been restarted after reboot; RC6 did not resume until X started.
+Those tests do not establish a regression caused by awake HDA clock gating.
+
+A warm kernel90 test with hpet0 selected as timecounter correctly kept HPET
+running and still produced75728 SLP_S0 ticks in10s (al90-hpet-guard). This
+initially suggested removing the HPET change. However, kernel91 with only the
+HDA fix, a fresh boot and X running produced zero SLP_S0 in two30s holds.
+Stopping HPET for the next hold immediately produced147994 ticks in20s.
+Logs: al91-cycle1/2 and al91-hpet-off. The warm result is therefore insufficient
+to remove HPET handling from the reproducible cold-boot path.
+
+* UPDATE 48 (2026-09-19): 1.66 W accepted; automatic suspend kernel92
+Battery test on91 with automatic HDA gating and manually stopped HPET:
+44.640 ->44.360Wh over606s including transitions:1.663W whole-machine.
+The600s hold recorded4626968 LPIT ticks (564.47s SLP_S0), PC10=97%, and
+RAPL1740881/2^14=106.25J (0.177W package). Only LPM mode0 advanced.
+Logs: /root/al91-battery-pre, -post, -log on the laptop.
+
+Optional NVMe suspension recorded44.240 ->44.090Wh over306s (1.765W),
+with2312439 SLP_S0 ticks and PC10=97%. No demonstrated saving; storage
+suspension is disabled. Logs: /root/al91-storage-pre, -post, -log.
+The user accepted1.66W; further suspend-power tuning is deferred.
+
+Kernel92 includes the suspend-only HDA gating and guarded HPET handling.
+Build: /root/build-al92.log; saved kernel: /netbsd.i915.rpm.92.
+SHA256: 4e47a1f655089c92ef0ef5ddf1ff5639d07dbbdc8e0d2f9a1143965047d3fed7.
+It is running and installed at the default /netbsd.i915.rpm boot entry.
+
+Fresh-boot verification exposed a startup qualification delay: the first two
+30s holds recorded SLP_S0=0 despite PC10=95-96% and advancing RC6 afterward.
+Without any hardware/configuration change, cycle3 recorded176380 ticks;
+cycles4/5 recorded225607/227548 ticks (27.52/27.76s of30s), PC10=96%.
+Thus the earlier immediate-success attribution to HPET alone is not conclusive.
+The reason for the initial delay is unresolved. Logs: /root/al92-cycle1..5.
+All five resumed; RC6 advanced, software GPU refs were zero, HPET config
+returned to1 and HDA CGCTL to00fb09bf. Existing HDMI codec2 RIRB timeouts
+occur during resume; functional audio has not been verified here.
+
+Ordinary lid handling uses /etc/powerd/scripts/lid_switch and
+/usr/local/bin/s0ix suspend. powerd is running. Timed-test timeout and
+freeze_storage are0; brightness20, DPMS300, USBoff. Vanilla /netbsd hash:
+e9bbdf019fcc8608181bd8457d370aded3f3c0e9fd0ccf8b1608c6c87b6be491.
+Next work is intermittent input latency, beginning with the custom tickless
+idle/timer path rather than replacing the scheduler.
