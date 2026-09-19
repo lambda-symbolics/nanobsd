@@ -91,6 +91,52 @@ isolation via its own sysctl with the daemon stopped, then the daemon on.
 Win = higher deep-skip rate + EPP watt saving on battery-idle, no perceptible
 input lag, no audio glitches.
 
+* Results (2026-09-19, kernel #93, battery, X idle, =lpsched-ab=)
+
+All mechanism runs at a fixed EPP 240 so only pack/coalesce vary.
+
+** Run 1 (screen on, 50 s settle / 20 s sample) — configs 4-6 CONTAMINATED
+| config         |    W | deep/s | early/s | ints/s |
+|----------------+------+--------+---------+--------|
+| stock          | 3.93 |    9.3 |     297 |     57 |
+| pack=1         | 3.93 |   10.1 |     301 |     64 |
+| pack=2         | 3.79 |   10.4 |     303 |     59 |
+| coalesce=50    | 2.59 |    8.9 |     294 |     67 |
+| pack2+coal50   | 3.72 |    9.9 |     309 |     61 |
+| powersave(240) | 3.69 |    9.7 |     316 |     60 |
+An =lpschedd= restart and two test windows were (wrongly) run on the box while
+this was in progress: from config 4 on the daemon rewrote the knobs under the
+script, and the 2.59 W is DPMS blanking the panel mid-sample, undone by the
+test windows.  Only the first three rows are clean.
+
+** Run 2 (=lpsched-ab coalesce=, clean, panel off, 60 s settle / 30 s sample)
+| config         |    W | deep/s | early/s | ints/s |
+|----------------+------+--------+---------+--------|
+| stock          | 2.46 |    7.4 |     337 |     66 |
+| coalesce=50    | 2.46 |    9.2 |     297 |     52 |
+| stock(2)       | 2.42 |    9.1 |     302 |     51 |
+| coalesce=50(2) | 2.43 |    9.8 |     315 |     57 |
+| pack=2         | 2.52 |    9.2 |     299 |     51 |
+
+** Verdict
+- Neither packing nor coalescing changes idle battery draw measurably: every
+  config sits within the ~±0.05 W noise of the EC discharge average.  The
+  run-1 "pack saves ~0.15 W" is not supported by run 2 and is withdrawn.
+- Coalescing raises cidle deep skips a little (7-9 -> 9-10 /s) with no power
+  effect.  The ~300/s early-wake floor is unchanged by both: with only ~55
+  device interrupts/s, those wakes are cross-CPU IPIs/reschedules from
+  X/stumpwm/statusbard — software, not callouts — which neither lever touches.
+- The mechanisms are correct and safe (no regression, no interactive lag
+  noticed, WM hook and stale-PID handling verified), but on this box the only
+  watt-class lever is EPP (128->255 = ~1.1 W measured earlier), which
+  =lpschedd= now drives automatically from AC/battery, load and input idle.
+- Untested, and the fair test for packing: a light *background* load (idle
+  is the worst case — there is nothing to pack).  Also unmeasured: the
+  latency cost of pack=2 under load.
+- Operational: never touch the daemon or open windows while =lpsched-ab= runs;
+  the EC discharge figure needs >=50 s settle; the panel blanks after 5 min
+  idle (=xset dpms 300=) and shifts the baseline by ~1.4 W.
+
 * Files
 - kernel/sys/lpsched.h, kernel/kern/kern_lpsched.c (new), kernel/kern/files.kern
 - kernel/kern/kern_runq.c, kernel/kern/kern_timeout.c, kernel/sys/callout.h
