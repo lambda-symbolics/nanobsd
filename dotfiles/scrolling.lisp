@@ -47,7 +47,7 @@
   (max 80 (round (* width (strip-column-width column)))))
 
 (defun strip-place (window x y width height)
-  "Move parents during scrolling; configure client sizes only when they change."
+  "Configure changed geometry and return true when the window changed."
   (let* ((width (max 1 (- width (* 2 *float-window-border*))))
          (height (max 1 (- height *float-window-title-height* *float-window-border*)))
          (new-x (unless (= x (window-x window)) x))
@@ -62,7 +62,16 @@
       (xwin-send-configuration-notify (window-xwin window)
                                       (+ x *float-window-border*)
                                       (+ y *float-window-title-height*)
-                                      width height 0))))
+                                      width height 0)
+      t)))
+
+(defun strip-request-redraw (window)
+  "Invalidate client contents after a layout's moves and unmaps are complete."
+  (let ((xwin (window-xwin window)))
+    (xlib:send-event xwin :exposure '(:exposure)
+                     :window xwin :x 0 :y 0
+                     :width (window-width window) :height (window-height window)
+                     :count 0)))
 
 (defun strip-layout (group &key center)
   "Reveal the focused column immediately and unmap fully offscreen clients."
@@ -87,7 +96,8 @@
                          (- (+ selected-start selected-width) width))
                         (t (strip-offset group)))))
           (let ((x (- left (strip-offset group)))
-                (fullscreen (and focus (window-fullscreen focus))))
+                (fullscreen (and focus (window-fullscreen focus)))
+                (redraw nil))
             (dolist (column (strip-columns group))
               (let* ((cw (strip-pixel-width column width))
                      (windows (strip-column-windows column))
@@ -102,12 +112,20 @@
                                         (and (< x (+ left width)) (> (+ x cw) left)))
                       do (cond
                            (visible
-                            (unless (window-fullscreen window)
-                              (strip-place window x y cw wh))
-                            (when (window-hidden-p window) (unhide-window window)))
+                            (let ((changed (unless (window-fullscreen window)
+                                             (strip-place window x y cw wh)))
+                                  (hidden (window-hidden-p window)))
+                              (when hidden (unhide-window window))
+                              (when (or changed hidden) (push window redraw))))
                            (t (hide-window window)))
                          (incf y (+ wh *strip-gap*)))
-                (incf x (+ cw *strip-gap*))))))))))
+                (incf x (+ cw *strip-gap*))))
+            ;; Alacritty can retain stale pixels when a moved client is uncovered
+            ;; by a later unmap. Notify affected clients after the entire layout,
+            ;; not while another parent still covers their destination.
+            (when (eq group (current-group))
+              (dolist (window redraw)
+                (strip-request-redraw window)))))))))
 
 (defmethod group-add-window ((group strip-group) window &key raise &allow-other-keys)
   (let ((previous (strip-current-column group)))

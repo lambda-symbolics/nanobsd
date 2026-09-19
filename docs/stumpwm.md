@@ -53,6 +53,9 @@ Layout runs on window/workspace events and keyboard commands. Fully offscreen
 windows are unmapped. During pure scrolling, only parent positions are changed;
 client sizes are configured only when resizing. Synthetic ConfigureNotify uses
 the known geometry instead of querying X for it. There is no animation timer.
+After all moves and unmaps, send one Expose notification to each visible client
+whose geometry or visibility changed. This prevents stale contents after column
+rearrangement; an unchanged layout sends none.
 
 Status sampling and reading run every three seconds. A worker reads the snapshot
 and uses StumpWM's existing request pipe to queue a main-thread callback. Pending
@@ -111,16 +114,19 @@ compiled without warnings on NetBSD, loaded, and confirmed in the live keymap an
 focus-policy setting after a reboot. The preceding rc and scrolling module are
 backed up under `/home/mag/.stumpwm.d/before-shift-focus-fix/`.
 
-The user reported delayed client redraw after stacking/unstacking, resolved by
-changing focus. An isolated two-window Alacritty check on 2026-09-19 showed
-immediate resize/redraw events and correctly repainted screenshots for stacking
-and keyboard unstacking. That run did not reproduce the reported failure.
+The stacking redraw issue was reproduced with five Alacritty windows, the pointer
+on the bar, and Super+Home, Super+comma, then Super+period. At the right edge, an
+unmapped window's old pixels covered a moved neighbour. X geometry and map state
+were correct, but the neighbour's log showed a move without a redraw. A targeted
+Expose cleared the stale pixels without changing focus.
 
-SSH became unavailable during the separate kernel-83 reboot before a second
-check with the pointer outside both windows could run. Continue with that case
-and offscreen columns when connectivity returns. Diagnostic client class:
-`ALRedraw`; event logs and screenshots: `/home/mag/.stumpwm.d/redraw-*`.
-The redraw cause is unresolved, and no speculative repaint workaround was added.
+The scrolling module now requests client redraws after completing layout changes.
+The updated module compiled without warnings on NetBSD. Keyboard stacking,
+unstacking and width changes repainted correctly in screenshots, and event logs
+confirmed immediate redraws. An instrumented unchanged layout emitted zero
+redraw notifications. The source and FASL were installed, checksums verified, and
+all diagnostic clients were closed. The preceding source is backed up as
+`/home/mag/.stumpwm.d/scrolling.lisp.before-redraw`.
 
 The pre-follow-up files are backed up under
 `/home/mag/.stumpwm.d/before-followup-29b36c5/`. Staged sources, FASLs and
