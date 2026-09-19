@@ -127,6 +127,48 @@ i915drmkms_sysctl_rpm(SYSCTLFN_ARGS)
 	return 0;
 }
 
+/* Software-only sample: reading this must not acquire a GPU wakeref. */
+static int
+i915drmkms_sysctl_pmstate(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	struct i915drmkms_softc *sc = lispbsd_i915_sc;
+	struct intel_gt *gt;
+	struct intel_uncore *uncore;
+	struct intel_engine_cs *engine;
+	enum intel_engine_id id;
+	char buf[768];
+	size_t off;
+	unsigned i;
+
+	if (sc == NULL || sc->sc_drm_dev == NULL)
+		return ENXIO;
+	gt = &to_i915(sc->sc_drm_dev)->gt;
+	uncore = gt->uncore;
+	off = snprintf(buf, sizeof(buf),
+	    "gt=%d user=%d awake=%d rc6=%d fw_active=0x%x fw_timer=0x%x fw_user=%u",
+	    atomic_read(&gt->wakeref.count), atomic_read(&gt->user_wakeref),
+	    READ_ONCE(gt->awake) != 0, gt->rc6.enabled,
+	    READ_ONCE(uncore->fw_domains_active),
+	    READ_ONCE(uncore->fw_domains_timer),
+	    READ_ONCE(uncore->user_forcewake_count));
+	for (i = 0; i < FW_DOMAIN_ID_COUNT && off < sizeof(buf); i++) {
+		if (uncore->fw_domain[i] == NULL)
+			continue;
+		off += snprintf(buf + off, sizeof(buf) - off, " fw%u=%u", i,
+		    READ_ONCE(uncore->fw_domain[i]->wake_count));
+	}
+	for_each_engine(engine, gt, id) {
+		if (off >= sizeof(buf))
+			break;
+		off += snprintf(buf + off, sizeof(buf) - off, " %s=%d",
+		    engine->name, atomic_read(&engine->wakeref.count));
+	}
+	node.sysctl_data = buf;
+	node.sysctl_size = strlen(buf) + 1;
+	return sysctl_lookup(SYSCTLFN_CALL(&node));
+}
+
 CFATTACH_DECL_NEW(i915drmkms, sizeof(struct i915drmkms_softc),
     i915drmkms_match, i915drmkms_attach, i915drmkms_detach, NULL);
 
@@ -264,6 +306,12 @@ i915drmkms_attach_real(device_t self)
 	    CTLFLAG_READWRITE, CTLTYPE_INT, "i915s0idle",
 	    SYSCTL_DESCR("LISPBSD force i915 S0-idle suspend (preserve RC6)"),
 	    NULL, 0, &i915_lispbsd_s0idle, 0,
+	    CTL_HW, CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(NULL, 0, NULL, NULL,
+	    CTLFLAG_READONLY, CTLTYPE_STRING, "i915pmstate",
+	    SYSCTL_DESCR("i915 software wakeref snapshot without waking the GPU"),
+	    i915drmkms_sysctl_pmstate, 0, NULL, 0,
 	    CTL_HW, CTL_CREATE, CTL_EOL);
 
 	/*

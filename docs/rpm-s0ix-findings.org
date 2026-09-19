@@ -1387,8 +1387,70 @@ the second measured 176625 RAPL units, approximately 0.18 W package power.
 PC3 and sampled SMI deltas were zero. Both resumed, and timeout was restored
 to zero. Logs: al85-cycle1/2; build-al84.log and build-al85.log.
 
-SLP_S0 is still zero. The laptop is on AC and charging, so these tests do not
-provide a new battery-power figure. Battery measurement and physical lid-wake
-revalidation of the changed wake policy require the user to unplug AC and
-operate the lid. Brightness is 20; DPMS is enabled at 300 s. The general
-shared-power-resource accounting defect is separate work, not repaired here.
+Those kernel 85 short tests ran on AC and charging, without a battery-power
+figure. The general shared-power-resource accounting defect is separate work,
+not repaired here.
+
+* UPDATE 44 (2026-09-19): lid validation and battery measurements
+The user unplugged AC and confirmed lid-close/open wake, touchpad and normal
+operation on kernel 85. The matching log shows woke=1 and 95% PC10.
+
+A subsequent 300 s timed suspension used 43.180 -> 43.000 Wh over 306 s,
+including transitions: 2.12 W whole-machine average. PC10 was 97%, PC3 0%,
+SLP_S0 delta zero, sampled SMI delta zero. RAPL delta 1099046 at 2^-14 J gives
+approximately 0.22 W package power. The 1 W target is unresolved.
+
+Screen-on idle at brightness 20, with screensaver and DPMS disabled, used
+42.920 -> 42.610 Wh over 190 s: 5.87 W. Persistent LWP CPU-time deltas were
+negligible (largest 0.12 s). This does not reproduce the earlier 4.32 W result.
+USB suspension was reapplied and Wi-Fi reported power-save enabled. DPMS300
+and timeout0 were restored. Audio was resumed after a separate isolation test.
+Remote evidence: al85-lid-validated, al85-battery-pre/post/log, al85-idle-pre/post.
+
+Subsequent awake samples had unchanged package residency counters despite
+high core C7 residency. Disabling the display with DPMS or suspending HDA did
+not recover package idle. GPU BAR0 was verified at 0x603c000000. Read-only
+/dev/mem samples of GT_GFX_RC6 (0x138108) stayed at 0x165fa738 over 10 s;
+GT_CORE_STATUS (0x138060) was 0x00800000 and RC_CONTROL (0xa090) 0x88040000.
+RC6 is enabled but the sampled GPU is in RC0. The ttyE0 mapping utility failed
+with EINVAL; its failed reads were not used as evidence.
+
+These battery and stuck-RC6 observations preceded the other agent's picom
+startup at 18:20:57 CEST. Later comparisons must account for that compositor.
+Kernel 86 adds a read-only software wakeref snapshot (hw.i915pmstate) to
+separate GT/engine references from forcewake without waking the GPU.
+
+* UPDATE 45 (2026-09-19): release cancelled i915 forcewake timers
+Kernel 86 identified the awake regression precisely. Before suspend, GT and
+engine wakerefs, forcewake counts and timer masks were zero; RC6 and package
+idle counters advanced. After suspend, GT/engine references were still zero,
+but forcewake domains 0 and 1 each retained one reference and fw_timer=0x3.
+RC6 and package idle counters stopped. This contradicts the earlier candidate
+of a leaked GT/engine reference. Logs: al86-awake-pre/post and al86-cycle1.
+
+The NetBSD hrtimer adapter calls callout_halt, then queries callout_pending to
+determine whether a timer was cancelled. callout_halt has already cleared that
+flag, and returns false unless it waited for an in-flight callback. Consequently
+hrtimer_cancel can return zero after cancelling a pending timer. The i915
+forcewake-reset code used that return value to decide whether to release the
+timer-owned reference, leaving a reference with no scheduled release.
+
+Kernel 87 reconciles timer-owned forcewake references after cancellation,
+under uncore.lock. It leaves a concurrently rearmed or running timer for the
+existing retry loop instead of releasing its reference. The change is scoped
+to the NetBSD i915 reset path; it does not redefine general hrtimer semantics.
+The software-only hw.i915pmstate diagnostic is retained.
+
+Two full suspend/resume cycles on kernel 87 returned all sampled references
+and timer masks to zero. GPU RC6 advanced again and screen-on package PC8
+reached approximately 57% in both post-resume windows. The second suspend
+reached 97% PC10. SLP_S0 was zero in both holds. Native Werror builds passed.
+Logs: al87-cycle1/2, al87-awake-cycle1/2; build-al86.log and build-al87.log.
+
+After those two resumes, kernel 87 screen-on idle at brightness 20 used
+40.270 -> 40.060 Wh over 197 s: 3.84 W. Reported rates were 3.812 and 3.664 W.
+GT/engine and forcewake references were zero at both endpoints; package PC8
+was approximately 64% over the window. Picom was running throughout this
+measurement. DPMS and the screensaver were disabled for the sample; DPMS300
+was restored afterward. Logs: al87-idle-pre/post. Kernel 87 is the default;
+85 and 86 are saved modified-kernel backups, and the vanilla kernel is untouched.
