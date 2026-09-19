@@ -12,6 +12,9 @@ Open a window to insert a column after the focused column. Columns keep their
 width when more windows open; focus a column beyond the panel edge to scroll.
 Stack windows vertically using consume/expel. The viewport targets the Nano's
 single panel. Focus changes and geometry updates are instantaneous.
+Moving a column between workspaces preserves its width and each window's height
+share. Focus-loss handling defers relayout until source membership is updated,
+so hiding a departing window cannot immediately remap it.
 
 ## Keys
 
@@ -80,7 +83,28 @@ application. The Xorg driver configuration was inspected rather than changed.
 The initial scrolling deployment was compiled and loaded on the laptop; its
 backups use the suffix `.before-scrolling-20260919`.
 
-The follow-up request-pipe, asynchronous-dispatch and geometry changes have had
-source review and syntax checks. Remote compilation and deployment are pending:
-SSH to `10.0.0.25` became unreachable during the follow-up. Runtime test workloads
-and power measurements were omitted while kernel power work was in progress.
+## Follow-up verification and deployment
+
+The rc file and both Lisp modules compile successfully on Linux SBCL 2.6.6
+against StumpWM 24.11 (`20d839f2ddfdfd25a8460152bc5dc45a9354e773`) and
+CLX 0.7.6 (`a444b1278dbd74ea4e6c4846d3ee653e05cccb94`). This was compilation
+only, without loading the configuration or starting X. Source review also
+covered the request pipe, event dispatcher, geometry updates and workspace
+transfer ordering.
+
+The laptop is powered off while travelling. NetBSD compilation, deployment and
+live X validation are pending; SSH attempts are paused. No power measurements or
+runtime test workloads were run during this follow-up.
+
+When the laptop is available and live validation is authorized:
+
+1. Back up the installed rc, modules and sampler; install the files listed above.
+2. Compile on the laptop, reload the rc, and restart the sampler for its restored
+   three-second cadence.
+3. Check workspace switching and column transfers, including stacked windows with
+   unequal heights, offscreen focus, resizing and fullscreen. Check status updates
+   and rc reloads for errors in the WM log.
+
+For rollback, restore the backed-up files and restart StumpWM and the sampler.
+Removing a module load from the rc is insufficient to undo dispatcher methods
+already redefined in a running Lisp image.

@@ -125,6 +125,7 @@
 ;; Resolve the inherited (GROUP FLOAT-WINDOW) specialization explicitly.
 (defmethod group-add-window ((group strip-group) (window float-window)
                              &key raise &allow-other-keys)
+  (declare (ignore raise))
   (call-next-method))
 
 (defmethod focus-window :before ((window strip-window) &optional raise)
@@ -167,7 +168,10 @@
     (if window (group-focus-window group window) (no-focus group nil))))
 
 (defmethod group-lost-focus ((group strip-group))
-  (unless *strip-layout-active* (strip-layout group)))
+  ;; Hiding precedes source-column removal during workspace transfers. Relayout
+  ;; here would remap the departing window; group-delete-window refocuses after
+  ;; removing it. Layout-driven hiding also needs no separate focus action.
+  nil)
 
 (defmethod group-resize-request ((group strip-group) window width height)
   (declare (ignore window width height))
@@ -290,9 +294,14 @@
   (let* ((group (current-group)) (column (strip-current-column group))
          (target (find-group (current-screen) name)))
     (when (and column (typep target 'strip-group) (not (eq group target)))
-      (let ((windows (copy-list (strip-column-windows column)))
-            (anchor (strip-current-column target)))
-        (dolist (window windows) (move-window-to-group window target))
+      (let* ((windows (copy-list (strip-column-windows column)))
+             (weights (mapcar (lambda (window) (gethash window (strip-weights group) 1.0))
+                              windows))
+             (anchor (strip-current-column target)))
+        (loop for window in windows
+              for weight in weights
+              do (move-window-to-group window target)
+                 (setf (gethash window (strip-weights target)) weight))
         ;; The ordinary lifecycle creates one column per moved window. Reassemble it.
         (setf (strip-columns target)
               (remove-if (lambda (c) (intersection windows (strip-column-windows c)))
