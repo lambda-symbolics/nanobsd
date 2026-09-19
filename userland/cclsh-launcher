@@ -1,0 +1,30 @@
+#!/bin/sh
+# Installed as /usr/local/bin/cclsh (mag's and root's login shell).
+# Interactive terminals share a per-user SBCL server. Scripts stay standalone.
+export CCLSH_LAUNCHER_PATH=/usr/local/bin/cclsh
+export CCLSH_SBCL=/usr/pkg/bin/sbcl
+export CCLSH_QUICKLISP_SETUP=/usr/local/lib/cclsh/quicklisp/setup.lisp
+base=/usr/local/lib/cclsh
+fallback="$base/cclsh-image"
+if [ ! -x "$fallback" ]; then fallback="$base/src/cclsh/scripts/cclsh-sbcl"; fi
+
+# Keep the console autologin OUT of the shared server.  cclsh's startup-load
+# holds a GLOBAL lock (*startup-load-lock*) for the whole of (load
+# startup.lisp), and on the console that file runs startx and blocks until the
+# X session ends -- so a shared console session pins that lock for hours and
+# every other terminal hangs before it can print a prompt.  Standalone, it
+# only ever blocks itself.
+if [ -z "${CCLSH_NO_DAEMON:-}" ]; then
+    case "$(tty 2>/dev/null)" in
+    /dev/constty|/dev/ttyE0) CCLSH_NO_DAEMON=1 ;;
+    esac
+fi
+
+if [ "$#" -eq 0 ] && [ -t 0 ] && [ -t 1 ] && [ -t 2 ] &&
+   [ "${CCLSH_NO_DAEMON:-0}" != 1 ]; then
+    /usr/local/bin/cclshd start >/dev/null 2>&1 || :
+    directory=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/cclshd-$(id -u)
+    socket=${CCLSH_DAEMON_SOCKET:-$directory/server.sock}
+    exec "$base/src/cclsh/cclsh-session" attach "$socket" "$fallback"
+fi
+exec "$fallback" "$@"

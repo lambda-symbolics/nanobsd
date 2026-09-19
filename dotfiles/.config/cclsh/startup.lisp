@@ -116,6 +116,13 @@
                "")))
   (when (and (null (getenv "DISPLAY"))
              (or (search "constty" tty) (search "ttyE0" tty))
+             ;; Never inside the shared cclshd server: startup-load holds a
+             ;; global lock for the whole load, and startx below blocks until
+             ;; X exits, which would hang every other terminal's prompt.
+             ;; The launcher keeps the console standalone; this is the guard
+             ;; for when it does not.
+             (let ((marker (find-symbol "*SESSION-PROCESS-FUNCTION*" :cclsh)))
+               (not (and marker (boundp marker) (symbol-value marker))))
              ;; A stale /tmp/.X0-lock from a killed server must not block us.
              (not (ignore-errors
                    (zerop (nth-value 2 (uiop:run-program "pgrep -x Xorg"
