@@ -16,6 +16,12 @@ paths.
   programs PAT on the BSP → write-combining framebuffer was uncached on APs).
 - `kernel/modules/cidle` — MWAIT deep C-state idle loop (acpicpu only picks C1);
   cores now reach C7, and exposes `machdep.cidle.residency` (core/package C-states).
+- `kernel/kern/kern_lpsched.c`, `kernel/sys/lpsched.h` + hooks in `kern_runq.c`,
+  `kern_timeout.c`, `wskbd.c`/`wsmouse.c` — **lpsched**, a laptop power governor:
+  idle-aware thread packing, callout coalescing and an input-idle signal under
+  `machdep.lpsched.*`, driven by `userland/lpschedd.c` (AC/load/idle → HWP EPP +
+  profile) with a StumpWM focus hook (`dotfiles/.stumpwm.d/lpsched.lisp`).
+  Design: `docs/lpsched-design.org`.
 - `kernel/external/.../i915` — Tiger Lake i915 bring-up + RC6 power-gating patch
   (package now reaches PC8).
 - `kernel/dev/acpi` — forced-S3 SSDT injection (`options ACPI_FORCE_S3`) and

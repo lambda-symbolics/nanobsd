@@ -1,0 +1,82 @@
+#!/bin/sh
+# lpsched-ab -- A/B the lpsched mechanisms in isolation (LISPBSD).
+#
+# Run as root, on battery, with the machine otherwise idle.  Stops lpschedd,
+# cycles through configurations with the SAME EPP so only pack/coalesce vary,
+# then a full powersave profile, and restores everything (and the daemon).
+#
+# Per configuration it prints: battery draw, cidle deep-skips/s (full tickless
+# windows reached), woke_early/s, and total interrupts/s.
+#
+#   SETTLE  seconds to wait after a change (EC discharge rate is a slow
+#           average; <45 s gives stale numbers)           default 50
+#   SAMPLE  seconds to sample counters                    default 20
+#   EPP     fixed EPP for the mechanism runs              default: current
+#
+# usage: lpsched-ab [quick]     (quick: SETTLE=20 SAMPLE=10, numbers rough)
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin:/usr/local/bin; export PATH
+
+SETTLE=${SETTLE:-50}
+SAMPLE=${SAMPLE:-20}
+[ "$1" = quick ] && { SETTLE=20; SAMPLE=10; }
+
+if ! sysctl -q machdep.lpsched.enabled >/dev/null 2>&1; then
+	echo "machdep.lpsched not present in this kernel" >&2; exit 1
+fi
+if envstat -d acpiacad0 2>/dev/null | grep -q 'connected: *TRUE'; then
+	echo "on AC: discharge numbers are meaningless, unplug first" >&2; exit 1
+fi
+
+ORIG_EN=$(sysctl -n machdep.lpsched.enabled)
+ORIG_PACK=$(sysctl -n machdep.lpsched.pack)
+ORIG_COAL=$(sysctl -n machdep.lpsched.coalesce_ms)
+ORIG_EPP=$(sysctl -n machdep.hwp.epp)
+EPP=${EPP:-$ORIG_EPP}
+DAEMON=0
+if /etc/rc.d/lpschedd status >/dev/null 2>&1; then
+	DAEMON=1; /etc/rc.d/lpschedd stop >/dev/null 2>&1
+fi
+
+restore() {
+	sysctl -qw machdep.lpsched.enabled=$ORIG_EN machdep.lpsched.pack=$ORIG_PACK \
+	    machdep.lpsched.coalesce_ms=$ORIG_COAL machdep.hwp.epp=$ORIG_EPP
+	[ $DAEMON = 1 ] && /etc/rc.d/lpschedd start >/dev/null 2>&1
+}
+trap 'restore; exit 1' INT TERM
+
+field() {	# field <tlstats-string> <key>
+	echo "$1" | sed -n "s/.*$2=\([0-9]*\).*/\1/p"
+}
+
+measure() {	# measure <label>
+	S1=$(sysctl -n machdep.cidle.tlstats)
+	I1=$(vmstat -i | awk '/^Total/{print $2}')
+	sleep $SAMPLE
+	S2=$(sysctl -n machdep.cidle.tlstats)
+	I2=$(vmstat -i | awk '/^Total/{print $2}')
+	W=$(envstat -d acpibat0 | awk '/discharge rate/{print $3}')
+	D=$(( $(field "$S2" deep) - $(field "$S1" deep) ))
+	E=$(( $(field "$S2" woke_early) - $(field "$S1" woke_early) ))
+	I=$(( I2 - I1 ))
+	awk -v l="$1" -v w="$W" -v d=$D -v e=$E -v i=$I -v s=$SAMPLE 'BEGIN {
+		printf "%-18s %6.2f W   deep/s %6.1f   early/s %7.1f   ints/s %6.1f\n",
+		    l, w, d/s, e/s, i/s }'
+}
+
+run() {		# run <label> <enabled> <pack> <coalesce_ms> <epp>
+	sysctl -qw machdep.lpsched.enabled=$2 machdep.lpsched.pack=$3 \
+	    machdep.lpsched.coalesce_ms=$4 machdep.hwp.epp=$5
+	sleep $SETTLE
+	measure "$1"
+}
+
+echo "lpsched A/B: settle ${SETTLE}s, sample ${SAMPLE}s, EPP $EPP (daemon was ${DAEMON})"
+run "stock"            0 0  0 $EPP
+run "pack=1"           1 1  0 $EPP
+run "pack=2"           1 2  0 $EPP
+run "coalesce=50"      1 0 50 $EPP
+run "pack2+coal50"     1 2 50 $EPP
+run "powersave(240)"   1 2 50 240
+restore
+echo "restored: enabled=$ORIG_EN pack=$ORIG_PACK coalesce=$ORIG_COAL epp=$ORIG_EPP daemon=$DAEMON"

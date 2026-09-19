@@ -1,0 +1,111 @@
+#+TITLE: lpsched — a laptop power governor for NetBSD (LISPBSD)
+#+DATE: 2026-09-19
+
+* Why
+
+The awake-idle wakeup investigation (2026-09-19) showed the kernel's tickless
+idle path (cidle) works, but never gets a quiet window: userland keeps waking
+cores, and the stock scheduler makes it worse by *spreading* work for
+throughput.  NetBSD's two schedulers (4BSD, M2) share one CPU picker in
+=kern/kern_runq.c= that knows the SMT/core/package topology but has zero
+idle-depth or power awareness, no wakeup coalescing, and no coupling to the
+HWP frequency governor.  Linux fills these gaps with idle-state-aware placement,
+timer slack and schedutil; NetBSD has none of them.
+
+lpsched adds the three missing laptop pieces without rewriting a scheduler.
+Expected: tenths of a watt from packing/coalescing, ~1 W-class from the EPP
+coupling (measured EPP 128->255 = ~1 W on this box), and zero interactive
+regression.  The main value is that these are genuinely missing NetBSD laptop
+capabilities.
+
+* Design (approved 2026-09-19)
+
+Three policy-free in-kernel *mechanisms* under =machdep.lpsched.*=, one
+userland *policy daemon*, one *stumpwm hook*.  Master switch
+=machdep.lpsched.enabled=0= gives exact stock behaviour.
+
+** Mechanism A — idle-aware packing (=kern/kern_runq.c=)
+- cidle exports a per-CPU idle depth (=lpsched_idle_depth[]=: active /
+  shallow MWAIT / tickless-deep MWAIT).
+- =sched_takecpu()=: when =pack>0= and the LWP is *not exempt*,
+  =lpsched_pack_pick()= chooses the cheapest CPU to wake: an idle SMT sibling
+  of a busy core (core already awake, cost 0) > shallow-idle > deep-idle.
+  =pack=2= will rather queue behind a running LWP on an awake CPU with an
+  empty run queue than wake a sleeping core.  NULL -> stock placement.
+- Exempt (always stock, latency-first): non-SCHED_OTHER classes, the focused
+  process (=fgpid=), interactive LWPs (=l_estcpu >> 11 < estcpu_thresh=,
+  default 2 — new threads inherit the parent's estcpu, so children of
+  CPU-bound parents are packed, children of interactive ones are not).
+- =sched_idle()= / =sched_catchlwp()=: =lpsched_min_catch()= raises the steal
+  threshold by =pack= for a CPU whose whole physical core is asleep, so a
+  gated core is not woken to steal one stray LWP.
+- Never oversubscribes: only returns idle CPUs (or, pack=2, an empty-queue
+  running CPU); with nothing idle it falls through to stock.
+
+** Mechanism B — callout coalescing (=kern/kern_timeout.c=)
+- =lpsched_coalesce()= in =callout_schedule_locked()= rounds a non-precise
+  callout's absolute expiry *up* to the =coalesce_ms= grid (hz=100, so 50 ms
+  = 5 ticks).  Timers fire in clusters; idle gaps lengthen; cidle's
+  =callout_next_ticks()= sees the rounded time and skips further.
+- Only delays, never fires early; unsigned modulus so a wrapped tick counter
+  still rounds upward; =to_ticks==0= (immediate) untouched.
+- New =CALLOUT_PRECISE= (0x0200, =sys/callout.h=) exempts time-critical
+  callouts.  Nothing is marked yet; mark on evidence.
+
+** Mechanism C — signals
+- =lpsched_last_input= set from =wskbd_input()= / =wsmouse_input()=; exported
+  as =machdep.lpsched.idle_ms= (RO).
+- =machdep.lpsched.fgpid= (RW): focused PID from the WM.
+
+** Governor daemon — =lpschedd(8)= (=userland/lpschedd.c=, /usr/local/sbin)
+- Policy lives in userland: trivial to retune without a reboot, easy to read
+  battery/AC, and it matches the existing mechanism-in-kernel/policy-outside
+  split (hwp/cidle).  An in-kernel kthread governor was rejected.
+- Inputs: AC from =/var/run/lpsched.ac= (written by powerd's =acadapter=
+  hook, seeded from =envstat -d acpiacad0= at start), 1-min load,
+  =idle_ms=, and =fgpid <pid>= datagrams on =/var/run/lpsched.sock=.
+- Outputs: =machdep.hwp.epp=, =machdep.lpsched.{enabled,pack,coalesce_ms,fgpid}=.
+- Profiles:
+  | profile   | EPP | pack | coalesce | when                                  |
+  |-----------+-----+------+----------+---------------------------------------|
+  | perf      |  32 |    0 |     0 ms | AC present (always); battery+load>1.5 |
+  | balanced  | 128 |    1 |    20 ms | battery + input within 10 s           |
+  | powersave | 240 |    2 |    50 ms | battery + idle                        |
+- Upshifts immediate; downshifts need 3 consecutive polls; load latch
+  releases below 1.0.  Poll 250 ms active / 500 ms in powersave via
+  =poll()= on the socket (the daemon's own timer is itself coalesced).
+- On exit: enabled=0, pack=0, coalesce=0, fgpid=0, EPP restored.
+- =rc.d/lpschedd= (=lpschedd=YES=), REQUIRE powerd.  The =acadapter= powerd
+  script no longer sets EPP (it would fight the daemon); it records AC state.
+
+** stumpwm hook — =dotfiles/.stumpwm.d/lpsched.lisp=
+=*focus-window-hook*= sends =fgpid <_NET_WM_PID>= (0 on no focus) as one
+datagram to the daemon socket.  Non-blocking, every error swallowed, keeps
+stumpwm unprivileged (socket is 0666).  Loaded from =.stumpwmrc=.
+
+* Measurement / success criteria
+Same rig as the S0ix work: =envstat -d acpibat0= discharge (55 s settle) on
+battery at screen-off and screen-on-idle; =machdep.cidle.tlstats= deep-skip
+rate; =vmstat -i= deltas; interactivity by feel.  Each mechanism is A/B'd in
+isolation via its own sysctl with the daemon stopped, then the daemon on.
+Win = higher deep-skip rate + EPP watt saving on battery-idle, no perceptible
+input lag, no audio glitches.
+
+* Files
+- kernel/sys/lpsched.h, kernel/kern/kern_lpsched.c (new), kernel/kern/files.kern
+- kernel/kern/kern_runq.c, kernel/kern/kern_timeout.c, kernel/sys/callout.h
+- kernel/dev/wscons/wskbd.c, kernel/dev/wscons/wsmouse.c
+- kernel/modules/cidle/cidle.c
+- userland/lpschedd.c, etc/rc.d/lpschedd, etc/powerd/scripts/acadapter
+- dotfiles/.stumpwmrc, dotfiles/.stumpwm.d/lpsched.lisp
+
+* Build / install (laptop)
+#+begin_example
+cd /usr/src/sys/arch/amd64/conf && config GENERIC
+cd ../compile/GENERIC && make -j8 depend && make -j8 netbsd
+cp /netbsd.i915.rpm /netbsd.i915.rpm.NN && cp netbsd /netbsd.i915.rpm   # NN = current build
+# boot.cfg entry 3 boots the previous kernel (92 = SLP_S0 baseline, pre-lpsched)
+cd /usr/src/sys/modules/cidle && make && cp cidle.kmod /stand/amd64/11.0/modules/cidle/
+cc -O2 -Wall -o /usr/local/sbin/lpschedd lpschedd.c -lutil
+shutdown -r now        # NOT `reboot` (iwx recursion panic)
+#+end_example
