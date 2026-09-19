@@ -135,3 +135,39 @@ The pre-follow-up files are backed up under
 For rollback, restore the backed-up files and restart StumpWM and the sampler.
 Removing a module load from the rc is insufficient to undo dispatcher methods
 already redefined in a running Lisp image.
+
+## Input-lag and efficiency audit, 2026-09-19
+
+The custom commands contain no sleeps or synchronous shell-command waits.
+Status collection runs in a separate process; snapshot reads run in the worker,
+not the X event thread. Ordinary application typing is not routed through the
+WM command handler. The custom code does not generate key presses or releases.
+Layout changes can still wait on Xorg through inherited window/focus operations;
+a stalled X server, input stack, application or scheduler requires separate
+runtime evidence. The audit did not reproduce or establish the cause of the
+reported multi-second input lag.
+
+The live WM had one status worker, no queued status callback and no active timer.
+An isolated SBCL 2.6.5 finite-select check waited 109 ms for a requested 100 ms.
+This did not reproduce the older busy-poll observation; the existing timer
+workaround was not changed.
+
+`userland/statusbar` now collects each subsystem once and parses all results in
+one awk process: seven external utility invocations per sample, including the
+parser. In particular, three envstat invocations become one, and individual
+mixer queries become one mixer snapshot. Fields and three-second cadence are
+preserved. Install it as `/usr/local/bin/statusbar`; the running sampler uses the
+new script on its next iteration. No battery-power improvement was measured.
+
+The column layout now traverses each window list once to identify its final
+member, rather than repeatedly scanning to the end. Geometry and redraw rules
+are unchanged. Last-member selection matched the old algorithm for list lengths
+0 through 100. The module compiled without warnings or failures on NetBSD and
+was loaded into the running WM; deployed source checksums matched.
+
+Run parser fixtures with `sbcl --script tests/statusbar.lisp`. They passed with
+Linux and NetBSD awk, covering CPU deltas/reset, RAM cache exclusion, hottest
+core, mixer fallbacks, battery states and missing samples. Live status publication
+also passed. Backups and staged files are in
+`/home/mag/.stumpwm.d/efficiency-audit/` (`statusbar.before` and
+`scrolling.lisp.before`).

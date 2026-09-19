@@ -104,8 +104,9 @@
                      (available (- height (* *strip-gap* (1- (length windows)))))
                      (total (loop for w in windows sum (gethash w (strip-weights group) 1.0)))
                      (y top))
-                (loop for window in windows
-                      for last = (eq window (car (last windows)))
+                (loop for remaining on windows
+                      for window = (car remaining)
+                      for last = (null (cdr remaining))
                       for wh = (if last (- (+ top height) y)
                                    (round (* available (/ (gethash window (strip-weights group) 1.0) total))))
                       for visible = (if fullscreen (eq window focus)

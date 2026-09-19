@@ -1,51 +1,80 @@
 #!/bin/sh
-# statusbar: one-shot system status for the StumpWM mode-line (NetBSD/lispbsd).
-# Prints a single line of key=value pairs; the Lisp side formats/colours it.
+# One-shot NetBSD status snapshot. Collect each subsystem once, parse in one awk.
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin:/usr/local/bin
 export PATH
 
-# RAM: % of managed pages in use, excluding file/exec cache (like waybar's memory)
-ram=$(vmstat -s 2>/dev/null | awk '
-  /^ *[0-9]+ pages managed$/          {m=$1}
-  /^ *[0-9]+ pages free$/             {f=$1}
-  /^ *[0-9]+ cached file pages$/      {c+=$1}
-  /^ *[0-9]+ cached executable pages$/ {c+=$1}
-  END { if (m>0) printf "%d", (m-f-c)*100/m; else print "?" }')
-
-# CPU: busy % since the previous call (kern.cp_time deltas kept in /tmp)
-st=/tmp/.statusbar.cp
-now=$(sysctl -n kern.cp_time 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+,?$/) { gsub(",","",$i); printf "%s ", $i }}')
-prev=$(cat $st 2>/dev/null); echo "$now" > $st
-cpu=$(echo "$prev|$now" | awk -F'|' '{
-  split($1,p," "); split($2,n," ");
-  if (length(p)<5) { print "?"; exit }
-  pt=0; nt=0; for(i=1;i<=5;i++){pt+=p[i]; nt+=n[i]}
-  dt=nt-pt; di=n[5]-p[5];
-  if (dt<=0) print 0; else printf "%d", (dt-di)*100/dt }')
-
-# Temperature: hottest CPU core (coretemp0..3), like waybar's package temp
-temp=$(envstat 2>/dev/null | awk '/^\[coretemp/ {z=1; next} /^\[/ {z=0} z && /temperature:/ { for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+\.[0-9]+$/) { v=int($i); if (v>t) t=v } } END { print (t?t:"?") }')
-
-# Audio: master volume and mic (0-255 -> %), mute flags
-vol=$(mixerctl -n outputs.master 2>/dev/null | awk -F, '{printf "%d", ($1*100+127)/255}')
-volm=$(mixerctl -n outputs.master.mute 2>/dev/null || mixerctl -n outputs.master3.mute 2>/dev/null); volm=${volm:-off}
-mic=$(mixerctl -n record.mic 2>/dev/null | awk -F, 'NF{printf "%d", ($1*100+127)/255}')
-micm=$(mixerctl -n record.mic2.mute 2>/dev/null || mixerctl -n record.mic.mute 2>/dev/null); micm=${micm:-off}
-
-# Battery: capacity % and state from acpibat0 (charging / discharging / full / ac)
-bat=$(envstat -d acpibat0 2>/dev/null | awk '
-  /charge:/ && !/rate|design|warning|low|critical/ { for(i=1;i<=NF;i++) if ($i ~ /^\(?[0-9.]+%\)?$/) { gsub(/[()%]/,"",$i); c=int($i) } }
-  /charging:/ { s=($2=="TRUE"||$2=="ON")?"chg":"dis" }
-  /connected:/ { if ($2=="FALSE") s="none" }
-  END { printf "%s %s", (c==""?"?":c), (s==""?"?":s) }')
-batp=${bat% *}; bats=${bat#* }
-# AC adapter present -> "plugged" when not charging
-ac=$(envstat -d acpiacad0 2>/dev/null | awk '/connected:/{print $2}')
-[ "$ac" = "TRUE" ] && [ "$bats" = "dis" ] && bats=plug
-[ "$ac" = "TRUE" ] && [ "$batp" = "100" ] && bats=full
-
-# WiFi SSID
-ssid=$(ifconfig iwx0 2>/dev/null | awk '/ssid/{for(i=1;i<=NF;i++) if($i=="ssid"){print $(i+1); exit}}')
-
-clk=$(date +%H:%M)
-echo "ram=$ram cpu=$cpu temp=$temp vol=$vol volm=$volm mic=$mic micm=$micm bat=$batp bats=$bats ssid=$ssid clk=$clk"
+{
+  echo '@ram'; vmstat -s 2>/dev/null
+  echo '@cpu'; sysctl -n kern.cp_time 2>/dev/null
+  echo '@sensors'; envstat 2>/dev/null
+  echo '@audio'; mixerctl -a 2>/dev/null
+  echo '@wifi'; ifconfig iwx0 2>/dev/null
+  echo '@clock'; date +%H:%M
+} | awk -v state="${STATUSBAR_CPU_STATE:-/tmp/.statusbar.cp}" '
+  BEGIN {
+    ram=cpu=temp=vol=mic=bat=bats="?"
+    volm=micm="off"; ssid=""; clk="--:--"
+  }
+  /^@(ram|cpu|sensors|audio|wifi|clock)$/ { section=$0; next }
+  section=="@ram" {
+    if ($0 ~ /^ *[0-9]+ pages managed$/) managed=$1
+    if ($0 ~ /^ *[0-9]+ pages free$/) free=$1
+    if ($0 ~ /^ *[0-9]+ cached (file|executable) pages$/) cache+=$1
+  }
+  section=="@cpu" {
+    for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+,?$/) {
+      value=$i; gsub(/,/, "", value); ticks[++nticks]=value
+    }
+  }
+  section=="@sensors" {
+    if ($0 ~ /^\[/) device=$0
+    if (device ~ /^\[coretemp/ && /temperature:/)
+      for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+\.[0-9]+$/ && $i+0>hottest)
+        hottest=$i+0
+    if (device=="[acpibat0]") {
+      if (/charge:/ && !/rate|design|warning|low|critical/)
+        for (i=1; i<=NF; i++) if ($i ~ /^\(?[0-9.]+%\)?$/) {
+          value=$i; gsub(/[()%]/, "", value); bat=int(value)
+        }
+      if (/charging:/) bats=($2=="TRUE" || $2=="ON")?"chg":"dis"
+      if (/(present|connected):/ && $2=="FALSE") absent=1
+    }
+    if (device=="[acpiacad0]" && /connected:/) ac=$2
+  }
+  section=="@audio" {
+    split($0, pair, "="); audio[pair[1]]=pair[2]
+  }
+  section=="@wifi" && /ssid/ {
+    for (i=1; i<=NF; i++) if ($i=="ssid") { ssid=$(i+1); break }
+  }
+  section=="@clock" { clk=$0 }
+  END {
+    if (managed>0) ram=int((managed-free-cache)*100/managed)
+    if (nticks==5) {
+      if ((getline previous < state)>0 && split(previous, old, " ")==5) {
+        for (i=1; i<=5; i++) delta+=ticks[i]-old[i]
+        idle=ticks[5]-old[5]
+        if (delta>0 && idle>=0 && idle<=delta) cpu=int((delta-idle)*100/delta)
+        else if (delta==0) cpu=0
+      }
+      close(state)
+      printf "%s %s %s %s %s\n", ticks[1],ticks[2],ticks[3],ticks[4],ticks[5] > state
+      close(state)
+    }
+    if (hottest>0) temp=int(hottest)
+    if ("outputs.master" in audio) {
+      split(audio["outputs.master"], channels, ","); vol=int((channels[1]*100+127)/255)
+    }
+    if ("record.mic" in audio) {
+      split(audio["record.mic"], channels, ","); mic=int((channels[1]*100+127)/255)
+    }
+    if ("outputs.master.mute" in audio) volm=audio["outputs.master.mute"]
+    else if ("outputs.master3.mute" in audio) volm=audio["outputs.master3.mute"]
+    if ("record.mic2.mute" in audio) micm=audio["record.mic2.mute"]
+    else if ("record.mic.mute" in audio) micm=audio["record.mic.mute"]
+    if (ac=="TRUE" && bats=="dis") bats="plug"
+    if (ac=="TRUE" && bat==100) bats="full"
+    if (absent) bats="none"
+    printf "ram=%s cpu=%s temp=%s vol=%s volm=%s mic=%s micm=%s bat=%s bats=%s ssid=%s clk=%s\n", ram,cpu,temp,vol,volm,mic,micm,bat,bats,ssid,clk
+  }
+'
