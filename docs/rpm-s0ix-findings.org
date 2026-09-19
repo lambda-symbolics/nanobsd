@@ -1313,8 +1313,9 @@ was zero. A further 45 s hold with hdaudio0 pre-suspended still reached only
 48% PC10, so that isolation did not recover residency. Audio was resumed afterward.
 No firmware floor or 1 W suspend result has been established.
 
-Automatic timeout wake and brightness restoration work. Physical lid/button wake
-and touchpad input still require confirmation on this kernel. The timeout is
-120 s until that validation; use =hw.acpi.sleep.freeze_timeout= for bounded tests
-or zero to wait for an explicit wake. Audio RIRB resume errors and repeat-cycle
-package power are unresolved.
+Automatic timeout wake and brightness restoration work. The user confirmed
+lid-close/open and working touchpad input on kernel 75. The matching log shows
+woke=1 after a 17 s hold, PC10 96%, and SLP_S0 delta zero, without a subsequent
+queued-close resuspend. Set freeze_timeout=0 at boot for normal lid use; a positive
+value enables bounded tests. Power-button wake is not yet physically verified.
+Audio RIRB resume errors and repeat-cycle package power are unresolved.
