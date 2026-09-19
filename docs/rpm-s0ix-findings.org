@@ -1319,3 +1319,27 @@ woke=1 after a 17 s hold, PC10 96%, and SLP_S0 delta zero, without a subsequent
 queued-close resuspend. Set freeze_timeout=0 at boot for normal lid use; a positive
 value enables bounded tests. Power-button wake is not yet physically verified.
 Audio RIRB resume errors and repeat-cycle package power are unresolved.
+
+* UPDATE 42 (2026-09-19): repeat regression is PC3; display-audio responses
+Kernels 79-80 distinguish the missing residency: a first 15 s hold reached
+95-96% PC10 and 0% PC3; the next reached 45-46% PC10 and 51% PC3. The sampled
+SMI counter delta was zero in both holds. A repeat with NVMe suspended still
+spent 54% in PC3. Disabling tickless in kernel 77 yielded 0% PC10, not recovery.
+SLP_S0 stayed zero throughout. Per-LWP snapshots included suspend/resume overhead;
+the rt_timer CPU-time increase does not isolate work during the actual hold.
+
+The RIRB failures are codec 2 (Intel 8086:2812, hdafg1), used for external display
+audio including DisplayPort. Realtek codec 0 responds. During failed codec-2
+commands, CORB read/write pointers match and advance, but RIRB does not advance.
+This is not a stalled command DMA ring. Resume codec presence was 0x1 initially.
+A scoped i915 POWER_DOMAIN_AUDIO reference plus AUD_PIN_BUF_ENABLE changed
+presence to 0x5 but did not restore responses. Restoring the cached audio clock
+(which was zero), explicit HDA link-reset suspension, and reapplying NHI _PS3
+also failed to fix the observed defects. Those behavioral trials were removed.
+Kernel 81 retains the package-state/SMI and failed-codec diagnostics only.
+Remote logs: al76-cycle1/2 through al80-cycle1/2, al77-periodic,
+al79-repeat-nvme; build-al76.log through build-al81.log.
+
+A concurrent agent is changing StumpWM and may compile on the machine. Preserve
+its work; reboot priority belongs to these kernel tests. Awake power measurements
+must account for that load. No true SLP_S0 or 1 W result has been obtained.

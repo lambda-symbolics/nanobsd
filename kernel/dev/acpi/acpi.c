@@ -3225,6 +3225,7 @@ acpi_enter_freeze(void)
 	extern int i915_lispbsd_s0idle;
 	int s0idle_save;
 	uint64_t h_tsc0 = 0, h_pc10_0 = 0, h_s0_0 = 0, h_rapl0 = 0;
+	uint64_t h_pc2, h_pc3, h_pc6, h_pc8, h_smi;
 	UINT64 h_latchsave = 0, h_etr3 = 0;
 	int h_s0r = -1, h_latch_armed = 0, h_latch_cleared = 0;
 	UINT64 ltr_saved = 0;
@@ -3339,6 +3340,11 @@ acpi_enter_freeze(void)
 	h_pc10_0 = acpi_s0_rdmsr(0x632);	/* PC10 residency */
 	h_s0r = acpi_slp_s0_read(&h_s0_0);	/* SLP_S0 residency */
 	h_rapl0 = (uint32_t)acpi_s0_rdmsr(0x611);	/* RAPL pkg energy */
+	h_pc2 = acpi_s0_rdmsr(0x60d);
+	h_pc3 = acpi_s0_rdmsr(0x3f8);
+	h_pc6 = acpi_s0_rdmsr(0x3f9);
+	h_pc8 = acpi_s0_rdmsr(0x630);
+	h_smi = acpi_s0_rdmsr(0x34);
 	/* Arm the C10 PMC latch to capture PMC status at deepest entry. */
 	if (ACPI_SUCCESS(AcpiOsReadMemory(0xfe001c34, &h_latchsave, 32))) {
 		if (ACPI_SUCCESS(AcpiOsWriteMemory(0xfe001c34,
@@ -3373,6 +3379,13 @@ acpi_enter_freeze(void)
 
 		if (dt == 0)
 			dt = 1;
+		aprint_normal_dev(sc->sc_dev,
+		    "s2idle: pc2=%ju%% pc3=%ju%% pc6=%ju%% pc8=%ju%% smi=%u\n",
+		    (uintmax_t)((acpi_s0_rdmsr(0x60d) - h_pc2) * 100 / dt),
+		    (uintmax_t)((acpi_s0_rdmsr(0x3f8) - h_pc3) * 100 / dt),
+		    (uintmax_t)((acpi_s0_rdmsr(0x3f9) - h_pc6) * 100 / dt),
+		    (uintmax_t)((acpi_s0_rdmsr(0x630) - h_pc8) * 100 / dt),
+		    (uint32_t)(acpi_s0_rdmsr(0x34) - h_smi));
 		aprint_normal_dev(sc->sc_dev,
 		    "s2idle: waking (woke=%d) hold pc10=%ju%% tsc=%ju "
 		    "slp_s0=%s status=%d/%d a=%ju b=%ju freq=%ju\n",
