@@ -1,0 +1,17 @@
+#!/bin/sh
+#
+# PROVIDE: lpschedd
+# REQUIRE: DAEMON powerd
+# BEFORE:  LOGIN
+#
+# LISPBSD laptop power governor: drives machdep.lpsched + machdep.hwp.epp.
+
+$_rc_subr_loaded . /etc/rc.subr
+
+name="lpschedd"
+rcvar=$name
+command="/usr/local/sbin/${name}"
+pidfile="/var/run/${name}.pid"
+
+load_rc_config $name
+run_rc_command "$1"
