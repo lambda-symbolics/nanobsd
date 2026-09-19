@@ -92,18 +92,23 @@ only, without loading the configuration or starting X. Source review also
 covered the request pipe, event dispatcher, geometry updates and workspace
 transfer ordering.
 
-The laptop is powered off while travelling. NetBSD compilation, deployment and
-live X validation are pending; SSH attempts are paused. No power measurements or
-runtime test workloads were run during this follow-up.
+Follow-ups `123fb13` and `29b36c5` were deployed over WireGuard on 2026-09-19.
+All three Lisp files compiled in the laptop's SBCL 2.6.5 StumpWM image with no
+warnings or failures. The rc reload succeeded, and installed file checksums
+matched the repository sources. The sampler was restarted as `mag`.
 
-When the laptop is available and live validation is authorized:
+Live inspection confirmed six `strip-group` workspaces, the `:pipe` status
+backend at a three-second interval, one refresher thread, no pending status
+callback and no native mode-line timer. The snapshot timestamp advanced by three
+seconds, and neither WM log grew during deployment. No power measurements or
+application test workloads were run.
 
-1. Back up the installed rc, modules and sampler; install the files listed above.
-2. Compile on the laptop, reload the rc, and restart the sampler for its restored
-   three-second cadence.
-3. Check workspace switching and column transfers, including stacked windows with
-   unequal heights, offscreen focus, resizing and fullscreen. Check status updates
-   and rc reloads for errors in the WM log.
+The six workspaces were empty. Interactive validation of column transfers,
+unequal stack heights, offscreen focus, resizing and fullscreen is still pending.
+
+The pre-follow-up files are backed up under
+`/home/mag/.stumpwm.d/before-followup-29b36c5/`. Staged sources, FASLs and
+`compile-report.sexp` are under `/home/mag/.stumpwm.d/followup-29b36c5/`.
 
 For rollback, restore the backed-up files and restart StumpWM and the sampler.
 Removing a module load from the rc is insufficient to undo dispatcher methods
