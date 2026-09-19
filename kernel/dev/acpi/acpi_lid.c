@@ -147,6 +147,9 @@ acpilid_status_changed(void *arg)
 	 * We still deliver the RELEASED event afterwards so powerd runs the
 	 * lid-open restore hook once userspace has thawed.
 	 */
+	/* Do not queue a close event for powerd while it is frozen. */
+	if (sc->sc_status == 0 && acpi_freeze_in_progress())
+		return;
 	if (sc->sc_status != 0)
 		(void)acpi_freeze_wakeup();
 

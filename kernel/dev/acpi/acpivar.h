@@ -380,6 +380,7 @@ struct acpi_drq		*acpi_res_drq(struct acpi_resources *, int);
 void			acpi_enter_sleep_state(int);
 void	acpi_enter_freeze(void);
 bool	acpi_freeze_wakeup(void);
+bool	acpi_freeze_in_progress(void);
 
 /*
  * MADT.

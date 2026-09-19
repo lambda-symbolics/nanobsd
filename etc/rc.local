@@ -31,3 +31,7 @@ ifconfig iwx0 powersave
 
 # bluetooth off by default (no A2DP on NetBSD anyway); `bluetooth on` to enable
 /usr/local/bin/bluetooth off >/dev/null 2>&1
+
+# Disable unused USB data controllers; run `usb on` when needed.
+/usr/local/bin/usb off >/dev/null 2>&1
+sysctl -w machdep.cidle.tickless=1 >/dev/null 2>&1

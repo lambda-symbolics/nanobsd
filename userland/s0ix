@@ -1,28 +1,33 @@
 #!/bin/sh
-# s2idle deep suspend for the X1 Nano. The KERNEL coordinator owns the whole
-# transition: hw.acpi.sleep.freeze=1 triggers acpi_enter_freeze(), which detaches
-# X, freezes userspace, pmf-suspends xHCI/i915/iwx (preserving GPU RC6 via the
-# i915s0idle latch so the package can reach deep C-states), sends the LPS0 _DSM
-# ENTRY (EC slow-blink LED), and holds until lid-open wakes it IN-KERNEL
-# (acpilid_status_changed -> acpi_freeze_wakeup). This script only manages the
-# panel backlight, which is outside the coordinator.
-export PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin
+# Kernel-coordinated s2idle. Requires the freeze busy-status interface.
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin
+export PATH
 BR=/var/run/s0ix.brightness
+LOCK=/var/run/s0ix.lock
+restore_brightness()
+{
+	b=$(cat "$BR" 2>/dev/null)
+	case "$b" in ''|*[!0-9]*) return ;; esac
+	sysctl -w hw.acpi.acpiout15.brightness="$b" >/dev/null 2>&1
+	sysctl -w hw.acpi.acpiout16.brightness="$b" >/dev/null 2>&1
+}
 case "$1" in
 suspend)
-	sysctl -n hw.acpi.acpiout15.brightness > $BR 2>/dev/null
+	mkdir "$LOCK" 2>/dev/null || exit 0
+	trap 'rmdir "$LOCK"' EXIT
+	sysctl -n hw.acpi.acpiout15.brightness > "$BR" || exit 1
 	sysctl -w hw.acpi.acpiout15.brightness=0 >/dev/null 2>&1
 	sysctl -w hw.acpi.acpiout16.brightness=0 >/dev/null 2>&1
-	sysctl -w hw.acpi.sleep.freeze=1 >/dev/null 2>&1
-	logger -t s0ix "suspend: requested kernel s2idle freeze"
+	if ! sysctl -w hw.acpi.sleep.freeze=1 >/dev/null; then
+		restore_brightness
+		exit 1
+	fi
+	while [ "$(sysctl -n hw.acpi.sleep.freeze)" = 1 ]; do sleep 1; done
+	restore_brightness
+	logger -t s0ix "resumed"
 	;;
 resume)
-	b=$(cat $BR 2>/dev/null)
-	[ -n "$b" ] && {
-		sysctl -w hw.acpi.acpiout15.brightness="$b" >/dev/null 2>&1
-		sysctl -w hw.acpi.acpiout16.brightness="$b" >/dev/null 2>&1
-	}
-	logger -t s0ix "resume: restored brightness $b"
+	restore_brightness
 	;;
 *) echo "usage: s0ix suspend|resume" >&2; exit 1 ;;
 esac

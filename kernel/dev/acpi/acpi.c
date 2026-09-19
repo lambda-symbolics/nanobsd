@@ -265,6 +265,10 @@ static volatile int	acpi_freeze_wake;
 static kmutex_t		acpi_freeze_mtx;
 static kcondvar_t	acpi_freeze_cv;
 static volatile int	acpi_freeze_req;
+static volatile int	acpi_freeze_busy;
+static int		acpi_freeze_timeout = 120;
+static int		acpi_freeze_ltr_ignore;
+static int		acpi_freeze_storage;
 static int		acpi_freeze_thread_started;
 static void		acpi_freeze_thread(void *);
 
@@ -1573,6 +1577,9 @@ acpi_fixed_button_pressed(void *context)
 {
 	struct sysmon_pswitch *smpsw = context;
 
+	if (acpi_freeze_wakeup())
+		return;
+
 	ACPI_DEBUG_PRINT((ACPI_DB_INFO, "%s fixed button pressed\n",
 		(smpsw->smpsw_type != ACPI_EVENT_SLEEP_BUTTON) ?
 		"power" : "sleep"));
@@ -1820,6 +1827,21 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 	    "freeze", SYSCTL_DESCR("Enter s2idle freeze (write 1)"),
 	    sysctl_hw_acpi_freeze, 0, NULL, 0,
 	    CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "freeze_timeout", SYSCTL_DESCR("s2idle test timeout in seconds; 0 waits for wake"),
+	    NULL, 0, &acpi_freeze_timeout, 0, CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "freeze_ltr_ignore", SYSCTL_DESCR("Ignore Tiger Lake IP LTRs during s2idle"),
+	    NULL, 0, &acpi_freeze_ltr_ignore, 0, CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "freeze_storage", SYSCTL_DESCR("Suspend NVMe and drain its disk queues during s2idle"),
+	    NULL, 0, &acpi_freeze_storage, 0, CTL_CREATE, CTL_EOL);
 
 	(void)sysctl_createv(NULL, 0, &snode, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
@@ -2372,6 +2394,15 @@ static bool
 acpi_s2idle_keep(device_t dev)
 {
 	const char *n = device_xname(dev);
+	device_t ancestor;
+
+	/* Quiesce the complete I2C subtree before its LPSS controller. */
+	for (ancestor = dev; ancestor != NULL; ancestor = device_parent(ancestor)) {
+		if (device_is_a(ancestor, "dwiic"))
+			return false;
+		if (acpi_freeze_storage && device_is_a(ancestor, "nvme"))
+			return false;
+	}
 
 	/*
 	 * s2idle: suspend ONLY the display stack (biggest power/heat draw,
@@ -2816,6 +2847,7 @@ static uint64_t acpi_s0_rdmsr(u_int m) { return rdmsr(m); }
 #define NHM_C1_AUTO_DEMOTE		(1ULL << 26)
 #define NHM_C3_AUTO_DEMOTE		(1ULL << 25)
 static uint64_t acpi_cstcfg_saved[MAXCPUS];
+static uint64_t acpi_cstcfg_readback[MAXCPUS];
 static void
 acpi_cstcfg_xc(void *disable, void *unused __unused)
 {
@@ -2837,6 +2869,7 @@ acpi_cstcfg_xc(void *disable, void *unused __unused)
 	} else {
 		wrmsr(MSR_PKG_CST_CONFIG_CONTROL, acpi_cstcfg_saved[idx]);
 	}
+	acpi_cstcfg_readback[idx] = rdmsr(MSR_PKG_CST_CONFIG_CONTROL);
 }
 #define ACPI_S2IDLE_CSTCFG	1
 #else
@@ -3111,11 +3144,10 @@ sysctl_hw_acpi_s0freeze(SYSCTLFN_ARGS)
 }
 
 /*
- * LISPBSD s2idle: drive the platform S0ix-constraint IPs into ACPI D3 via their
- * power resources (_PR3 off + _PS3) -- the platform power-down that PCI D3 alone
- * does NOT do, and what the PMC per-IP low-power REQ_STS gates want (ISH_REQ b7,
- * USB2_SUS_PG b10, MPHY_SUS b22 via the Thunderbolt devices).  state = ACPI D3
- * on suspend, D0 on resume.  Boot NVMe / PEG root (dev6) deliberately excluded.
+ * Apply ACPI device-state methods and target-state resource references after
+ * driver quiescence.  acpi_power_set(D3) enables _PR3 resources, releases the
+ * previous state's references and invokes _PS3; it does not imply D3cold.
+ * Restore resources before resuming drivers.  Storage is excluded.
  */
 static void
 acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
@@ -3133,8 +3165,26 @@ acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
 		0x00070000,	/* Thunderbolt PCIe root port 1 */
 		0x00070002,	/* Thunderbolt PCIe root port 2 */
 	};
+	static ACPI_HANDLE changed[__arraycount(adrs)];
+	static int previous[__arraycount(adrs)];
 	struct acpi_devnode *ad;
 	unsigned i;
+	int old;
+
+	if (state == ACPI_STATE_D0) {
+		for (i = 0; i < __arraycount(adrs); i++) {
+			if (changed[i] == NULL)
+				continue;
+			if (!acpi_power_get(changed[i], &old) || old != previous[i])
+				aprint_normal_dev(sc->sc_dev,
+				    "s2idle: restore adr=0x%x D%d -> %d\n",
+				    adrs[i], previous[i],
+				    (int)acpi_power_set(changed[i], previous[i]));
+			changed[i] = NULL;
+		}
+		return;
+	}
+	memset(changed, 0, sizeof(changed));
 
 	SIMPLEQ_FOREACH(ad, &sc->sc_head, ad_list) {
 		if (ad->ad_devinfo->Type != ACPI_TYPE_DEVICE ||
@@ -3143,6 +3193,17 @@ acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
 		for (i = 0; i < __arraycount(adrs); i++) {
 			if ((uint32_t)ad->ad_devinfo->Address != adrs[i])
 				continue;
+			/* Do not power up devices on resume that were already off. */
+			old = ACPI_STATE_ERROR;
+			if (!acpi_power_get(ad->ad_handle, &old) || old == state) {
+				aprint_normal_dev(sc->sc_dev,
+				    "s2idle: ACPI adr=0x%x current=%d skipped\n",
+				    adrs[i], old);
+				break;
+			}
+			/* Retain the old state even if a resource operation fails partway. */
+			changed[i] = ad->ad_handle;
+			previous[i] = old;
 			aprint_normal_dev(sc->sc_dev,
 			    "s2idle: acpi_power_set adr=0x%x D%d -> %d\n",
 			    adrs[i], state,
@@ -3158,17 +3219,23 @@ acpi_enter_freeze(void)
 	struct acpi_softc *sc = acpi_softc;
 	device_t curdev, parent;
 	deviter_t di;
+	device_t suspended[128];
+	unsigned nsuspended = 0;
+	bool suspend_failed = false;
 	extern int i915_lispbsd_s0idle;
 	int s0idle_save;
 	uint64_t h_tsc0 = 0, h_pc10_0 = 0, h_s0_0 = 0, h_rapl0 = 0;
 	UINT64 h_latchsave = 0, h_etr3 = 0;
-	int h_s0r = -1, h_latch_armed = 0;
+	int h_s0r = -1, h_latch_armed = 0, h_latch_cleared = 0;
+	UINT64 ltr_saved = 0;
+	bool ltr_changed = false;
 
 	if (sc == NULL || sc->sc_sleepstate != ACPI_STATE_S0)
 		return;
 
 	aprint_normal_dev(sc->sc_dev,
 	    "s2idle: freezing (S0-idle, selective suspend)\n");
+	acpi_slp_s0_probe();
 
 	/*
 	 * Arm the wake latch BEFORE any preparation, so a lid-open or button
@@ -3210,15 +3277,27 @@ acpi_enter_freeze(void)
 	     curdev != NULL; curdev = deviter_next(&di)) {
 		if (!device_is_active(curdev) || acpi_s2idle_keep(curdev))
 			continue;
+		if (nsuspended == __arraycount(suspended)) {
+			suspend_failed = true;
+			break;
+		}
+		suspended[nsuspended++] = curdev;
 		if (pmf_device_suspend(curdev, PMF_Q_NONE))
 			aprint_normal("s2idle: suspend %s\n",
 			    device_xname(curdev));
-		else
+		else {
 			aprint_normal("s2idle: suspend %s FAILED\n",
 			    device_xname(curdev));
+			suspend_failed = true;
+			break;
+		}
 	}
 	deviter_release(&di);
 	KERNEL_UNLOCK_ONE(NULL);
+	if (suspend_failed) {
+		acpi_freeze_active = 0;
+		goto resume_devices;
+	}
 
 	/* Platform power-down of the S0ix-constraint IPs (ISH/USB2/TB/...). */
 	acpi_s2idle_powerdown(sc, ACPI_STATE_D3);
@@ -3239,7 +3318,23 @@ acpi_enter_freeze(void)
 		    (int)!!(cst & NHM_C3_AUTO_DEMOTE));
 	}
 	xc_wait(xc_broadcast(0, acpi_cstcfg_xc, (void *)1, NULL));
+	{
+		struct cpu_info *ci;
+		CPU_INFO_ITERATOR cii;
+		for (CPU_INFO_FOREACH(cii, ci))
+			aprint_normal_dev(sc->sc_dev,
+			    "s2idle: cpu%u CST_CFG readback=0x%jx\n",
+			    cpu_index(ci),
+			    (uintmax_t)acpi_cstcfg_readback[cpu_index(ci)]);
+	}
 #endif
+	/* Match the Intel PMC suspend policy, with restoration before device resume. */
+	if (acpi_freeze_ltr_ignore &&
+	    ACPI_SUCCESS(AcpiOsReadMemory(0xfe001b0c, &ltr_saved, 32)))
+		ltr_changed = ACPI_SUCCESS(AcpiOsWriteMemory(0xfe001b0c,
+		    ltr_saved | 0x007fffff, 32));
+	aprint_normal_dev(sc->sc_dev, "s2idle: LTR ignore requested=%d applied=%d\n",
+	    acpi_freeze_ltr_ignore, ltr_changed);
 	h_tsc0 = acpi_s0_rdmsr(0x10);		/* TSC */
 	h_pc10_0 = acpi_s0_rdmsr(0x632);	/* PC10 residency */
 	h_s0r = acpi_slp_s0_read(&h_s0_0);	/* SLP_S0 residency */
@@ -3249,55 +3344,69 @@ acpi_enter_freeze(void)
 		if (ACPI_SUCCESS(AcpiOsWriteMemory(0xfe001c34,
 		    h_latchsave & ~(1U << 31), 32)))
 			h_latch_armed = 1;
-		if (ACPI_SUCCESS(AcpiOsReadMemory(0xfe001048, &h_etr3, 32)))
-			(void)AcpiOsWriteMemory(0xfe001048,
-			    h_etr3 | (1U << 28), 32);
+		if (ACPI_SUCCESS(AcpiOsReadMemory(0xfe001048, &h_etr3, 32)) &&
+		    ACPI_SUCCESS(AcpiOsWriteMemory(0xfe001048,
+		    h_etr3 | (1U << 28), 32)))
+			h_latch_cleared = 1;
 	}
 
-	/*
-	 * Hold with a 1 s coordinator wake interval (was hz/10 = 100 ms).
-	 * The 100 ms poll pinned CPU0 out of deep idle and capped PC10 ~48%;
-	 * at 1 s all cores can sustain long MWAIT -> higher PC10 -> lower
-	 * package power.  kpause keeps a clock-based ~300 s auto-thaw fallback
-	 * (safe: no hard clock-freeze), and wake latency stays <= 1 s.
-	 */
-	{ int _i; for (_i = 0; _i < 300 && acpi_freeze_wake == 0; _i++)
-		kpause("s2idle", false, MAX(1, hz), NULL); }
+	/* A bounded hold is useful for tests; zero timeout waits for a real wake. */
+	{
+		int elapsed = 0;
+		while (acpi_freeze_wake == 0 &&
+		    (acpi_freeze_timeout <= 0 || elapsed < acpi_freeze_timeout)) {
+			kpause("s2idle", false, MAX(1, hz), NULL);
+			elapsed++;
+		}
+	}
 	acpi_freeze_active = 0;
 
+	if (ltr_changed && ACPI_FAILURE(AcpiOsWriteMemory(0xfe001b0c,
+	    ltr_saved, 32)))
+		aprint_error_dev(sc->sc_dev, "s2idle: LTR restore failed\n");
 	{
 		uint64_t tsc1 = acpi_s0_rdmsr(0x10);
 		uint64_t pc10_1 = acpi_s0_rdmsr(0x632);
 		uint64_t s0_1 = 0, dt = tsc1 - h_tsc0;
 
-		(void)acpi_slp_s0_read(&s0_1);
+		int s0r1 = acpi_slp_s0_read(&s0_1);
+
 		if (dt == 0)
 			dt = 1;
 		aprint_normal_dev(sc->sc_dev,
-		    "s2idle: waking (woke=%d) hold pc10=%ju%% slp_s0 d=%ju\n",
+		    "s2idle: waking (woke=%d) hold pc10=%ju%% tsc=%ju "
+		    "slp_s0=%s status=%d/%d a=%ju b=%ju freq=%ju\n",
 		    acpi_freeze_wake,
 		    (uintmax_t)((pc10_1 - h_pc10_0) * 100 / dt),
-		    (uintmax_t)(h_s0r == 0 ? (uint32_t)(s0_1 - h_s0_0) : 0));
+		    (uintmax_t)dt, h_s0r == 0 && s0r1 == 0 ? "ok" : "UNAVAIL",
+		    h_s0r, s0r1, (uintmax_t)h_s0_0, (uintmax_t)s0_1,
+		    (uintmax_t)acpi_slp_s0_freq);
+		if (h_s0r == 0 && s0r1 == 0)
+			aprint_normal_dev(sc->sc_dev, "s2idle: slp_s0 delta=%u\n",
+			    (uint32_t)(s0_1 - h_s0_0));
 	}
 	{
 		UINT64 w[6];
-		unsigned pi;
+		unsigned pi, valid = 0;
 		uint32_t de = (uint32_t)((uint32_t)acpi_s0_rdmsr(0x611) -
 		    (uint32_t)h_rapl0);
 		uint32_t esu = (uint32_t)((acpi_s0_rdmsr(0x606) >> 8) & 0x1f);
 
 		for (pi = 0; pi < 6; pi++) {
 			w[pi] = 0;
-			(void)AcpiOsReadMemory(0xfe001c3c + pi * 4, &w[pi], 32);
+			if (ACPI_SUCCESS(AcpiOsReadMemory(0xfe001c3c + pi * 4,
+			    &w[pi], 32)))
+				valid |= 1U << pi;
 		}
 		aprint_normal_dev(sc->sc_dev,
 		    "s2idle: PMClatch %08x %08x %08x %08x %08x %08x "
-		    "rapl_dE=%u esu=%u armed=%d\n",
+		    "rapl_dE=%u esu=%u armed=%d cleared=%d valid=0x%x\n",
 		    (uint32_t)w[0], (uint32_t)w[1], (uint32_t)w[2],
 		    (uint32_t)w[3], (uint32_t)w[4], (uint32_t)w[5],
-		    de, esu, h_latch_armed);
-		if (h_latch_armed)
-			(void)AcpiOsWriteMemory(0xfe001c34, h_latchsave, 32);
+		    de, esu, h_latch_armed, h_latch_cleared, valid);
+		if (h_latch_armed && ACPI_FAILURE(AcpiOsWriteMemory(0xfe001c34,
+		    h_latchsave, 32)))
+			aprint_error_dev(sc->sc_dev, "s2idle: latch restore failed\n");
 	}
 #ifdef ACPI_S2IDLE_CSTCFG
 	xc_wait(xc_broadcast(0, acpi_cstcfg_xc, NULL, NULL));
@@ -3306,13 +3415,19 @@ acpi_enter_freeze(void)
 	acpi_lps0_exit();
 
 	acpi_wakedev_commit(sc, ACPI_STATE_S0);
+	/* Power resources must be available before any driver accesses its BAR. */
+	acpi_s2idle_powerdown(sc, ACPI_STATE_D0);
 
+resume_devices:
+	/* Reverse only this transaction, preserving devices already suspended. */
 	KERNEL_LOCK(1, NULL);
 	for (curdev = deviter_first(&di, DEVITER_F_ROOT_FIRST);
 	     curdev != NULL; curdev = deviter_next(&di)) {
-		if (device_is_active(curdev) || !device_is_enabled(curdev))
-			continue;
-		if (acpi_s2idle_keep(curdev))
+		unsigned si;
+		for (si = 0; si < nsuspended; si++)
+			if (suspended[si] == curdev)
+				break;
+		if (si == nsuspended)
 			continue;
 		parent = device_parent(curdev);
 		if (parent != NULL && !device_is_active(parent))
@@ -3328,9 +3443,6 @@ acpi_enter_freeze(void)
 	KERNEL_UNLOCK_ONE(NULL);
 
 	i915_lispbsd_s0idle = s0idle_save;	/* restore RC6-preserve latch */
-
-	/* Restore the S0ix-constraint IPs to D0 (mirror of the suspend power-down). */
-	acpi_s2idle_powerdown(sc, ACPI_STATE_D0);
 
 	acpi_s0_freeze_userspace(false);	/* thaw userspace once devices are back */
 
@@ -3376,6 +3488,11 @@ sysctl_hw_acpi_wake(SYSCTLFN_ARGS)
 	return 0;
 }
 
+bool
+acpi_freeze_in_progress(void)
+{
+	return acpi_freeze_busy != 0 || acpi_freeze_active != 0;
+}
 static void
 acpi_freeze_thread(void *arg)
 {
@@ -3384,12 +3501,16 @@ acpi_freeze_thread(void *arg)
 		while (acpi_freeze_req == 0)
 			cv_wait(&acpi_freeze_cv, &acpi_freeze_mtx);
 		acpi_freeze_req = 0;
+		acpi_freeze_busy = 1;
 		mutex_exit(&acpi_freeze_mtx);
 
 		if (acpi_freeze_mode)
 			acpi_s0_freeze_test();
 		else
 			acpi_enter_freeze();
+		mutex_enter(&acpi_freeze_mtx);
+		acpi_freeze_busy = 0;
+		mutex_exit(&acpi_freeze_mtx);
 	}
 }
 
@@ -3428,7 +3549,7 @@ sysctl_hw_acpi_freeze(SYSCTLFN_ARGS)
 	if (acpi_softc == NULL)
 		return ENOSYS;
 
-	t = 0;
+	t = acpi_freeze_busy || acpi_freeze_req;
 	node = *rnode;
 	node.sysctl_data = &t;
 
@@ -3452,7 +3573,12 @@ sysctl_hw_acpi_freeze(SYSCTLFN_ARGS)
 		}
 		if (acpi_freeze_thread_started != 0) {
 			mutex_enter(&acpi_freeze_mtx);
+			if (acpi_freeze_busy || acpi_freeze_req) {
+				mutex_exit(&acpi_freeze_mtx);
+				return EBUSY;
+			}
 			acpi_freeze_req = 1;
+			acpi_freeze_busy = 1;
 			cv_signal(&acpi_freeze_cv);
 			mutex_exit(&acpi_freeze_mtx);
 		}

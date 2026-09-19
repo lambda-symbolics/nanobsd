@@ -1267,9 +1267,54 @@ Linux's TGL decoder) internal PLL/clock/fabric conditions, plus w5 wake polarity
 These do not move under any OS action and are the firmware-internal "S0ix's own
 consequences" (chicken-and-egg: they clear on S0ix entry, which they gate).
 
-** CONCLUSION
-2.02 W (from 7.3 W idle, 72% cut; package 0.17 W, PC10 97%, LED, lid-wired) is the
-achievable NetBSD floor.  ~1 W / SLP_S0 is FIRMWARE-WALLED: the last mode0
-requirements are unmapped internal PLL/fabric bits with no OS lever.  A Linux boot
-(unavailable) or BIOS "Sleep State"/Thunderbolt-disable are the only remaining
-angles to confirm whether ANY OS reaches SLP_S0 on this exact unit+firmware.
+** Superseded conclusion
+The 2.02 W result is a measurement, not a demonstrated NetBSD floor. Unnamed
+PMC bits do not establish firmware ownership.
+
+* UPDATE 40 (2026-09-19): driver-managed LPSS and valid measurement
+Kernels 72-74 suspend the full dwiic subtree through PMF, including an ihidev
+workqueue guard and interrupt masking. Resume restores ACPI resources before
+callbacks and LPSS reset/remap registers after PCI D0. Initial clean holds
+reach 95-97% PC10 with LPSS_PG and IS_D3 set. SLP_S0 is still zero with valid
+initial/final reads, explicit LPIT probing, and six successful latch reads.
+Per-CPU readback confirms 0x74008008 -> 0x70008008 on all eight logical CPUs.
+
+Kernel 73 adds fixed-event power-button wake, suppresses lid-close events during
+freeze, exposes busy status, and restores brightness after every wake path.
+The automatic-wake test restored both brightness controls to 20. Kernel 74
+restores only ACPI states actually changed during the transaction.
+
+Measurements:
+- Kernel 73: 28.450 -> 28.370 Wh over 128 s, ~2.25 W including transition overhead.
+- Kernel 74 first hold: PC10 97%, package ~0.18 W, SLP_S0 delta zero.
+- Kernel 74 second hold with LTR-ignore: SLP_S0 zero, PC10 48%. This is confounded
+  by being the second cycle, not an isolated LTR A/B.
+Use battery energy differences over elapsed time, not an immediate post-resume
+rate sample. Disable DPMS/screensaver and fix brightness for screen-on tests.
+Audio RIRB timeouts on resume are an outstanding defect.
+
+* UPDATE 41 (2026-09-19): kernel 75, idle measurement and repeat-cycle defect
+Kernel 75 records attempted PMF suspensions and resumes only that transaction's
+subtree, root first. It aborts on PMF suspend failure and unwinds attempted
+callbacks. Pre-suspended USB controllers were correctly left suspended in tests.
+The optional freeze_storage=1 path drains ld queues and suspends NVMe through PMF.
+A 90 s hold reached 97% PC10, package about 0.20 W, but valid SLP_S0 delta zero.
+Battery 26.980 -> 26.910 Wh over 98 s gives 2.57 W including transitions.
+Storage suspension and LTR-ignore are disabled by default.
+
+Screen-on idle with brightness 20, screensaver/DPMS disabled and USB off:
+26.790 -> 26.640 Wh over 125 s = 4.32 W average. Steady reported rates were
+3.738-3.873 W. Restore the 300 s DPMS policy after measuring; enable USB with
+=usb on= when needed. The boot configuration now applies USB-off and tickless.
+
+A subsequent 120 s hold fell to 50% PC10 and approximately 2.36 W package power.
+Battery 26.640 -> 26.540 Wh over 128 s = 2.81 W including transitions. SLP_S0
+was zero. A further 45 s hold with hdaudio0 pre-suspended still reached only
+48% PC10, so that isolation did not recover residency. Audio was resumed afterward.
+No firmware floor or 1 W suspend result has been established.
+
+Automatic timeout wake and brightness restoration work. Physical lid/button wake
+and touchpad input still require confirmation on this kernel. The timeout is
+120 s until that validation; use =hw.acpi.sleep.freeze_timeout= for bounded tests
+or zero to wait for an explicit wake. Audio RIRB resume errors and repeat-cycle
+package power are unresolved.

@@ -357,14 +357,6 @@ dwiic_pci_power(struct dwiic_softc *dwsc, bool power)
 	pcireg_t pmreg, csr;
 	uint32_t reset, rlo, rhi;
 
-	csr = pci_conf_read(sc->sc_pc, sc->sc_ptag, PCI_COMMAND_STATUS_REG);
-	reset = lpss_read(sc, LPSS_RESET);
-	rlo = lpss_read(sc, LPSS_REMAP_LO);
-	rhi = lpss_read(sc, LPSS_REMAP_HI);
-	aprint_debug_dev(dwsc->sc_dev,
-	    "status 0x%x reset 0x%x rlo 0x%x rhi 0x%x\n",
-	    csr, reset, rlo, rhi);
-
 	if (!power)
 		lpss_write(sc, LPSS_CLKGATE, LPSS_CLKGATE_CTRL_OFF);
 	if (pci_get_capability(sc->sc_pc, sc->sc_ptag, PCI_CAP_PWRMGMT,
@@ -378,7 +370,23 @@ dwiic_pci_power(struct dwiic_softc *dwsc, bool power)
 		    pci_conf_read(sc->sc_pc, sc->sc_ptag, pmreg + PCI_PMCSR)));
 	}
 	if (power) {
+		/* The LPSS BAR is accessible only after restoring PCI D0. */
+		csr = pci_conf_read(sc->sc_pc, sc->sc_ptag, PCI_COMMAND_STATUS_REG);
+		reset = lpss_read(sc, LPSS_RESET);
+		rlo = lpss_read(sc, LPSS_REMAP_LO);
+		rhi = lpss_read(sc, LPSS_REMAP_HI);
+		aprint_debug_dev(dwsc->sc_dev,
+		    "status 0x%x reset 0x%x rlo 0x%x rhi 0x%x\n",
+		    csr, reset, rlo, rhi);
 		lpss_write(sc, LPSS_CLKGATE, LPSS_CLKGATE_CTRL_ON);
+		/* ACPI power removal can lose LPSS reset and address-remap state. */
+		lpss_write(sc, LPSS_RESET, LPSS_RESET_CTRL_REL);
+		lpss_write(sc, LPSS_REMAP_LO,
+		    pci_conf_read(sc->sc_pc, sc->sc_ptag, PCI_BAR0));
+		lpss_write(sc, LPSS_REMAP_HI,
+		    pci_conf_read(sc->sc_pc, sc->sc_ptag, PCI_BAR0 + 4));
+		aprint_debug_dev(dwsc->sc_dev, "LPSS restored reset=0x%x\n",
+		    lpss_read(sc, LPSS_RESET));
 	}
 	return true;
 }

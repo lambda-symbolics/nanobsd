@@ -1,5 +1,5 @@
 #!/bin/sh
-# powerd(8) lid hook -> true S0ix deep suspend. $2 = pressed(closed)/released(open).
+# powerd lid hook: pressed=closed, released=open. Kernel handles s2idle wake.
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
 logger -p info -t lid "lid: $*"
 case "$2" in
