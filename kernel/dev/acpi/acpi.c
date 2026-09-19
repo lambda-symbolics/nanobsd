@@ -3204,9 +3204,15 @@ acpi_enter_freeze(void)
 			    h_etr3 | (1U << 28), 32);
 	}
 
-	/* Enter the hold only if no wake arrived during preparation. */
-	{ int _i; for (_i = 0; _i < 3000 && acpi_freeze_wake == 0; _i++)
-		kpause("s2idle", false, MAX(1, hz / 10), NULL); }
+	/*
+	 * Hold with a 1 s coordinator wake interval (was hz/10 = 100 ms).
+	 * The 100 ms poll pinned CPU0 out of deep idle and capped PC10 ~48%;
+	 * at 1 s all cores can sustain long MWAIT -> higher PC10 -> lower
+	 * package power.  kpause keeps a clock-based ~300 s auto-thaw fallback
+	 * (safe: no hard clock-freeze), and wake latency stays <= 1 s.
+	 */
+	{ int _i; for (_i = 0; _i < 300 && acpi_freeze_wake == 0; _i++)
+		kpause("s2idle", false, MAX(1, hz), NULL); }
 	acpi_freeze_active = 0;
 
 	{

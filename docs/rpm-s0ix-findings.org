@@ -1114,3 +1114,14 @@ interval (hz/10 -> 1s, for higher PC10); it is otherwise #68.  Kernels available
 LESSON: autonomous kernel-change->reboot cycles are unsafe on this box (reboot hangs
 ~half the time, needs a human hard-cycle).  Do kernel iteration only with the user
 present; overnight = analysis/prep only.
+
+* UPDATE 34 (2026-09-19 ~10:00): #69 hold-interval -> 2.68 W; gates stable
+Kernel #69 lengthened the coordinator hold interval hz/10 -> 1 s (10x fewer CPU0
+wakeups, safe: kpause auto-thaw + <=1 s wake latency retained).
+Real freeze on BATTERY (charge-delta, 322 s): 2.68 W (was ~3.3 W on #66/67); the
+win is reduced wake OVERHEAD (PC10 unchanged ~48%).
+PMClatch unchanged: b57c0074 c43de3ef 00001eef 00001040 3d17fa6d 000aaaaa
+  => SLP_S0 gates stable: w4 b7 ISH_REQ, b10 USB2_SUS_PG, b22 MPHY_SUS; w5 timer.
+NVMe already autonomously in PS4/4mW (not the MPHY blocker; MPHY = shared PCIe/TB
+PHY link-state).  Raw PMCSR D3 on ISH does NOT clear b7 -> needs ACPI _PS3.
+NEXT (user present): suspend-time clock-freeze for w5 + PC10; then _PS3 ISH/USB2.
