@@ -7,5 +7,5 @@ export PATH
 out=/tmp/.statusline
 while :; do
 	statusbar > "$out.tmp" 2>/dev/null && mv "$out.tmp" "$out"
-	sleep 3
+	sleep 60
 done
