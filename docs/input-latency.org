@@ -1,0 +1,55 @@
+#+title: Input latency investigation
+
+* 2026-09-19: custom tickless idle A/B/A
+The user reports intermittent typing stalls and repeated keys, including on AC.
+Kernel92, uncomposited X/StumpWM, TSC timecounter, hz100, cidle hint0x60,
+maxskip100, minskip4, forceskip0. This measurement was on battery.
+The built-in keyboard is pckbd0/wskbd0 on IRQ1; ihidev0 is the touchpad.
+
+Compile userland/timer-latency.c with cc -O2 -Wall -Wextra -Werror.
+Run four concurrent copies pinned with schedctl -A to CPUs0,1,4,7, each
+requesting500 relative nanosleeps of50ms. Measure with CLOCK_MONOTONIC.
+Only machdep.cidle.tickless changed between the three batches.
+
+| Mode        | CPU0 max ms | CPU1 max ms | CPU4 max ms | CPU7 max ms |
+|-------------+-------------+-------------+-------------+-------------|
+| tickless1 A |     196.705 |     189.174 |     102.744 |      95.345 |
+| tickless0 B |      60.261 |      60.243 |      60.165 |      60.079 |
+| tickless1 A |     158.128 |     197.351 |      91.700 |     102.423 |
+
+Mean durations were61.5-63.5ms with tickless,60.0ms without. Both tickless
+batches had five sleeps exceeding the request by100ms; the periodic batch
+had none. The roughly60ms periodic baseline includes100Hz timer granularity.
+Remote logs /root/al92-timer-MODE-CPU retain the final batch of each mode;
+Autolith job exec:144 records all three batches. This reproduces timer
+latency degradation, not the physical repeated-key symptom or multisecond
+stalls. No scheduler replacement is justified by these measurements.
+
+Source findings:
+- lapic_oneshot() replaces the current periodic countdown with a full number
+  of ticks, without preserving the partial period already elapsed.
+- lapic_oneshot_done() floors elapsed time to whole ticks and starts a fresh
+  full periodic tick, discarding the remainder on early wake.
+- cidle_idle_tickless() replays hardclock ticks with interrupts disabled
+  before servicing the pending device IRQ. The precise contribution of each
+  mechanism to the measured tail latency has not been isolated.
+
+* Deployed mitigation and suspend verification
+/etc/rc.local sets machdep.cidle.tickless=0 for awake operation. Deep MWAIT
+idle is still enabled. userland/s0ix saves the awake tickless value, enables
+it before requesting suspend, and restores the saved value through its EXIT
+trap, including error exits. Normal lid handling uses this script.
+
+Leaving tickless0 during the hold was tested: PC10=0% and only478 SLP_S0
+ticks in30s. Therefore it must be enabled during low-power suspend.
+With the scoped script, two30s holds recorded228930/230305 SLP_S0 ticks
+(27.93/28.10s) and PC10=96/97%. After both resumes: tickless0, brightness20,
+software GPU refs0, RC6 advancing. Logs: /root/al92-scoped-tickless-1/2.
+freeze_timeout and freeze_storage are0. Both shell files pass NetBSD sh -n;
+live/archive SHA256 hashes match. Backups: /root/s0ix.before-periodic and
+/root/rc.local.before-periodic. Kernel92 is unchanged.
+
+The awake-power cost of periodic ticks has not been measured. Physical typing
+confirmation is the next necessary check. If stalls persist, correlate PS/2
+interrupt delivery, X event timestamps and client scheduling around an actual
+stall before attempting a scheduler redesign.

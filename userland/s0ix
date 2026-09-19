@@ -4,6 +4,13 @@ PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin
 export PATH
 BR=/var/run/s0ix.brightness
 LOCK=/var/run/s0ix.lock
+TICKLESS=
+restore_tickless()
+{
+	case "$TICKLESS" in
+	0|1) sysctl -w machdep.cidle.tickless="$TICKLESS" >/dev/null ;;
+	esac
+}
 restore_brightness()
 {
 	b=$(cat "$BR" 2>/dev/null)
@@ -14,7 +21,10 @@ restore_brightness()
 case "$1" in
 suspend)
 	mkdir "$LOCK" 2>/dev/null || exit 0
-	trap 'rmdir "$LOCK"' EXIT
+	trap 'restore_tickless; rmdir "$LOCK"' EXIT
+	TICKLESS=$(sysctl -n machdep.cidle.tickless) || exit 1
+	# The low-power hold needs tickless idle; restore the awake policy on exit.
+	sysctl -w machdep.cidle.tickless=1 >/dev/null || exit 1
 	sysctl -n hw.acpi.acpiout15.brightness > "$BR" || exit 1
 	sysctl -w hw.acpi.acpiout15.brightness=0 >/dev/null 2>&1
 	sysctl -w hw.acpi.acpiout16.brightness=0 >/dev/null 2>&1

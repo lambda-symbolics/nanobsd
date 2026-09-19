@@ -34,7 +34,8 @@ ifconfig iwx0 powersave
 
 # Disable unused USB data controllers; run `usb on` when needed.
 /usr/local/bin/usb off >/dev/null 2>&1
-sysctl -w machdep.cidle.tickless=1 >/dev/null 2>&1
+# Use periodic ticks awake; s0ix enables tickless only across suspend.
+sysctl -w machdep.cidle.tickless=0 >/dev/null 2>&1
 
 # Wait for lid/button wake; set a positive timeout for bounded suspend tests.
 sysctl -w hw.acpi.sleep.freeze_timeout=0 >/dev/null 2>&1
