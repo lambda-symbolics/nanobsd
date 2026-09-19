@@ -3105,6 +3105,45 @@ sysctl_hw_acpi_s0freeze(SYSCTLFN_ARGS)
 	return 0;
 }
 
+/*
+ * LISPBSD s2idle: drive the platform S0ix-constraint IPs into ACPI D3 via their
+ * power resources (_PR3 off + _PS3) -- the platform power-down that PCI D3 alone
+ * does NOT do, and what the PMC per-IP low-power REQ_STS gates want (ISH_REQ b7,
+ * USB2_SUS_PG b10, MPHY_SUS b22 via the Thunderbolt devices).  state = ACPI D3
+ * on suspend, D0 on resume.  Boot NVMe / PEG root (dev6) deliberately excluded.
+ */
+static void
+acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
+{
+	static const uint32_t adrs[] = {
+		0x00120000,	/* ISH (sensor hub) */
+		0x00140000,	/* xHCI (USB2) */
+		0x00160000,	/* HECI / CSME */
+		0x00080000,	/* GNA */
+		0x000d0002,	/* Thunderbolt DMA 1 */
+		0x000d0003,	/* Thunderbolt DMA 2 */
+		0x00070000,	/* Thunderbolt PCIe root port 1 */
+		0x00070002,	/* Thunderbolt PCIe root port 2 */
+	};
+	struct acpi_devnode *ad;
+	unsigned i;
+
+	SIMPLEQ_FOREACH(ad, &sc->sc_head, ad_list) {
+		if (ad->ad_devinfo->Type != ACPI_TYPE_DEVICE ||
+		    (ad->ad_devinfo->Valid & ACPI_VALID_ADR) == 0)
+			continue;
+		for (i = 0; i < __arraycount(adrs); i++) {
+			if ((uint32_t)ad->ad_devinfo->Address != adrs[i])
+				continue;
+			aprint_normal_dev(sc->sc_dev,
+			    "s2idle: acpi_power_set adr=0x%x D%d -> %d\n",
+			    adrs[i], state,
+			    (int)acpi_power_set(ad->ad_handle, state));
+			break;
+		}
+	}
+}
+
 void
 acpi_enter_freeze(void)
 {
@@ -3172,6 +3211,9 @@ acpi_enter_freeze(void)
 	}
 	deviter_release(&di);
 	KERNEL_UNLOCK_ONE(NULL);
+
+	/* Platform power-down of the S0ix-constraint IPs (ISH/USB2/TB/...). */
+	acpi_s2idle_powerdown(sc, ACPI_STATE_D3);
 
 	sc->sc_sleepstate = ACPI_STATE_S3;
 	acpi_wakedev_commit(sc, ACPI_STATE_S3);
@@ -3278,6 +3320,9 @@ acpi_enter_freeze(void)
 	KERNEL_UNLOCK_ONE(NULL);
 
 	i915_lispbsd_s0idle = s0idle_save;	/* restore RC6-preserve latch */
+
+	/* Restore the S0ix-constraint IPs to D0 (mirror of the suspend power-down). */
+	acpi_s2idle_powerdown(sc, ACPI_STATE_D0);
 
 	acpi_s0_freeze_userspace(false);	/* thaw userspace once devices are back */
 
