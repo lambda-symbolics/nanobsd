@@ -1172,3 +1172,31 @@ NEXT: _PS3 for ISH (+ its power resources) is the safest tractable gate -> kerne
 change but no timekeeping risk (auto-thaw intact).  Then whether MPHY/USB2 cascade
 once ISH clears (the input-vs-consequence question for Astra).  MPHY (TB PHY) remains
 the likely hard wall -- NetBSD has no Thunderbolt power management.
+
+* UPDATE 37 (2026-09-19 ~11:00): constraint ACPI-D3 -> PC10 97%, 2.02 W (package basically done)
+Kernel #70 adds acpi_s2idle_powerdown(): during the freeze, drive the S0ix-
+constraint IPs to ACPI D3 via their POWER RESOURCES (acpi_power_set = _PR3-off +
+_PS3), not just PCI D3.  Devices: ISH 0x120000, xHCI 0x140000, HECI 0x160000,
+GNA 0x080000, TB-DMA 0x0d0002/3, TB root ports 0x070000/2.
+acpi_power_set results: succeeded (ret 1) for ISH, GNA, HECI, TB-DMA-f2; FAILED
+(ret 0, no power resources) for xHCI, TB-DMA-f3, TB root ports.  Clean resume,
+all devices sane afterwards.
+
+** Measured (real freeze on battery, 321 s)
+  BATTERY 2.019 W  (was 2.68 W on #69)   -- 72% below the 7.3 W idle baseline
+  PC10 = 97%       (was 48%!)            -- the constraint ACPI-D3 removed whatever
+                                            kept the package shallow (ISH/GNA活动)
+  RAPL package dE=900414 esu=14 = ~55 J / 321 s = ~0.17 W  -- package now MINIMAL
+  slp_s0 = 0 STILL; PMClatch unchanged (b57c0074 c43de3ef 00001eef 00001040
+           3d17fa6d 000aaaaa) -> w4 gates ISH_REQ/USB2_SUS_PG/MPHY_SUS STILL unmet.
+
+** Where the remaining ~1 W gap is
+  Package is done (~0.17 W).  The ~1.85 W left is the PLATFORM floor: DRAM not in
+  self-refresh + board/VRM.  That is exactly what SLP_S0 gates (rails off, DRAM SR).
+  So 1 W now hinges ENTIRELY on reaching SLP_S0 -- and ACPI D3 of the IPs (even when
+  acpi_power_set succeeds, e.g. ISH) does NOT set the PMC per-IP REQ_STS gates.
+  Those gates need the IP's own low-power handshake (ISH firmware sleep; USB2 PHY PG;
+  Thunderbolt PHY suspend), which NetBSD doesn't drive.  MPHY (TB) remains the wall.
+NEXT: 2.02 W is the shipped result; 1 W needs the SLP_S0 platform transition (DRAM
+self-refresh), gated by IP low-power handshakes NetBSD lacks -- Astra: is that
+reachable, or firmware/TB-PM-bound?
