@@ -98,6 +98,7 @@ __KERNEL_RCSID(0, "$NetBSD: kern_timeout.c,v 1.79 2023/10/08 13:23:05 ad Exp $")
 #include <sys/cpu.h>
 #include <sys/kmem.h>
 #include <sys/sdt.h>
+#include <sys/lpsched.h>
 
 #ifdef DDB
 #include <machine/db_machdep.h>
@@ -406,6 +407,35 @@ callout_destroy(callout_t *cs)
 }
 
 /*
+ * lpsched_coalesce:
+ *
+ *	Callout coalescing.  While the governor has a slack grid set, round
+ *	the absolute expiry of a non-precise callout up to the grid so that
+ *	timers fire in clusters and idle CPUs see longer uninterrupted gaps
+ *	(callout_next_ticks() reports the rounded time, so the tickless idle
+ *	path skips further too).  Only ever delays, never fires early.
+ */
+static inline int
+lpsched_coalesce(const callout_impl_t *c, int to_ticks, int now)
+{
+	int abs, grid;
+	u_int rem;
+
+	abs = to_ticks + now;
+	if (__predict_true(lpsched_enabled == 0 || lpsched_coalesce_ms == 0) ||
+	    to_ticks == 0 || (c->c_flags & CALLOUT_PRECISE) != 0)
+		return abs;
+	grid = mstohz(lpsched_coalesce_ms);
+	if (grid <= 1)
+		return abs;
+	/* Unsigned modulus so a wrapped tick counter still rounds upward. */
+	rem = (u_int)abs % (u_int)grid;
+	if (rem != 0)
+		abs += grid - (int)rem;
+	return abs;
+}
+
+/*
  * callout_schedule_locked:
  *
  *	Schedule a callout to run.  The function and argument must
@@ -436,7 +466,7 @@ callout_schedule_locked(callout_impl_t *c, kmutex_t *lock, int to_ticks)
 	if ((c->c_flags & CALLOUT_PENDING) != 0) {
 		/* Leave on existing CPU. */
 		old_time = c->c_time;
-		c->c_time = to_ticks + occ->cc_ticks;
+		c->c_time = lpsched_coalesce(c, to_ticks, occ->cc_ticks);
 		if (c->c_time - old_time < 0) {
 			CIRCQ_REMOVE(&c->c_list);
 			CIRCQ_INSERT(&c->c_list, &occ->cc_todo);
@@ -449,13 +479,13 @@ callout_schedule_locked(callout_impl_t *c, kmutex_t *lock, int to_ticks)
 	if ((c->c_flags & CALLOUT_BOUND) != 0 || cc == occ ||
 	    !mutex_tryenter(cc->cc_lock)) {
 		/* Leave on existing CPU. */
-		c->c_time = to_ticks + occ->cc_ticks;
+		c->c_time = lpsched_coalesce(c, to_ticks, occ->cc_ticks);
 		c->c_flags |= CALLOUT_PENDING;
 		CIRCQ_INSERT(&c->c_list, &occ->cc_todo);
 	} else {
 		/* Move to this CPU. */
 		c->c_cpu = cc;
-		c->c_time = to_ticks + cc->cc_ticks;
+		c->c_time = lpsched_coalesce(c, to_ticks, cc->cc_ticks);
 		c->c_flags |= CALLOUT_PENDING;
 		CIRCQ_INSERT(&c->c_list, &cc->cc_todo);
 		mutex_spin_exit(cc->cc_lock);
