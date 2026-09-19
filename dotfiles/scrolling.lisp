@@ -314,7 +314,7 @@
 (defun strip-enable ()
   "Adopt existing windows in number order without restarting applications."
   (setf *float-window-border* 1 *float-window-title-height* 1
-        *mouse-focus-policy* :click *default-group-type* 'strip-group)
+        *mouse-focus-policy* :sloppy *default-group-type* 'strip-group)
   (dolist (group (screen-groups (current-screen)))
     (unless (typep group 'strip-group)
       (let ((windows (sort (copy-list (group-windows group)) #'< :key #'window-number))

@@ -43,7 +43,9 @@ Use Super as Mod.
 | Super + Shift + P | Panel off |
 
 Default column width is 30%, with 16-pixel gaps and one-pixel borders.
-Use keyboard or click focus; pointer motion does not change the viewport.
+Focus follows the cursor (`:sloppy`); entering a window focuses it and reveals
+its column as needed. Use uppercase keysyms for shifted letters in the rc, for
+example `s-F` for Super+Shift+F.
 
 ## Idle work
 
@@ -103,8 +105,15 @@ callback and no native mode-line timer. The snapshot timestamp advanced by three
 seconds, and neither WM log grew during deployment. No power measurements or
 application test workloads were run.
 
-The six workspaces were empty. Interactive validation of column transfers,
-unequal stack heights, offscreen focus, resizing and fullscreen is still pending.
+The initial deployment had six empty workspaces. Subsequent user checks found
+incorrect shifted-letter bindings and missing pointer focus. Both were corrected,
+compiled without warnings on NetBSD, loaded, and confirmed in the live keymap and
+focus-policy setting after a reboot. The preceding rc and scrolling module are
+backed up under `/home/mag/.stumpwm.d/before-shift-focus-fix/`.
+
+The user also reported delayed client redraw after stacking/unstacking, resolved
+by changing focus. Its cause is not yet established; further interactive layout
+validation is pending.
 
 The pre-follow-up files are backed up under
 `/home/mag/.stumpwm.d/before-followup-29b36c5/`. Staged sources, FASLs and

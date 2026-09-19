@@ -123,23 +123,23 @@
  "s-period"         "strip-expel"
  "s-r"              "strip-width preset"
  "s-f"              "strip-width max"
- "s-S-f"            "strip-fullscreen"
- "s-S-c"            "strip-center"
+ "s-F"              "strip-fullscreen"
+ "s-C"              "strip-center"
  "s-d"              "strip-width -"
  "s-w"              "strip-width +"
- "s-S-d"            "strip-height -"
- "s-S-w"            "strip-height +"
+ "s-D"              "strip-height -"
+ "s-W"              "strip-height +"
  "s-Tab"            "next"
  "s-S-Tab"          "prev"
  "Print"            "screenshot"
- "s-S-e"            "quit"
- "s-S-p"            "monitors-off"
+ "s-E"              "quit"
+ "s-P"              "monitors-off"
  "s-p"              "launcher"
  "s-Return"         "terminal"
  "s-S-Return"       "exec if command -v dfly >/dev/null 2>&1; then alacritty -e dfly; else alacritty; fi"
  "s-u"              "exec if command -v e >/dev/null 2>&1; then e; else emacsclient -c -a emacs; fi"
  "s-o"              "monitors-on"
- "s-S-o"            "monitors-off"
+ "s-O"              "monitors-off"
  "s-semicolon"      "colon"
  "s-x"              "eval"
  "XF86AudioRaiseVolume" "volume-up"
@@ -149,8 +149,11 @@
  "XF86MonBrightnessUp"   "brightness-up"
  "XF86MonBrightnessDown" "brightness-down")
 
-;; Remove the old frame-deletion binding when reloading a tiling configuration.
-(undefine-key *top-map* (kbd "s-S-r"))
+;; X translates Shift+letter to the uppercase keysym, without a Shift modifier.
+;; Remove the old spellings and obsolete frame-deletion binding on live reload.
+(dolist (key '("s-S-f" "s-S-c" "s-S-d" "s-S-w" "s-S-e" "s-S-p" "s-S-o"
+               "s-S-r" "s-R"))
+  (undefine-key *top-map* (kbd key)))
 
 ;;;; -- Mode line (waybar-style right side) --
 ;;; statusbard publishes /tmp/.statusline. A worker reads it; the event thread
