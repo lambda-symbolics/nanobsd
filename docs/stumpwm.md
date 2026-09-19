@@ -111,9 +111,16 @@ compiled without warnings on NetBSD, loaded, and confirmed in the live keymap an
 focus-policy setting after a reboot. The preceding rc and scrolling module are
 backed up under `/home/mag/.stumpwm.d/before-shift-focus-fix/`.
 
-The user also reported delayed client redraw after stacking/unstacking, resolved
-by changing focus. Its cause is not yet established; further interactive layout
-validation is pending.
+The user reported delayed client redraw after stacking/unstacking, resolved by
+changing focus. An isolated two-window Alacritty check on 2026-09-19 showed
+immediate resize/redraw events and correctly repainted screenshots for stacking
+and keyboard unstacking. That run did not reproduce the reported failure.
+
+SSH became unavailable during the separate kernel-83 reboot before a second
+check with the pointer outside both windows could run. Continue with that case
+and offscreen columns when connectivity returns. Diagnostic client class:
+`ALRedraw`; event logs and screenshots: `/home/mag/.stumpwm.d/redraw-*`.
+The redraw cause is unresolved, and no speculative repaint workaround was added.
 
 The pre-follow-up files are backed up under
 `/home/mag/.stumpwm.d/before-followup-29b36c5/`. Staged sources, FASLs and
