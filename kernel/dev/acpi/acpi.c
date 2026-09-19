@@ -3300,11 +3300,11 @@ acpi_enter_freeze(void)
 		goto resume_devices;
 	}
 
-	/* Platform power-down of the S0ix-constraint IPs (ISH/USB2/TB/...). */
+	/* Notify the actual system state before runtime power-resource changes. */
+	acpi_wakedev_prepare(sc, ACPI_STATE_S0);
 	acpi_s2idle_powerdown(sc, ACPI_STATE_D3);
 
 	sc->sc_sleepstate = ACPI_STATE_S3;
-	acpi_wakedev_commit(sc, ACPI_STATE_S3);
 
 	acpi_lps0_enter();
 

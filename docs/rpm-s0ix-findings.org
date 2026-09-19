@@ -1343,3 +1343,52 @@ al79-repeat-nvme; build-al76.log through build-al81.log.
 A concurrent agent is changing StumpWM and may compile on the machine. Preserve
 its work; reboot priority belongs to these kernel tests. Awake power measurements
 must account for that load. No true SLP_S0 or 1 W result has been obtained.
+
+* UPDATE 43 (2026-09-19): platform isolation and incorrect S3 wake target
+Disabling BIOS PCIe tunneling did not fix repeat-cycle residency: kernel 81
+measured PC10 96% then 48%, with SLP_S0 zero. This setting does not establish
+that all Thunderbolt functionality is disabled.
+
+Kernel 82 cycled platform exit/entry without resuming drivers or thawing
+userspace. PC10 fell from 94% to 43%. Later driver-subtree stages were confounded
+by this partial-cycle state and do not identify the original culprit.
+
+Kernel 83 split the platform steps inside one userspace freeze, with 8 s holds:
+| Stage | Preceding action             | PC10 | PC3 | RAPL raw delta |
+|-------+------------------------------+------+-----+----------------|
+|     0 | Original suspension          |  96% |  0% |          22389 |
+|     1 | No-op                        |  97% |  0% |          21891 |
+|     2 | LPS0 DSM exit/entry           |  96% |  1% |          23236 |
+|     3 | Wake-device exit/entry       |  96% |  0% |          34511 |
+|     4 | Power-resource restore/down  |  51% | 47% |         407966 |
+SLP_S0 and sampled SMI deltas were zero throughout. Energy units are 2^-14 J.
+Logs: /root/al81-pcie-off-cycle1/2, /root/al82-isolation,
+/root/al83-platform-isolation.
+
+The current firmware SSDT (remote /var/tmp/al83-acpi/ssdt10.dsl) implements
+TDM0._DSW by saving its system-state argument in SD3C. TBT0._OFF invokes TG0F
+only when SD3C is zero. Our s2idle path supplied S3; commit(S0) only cleared
+wake masks, without resetting _DSW. This can inhibit runtime power-down after
+resource restoration. TDM0 also declares identical _PR0 and _PR3 packages;
+the native power backend enables the target package then disables the old
+package, including shared entries. A successful D0 return therefore does not
+prove that all target resources are on.
+
+Kernel 84 separates wake preparation from commit(S0) cleanup and passes the
+actual S0 target before platform power-down. The same five stages reached
+95%, 93%, 95%, 95%, 94% PC10; the resource stage used 20463 RAPL units rather
+than 407966. A subsequent full 15 s suspend reached 96% PC10 and approximately
+0.16 W package power. Logs: al84-platform-isolation and al84-cycle2.
+
+Kernel 85 removes the temporary cycle sysctl, staged holds and driver-subtree
+probe machinery. It is installed as the default, with native Werror builds
+passing. Two normal suspends reached 94% PC10 over 15 s and 96% over 60 s;
+the second measured 176625 RAPL units, approximately 0.18 W package power.
+PC3 and sampled SMI deltas were zero. Both resumed, and timeout was restored
+to zero. Logs: al85-cycle1/2; build-al84.log and build-al85.log.
+
+SLP_S0 is still zero. The laptop is on AC and charging, so these tests do not
+provide a new battery-power figure. Battery measurement and physical lid-wake
+revalidation of the changed wake policy require the user to unplug AC and
+operate the lid. Brightness is 20; DPMS is enabled at 300 s. The general
+shared-power-resource accounting defect is separate work, not repaired here.
