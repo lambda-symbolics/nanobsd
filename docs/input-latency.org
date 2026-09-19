@@ -35,8 +35,8 @@ Source findings:
   mechanism to the measured tail latency has not been isolated.
 
 * Deployed mitigation and suspend verification
-/etc/rc.local sets machdep.cidle.tickless=0 for awake operation. Deep MWAIT
-idle is still enabled. userland/s0ix saves the awake tickless value, enables
+The initial mitigation set machdep.cidle.tickless=0 in /etc/rc.local.
+Deep MWAIT idle was enabled. userland/s0ix saves the awake tickless value, enables
 it before requesting suspend, and restores the saved value through its EXIT
 trap, including error exits. Normal lid handling uses this script.
 
@@ -49,7 +49,13 @@ freeze_timeout and freeze_storage are0. Both shell files pass NetBSD sh -n;
 live/archive SHA256 hashes match. Backups: /root/s0ix.before-periodic and
 /root/rc.local.before-periodic. Kernel92 is unchanged.
 
-The awake-power cost of periodic ticks has not been measured. Physical typing
-confirmation is the next necessary check. If stalls persist, correlate PS/2
-interrupt delivery, X event timestamps and client scheduling around an actual
-stall before attempting a scheduler redesign.
+The awake-power cost of periodic ticks has not been measured.
+
+* Follow-up: tickless re-enabled without Picom
+The user reports that typing stalls/repeated keys no longer seem to occur
+and confirms that physical lid close/open works. They suspect Picom removal
+rather than periodic ticks resolved the input symptom and requested tickless
+again. Set machdep.cidle.tickless=1 live and at boot for this comparison;
+Picom is not running. The suspend script preserves the selected awake policy.
+The timer A/B/A results above do not establish the cause of the original
+input symptom. Typing feedback with tickless re-enabled is pending.
