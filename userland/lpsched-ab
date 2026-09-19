@@ -13,13 +13,19 @@
 #   SAMPLE  seconds to sample counters                    default 20
 #   EPP     fixed EPP for the mechanism runs              default: current
 #
-# usage: lpsched-ab [quick]     (quick: SETTLE=20 SAMPLE=10, numbers rough)
+# usage: lpsched-ab [quick|coalesce]
+#   quick     SETTLE=20 SAMPLE=10, rough numbers
+#   coalesce  stock/coalesce=50 alternated twice + pack=2, SETTLE=60 SAMPLE=30
+#             (to confirm or refute a single coalesce reading)
 
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin:/usr/local/bin; export PATH
 
-SETTLE=${SETTLE:-50}
-SAMPLE=${SAMPLE:-20}
-[ "$1" = quick ] && { SETTLE=20; SAMPLE=10; }
+MODE=${1:-full}
+case $MODE in
+quick)    SETTLE=${SETTLE:-20}; SAMPLE=${SAMPLE:-10} ;;
+coalesce) SETTLE=${SETTLE:-60}; SAMPLE=${SAMPLE:-30} ;;
+*)        SETTLE=${SETTLE:-50}; SAMPLE=${SAMPLE:-20} ;;
+esac
 
 if ! sysctl -q machdep.lpsched.enabled >/dev/null 2>&1; then
 	echo "machdep.lpsched not present in this kernel" >&2; exit 1
@@ -71,12 +77,20 @@ run() {		# run <label> <enabled> <pack> <coalesce_ms> <epp>
 	measure "$1"
 }
 
-echo "lpsched A/B: settle ${SETTLE}s, sample ${SAMPLE}s, EPP $EPP (daemon was ${DAEMON})"
-run "stock"            0 0  0 $EPP
-run "pack=1"           1 1  0 $EPP
-run "pack=2"           1 2  0 $EPP
-run "coalesce=50"      1 0 50 $EPP
-run "pack2+coal50"     1 2 50 $EPP
-run "powersave(240)"   1 2 50 240
+echo "lpsched A/B ($MODE): settle ${SETTLE}s, sample ${SAMPLE}s, EPP $EPP (daemon was ${DAEMON})"
+if [ $MODE = coalesce ]; then
+	run "stock"            0 0  0 $EPP
+	run "coalesce=50"      1 0 50 $EPP
+	run "stock(2)"         0 0  0 $EPP
+	run "coalesce=50(2)"   1 0 50 $EPP
+	run "pack=2"           1 2  0 $EPP
+else
+	run "stock"            0 0  0 $EPP
+	run "pack=1"           1 1  0 $EPP
+	run "pack=2"           1 2  0 $EPP
+	run "coalesce=50"      1 0 50 $EPP
+	run "pack2+coal50"     1 2 50 $EPP
+	run "powersave(240)"   1 2 50 240
+fi
 restore
 echo "restored: enabled=$ORIG_EN pack=$ORIG_PACK coalesce=$ORIG_COAL epp=$ORIG_EPP daemon=$DAEMON"

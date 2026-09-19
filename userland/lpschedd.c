@@ -46,6 +46,7 @@
 #include <util.h>
 
 #define	AC_FILE		"/var/run/lpsched.ac"
+#define	EPP_FILE	"/var/run/lpsched.epp0"	/* EPP found by the first instance */
 #define	SOCK_PATH	"/var/run/lpsched.sock"
 
 #define	DOWNSHIFT_SAMPLES	3	/* polls a lower profile must persist */
@@ -163,6 +164,32 @@ write_ac_file(int ac)
 	fclose(fp);
 }
 
+static int
+read_epp_file(int *val)
+{
+	FILE *fp;
+	int rv;
+
+	fp = fopen(EPP_FILE, "r");
+	if (fp == NULL)
+		return -1;
+	rv = (fscanf(fp, "%d", val) == 1) ? 0 : -1;
+	fclose(fp);
+	return rv;
+}
+
+static void
+write_epp_file(int val)
+{
+	FILE *fp;
+
+	fp = fopen(EPP_FILE, "w");
+	if (fp == NULL)
+		return;
+	fprintf(fp, "%d\n", val);
+	fclose(fp);
+}
+
 static void
 apply_profile(enum profile p)
 {
@@ -254,6 +281,8 @@ cleanup(void)
 	sysctl_set("machdep.lpsched.coalesce_ms", 0);
 	sysctl_set("machdep.lpsched.fgpid", 0);
 	sysctl_set("machdep.hwp.epp", orig_epp);
+	if (!dryrun)
+		unlink(EPP_FILE);
 	if (sockfd != -1)
 		close(sockfd);
 	unlink(SOCK_PATH);
@@ -300,8 +329,17 @@ main(int argc, char **argv)
 	signal(SIGINT, on_signal);
 	signal(SIGHUP, SIG_IGN);
 
-	if (sysctl_get("machdep.hwp.epp", &orig_epp) == -1)
-		orig_epp = 128;
+	/*
+	 * Remember the EPP we found.  A restart while a profile is active
+	 * must not adopt our own setting as the "original"; the first
+	 * instance's value lives in EPP_FILE until a clean exit removes it
+	 * (/var/run is cleared at boot, when sysctl.conf sets EPP anyway).
+	 */
+	if (read_epp_file(&orig_epp) == -1) {
+		if (sysctl_get("machdep.hwp.epp", &orig_epp) == -1)
+			orig_epp = 128;
+		write_epp_file(orig_epp);
+	}
 
 	ac = read_ac_file();
 	if (ac == -1) {
@@ -323,6 +361,15 @@ main(int argc, char **argv)
 		if (poll(&pfd, sockfd == -1 ? 0 : 1, timeout) > 0 &&
 		    (pfd.revents & POLLIN))
 			handle_socket(&fgpid);
+
+		/*
+		 * The WM only reports focus gains, so the last PID goes stale
+		 * when that window closes; drop it once the process is gone.
+		 */
+		if (fgpid != 0 && kill(fgpid, 0) == -1 && errno == ESRCH) {
+			fgpid = 0;
+			sysctl_set("machdep.lpsched.fgpid", 0);
+		}
 
 		c = read_ac_file();
 		if (c != -1)
