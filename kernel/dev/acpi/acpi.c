@@ -2824,12 +2824,17 @@ acpi_cstcfg_xc(void *disable, void *unused __unused)
 
 	if (idx >= MAXCPUS)
 		return;
+	/*
+	 * CFG_LOCK (bit15) covers only bits 15:0; the C1/C3 auto-demote enables
+	 * (bits 26/25) are OUTSIDE the lock and ARE writable even when locked.
+	 * Linux's TGL PMC s2idle hook clears bit26 unconditionally.  Clear and
+	 * restore unconditionally; the caller reads back to confirm.
+	 */
 	if (disable != NULL) {
 		acpi_cstcfg_saved[idx] = v;
-		if ((v & PKG_CST_CFG_LOCK) == 0)
-			wrmsr(MSR_PKG_CST_CONFIG_CONTROL,
-			    v & ~(NHM_C1_AUTO_DEMOTE | NHM_C3_AUTO_DEMOTE));
-	} else if ((acpi_cstcfg_saved[idx] & PKG_CST_CFG_LOCK) == 0) {
+		wrmsr(MSR_PKG_CST_CONFIG_CONTROL,
+		    v & ~(NHM_C1_AUTO_DEMOTE | NHM_C3_AUTO_DEMOTE));
+	} else {
 		wrmsr(MSR_PKG_CST_CONFIG_CONTROL, acpi_cstcfg_saved[idx]);
 	}
 }
@@ -3116,6 +3121,9 @@ static void
 acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
 {
 	static const uint32_t adrs[] = {
+		0x00150000,	/* LPSS I2C0 -> LPSS_PG (w1.22, mode0 REQUIRED) */
+		0x00150003,	/* LPSS I2C3 -> LPSS_PG */
+		0x00050000,	/* IPU / image sensor -> IS_D3 (w2.8, mode0 REQUIRED) */
 		0x00120000,	/* ISH (sensor hub) */
 		0x00140000,	/* xHCI (USB2) */
 		0x00160000,	/* HECI / CSME */

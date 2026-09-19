@@ -1234,3 +1234,42 @@ FAST EMPIRICAL TEST (proposed to user, not yet run): disable Thunderbolt (+ISH) 
 BIOS, re-run the freeze, check if MPHY_SUS/ISH_REQ clear and SLP_S0 arms -> ~1 W.
 This sidesteps the driver work by removing the devices; it is the quickest way to
 learn whether ~1 W is attainable on this unit at all.
+
+* UPDATE 39 (2026-09-19 ~11:30): Astra's decode was right — cleared LPSS_PG+IS_D3; SLP_S0 wall = UNMAPPED firmware bits
+Astra corrected U33-37: ISH_REQ(w4.7)/USB2_SUS_PG(w4.10)/MPHY_SUS(w4.22) are NOT
+required for mode0 (I wrongly treated clear-but-unrequired bits as blockers).  The
+real mode0 gates were LPSS_PG(w1.22) and IS_D3(w2.8), which the #70 coordinator had
+dropped.  Also fixed: C1 auto-demote (MSR 0xe2 bit26) IS writable -- CFG_LOCK(bit15)
+covers only bits15:0 -- my lock-check wrongly skipped it (kernel #71 clears it uncond).
+
+** Cleared the two real gates via RAW PMCSR D3 (acpi_power_set does NOT do it)
+acpi_power_set (=_PR3-off+_PS3) succeeds but does NOT set the PMC d3/pg bits.
+Raw PMCSR D3 (pcictl 0x84=3) on LPSS I2C 21:0/21:3 + ISH/GNA/HECI/TB-DMA DOES:
+  w1: c43de3ef -> c47de3ef  => LPSS_PG (bit22) MET
+  w2: 00001eef -> 00001fef  => IS_D3   (bit8)  MET
+Tradeoff: raw-D3 (dwiic driver fights the yanked controller) drops PC10 97%->48%,
+power 2.02->2.87 W.  Since SLP_S0 did not arm, that is a net loss -> reverted s0ix
+to the acpi_power_set path (kernel #70/#71) = 2.02 W / PC10 97% for shipping.
+
+** DEFINITIVE mode0 unmet (authoritative _DSM func1 req [U20] vs current latch)
+  req0  757c0236 807c01ef 0000112c 00000000 183fe805 aaa00000
+  stat  b57c0074 c47de3ef 00001fef 00001040 3d17fa6d 000aaaaa
+  UNMET = req & ~stat:
+    w0 = 0x40000202  (bits 1, 9, 30)   -- UNMAPPED in tgl_clocksource_status_map
+    w1 = 0            (LPSS_PG met)
+    w2 = 0            (IS_D3 met)
+    w3 = 0
+    w4 = 0x00280000  (bits 19, 21)     -- UNMAPPED in tgl_vnn_misc_status_map
+    w5 = 0xaaa00000  (Int wake POLARITY -- Intel selftest excludes these)
+=> Every NAMED / OS-reachable mode0 requirement is now MET.  SLP_S0 remains 0,
+blocked ONLY by w0 bits 1/9/30 + w4 bits 19/21 -- all UNMAPPED (unnamed even in
+Linux's TGL decoder) internal PLL/clock/fabric conditions, plus w5 wake polarity.
+These do not move under any OS action and are the firmware-internal "S0ix's own
+consequences" (chicken-and-egg: they clear on S0ix entry, which they gate).
+
+** CONCLUSION
+2.02 W (from 7.3 W idle, 72% cut; package 0.17 W, PC10 97%, LED, lid-wired) is the
+achievable NetBSD floor.  ~1 W / SLP_S0 is FIRMWARE-WALLED: the last mode0
+requirements are unmapped internal PLL/fabric bits with no OS lever.  A Linux boot
+(unavailable) or BIOS "Sleep State"/Thunderbolt-disable are the only remaining
+angles to confirm whether ANY OS reaches SLP_S0 on this exact unit+firmware.
