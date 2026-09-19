@@ -1125,3 +1125,29 @@ PMClatch unchanged: b57c0074 c43de3ef 00001eef 00001040 3d17fa6d 000aaaaa
 NVMe already autonomously in PS4/4mW (not the MPHY blocker; MPHY = shared PCIe/TB
 PHY link-state).  Raw PMCSR D3 on ISH does NOT clear b7 -> needs ACPI _PS3.
 NEXT (user present): suspend-time clock-freeze for w5 + PC10; then _PS3 ISH/USB2.
+
+* UPDATE 35 (2026-09-19 ~11:00): MPHY_SUS is the decisive SLP_S0 wall (Thunderbolt PHY)
+Reboot-free probing on #69 pinned down the remaining SLP_S0 gates precisely:
+  - NVMe PCIe link is FULLY L1.2-configured on BOTH ends (root port dev6 L1SS
+    ctl1=0x40692d1f + ASPM L1 in LinkCtl; endpoint pci1 L1SS ctl1=0x4069000f +
+    ASPM L1 @PCIe cap 0xc0).  NVMe is autonomously in PS3/PS4 (4-50mW).  So the
+    NVMe lane is NOT the MPHY blocker.
+  - Thunderbolt root ports dev7 f0/f2: ASPM L1 enabled, NO L1SS cap (no L1.2),
+    no device attached.  The kernel does NOT suspend them (they're bridges, not in
+    the s2idle suspend set).
+  - TEST: raw-D3 the TB root ports (7:0/7:2 @0xa4) + TB-DMA + full quiesce, then
+    diagnostic freeze -> w4 latch 0x3d17fa2d: MPHY_SUS (bit22) STILL 0, ISH_REQ
+    (bit7) STILL 0.  PCI D3 of the TB root ports does NOT power down the ModPHY.
+CONCLUSION: MPHY_SUS requires the Thunderbolt/USB4 ModPHY to actually suspend,
+which needs TB/USB4 subsystem power management (firmware/driver) that NetBSD does
+not implement -- PCI D3 of the root ports is insufficient, and the TB ports lack
+L1SS so their links can't reach L1.2.  ISH_REQ needs ACPI _PS3 (not PCI D3).
+=> ~1 W via SLP_S0 is NOT reachable on NetBSD as-is: it is gated by MPHY_SUS
+(Thunderbolt PHY suspend) with no OS lever, plus ISH _PS3, USB2 power-gate, and the
+timer clock-freeze.  The clock-freeze is orthogonal (helps PC10/package power, ~2.2W)
+but cannot clear MPHY.  Best achieved: 2.68 W true suspend (LED, lid-wired, resumes).
+
+OPEN FOR ASTRA: is MPHY_SUS_REQ_STS an INPUT (ModPHY must be made to suspend by a
+TB/USB4 PM action NetBSD lacks) or a PMC OUTPUT that would assert once timer+ISH+USB2
+are met (consequence-chain)?  If the latter, clearing the OS-reachable gates might
+cascade to SLP_S0.  If the former, 1 W needs TB PHY PM (major driver work) or firmware.
