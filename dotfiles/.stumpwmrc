@@ -306,3 +306,6 @@
 
 ;;;; -- Scrolling columns --
 (load (merge-pathnames ".stumpwm.d/scrolling.lisp" (user-homedir-pathname)))
+
+;;;; -- lpsched: tell the laptop power governor which window has focus --
+(load (merge-pathnames ".stumpwm.d/lpsched.lisp" (user-homedir-pathname)))
