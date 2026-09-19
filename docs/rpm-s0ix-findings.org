@@ -1200,3 +1200,37 @@ all devices sane afterwards.
 NEXT: 2.02 W is the shipped result; 1 W needs the SLP_S0 platform transition (DRAM
 self-refresh), gated by IP low-power handshakes NetBSD lacks -- Astra: is that
 reachable, or firmware/TB-PM-bound?
+
+* UPDATE 38 (2026-09-19 ~11:45): ASTRA BRIEF — the last watt (2.02 W -> ~1 W)
+State: 7.3 W idle -> 2.02 W frozen (kernel #70), package RAPL ~0.17 W, PC10 97%.
+The package is DONE.  The remaining ~1.85 W is the PLATFORM domain and it will only
+drop with the SLP_S0 transition (DRAM self-refresh + rail/PHY gating).  SLP_S0 is
+gated by exactly 3 PMC vnn_misc REQ_STS bits that neither PCI-D3 nor ACPI-D3
+(acpi_power_set, even when it succeeds) clears:
+  b7  ISH_REQ        - ISH never issues its low-power request (NetBSD loads no ISH
+                       firmware/driver; ACPI D3 of the node does not set the bit).
+  b10 USB2_SUS_PG    - USB2 controller PHY not system-power-gated (xHCI U3 suspend
+                       and ACPI D3 both insufficient; no ACPI power resource on xHCI).
+  b22 MPHY_SUS       - Thunderbolt/USB4 ModPHY not suspended; TB roots have no L1SS,
+                       acpi_power_set on them FAILS (no power resources), raw D3 no-op.
+                       The TB PHY is also likely drawing real power while up (part of
+                       the 1.85 W), so this is both a gate AND a consumer.
+
+QUESTIONS FOR ASTRA:
+1. Are these 3 REQ_STS bits INPUTS the OS must satisfy per-IP, or does the PMC assert
+   them itself once the others + LPS0 ENTRY are in place (consequence chain)?  PC10 is
+   now 97% and w1/w2/w3 met, so if it were a consequence it should have fired.
+2. ISH: is there an OS-reachable way to make ISH assert low-power without a full ISH
+   stack -- an ACPI _DSM/_PS3-cold, a PMC "func disable", or does it need ISH FW D0i3?
+3. USB2_SUS_PG: what actually sets it -- a PCH USB2 PHY power-gate register, or the
+   xHCI runtime-PM D3cold path?  (NetBSD xhci_suspend only drives ports to U3.)
+4. MPHY/Thunderbolt: is TB PHY suspend achievable from the OS at all on TGL (a TB CM/
+   NHI action, an ACPI method), or is BIOS-disable-Thunderbolt the only lever?  Would
+   disabling TB in BIOS auto-satisfy MPHY_SUS AND remove the TB PHY's standing power?
+5. Is the LPS0 _DSM GET_DEVICE_CONSTRAINTS (Intel uuid func1) worth querying to get the
+   firmware's exact required device list + D-states, and would enforcing them help?
+
+FAST EMPIRICAL TEST (proposed to user, not yet run): disable Thunderbolt (+ISH) in
+BIOS, re-run the freeze, check if MPHY_SUS/ISH_REQ clear and SLP_S0 arms -> ~1 W.
+This sidesteps the driver work by removing the devices; it is the quickest way to
+learn whether ~1 W is attainable on this unit at all.
