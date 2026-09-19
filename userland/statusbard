@@ -1,11 +1,11 @@
 #!/bin/sh
-# statusbard: write the status line to /tmp/.statusline every few seconds so the
-# StumpWM mode-line can read it with a single cheap file read (never forking on
-# the WM event thread). Started from ~/.xinitrc.
+# statusbard: publish a status snapshot every three seconds. The StumpWM worker
+# reads it and queues changed snapshots through the WM's request pipe.
+# Started from ~/.xinitrc.
 PATH=/usr/local/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin
 export PATH
 out=/tmp/.statusline
 while :; do
 	statusbar > "$out.tmp" 2>/dev/null && mv "$out.tmp" "$out"
-	sleep 60
+	sleep 3
 done

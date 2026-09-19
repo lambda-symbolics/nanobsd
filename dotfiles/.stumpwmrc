@@ -153,18 +153,25 @@
 (undefine-key *top-map* (kbd "s-S-r"))
 
 ;;;; -- Mode line (waybar-style right side) --
-;;; A background daemon (/usr/local/bin/statusbard, started from ~/.xinitrc)
-;;; refreshes /tmp/.statusline; the mode-line only reads that file, so a redraw
-;;; never forks a subprocess on the event thread.  Colours match ~/.config/waybar.
+;;; statusbard publishes /tmp/.statusline. A worker reads it; the event thread
+;;; formats an in-memory snapshot and repaints only when the text changes.
 
 (defvar *sb-file* "/tmp/.statusline")
 
-(defun sb-read ()
-  "Return the cached status line, or \"\" if it isn't there yet."
+(defvar *sb-cache* "")
+
+(defun sb-read-file ()
+  "Read the sampler's atomically replaced snapshot, retaining it on I/O errors."
   (handler-case
       (with-open-file (s *sb-file* :if-does-not-exist nil)
-        (if s (or (read-line s nil nil) "") ""))
-    (error () "")))
+        (if s (or (read-line s nil nil) *sb-cache*) *sb-cache*))
+    (error () *sb-cache*)))
+
+(defun sb-read ()
+  "Return the snapshot without filesystem I/O on the X event thread."
+  *sb-cache*)
+
+(setf *sb-cache* (sb-read-file))
 
 (defun sb-get (line key &optional (default "?"))
   "Value of KEY=... in the whitespace-separated status LINE."
@@ -221,7 +228,7 @@
 (setf *mode-line-border-width* 0)
 (setf *mode-line-pad-x* 2)
 (setf *mode-line-pad-y* 1)
-(setf *mode-line-timeout* 60)
+(setf *mode-line-timeout* 3)
 ;; left side unchanged (groups + windows); ^> right-justifies the waybar blocks
 (setf *screen-mode-line-format*
       (list "^B[%g]^b %W ^> " '(:eval (sb-right))))
@@ -232,64 +239,67 @@
 (run-shell-command "hsetroot -solid '#0A0A0A'")
 (run-shell-command "pgrep -x alacritty >/dev/null || { rm -f /tmp/alacritty.sock; alacritty --daemon --socket /tmp/alacritty.sock; }")
 
-;;;; ==== LISPBSD battery fix: mode-line refresh without the SBCL busy-poll (2026-09-17) ====
-;;;; StumpWM's periodic *mode-line-timer* keeps the event loop in a finite-timeout
-;;;; xlib:event-listen, which this SBCL/NetBSD build busy-polls (~871k syscalls/s, ~2.5 W).
-;;;; Cancel that timer and refresh through a separate X connection once a minute.
-;;;; Send an Expose event, without clearing the bar or interrupting the WM thread.
+;;;; -- Pipe-based status delivery --
+;;; Keep the existing finite-timeout busy-poll workaround on this NetBSD build.
+;;; The worker sleeps; the WM blocks in select and wakes on its request pipe.
+;;; Unlike a synthetic Expose, update-all-mode-lines skips unchanged contents.
+(when *mode-line-timer*
+  (cancel-timer *mode-line-timer*)
+  (setf *mode-line-timer* nil))
+
 (defvar *lispbsd-ml-thread* nil)
+(defvar *lispbsd-ml-backend* nil)
+(defparameter *lispbsd-ml-interval* 3)
+(defvar *lispbsd-ml-lock* (sb-thread:make-mutex :name "status delivery"))
+(defvar *lispbsd-ml-pending* nil)
+(defvar *lispbsd-ml-next-line* "")
+
 (defun lispbsd-ml-window-id ()
-  ;; Retire the old fixed-15s refresher cooperatively during the first live reload.
-  (when (and (equal (sb-thread:thread-name sb-thread:*current-thread*) "lispbsd-ml-refresher")
-             (not (eq sb-thread:*current-thread* *lispbsd-ml-thread*)))
-    (sb-thread:return-from-thread nil))
-  (ignore-errors
-    (let* ((head (current-head))
-           (ml (and head (head-mode-line head))))
-      (when ml (xlib:window-id (mode-line-window ml))))))
+  "Cooperative exit point for the obsolete X-connection refresher on live reload."
+  (when (equal (sb-thread:thread-name sb-thread:*current-thread*) "lispbsd-ml-refresher")
+    (sb-thread:return-from-thread nil)))
 
-(defun lispbsd-ml-right ()
-  "Return the right-side status blocks without debug I/O."
-  (sb-right))
+(defun lispbsd-apply-status ()
+  "Apply the latest queued snapshot on the WM thread."
+  (when (sb-thread:with-mutex (*lispbsd-ml-lock*)
+          (setf *lispbsd-ml-pending* nil)
+          (unless (string= *lispbsd-ml-next-line* *sb-cache*)
+            (setf *sb-cache* *lispbsd-ml-next-line*)
+            t))
+    (update-all-mode-lines)))
 
-(setf *screen-mode-line-format*
-      (list "^B[%g]^b %W ^> " '(:eval (lispbsd-ml-right))))
-(ignore-errors (update-all-mode-lines))
+(defun lispbsd-queue-status (line)
+  "Coalesce updates into one pending callback on StumpWM's request pipe."
+  (when (sb-thread:with-mutex (*lispbsd-ml-lock*)
+          (setf *lispbsd-ml-next-line* line)
+          (when (and (not *lispbsd-ml-pending*) (not (string= line *sb-cache*)))
+            (setf *lispbsd-ml-pending* t)))
+    (handler-case
+        (call-in-main-thread #'lispbsd-apply-status)
+      (error (c)
+        (sb-thread:with-mutex (*lispbsd-ml-lock*)
+          (setf *lispbsd-ml-pending* nil))
+        (warn "Status delivery failed: ~a" c)))))
 
-(ignore-errors
-  (let ((sym (find-symbol "*MODE-LINE-TIMER*" :stumpwm)))
-    (when (and sym (boundp sym) (symbol-value sym))
-      (cancel-timer (symbol-value sym))
-      (setf (symbol-value sym) nil))))
-
-(unless (boundp '*lispbsd-ml-interval*)
-  (setf *lispbsd-ml-thread* nil))
-(defparameter *lispbsd-ml-interval* 60)
-(defun lispbsd-start-ml-refresher (&optional (interval *lispbsd-ml-interval*))
-  (setf *lispbsd-ml-interval* interval)
+(defun lispbsd-start-ml-refresher ()
+  "Start one sleeping status reader; perform all X operations on the WM thread."
+  (unless (eq *lispbsd-ml-backend* :pipe)
+    (setf *lispbsd-ml-thread* nil
+          *lispbsd-ml-backend* :pipe))
   (unless (and *lispbsd-ml-thread* (sb-thread:thread-alive-p *lispbsd-ml-thread*))
     (setf *lispbsd-ml-thread*
           (sb-thread:make-thread
            (lambda ()
-             (let ((dpy nil))
-               (unwind-protect
-                    (loop
-                      (sleep *lispbsd-ml-interval*)
-                      (handler-case
-                          (progn
-                            (unless dpy (setf dpy (xlib:open-default-display)))
-                            (let ((id (and dpy (lispbsd-ml-window-id))))
-                              (when id
-                                (let ((w (xlib::lookup-window dpy id)))
-                                  (when w
-                                    (xlib:send-event w :exposure (quote (:exposure)) :window w :x 0 :y 0 :width 8192 :height 100 :count 0)
-                                    (xlib:display-force-output dpy))))))
-                        (serious-condition ()
-                          (ignore-errors (when dpy (xlib:close-display dpy)))
-                          (setf dpy nil))))
-                 (ignore-errors (when dpy (xlib:close-display dpy))))))
+             (loop
+               (sleep *lispbsd-ml-interval*)
+               (unless (eq sb-thread:*current-thread* *lispbsd-ml-thread*) (return))
+               (let ((line (sb-read-file)))
+                 (when *request-channel*
+                   (lispbsd-queue-status line)))))
            :name "lispbsd-ml-refresher"))))
-(lispbsd-start-ml-refresher 60)
+
+(lispbsd-start-ml-refresher)
+(load (merge-pathnames ".stumpwm.d/x11-efficiency.lisp" (user-homedir-pathname)))
 
 ;;;; -- Scrolling columns --
 (load (merge-pathnames ".stumpwm.d/scrolling.lisp" (user-homedir-pathname)))

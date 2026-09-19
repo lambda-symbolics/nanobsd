@@ -47,13 +47,22 @@
   (max 80 (round (* width (strip-column-width column)))))
 
 (defun strip-place (window x y width height)
-  "Configure only changed geometry; scrolling normally moves, rather than resizes."
-  (let ((width (max 1 (- width (* 2 *float-window-border*))))
-        (height (max 1 (- height *float-window-title-height* *float-window-border*))))
-    (unless (and (= x (window-x window)) (= y (window-y window))
-                 (= width (window-width window)) (= height (window-height window)))
-      (float-window-move-resize window :x x :y y :width width :height height)
-      (update-configuration window))))
+  "Move parents during scrolling; configure client sizes only when they change."
+  (let* ((width (max 1 (- width (* 2 *float-window-border*))))
+         (height (max 1 (- height *float-window-title-height* *float-window-border*)))
+         (new-x (unless (= x (window-x window)) x))
+         (new-y (unless (= y (window-y window)) y))
+         (new-width (unless (= width (window-width window)) width))
+         (new-height (unless (= height (window-height window)) height)))
+    (when (or new-x new-y new-width new-height)
+      (float-window-move-resize window :x new-x :y new-y
+                                      :width new-width :height new-height)
+      ;; The child offsets are fixed by float-window-align. Reuse known geometry
+      ;; rather than querying the X server to build the ICCCM ConfigureNotify.
+      (xwin-send-configuration-notify (window-xwin window)
+                                      (+ x *float-window-border*)
+                                      (+ y *float-window-title-height*)
+                                      width height 0))))
 
 (defun strip-layout (group &key center)
   "Reveal the focused column immediately and unmap fully offscreen clients."
