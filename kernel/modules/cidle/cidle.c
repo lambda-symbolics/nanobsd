@@ -43,6 +43,8 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <machine/cpufunc.h>
 #include <machine/cpu.h>
 
+#include <sys/lpsched.h>	/* per-CPU idle depth for the packing scheduler */
+
 MODULE(MODULE_CLASS_MISC, cidle, NULL);
 
 void x86_cpu_idle_set(void (*)(void), const char *, bool);
@@ -170,15 +172,19 @@ cidle_idle_tickless(struct cpu_info *ci)
 		 * timer wakes us within a tick and delivers hardclock on sti.
 		 * ecx=1 => interrupts break MWAIT even though IF=0.
 		 */
+		lpsched_set_idle_depth(cpu_index(ci), LPSCHED_IDLE_SHALLOW);
 		x86_mwait((uint32_t)cidle_hint, 1);
+		lpsched_set_idle_depth(cpu_index(ci), LPSCHED_IDLE_ACTIVE);
 		x86_enable_intr();
 		return;
 	}
 
 	/* Stop the tick and go deep. */
 	heartbeat_suspend();
+	lpsched_set_idle_depth(cpu_index(ci), LPSCHED_IDLE_DEEP);
 	lapic_oneshot((uint32_t)skip);
 	x86_mwait((uint32_t)cidle_hint, 1);
+	lpsched_set_idle_depth(cpu_index(ci), LPSCHED_IDLE_ACTIVE);
 
 	/* Woke (IF still 0, no ISR ran).  Reconcile and restore the tick. */
 	elapsed = lapic_oneshot_done((uint32_t)skip, &pending);
@@ -219,7 +225,9 @@ cidle_idle(void)
 	x86_monitor(&ci->ci_want_resched, 0, 0);
 	if (__predict_false(ci->ci_want_resched != 0))
 		return;
+	lpsched_set_idle_depth(cpu_index(ci), LPSCHED_IDLE_SHALLOW);
 	x86_mwait((uint32_t)cidle_hint, 0);
+	lpsched_set_idle_depth(cpu_index(ci), LPSCHED_IDLE_ACTIVE);
 }
 
 static void
