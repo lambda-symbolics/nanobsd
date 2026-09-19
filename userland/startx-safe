@@ -1,0 +1,47 @@
+#!/bin/sh
+# startx-safe -- start X after clearing leftovers from a killed session.
+#
+# startx runs xauth to put a fresh cookie in ~/.Xauthority.  xauth locks that
+# file with ~/.Xauthority-l and ~/.Xauthority-c, and a startx/X that is killed
+# (rather than exiting) leaves those behind.  Every later startx then fails:
+#
+#   xauth: timeout in locking authority file /home/mag/.Xauthority
+#   Invalid MIT-MAGIC-COOKIE-1 key
+#   xinit: server error
+#
+# which bricks the console autologin session until someone removes them by
+# hand.  A bare `xinit` appears to work because it never calls xauth.
+# The same kills also leak one ~/.serverauth.PID per run.
+#
+# When no X server is running, both are definitionally stale, so clear them
+# and hand over to startx.  With an X server up we touch nothing and let
+# startx fail on its own -- that is a real conflict, not a leftover.
+#
+# usage: startx-safe [startx arguments ...]
+
+PATH=/usr/X11R7/bin:/usr/local/bin:/usr/pkg/bin:/bin:/usr/bin; export PATH
+HOME=${HOME:-/home/mag}
+
+# Is an X server up?  NOT `pgrep -x X`: this server's accounting name is "X"
+# but NetBSD's pgrep does not match it that way (verified on this machine --
+# `pgrep -x login` matches, `pgrep -x X` does not), so the guard would be
+# silently always-true and we would clear locks out from under a live
+# session.  Match the command line instead, which also catches xinit while a
+# session is still coming up.
+x_is_running()
+{
+	ps -axo command 2>/dev/null |
+	    grep -qE '(^|/)(X|Xorg)([[:space:]]|$)'
+}
+
+if x_is_running; then
+	exec startx "$@"
+fi
+
+rm -f "$HOME/.Xauthority-l" "$HOME/.Xauthority-c"
+
+# Leaked server cookies: keep the newest few, they are one-per-session junk.
+leaked=$(ls -t "$HOME"/.serverauth.* 2>/dev/null | tail -n +4)
+[ -n "$leaked" ] && rm -f $leaked
+
+exec startx "$@"

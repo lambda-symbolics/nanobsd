@@ -120,4 +120,7 @@
              (not (ignore-errors
                    (zerop (nth-value 2 (uiop:run-program "pgrep -x Xorg"
                                                          :ignore-error-status t))))))
-    (run "startx")))
+    ;; startx-safe first clears a stale ~/.Xauthority lock left by a killed
+    ;; session, which otherwise fails every later startx with
+    ;; "xauth: timeout in locking authority file".
+    (run "/usr/local/bin/startx-safe")))
