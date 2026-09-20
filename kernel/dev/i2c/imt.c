@@ -55,7 +55,15 @@ __KERNEL_RCSID(0, "$NetBSD$");
  * tunables because the right value is a matter of taste.
  */
 #define IMT_MOTION_DIV_DEFAULT	3
-#define IMT_SCROLL_DIV_DEFAULT	4
+/*
+ * Pad units per wheel click.  Scrolling is delivered as z/w axis deltas
+ * through wsmouse_input(), NOT via wsmouse_precision_scroll(): the X ws
+ * driver here consumes the wheel axes ("ZAxisMapping 4 5 6 7"), which is
+ * also how pms(4) delivers the TrackPoint's working middle-button scroll.
+ * wsmouse_precision_scroll() emits WSCONS_EVENT_[HV]SCROLL instead, which
+ * that path ignores, so two-finger scrolling produced nothing at all.
+ */
+#define IMT_SCROLL_DIV_DEFAULT	100
 
 /* Ignore absurd jumps, e.g. when a finger is lifted and set down elsewhere. */
 #define IMT_JUMP_LIMIT		400
@@ -85,6 +93,8 @@ struct imt_softc {
 	int			sc_prev_x, sc_prev_y;
 	int			sc_prev_down;
 	uint32_t		sc_prev_btn;
+	/* sub-click scroll remainder, so slow drags still scroll */
+	int			sc_acc_x, sc_acc_y;
 };
 
 static int	imt_match(device_t, cfdata_t, void *);
@@ -99,6 +109,7 @@ static int	imt_ioctl(void *, u_long, void *, int, struct lwp *);
 int imt_debug = 0;
 int imt_motion_div = IMT_MOTION_DIV_DEFAULT;
 int imt_scroll_div = IMT_SCROLL_DIV_DEFAULT;
+int imt_scroll_invert = 0;
 
 static struct sysctllog *imt_sysctllog;
 
@@ -217,6 +228,10 @@ imt_sysctl_setup(void)
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "scroll_div",
 	    SYSCTL_DESCR("pad units per scroll unit (higher = slower)"),
 	    NULL, 0, &imt_scroll_div, 0, CTL_CREATE, CTL_EOL);
+	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "scroll_invert",
+	    SYSCTL_DESCR("reverse the two-finger scroll direction"),
+	    NULL, 0, &imt_scroll_invert, 0, CTL_CREATE, CTL_EOL);
 	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "debug",
 	    SYSCTL_DESCR("report what each HID report id contains at attach"),
@@ -384,15 +399,26 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 	s = spltty();
 	if (down == 2) {
 		/*
-		 * Two fingers: scroll.  wsmouse_precision_scroll() emits
-		 * WSCONS_EVENT_[HV]SCROLL, which is what X's ws driver turns
-		 * into buttons 4/5 (and 6/7) for clients.
+		 * Two fingers: scroll on the wheel axes.  Accumulate the
+		 * remainder so a slow drag still scrolls instead of being
+		 * truncated away on every report.
 		 */
-		if ((dx != 0 || dy != 0) && imt_scroll_div > 0)
-			wsmouse_precision_scroll(sc->sc_wsmousedev,
-			    dx / imt_scroll_div, dy / imt_scroll_div);
-		if (btn != sc->sc_prev_btn)
-			wsmouse_input(sc->sc_wsmousedev, btn, 0, 0, 0, 0,
+		int z = 0, w = 0;
+
+		sc->sc_acc_y += dy;
+		sc->sc_acc_x += dx;
+		if (imt_scroll_div > 0) {
+			z = sc->sc_acc_y / imt_scroll_div;
+			w = sc->sc_acc_x / imt_scroll_div;
+			sc->sc_acc_y -= z * imt_scroll_div;
+			sc->sc_acc_x -= w * imt_scroll_div;
+		}
+		if (imt_scroll_invert) {
+			z = -z;
+			w = -w;
+		}
+		if (z != 0 || w != 0 || btn != sc->sc_prev_btn)
+			wsmouse_input(sc->sc_wsmousedev, btn, 0, 0, z, w,
 			    WSMOUSE_INPUT_DELTA);
 	} else if (down == 1 || btn != sc->sc_prev_btn) {
 		/* One finger (or a button change): ordinary pointer motion. */
@@ -408,6 +434,8 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 	}
 	splx(s);
 
+	if (down != sc->sc_prev_down)
+		sc->sc_acc_x = sc->sc_acc_y = 0;
 	sc->sc_prev_x = x;
 	sc->sc_prev_y = y;
 	sc->sc_prev_down = down;
