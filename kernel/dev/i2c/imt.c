@@ -60,6 +60,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #define IMT_USAGE_BUTTON_SW	HID_USAGE2(HUP_DIGITIZERS, 0x58)
 #define IMT_USAGE_LATENCY	HID_USAGE2(HUP_DIGITIZERS, 0x60)
 #define IMT_USAGE_CONTACTMAX	HID_USAGE2(HUP_DIGITIZERS, 0x55)
+#define IMT_USAGE_SCANTIME	HID_USAGE2(HUP_DIGITIZERS, 0x56)
 #define IMT_USAGE_CERT		0xff0000c5
 
 /*
@@ -126,12 +127,28 @@ struct imt_softc {
 	struct hid_location	sc_loc_latency;
 
 	uint32_t		sc_prev_ids;	/* which contact IDs were down */
+
+	struct hid_location	sc_loc_scantime;
+	bool			sc_have_scantime;
+
+	/*
+	 * A frame under construction.  This pad reports in hybrid mode: one
+	 * contact per packet, with the contact count carried only in the
+	 * first packet of a frame and zero in the continuations.
+	 */
+	struct imt_fcontact {
+		int	id, x, y, tip;
+	}			sc_frame[IMT_MAX_CONTACTS];
+	int			sc_frame_n;	/* records collected */
+	int			sc_frame_expect;/* records the frame will have */
+	uint32_t		sc_scantime;
 };
 
 static int	imt_match(device_t, cfdata_t, void *);
 static void	imt_attach(device_t, device_t, void *);
 static int	imt_detach(device_t, int);
 static void	imt_intr(struct ihidev *, void *, u_int);
+static void	imt_emit(struct imt_softc *, uint32_t);
 
 static int	imt_set_mode(struct imt_softc *, uint8_t);
 static void	imt_scan_features(struct imt_softc *, const void *, int);
@@ -226,6 +243,10 @@ imt_parse_input(struct imt_softc *sc, const void *desc, int dlen, uint8_t repid)
 			break;
 		case HID_USAGE2(HUP_DIGITIZERS, HUD_CONTACTCOUNT):
 			sc->sc_loc_count = h.loc;
+			break;
+		case IMT_USAGE_SCANTIME:
+			sc->sc_loc_scantime = h.loc;
+			sc->sc_have_scantime = true;
 			break;
 		case HID_USAGE2(HUP_BUTTON, 1):
 			sc->sc_loc_btn = h.loc;
@@ -880,55 +901,21 @@ imt_detach(device_t self, int flags)
 }
 
 static void
-imt_intr(struct ihidev *addr, void *buf, u_int len)
+imt_emit(struct imt_softc *sc, uint32_t btn)
 {
-	struct imt_softc *sc = (struct imt_softc *)addr;
-	uint8_t *data = buf;
-	uint32_t btn = 0;
-	int i, down = 0, x = 0, y = 0, dx, dy, s, sumx, sumy;
-	int nvalid, cnt;
+	int i, down = 0, x = 0, y = 0, dx, dy, s, sumx = 0, sumy = 0;
 	uint32_t ids = 0;
 
-	if (!sc->sc_enabled || sc->sc_wsmousedev == NULL)
-		return;
-	if (len < (u_int)sc->sc_hdev.sc_isize)
-		return;
-
-	if (sc->sc_have_btn && hid_get_udata(data, &sc->sc_loc_btn))
-		btn = 1;
-
 	/*
-	 * Track the CENTROID of the contacts that are down, not the first one
-	 * found.  The order contacts appear in a report is not stable, so with
-	 * two fingers "the first one down" alternates between them and the
-	 * position jumps back and forth by the distance between the fingers:
-	 * every delta then looks like a huge jump, gets discarded below, and
-	 * nothing ever scrolls.  The centroid is stable under reordering.
+	 * Contact Count covers the whole frame regardless of tip state, so a
+	 * record with the tip up is still part of it; it just is not a finger.
 	 */
-	/*
-	 * Contact Count says how many of the slots in this report carry a real
-	 * contact; the rest are stale padding that still has Tip set on some
-	 * pads.  Counting every tip-set slot therefore overcounts fingers and
-	 * turns a one-finger drag into a phantom two-finger scroll.
-	 */
-	nvalid = sc->sc_nslots;
-	if (sc->sc_loc_count.size > 0) {
-		cnt = (int)hid_get_udata(data, &sc->sc_loc_count);
-		if (cnt > 0 && cnt < nvalid)
-			nvalid = cnt;
-	}
-
-	sumx = sumy = 0;
-	for (i = 0; i < nvalid; i++) {
-		if (!sc->sc_contacts[i].valid)
+	for (i = 0; i < sc->sc_frame_n; i++) {
+		if (!sc->sc_frame[i].tip)
 			continue;
-		if (!hid_get_udata(data, &sc->sc_contacts[i].loc_tip))
-			continue;
-		sumx += (int)hid_get_udata(data, &sc->sc_contacts[i].loc_x);
-		sumy += (int)hid_get_udata(data, &sc->sc_contacts[i].loc_y);
-		if (sc->sc_contacts[i].loc_id.size > 0)
-			ids |= 1U << (hid_get_udata(data,
-			    &sc->sc_contacts[i].loc_id) & 31);
+		sumx += sc->sc_frame[i].x;
+		sumy += sc->sc_frame[i].y;
+		ids |= 1U << (sc->sc_frame[i].id & 31);
 		down++;
 	}
 	if (down > 0) {
@@ -937,24 +924,23 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 	}
 
 	/*
-	 * A delta only means anything if it is between the same fingers.  The
-	 * finger count staying equal is not enough: one finger can lift while
-	 * another lands in the same report, and the centroid then jumps.
+	 * A delta only means anything between the same fingers.  An equal
+	 * finger count is not enough: one finger can lift while another lands
+	 * in the same frame, and the centroid then jumps.
 	 */
 	dx = dy = 0;
 	if (down > 0 && down == sc->sc_prev_down && ids == sc->sc_prev_ids) {
 		dx = x - sc->sc_prev_x;
 		dy = y - sc->sc_prev_y;
-		/* A lift-and-replace looks like a huge jump; ignore it. */
 		if (dx > IMT_JUMP_LIMIT || dx < -IMT_JUMP_LIMIT ||
 		    dy > IMT_JUMP_LIMIT || dy < -IMT_JUMP_LIMIT)
 			dx = dy = 0;
 	}
 
-	if (imt_debug > 1 && sc->sc_traced < 40) {
+	if (imt_debug > 1 && sc->sc_traced < 60) {
 		sc->sc_traced++;
-		printf("imt: down=%d x=%d y=%d dx=%d dy=%d acc=%d btn=%u\n",
-		    down, x, y, dx, dy, sc->sc_acc_y, btn);
+		printf("imt: frame n=%d down=%d x=%d y=%d dx=%d dy=%d btn=%u\n",
+		    sc->sc_frame_n, down, x, y, dx, dy, btn);
 	}
 
 	s = spltty();
@@ -962,7 +948,7 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 		/*
 		 * Two fingers: scroll on the wheel axes.  Accumulate the
 		 * remainder so a slow drag still scrolls instead of being
-		 * truncated away on every report.
+		 * truncated away on every frame.
 		 */
 		int z = 0, w = 0;
 
@@ -1007,6 +993,85 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 	sc->sc_prev_btn = btn;
 }
 
+/*
+ * Assemble a contact frame from one or more packets before acting on it.
+ *
+ * In hybrid reporting a packet carries as many contact records as fit in the
+ * report - one, here - and the Contact Count appears only in the first packet
+ * of a frame, with zero standing for "continuation".  Treating each packet as
+ * a finished frame therefore sees two separate one-finger frames during a
+ * two-finger gesture, and the scroll branch can never be reached no matter
+ * how the sensitivity is tuned.
+ */
+static void
+imt_intr(struct ihidev *addr, void *buf, u_int len)
+{
+	struct imt_softc *sc = (struct imt_softc *)addr;
+	uint8_t *data = buf;
+	struct imt_fcontact *f;
+	uint32_t btn = 0;
+	int i, cnt = 0;
+
+	if (!sc->sc_enabled || sc->sc_wsmousedev == NULL)
+		return;
+	if (len < (u_int)sc->sc_hdev.sc_isize)
+		return;
+
+	if (sc->sc_have_btn && hid_get_udata(data, &sc->sc_loc_btn))
+		btn = 1;
+	if (sc->sc_loc_count.size > 0)
+		cnt = (int)hid_get_udata(data, &sc->sc_loc_count);
+	if (sc->sc_have_scantime)
+		sc->sc_scantime = (uint32_t)hid_get_udata(data,
+		    &sc->sc_loc_scantime);
+
+	if (imt_debug > 1 && sc->sc_traced < 60) {
+		sc->sc_traced++;
+		printf("imt: pkt cnt=%d scan=%u btn=%u slot0 tip=%lu id=%lu "
+		    "x=%lu y=%lu\n", cnt, sc->sc_scantime, btn,
+		    sc->sc_nslots > 0 ?
+		    hid_get_udata(data, &sc->sc_contacts[0].loc_tip) : 0,
+		    sc->sc_nslots > 0 ?
+		    hid_get_udata(data, &sc->sc_contacts[0].loc_id) : 0,
+		    sc->sc_nslots > 0 ?
+		    hid_get_udata(data, &sc->sc_contacts[0].loc_x) : 0,
+		    sc->sc_nslots > 0 ?
+		    hid_get_udata(data, &sc->sc_contacts[0].loc_y) : 0);
+	}
+
+	if (cnt > 0) {
+		/* First packet of a frame. */
+		sc->sc_frame_expect = cnt;
+		if (sc->sc_frame_expect > IMT_MAX_CONTACTS)
+			sc->sc_frame_expect = IMT_MAX_CONTACTS;
+		sc->sc_frame_n = 0;
+	} else if (sc->sc_frame_expect == 0) {
+		/* Continuation with no frame open; nothing to attach it to. */
+		return;
+	}
+
+	for (i = 0; i < sc->sc_nslots; i++) {
+		if (!sc->sc_contacts[i].valid)
+			continue;
+		if (sc->sc_frame_n >= sc->sc_frame_expect)
+			break;
+		f = &sc->sc_frame[sc->sc_frame_n++];
+		f->tip = hid_get_udata(data, &sc->sc_contacts[i].loc_tip) ?
+		    1 : 0;
+		f->id = sc->sc_contacts[i].loc_id.size > 0 ?
+		    (int)hid_get_udata(data, &sc->sc_contacts[i].loc_id) : 0;
+		f->x = (int)hid_get_udata(data, &sc->sc_contacts[i].loc_x);
+		f->y = (int)hid_get_udata(data, &sc->sc_contacts[i].loc_y);
+	}
+
+	if (sc->sc_frame_n < sc->sc_frame_expect)
+		return;		/* wait for the rest of the frame */
+
+	imt_emit(sc, btn);
+	sc->sc_frame_n = 0;
+	sc->sc_frame_expect = 0;
+}
+
 static int
 imt_enable(void *v)
 {
@@ -1021,10 +1086,21 @@ imt_enable(void *v)
 			printf("imt: ihidev_open failed %d\n", error);
 		return error;
 	}
-	(void)imt_ptp_init(sc);
+	/*
+	 * A pad that cannot be put into Precision Touchpad mode is of no use
+	 * to this driver, and ims(4) still provides mouse mode, so report the
+	 * failure rather than pretending to have opened successfully.
+	 */
+	if ((error = imt_ptp_init(sc)) != 0) {
+		printf("imt: PTP initialisation failed (%d)\n", error);
+		ihidev_close(&sc->sc_hdev);
+		return error;
+	}
 	sc->sc_prev_down = 0;
 	sc->sc_prev_btn = 0;
 	sc->sc_prev_ids = 0;
+	sc->sc_frame_n = 0;
+	sc->sc_frame_expect = 0;
 	sc->sc_enabled = true;
 	return 0;
 }

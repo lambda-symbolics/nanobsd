@@ -128,6 +128,7 @@ static void	ihidev_work(struct work *, void *);
 #endif
 static int	ihidev_poweron(struct ihidev_softc *, bool);
 static int	ihidev_reset(struct ihidev_softc *, bool);
+static int	ihidev_reset_locked(struct ihidev_softc *, bool);
 static int	ihidev_hid_desc_parse(struct ihidev_softc *);
 
 static int	ihidev_maxrepid(void *, int);
@@ -326,7 +327,7 @@ ihidev_resume(device_t self, const pmf_qual_t *q)
 	mutex_enter(&sc->sc_lock);
 	if (sc->sc_refcnt > 0) {
 		printf("ihidev power reset\n");
-		ihidev_reset(sc, true);
+		ihidev_reset_locked(sc, true);
 	}
 	sc->sc_suspended = false;
 #if NACPICA > 0
@@ -641,15 +642,24 @@ ihidev_kick(device_t dev)
 	    sc->sc_refcnt, sc->sc_isize, sc->sc_suspended, sc->sc_nrepid);
 	err = ihidev_poweron(sc, false);
 	printf("ihidev: poweron -> %d\n", err);
+	if (err != 0)
+		return err;
 	err = ihidev_reset(sc, false);
 	printf("ihidev: reset -> %d\n", err);
 	return err;
 }
 
+/*
+ * Reset the device.  The caller must hold sc_lock: the acknowledgement wait
+ * releases it through cv_timedwait() so the input worker can take it and
+ * signal us, and ihidev_resume() already holds it when it resets.
+ */
 static int
-ihidev_reset(struct ihidev_softc *sc, bool poll)
+ihidev_reset_locked(struct ihidev_softc *sc, bool poll)
 {
 	bool wait;
+
+	KASSERT(mutex_owned(&sc->sc_lock));
 
 	DPRINTF(("%s: resetting\n", device_xname(sc->sc_dev)));
 
@@ -664,16 +674,12 @@ ihidev_reset(struct ihidev_softc *sc, bool poll)
 	 */
 	wait = !poll && sc->sc_ih != NULL && sc->sc_wq != NULL;
 
-	mutex_enter(&sc->sc_lock);
 	sc->sc_reset_pending = wait;
-	mutex_exit(&sc->sc_lock);
 
 	if (ihidev_hid_command(sc, I2C_HID_CMD_RESET, 0, poll)) {
 		aprint_error_dev(sc->sc_dev, "failed to reset hardware\n");
 
-		mutex_enter(&sc->sc_lock);
 		sc->sc_reset_pending = false;
-		mutex_exit(&sc->sc_lock);
 
 		ihidev_hid_command(sc, I2C_HID_CMD_SET_POWER,
 		    &I2C_HID_POWER_OFF, poll);
@@ -691,20 +697,34 @@ ihidev_reset(struct ihidev_softc *sc, bool poll)
 	 * can swallow the acknowledgement, so callers must not configure the
 	 * device until this returns.
 	 */
-	mutex_enter(&sc->sc_lock);
 	while (sc->sc_reset_pending) {
 		if (cv_timedwait(&sc->sc_reset_cv, &sc->sc_lock,
 		    mstohz(500)) == EWOULDBLOCK) {
 			sc->sc_reset_pending = false;
-			mutex_exit(&sc->sc_lock);
 			aprint_error_dev(sc->sc_dev,
 			    "timed out waiting for reset acknowledgement\n");
-			return (0);
+			/*
+			 * Report the failure.  Configuring the device after an
+			 * unacknowledged reset is exactly what this wait
+			 * exists to prevent, so callers must be able to see
+			 * that it did not happen.
+			 */
+			return (1);
 		}
 	}
-	mutex_exit(&sc->sc_lock);
 
 	return (0);
+}
+
+static int
+ihidev_reset(struct ihidev_softc *sc, bool poll)
+{
+	int err;
+
+	mutex_enter(&sc->sc_lock);
+	err = ihidev_reset_locked(sc, poll);
+	mutex_exit(&sc->sc_lock);
+	return err;
 }
 
 /*

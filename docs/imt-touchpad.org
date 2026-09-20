@@ -206,3 +206,48 @@ worker recognises the zero-length packet as the acknowledgement and wakes the
 waiter.  Feature requests issued while a reset is outstanding can swallow that
 acknowledgement.  The wait is bounded at 500 ms and is skipped for the reset
 during attach, which runs before the handler and workqueue exist.
+
+* Hybrid frame assembly (kernel #120)
+
+With the switches written correctly the pad reports in Precision Touchpad mode
+and the pointer moves, but two-finger scrolling still did nothing.  The reason
+is in the report layout rather than in sensitivity.
+
+Report 4 is 11 bytes, which holds exactly one contact record plus scan time,
+contact count and the button.  The attach line says as much:
+
+: imt0 at ihidev0 reportid 4: 1 contacts, clickpad, two-finger scrolling
+
+This is hybrid reporting.  A two-finger frame arrives as two packets: the
+first carries Contact Count = 2 and one contact, the second carries Contact
+Count = 0 - meaning "continuation" - and the other contact.  The old decoder
+treated every packet as a complete frame, so a two-finger gesture looked like
+two separate one-finger frames, =down= was never 2, and the scroll branch was
+unreachable.  No value of =machdep.imt.scroll_div= could have helped.
+
+=imt_intr()= now assembles: a nonzero count opens a frame and sets how many
+records to expect, zero appends to the open one, and only a complete frame is
+handed to =imt_emit()=.  Contact Count covers the frame regardless of tip
+state, so records with the tip up are collected as part of the frame and
+simply do not count as fingers.
+
+* Corrections to the reset work
+
+=ihidev_resume()= holds =sc_lock= and called =ihidev_reset()=, which acquired
+it again; =poll=true= skips the acknowledgement wait but not the mutex.  That
+is a resume panic, introduced by the reset change and not present before it.
+Split into =ihidev_reset_locked()=, which requires the lock and is what resume
+calls, and a wrapper that takes it.
+
+The acknowledgement timeout also returned success, which defeated the point of
+waiting: configuration could still proceed after an unacknowledged reset.  It
+now returns an error, and =imt_enable()= propagates a failed handshake instead
+of discarding it.
+
+** Known limitation
+
+=imt_set_fields()='s "zero-fill is safe when the write covers the whole
+report" rule is asserted by the caller, not checked against the descriptor.
+It is correct for report 5 on this pad, whose only nonconstant fields are the
+two switches, but it should be validated against the nonconstant field list
+before the driver is used on other hardware.
