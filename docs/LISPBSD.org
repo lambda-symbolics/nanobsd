@@ -73,7 +73,12 @@ type =gop= (lists modes), =gop 2160x1350=, =boot=; then put =gop 2160x1350;= bef
 - Super+F maximize toggle · Super+Shift+F fullscreen · Super+comma/period split · Super+Shift+R remove split
 - Super+D/W width, Super+Shift+D/W height · Print screenshot (~/screenshot-*.png) · Super+; StumpWM command line
 - TrackPoint: hold the middle button and nudge the stick to scroll (X "mouse" driver wheel emulation).
-  The touchpad has no driver (dwiic cannot map its registers on this machine).
+  The touchpad works too: =imt(4)= (=kernel/dev/i2c/imt.c=, written for this
+  machine) drives it as a Windows Precision Touchpad, giving one-finger motion
+  and two-finger scrolling.  Knobs live under =machdep.imt.*=:
+  =motion_div= and =scroll_div= (higher is slower), =scroll_invert=, =ptp= to
+  fall back to mouse mode, =kick= to power-cycle and re-run the handshake, and
+  =debug= for tracing.  See =docs/imt-touchpad.org=.
 - Restart X after config changes: Super+Shift+E, then type =exit= at the console prompt (autologin starts X again) or =startx=.
 - Config: =~/.stumpwmrc=, =~/.xinitrc=, =/etc/X11/xorg.conf= (backup of the old mouse setup: xorg.conf.bak-ws).
 

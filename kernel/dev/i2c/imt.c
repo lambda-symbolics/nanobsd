@@ -36,7 +36,6 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/device.h>
 #include <sys/ioctl.h>
 #include <sys/sysctl.h>
-#include <sys/kthread.h>
 #include <sys/pmf.h>
 
 #include <dev/i2c/i2cvar.h>
@@ -158,7 +157,7 @@ static int	imt_enable(void *);
 static void	imt_disable(void *);
 static int	imt_ioctl(void *, u_long, void *, int, struct lwp *);
 
-int imt_debug = 1;
+int imt_debug = 0;
 /*
  * Switching the pad into Precision Touchpad mode makes it stop sending the
  * mouse report -- and on this Elan pad it then sends NOTHING AT ALL, not even
@@ -175,18 +174,6 @@ int imt_scroll_invert = 0;
 static struct sysctllog *imt_sysctllog;
 static struct imt_softc *imt_instance;	/* for the live mode toggle */
 
-/*
- * Diagnostic polling path.  The pad answers I2C happily but its interrupt
- * has never fired since the switch to Precision Touchpad mode, and those are
- * two very different bugs.  Fetching the input report over I2C on a timer
- * asks the pad directly whether it has anything to say, independent of the
- * interrupt line.  I2C transfers can sleep, so this has to be a kthread and
- * not a callout.
- */
-int imt_poll_ms = 0;
-static lwp_t *imt_poll_lwp;
-static volatile int imt_poll_stop;
-static void	imt_poll_thread(void *);
 
 static const struct wsmouse_accessops imt_accessops = {
 	imt_enable,
@@ -314,46 +301,6 @@ imt_sysctl_ptp(SYSCTLFN_ARGS)
 	return 0;
 }
 
-/*
- * Ask the pad for its input report over I2C, on a timer, and log whatever
- * comes back.  This deliberately bypasses the interrupt: if a finger on the
- * pad shows up here while the interrupt count stays at zero, the reports are
- * being produced and only the interrupt is lost; if nothing shows up here
- * either, the pad really has gone quiet and the mode switch is at fault.
- */
-static void
-imt_poll_thread(void *arg)
-{
-	struct imt_softc *sc = arg;
-	uint8_t buf[64];
-	int size, i, err;
-
-	size = sc->sc_hdev.sc_isize;
-	if (size <= 0 || size > (int)sizeof(buf))
-		size = (int)sizeof(buf);
-
-	while (!imt_poll_stop && imt_poll_ms > 0) {
-		memset(buf, 0, size);
-		err = ihidev_get_report((device_t)sc->sc_hdev.sc_parent,
-		    hid_input, sc->sc_hdev.sc_report_id, buf, size);
-		if (err == 0) {
-			for (i = 0; i < size; i++)
-				if (buf[i] != 0)
-					break;
-			if (i < size) {
-				printf("imt: poll rep %d:", sc->sc_hdev.sc_report_id);
-				for (i = 0; i < size; i++)
-					printf(" %02x", buf[i]);
-				printf("\n");
-			}
-		} else
-			printf("imt: poll get_report failed\n");
-		kpause("imtpoll", false, MAX(1, mstohz(imt_poll_ms)), NULL);
-	}
-	imt_poll_lwp = NULL;
-	kthread_exit(0);
-}
-
 static int
 imt_sysctl_kick(SYSCTLFN_ARGS)
 {
@@ -370,31 +317,6 @@ imt_sysctl_kick(SYSCTLFN_ARGS)
 	(void)ihidev_kick((device_t)imt_instance->sc_hdev.sc_parent);
 	(void)imt_ptp_init(imt_instance);
 	return 0;
-}
-
-static int
-imt_sysctl_poll(SYSCTLFN_ARGS)
-{
-	struct sysctlnode node = *rnode;
-	int val = imt_poll_ms, error;
-
-	node.sysctl_data = &val;
-	error = sysctl_lookup(SYSCTLFN_CALL(&node));
-	if (error || newp == NULL)
-		return error;
-	if (val < 0 || val > 10000)
-		return EINVAL;
-
-	imt_poll_ms = val;
-	if (val == 0) {
-		imt_poll_stop = 1;
-		return 0;
-	}
-	if (imt_instance == NULL || imt_poll_lwp != NULL)
-		return 0;
-	imt_poll_stop = 0;
-	return kthread_create(PRI_NONE, KTHREAD_MPSAFE, NULL,
-	    imt_poll_thread, imt_instance, &imt_poll_lwp, "imtpoll");
 }
 
 /*
@@ -434,10 +356,6 @@ imt_sysctl_setup(void)
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "kick",
 	    SYSCTL_DESCR("power on, reset and re-run the PTP handshake"),
 	    imt_sysctl_kick, 0, NULL, 0, CTL_CREATE, CTL_EOL);
-	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
-	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "poll_ms",
-	    SYSCTL_DESCR("diagnostic: poll the input report every N ms, 0 = off"),
-	    imt_sysctl_poll, 0, &imt_poll_ms, 0, CTL_CREATE, CTL_EOL);
 	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "debug",
 	    SYSCTL_DESCR("1 = log emitted scrolls, 2 = log every report"),
@@ -502,12 +420,14 @@ imt_set_fields(struct imt_softc *sc, int rid,
 		 * rather than clear a field belonging to someone else.
 		 */
 		if (!complete) {
-			printf("imt: %s: rid %d unreadable, skipping\n", what,
-			    rid);
+			if (imt_debug)
+				printf("imt: %s: rid %d unreadable, "
+				    "skipping\n", what, rid);
 			return 0;
 		}
-		printf("imt: %s: rid %d unreadable, writing from zeroes\n",
-		    what, rid);
+		if (imt_debug)
+			printf("imt: %s: rid %d unreadable, writing from "
+			    "zeroes\n", what, rid);
 		memset(rep, 0, sizeof(rep));
 	}
 	if (loc1 != NULL)
@@ -523,6 +443,12 @@ imt_set_fields(struct imt_softc *sc, int rid,
 	 */
 	{
 		uint8_t back[32];
+
+		if (err != 0)
+			printf("imt: %s: writing rid %d failed (%d)\n", what,
+			    rid, err);
+		if (!imt_debug)
+			return err;
 
 		memset(back, 0, sizeof(back));
 		if (ihidev_get_report(parent, hid_feature, rid, back, len) == 0)
@@ -588,9 +514,11 @@ imt_scan_features(struct imt_softc *sc, const void *desc, int dlen)
 		 * log one line per (report, usage) run instead of per byte.
 		 */
 		if (h.report_ID != last_rid || h.usage != last_usage) {
-			printf("imt: feature rid %d usage 0x%08x pos %u "
-			    "size %u flags 0x%x\n", h.report_ID, h.usage,
-			    h.loc.pos, h.loc.size, h.flags);
+				if (imt_debug > 1)
+				printf("imt: feature rid %d usage 0x%08x "
+				    "pos %u size %u flags 0x%x\n",
+				    h.report_ID, h.usage, h.loc.pos,
+				    h.loc.size, h.flags);
 			last_rid = h.report_ID;
 			last_usage = h.usage;
 		}
@@ -662,6 +590,7 @@ imt_ptp_init(struct imt_softc *sc)
 			memset(blob, 0, sizeof(blob));
 			err = ihidev_get_report(parent, hid_feature,
 			    sc->sc_cert_rid, blob, len);
+			if (imt_debug)
 			printf("imt: cert blob rid %d len %d -> err %d, "
 			    "%02x %02x %02x %02x\n", sc->sc_cert_rid, len,
 			    err, blob[0], blob[1], blob[2], blob[3]);
@@ -681,7 +610,8 @@ imt_ptp_init(struct imt_softc *sc)
 			memset(blob, 0, sizeof(blob));
 			err = ihidev_get_report(parent, hid_feature,
 			    sc->sc_contactmax_rid, blob, len);
-			printf("imt: contact max rid %d -> err %d, %02x %02x\n",
+			if (imt_debug)
+				printf("imt: contact max rid %d -> err %d, %02x %02x\n",
 			    sc->sc_contactmax_rid, err, blob[0], blob[1]);
 		}
 	}
@@ -766,7 +696,8 @@ imt_set_mode(struct imt_softc *sc, uint8_t want)
 
 	err = ihidev_set_report((device_t)sc->sc_hdev.sc_parent, hid_feature,
 	    sc->sc_cfg_rid, rep, len);
-	printf("imt: set input mode rid %d len %d -> %d (err %d)\n",
+	if (imt_debug)
+		printf("imt: set input mode rid %d len %d -> %d (err %d)\n",
 	    sc->sc_cfg_rid, len, rep[0], err);
 
 	/*
@@ -774,12 +705,15 @@ imt_set_mode(struct imt_softc *sc, uint8_t want)
 	 * still returns success here, so the write returning 0 is not
 	 * evidence that the pad actually changed mode.
 	 */
-	memset(rep, 0, sizeof(rep));
-	if (ihidev_get_report((device_t)sc->sc_hdev.sc_parent, hid_feature,
-	    sc->sc_cfg_rid, rep, len) == 0)
-		printf("imt: input mode reads back %d %d\n", rep[0], rep[1]);
-	else
-		printf("imt: input mode readback failed\n");
+	if (imt_debug) {
+		memset(rep, 0, sizeof(rep));
+		if (ihidev_get_report((device_t)sc->sc_hdev.sc_parent,
+		    hid_feature, sc->sc_cfg_rid, rep, len) == 0)
+			printf("imt: input mode reads back %d %d\n", rep[0],
+			    rep[1]);
+		else
+			printf("imt: input mode readback failed\n");
+	}
 
 	return err;
 }
@@ -823,6 +757,7 @@ imt_match(device_t parent, cfdata_t match, void *aux)
 	cfg = -1;
 	(void)imt_find_config(desc, size, &cfg);
 	if (imt_debug)
+		if (imt_debug > 1)
 		printf("imt: rid %d: tip=%d cid=%d x=%d y=%d cfg_rid=%d\n",
 		    rid, tip, cid, x, y, cfg);
 
@@ -882,7 +817,6 @@ imt_attach(device_t parent, device_t self, void *aux)
 	imt_instance = sc;
 	imt_sysctl_setup();
 
-	printf("imt: attach complete, awaiting open\n");
 	a.accessops = &imt_accessops;
 	a.accesscookie = sc;
 	sc->sc_wsmousedev = config_found(self, &a, wsmousedevprint, CFARGS_NONE);
@@ -1078,7 +1012,6 @@ imt_enable(void *v)
 	struct imt_softc *sc = v;
 	int error;
 
-	printf("imt: enable called\n");
 	if (sc->sc_enabled)
 		return EBUSY;
 	if ((error = ihidev_open(&sc->sc_hdev)) != 0) {

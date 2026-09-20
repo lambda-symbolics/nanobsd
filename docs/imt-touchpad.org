@@ -251,3 +251,37 @@ report" rule is asserted by the caller, not checked against the descriptor.
 It is correct for report 5 on this pad, whose only nonconstant fields are the
 two switches, but it should be validated against the nonconstant field list
 before the driver is used on other hardware.
+
+* Working, and what it took
+
+Kernel #120 onward: one-finger motion and two-finger scrolling both work.
+
+The failure had two independent causes stacked on top of each other, and each
+one alone was enough to produce silence or no scrolling:
+
+1. The reporting switches were written into padding, because the descriptor
+   scan trusted usages that NetBSD's parser had carried over onto constant
+   items.  This kept the pad silent in Precision Touchpad mode while mouse
+   mode still worked.
+2. The decoder treated each packet as a complete frame, but the pad reports
+   in hybrid mode with one contact per packet, so a two-finger gesture never
+   looked like two fingers.
+
+Both were found by the same method: put the pad in a mode known to work,
+compare, and read the driver's own log rather than reasoning about what the
+hardware "should" do.  The mouse-mode interrupt count going from 1 to 573
+under a finger is what turned this from guesswork into a bisection.
+
+** Diagnostics removed after the fact
+
+The =ihidev_repdebug= raw/dispatch probes and the =machdep.imt.poll_ms=
+polling thread are gone.  The polling path is worth remembering as a dead end:
+this pad fails =GET_REPORT= on input reports in every mode, so polling could
+never substitute for the interrupt, and a failed poll said nothing about
+whether reports were available.  =ihidev_get_report()='s failure message is
+now =aprint_debug_dev=, since a refused read is a normal answer on this
+hardware and the caller decides whether it matters.
+
+=machdep.imt.kick= is kept deliberately: it powers the device on, resets it
+and re-runs the handshake, which is the fastest way to tell a wedged pad from
+a driver bug without rebooting.
