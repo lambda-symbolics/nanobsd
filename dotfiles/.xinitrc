@@ -13,6 +13,8 @@ pgrep -f statusbard >/dev/null || /usr/local/bin/statusbard &
 /usr/local/bin/screentemp 4000 -d &
 
 /usr/local/bin/brightness "$(cat "$HOME/.brightness" 2>/dev/null || echo 20)" >/dev/null 2>&1
+# the mixer resets to the codec default on every boot; replay the last setting
+/usr/local/bin/volume restore >/dev/null 2>&1
 xset +dpms 2>/dev/null
 xset dpms 300 300 300 2>/dev/null
 exec stumpwm >> "$HOME/.xsession-errors" 2>&1

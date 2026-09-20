@@ -1,5 +1,5 @@
 #!/bin/sh
-# volume [up|down|mute|get] - adjust every output path at once.
+# volume [up|down|mute|get|save|restore] - adjust every output path at once.
 #
 # The codec exposes one volume control per output path (outputs.master,
 # outputs.master2, ...) and one mute per pin (outputs.master3.mute, ...).
@@ -7,17 +7,46 @@
 # pinned to "outputs.master" silently stops working the moment headphones
 # are plugged in.  Enumerate whatever exists instead of hardcoding names.
 
+#
+# Every change is saved to ~/.volume and replayed by .xinitrc, because the
+# mixer comes up at the codec's default on each boot.  The state is restored
+# from the X session rather than from rc.local for two reasons: the headphone
+# pin fix reattaches hdafg, which resets the mixer, and X starts after all of
+# that, so the session is the first moment the final set of controls exists.
+
 PATH=/sbin:/usr/sbin:/bin:/usr/bin; export PATH
 STEP=${VOL_STEP:-16}
+STATE="${HOME:-/home/mag}/.volume"
 
 vols() { mixerctl -a | sed -n 's/^\(outputs\.master[0-9]*\)=.*/\1/p'; }
 mutes() { mixerctl -a | sed -n 's/^\(outputs\.master[0-9]*\.mute\)=.*/\1/p'; }
 
+save() {
+	{
+		for c in $(vols) $(mutes); do
+			printf '%s=%s\n' "$c" "$(mixerctl -n "$c" 2>/dev/null)"
+		done
+	} > "$STATE.tmp" 2>/dev/null && mv "$STATE.tmp" "$STATE" 2>/dev/null
+}
+
+# Controls that no longer exist (the headphone path comes and goes) simply
+# fail to set, which is why each line is applied on its own.
+restore() {
+	[ -r "$STATE" ] || return 0
+	while IFS= read -r line; do
+		case "$line" in
+		outputs.master*=?*) mixerctl -w "$line" >/dev/null 2>&1 ;;
+		esac
+	done < "$STATE"
+}
+
 case "${1:-get}" in
 up)
-	for c in $(vols); do mixerctl -w "$c+=$STEP" >/dev/null 2>&1; done ;;
+	for c in $(vols); do mixerctl -w "$c+=$STEP" >/dev/null 2>&1; done
+	save ;;
 down)
-	for c in $(vols); do mixerctl -w "$c-=$STEP" >/dev/null 2>&1; done ;;
+	for c in $(vols); do mixerctl -w "$c-=$STEP" >/dev/null 2>&1; done
+	save ;;
 mute)
 	# If anything is unmuted, mute everything; otherwise unmute everything.
 	want=on
@@ -25,9 +54,14 @@ mute)
 		[ "$(mixerctl -n "$c" 2>/dev/null)" = off ] && { want=on; break; }
 		want=off
 	done
-	for c in $(mutes); do mixerctl -w "$c=$want" >/dev/null 2>&1; done ;;
+	for c in $(mutes); do mixerctl -w "$c=$want" >/dev/null 2>&1; done
+	save ;;
 get)
 	for c in $(vols); do printf '%s=%s ' "$c" "$(mixerctl -n "$c")"; done; echo ;;
+save)
+	save ;;
+restore)
+	restore ;;
 *)
-	echo "usage: volume [up|down|mute|get]" >&2; exit 2 ;;
+	echo "usage: volume [up|down|mute|get|save|restore]" >&2; exit 2 ;;
 esac

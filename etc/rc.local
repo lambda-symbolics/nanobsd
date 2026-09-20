@@ -43,3 +43,10 @@ sysctl -w hw.acpi.sleep.freeze_timeout=0 >/dev/null 2>&1
 # Headphone jack: re-associate pin 0x21 so hdafg enables headphone
 # redirection (see the script for the full reasoning).
 [ -x /usr/local/sbin/hdafg-hp-fix ] && /usr/local/sbin/hdafg-hp-fix
+
+# Replay the saved mixer levels.  This must follow hdafg-hp-fix: that
+# reattaches the codec, which resets the mixer to its defaults.  The X
+# session restores them again from .xinitrc, which also covers the mixer
+# being re-enumerated later; doing it here as well means the console and
+# any non-X login get the right level too.
+[ -x /usr/local/bin/volume ] && HOME=/home/mag /usr/local/bin/volume restore
