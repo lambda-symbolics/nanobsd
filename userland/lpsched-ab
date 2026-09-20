@@ -28,6 +28,7 @@ MODE=${1:-full}
 case $MODE in
 quick)    SETTLE=${SETTLE:-20}; SAMPLE=${SAMPLE:-10} ;;
 load)     SETTLE=${SETTLE:-40}; SAMPLE=${SAMPLE:-20}; NPOLL=${NPOLL:-4} ;;
+loadab)   SETTLE=${SETTLE:-50}; SAMPLE=${SAMPLE:-20}; NPOLL=${NPOLL:-4} ;;
 coalesce) SETTLE=${SETTLE:-60}; SAMPLE=${SAMPLE:-30} ;;
 *)        SETTLE=${SETTLE:-50}; SAMPLE=${SAMPLE:-20} ;;
 esac
@@ -111,7 +112,21 @@ run() {		# run <label> <enabled> <pack> <coalesce_ms> <epp>
 }
 
 echo "lpsched A/B ($MODE): settle ${SETTLE}s, sample ${SAMPLE}s, EPP $EPP (daemon was ${DAEMON})"
-if [ $MODE = load ]; then
+if [ $MODE = loadab ]; then
+	# Interleaved A/B/A/B under load.  A single pass through the configs
+	# cannot separate a real effect from slow drift in the EC discharge
+	# average (which reads monotonically downward for minutes after an
+	# unplug or a panel blank); alternating does.
+	command -v poller >/dev/null 2>&1 || { echo "poller(1) not installed" >&2; restore; exit 1; }
+	DUR=$(( (SETTLE + SAMPLE + 5) * 5 ))
+	echo "starting $NPOLL background pollers (~5% duty each) for ${DUR}s"
+	i=0; while [ $i -lt "$NPOLL" ]; do poller $DUR >/dev/null 2>&1 & i=$((i+1)); done
+	run "stock"      0 0 0 $EPP
+	run "pack=2"     1 2 0 $EPP
+	run "stock(2)"   0 0 0 $EPP
+	run "pack=2(2)"  1 2 0 $EPP
+	pkill -x poller 2>/dev/null
+elif [ $MODE = load ]; then
 	command -v poller >/dev/null 2>&1 || { echo "poller(1) not installed" >&2; restore; exit 1; }
 	DUR=$(( (SETTLE + SAMPLE + 5) * 4 ))
 	echo "starting $NPOLL background pollers (~5% duty each) for ${DUR}s"
