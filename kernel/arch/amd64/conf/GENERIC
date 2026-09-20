@@ -619,8 +619,6 @@ ihidev* at iic?
 
 # I2C Mice
 ims*	at ihidev? reportid ?
-imt*	at ihidev? reportid ?	# I2C HID multitouch (two-finger scroll)
-wsmouse* at imt? mux 0
 wsmouse* at ims? mux 0
 
 # I2O devices
