@@ -1,20 +1,24 @@
 #!/bin/sh
 # powerd(8) AC adapter hook (LISPBSD).
-#   pressed  = adapter plugged in  -> bright panel
-#   released = running on battery  -> dimmer panel
+#   pressed  = adapter plugged in  -> restore the AC brightness
+#   released = running on battery  -> restore the battery brightness
+# The two levels are remembered separately by brightness(1), so plugging in
+# no longer discards the level chosen on battery, or the other way round.
+# The supply is passed explicitly because envstat can still be reporting the
+# previous state at the instant this hook runs.
 # The HWP energy/perf bias is no longer set here: lpschedd(8) owns EPP and
 # reads the AC state we record in /var/run/lpsched.ac.
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/bin; export PATH
 case "$2" in
 pressed)
 	echo 1 > /var/run/lpsched.ac
-	brightness 100 >/dev/null 2>&1
-	logger -p info -t acadapter "AC connected: brightness 100"
+	logger -p info -t acadapter \
+	    "AC connected: brightness $(brightness restore ac)"
 	;;
 released)
 	echo 0 > /var/run/lpsched.ac
-	brightness 50 >/dev/null 2>&1
-	logger -p info -t acadapter "AC disconnected: brightness 50"
+	logger -p info -t acadapter \
+	    "AC disconnected: brightness $(brightness restore bat)"
 	;;
 esac
 exit 0

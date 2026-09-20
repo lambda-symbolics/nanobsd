@@ -1,21 +1,71 @@
 #!/bin/sh
-# brightness - panel backlight via ACPI. Saves last value to $HOME/.brightness;
-# restore at session start with:  brightness "$(cat ~/.brightness 2>/dev/null || echo 20)"
+# brightness [N|+N|-N|restore [ac|bat]] - panel backlight via ACPI.
+#
+# AC and battery levels are remembered separately: the panel wants to be much
+# brighter plugged in than it does on the train, and one shared setting means
+# every AC transition throws away whichever one you had just chosen.
+#
+# The state files are NOT under $HOME.  The keybindings run as mag, but the
+# powerd(8) AC hook runs as root, and both have to read and write the same
+# two files, so the location is fixed here instead.
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
 N15=hw.acpi.acpiout15.brightness; N16=hw.acpi.acpiout16.brightness
-STATE="${HOME:-/home/mag}/.brightness"
+STATE_DIR=${BRIGHTNESS_STATE_DIR:-/home/mag}
+DEFAULT_AC=100
+DEFAULT_BAT=50
+
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="doas"
+
+# Which supply are we on?  envstat is the authority, but the AC hook knows
+# better than envstat does at the moment of a transition, so it passes the
+# answer in explicitly.
+ac_state() {
+	case "$(envstat -d acpiacad0 2>/dev/null |
+	    awk '/connected/ { print $2 }')" in
+	TRUE)	echo ac ;;
+	*)	echo bat ;;
+	esac
+}
+
+state_file() { echo "$STATE_DIR/.brightness.$1"; }
+
+read_state() {
+	_v=$(cat "$(state_file "$1")" 2>/dev/null)
+	# Fall back to the old single-level file, then to a sane default.
+	[ -z "$_v" ] && _v=$(cat "$STATE_DIR/.brightness" 2>/dev/null)
+	if [ -z "$_v" ]; then
+		[ "$1" = ac ] && _v=$DEFAULT_AC || _v=$DEFAULT_BAT
+	fi
+	echo "$_v"
+}
+
+apply() {
+	$SUDO /sbin/sysctl -w "$N15=$1" >/dev/null 2>&1
+	$SUDO /sbin/sysctl -w "$N16=$1" >/dev/null 2>&1
+}
+
 cur=$(sysctl -n "$N15" 2>/dev/null); [ -z "$cur" ] && cur=100
-[ $# -eq 0 ] && { echo "$cur"; exit 0; }
-case "$1" in
-  +[0-9]*) new=$((cur + ${1#+})) ;;
-  -[0-9]*) new=$((cur - ${1#-})) ;;
-  [0-9]*)  new=$1 ;;
-  *) echo "usage: brightness [N|+N|-N]" >&2; exit 1 ;;
+
+case "${1:-}" in
+"")
+	echo "$cur"; exit 0 ;;
+restore)
+	# Reapply the level remembered for this supply.  Deliberately does not
+	# save: restoring is not the user choosing a level, and saving here
+	# would let a default overwrite a real preference.
+	src=${2:-$(ac_state)}
+	new=$(read_state "$src")
+	apply "$new"
+	echo "$new"; exit 0 ;;
++[0-9]*) new=$((cur + ${1#+})) ;;
+-[0-9]*) new=$((cur - ${1#-})) ;;
+[0-9]*)  new=$1 ;;
+*)
+	echo "usage: brightness [N|+N|-N|restore [ac|bat]]" >&2; exit 1 ;;
 esac
+
 [ "$new" -lt 1 ] && new=1
 [ "$new" -gt 100 ] && new=100
-SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="doas"
-$SUDO /sbin/sysctl -w "$N15=$new" >/dev/null 2>&1
-$SUDO /sbin/sysctl -w "$N16=$new" >/dev/null 2>&1
-echo "$new" > "$STATE" 2>/dev/null
+apply "$new"
+echo "$new" > "$(state_file "$(ac_state)")" 2>/dev/null
 echo "$new"

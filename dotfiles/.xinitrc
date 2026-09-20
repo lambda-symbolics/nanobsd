@@ -8,11 +8,15 @@ xset r rate 300 40
 xset s off
 [ -r "$HOME/.Xresources" ] && xrdb -merge "$HOME/.Xresources"
 hsetroot -solid '#0A0A0A'
+# Give the root window a cursor.  StumpWM never defines one, so until some
+# client maps a window with its own cursor, the pointer over bare root is
+# whatever X inherited - which on this machine is nothing visible at all.
+xsetroot -cursor_name left_ptr
 # static warm display colour (~4000K), reapplied across DPMS blanks
 pgrep -f statusbard >/dev/null || /usr/local/bin/statusbard &
 /usr/local/bin/screentemp 4000 -d &
 
-/usr/local/bin/brightness "$(cat "$HOME/.brightness" 2>/dev/null || echo 20)" >/dev/null 2>&1
+/usr/local/bin/brightness restore >/dev/null 2>&1
 # the mixer resets to the codec default on every boot; replay the last setting
 /usr/local/bin/volume restore >/dev/null 2>&1
 xset +dpms 2>/dev/null
