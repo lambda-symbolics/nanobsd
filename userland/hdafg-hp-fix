@@ -3,53 +3,51 @@
 #
 # The codec describes pin 0x21 (the 3.5mm jack) as its own association
 # (As=2 Seq=0).  hdafg(4) then tries to give that association its own DAC,
-# but the 4-channel speaker association has already claimed both DACs the
-# codec has, so the trace fails and the jack is dropped entirely:
+# but the speaker association has already claimed both DACs the codec has,
+# so the trace fails and the jack is dropped entirely:
 #
 #   hdafg0: depth 2 nid 02 busy by assoc 0
-#   hdafg0: depth 2 nid 03 busy by assoc 0
 #   hdafg0:   trace failed as=1 seq=0 pin=21 hpredir=-1 minassoc=0
 #
 # hdafg already implements headphone redirection -- sharing the speakers'
-# DAC and switching on jack sense -- but only enables it for a headphone pin
-# that sits INSIDE the speaker association at sequence 15:
+# DAC and switching on jack sense -- but only for a headphone pin that sits
+# INSIDE the speaker association at sequence 15:
 #
 #   /* Headphones with seq=15 may mean redirection */
 #   if (type == COP_DEVICE_HP_OUT && seq == 15)
 #
-# So rewrite the pin's configuration default from association 2 / sequence 0
-# to association 1 / sequence 15, i.e. 0x03211020 -> 0x0321101f, and hand it
-# back through the pin-config property.  hdafg re-attaches and reports
+# So rewrite pin 0x21's configuration default to association 1 / sequence 15
+# and hand it back through the pin-config property.  The codec forgets this
+# over a power cycle, so it is reapplied at boot.
 #
-#   DAC00 4ch: Speaker [...], HP Out [Jack Black(21)]
+# The codec reverts to its factory configuration on every power-on, so this
+# only ever has to ADD overrides -- it must never try to "restore" a value.
+# An earlier version did, with a global substitution of the unconnected-pin
+# value, which rewrote EVERY unused pin (0x13, 0x18, 0x1a, 0x1b, 0x1e) into a
+# speaker and left the codec with no usable output association at all.
 #
-# The codec forgets this over a power cycle, so it is reapplied at boot.
+# IMT_DROP_SPK2=1 additionally retires the second speaker pin (0x17) to make
+# the group plain 2ch stereo.  That was tried to cure thin-sounding
+# headphones and made the SPEAKERS equally thin, so it is off by default:
+# 0x14 alone is evidently the small driver and both pins are needed.
 
 PATH=/sbin:/usr/sbin:/bin:/usr/bin; export PATH
 DEV=${1:-/dev/hdaudio0}
-OLD=0x3211020		# as printed by hdaudioctl (no leading zero)
-NEW=0x321101f
-# The speaker association is FOUR channels: pin 0x14 (seq 0) and pin 0x17
-# (seq 1).  A headphone redirected into a 4-channel group is fed a channel
-# pair of that group rather than the full stereo mix, which sounds thin and
-# treble-heavy.  Retiring the second speaker pin makes the group plain 2ch
-# stereo, so the jack carries the whole mix.  Set IMT_KEEP_4CH=1 to skip
-# this and keep both speaker pins instead.
-SPK2_OLD=0x90170111
-SPK2_NEW=0x411111f0	# "no physical connection"
+CUR=/tmp/hdafg-cur.$$
+NEW=/tmp/hdafg-new.$$
 
-hdaudioctl -f "$DEV" get 0 0x01 > /tmp/hdafg-pincfg.$$ 2>/dev/null || exit 0
-if ! grep -qE "<integer>($OLD|$SPK2_OLD)</integer>" /tmp/hdafg-pincfg.$$; then
-	rm -f /tmp/hdafg-pincfg.$$
-	exit 0			# already patched, or a different codec
+hdaudioctl -f "$DEV" get 0 0x01 > "$CUR" 2>/dev/null || exit 0
+
+# 0x21: headphones -> association 1, sequence 15 (redirection)
+sed -e 's|<integer>0x3211020</integer>|<integer>0x321101f</integer>|' "$CUR" > "$NEW"
+if [ "${IMT_DROP_SPK2:-0}" = 1 ]; then
+	# 0x90170111 is pin 0x17 alone; pin 0x14 is 0x90170110.
+	sed -i -e 's|<integer>0x90170111</integer>|<integer>0x411111f0</integer>|' "$NEW"
 fi
-if [ "${IMT_KEEP_4CH:-0}" = 1 ]; then
-	sed "s|<integer>$OLD</integer>|<integer>$NEW</integer>|" \
-	    /tmp/hdafg-pincfg.$$ > /tmp/hdafg-pincfg-hp.$$
-else
-	sed -e "s|<integer>$OLD</integer>|<integer>$NEW</integer>|" \
-	    -e "s|<integer>$SPK2_OLD</integer>|<integer>$SPK2_NEW</integer>|" \
-	    /tmp/hdafg-pincfg.$$ > /tmp/hdafg-pincfg-hp.$$
+
+if cmp -s "$CUR" "$NEW"; then
+	rm -f "$CUR" "$NEW"
+	exit 0			# already in the wanted state
 fi
-hdaudioctl -f "$DEV" set 0 0x01 /tmp/hdafg-pincfg-hp.$$ >/dev/null 2>&1
-rm -f /tmp/hdafg-pincfg.$$ /tmp/hdafg-pincfg-hp.$$
+hdaudioctl -f "$DEV" set 0 0x01 "$NEW" >/dev/null 2>&1
+rm -f "$CUR" "$NEW"

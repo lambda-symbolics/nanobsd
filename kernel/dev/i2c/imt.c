@@ -88,6 +88,7 @@ struct imt_softc {
 	bool			sc_have_btn;
 
 	int			sc_cfg_rid;	/* Input Mode feature report */
+	int			sc_cfg_size;	/* ...and its length in bytes */
 
 	/* gesture state, carried between reports */
 	int			sc_prev_x, sc_prev_y;
@@ -95,6 +96,7 @@ struct imt_softc {
 	uint32_t		sc_prev_btn;
 	/* sub-click scroll remainder, so slow drags still scroll */
 	int			sc_acc_x, sc_acc_y;
+	int			sc_traced;
 };
 
 static int	imt_match(device_t, cfdata_t, void *);
@@ -106,7 +108,7 @@ static int	imt_enable(void *);
 static void	imt_disable(void *);
 static int	imt_ioctl(void *, u_long, void *, int, struct lwp *);
 
-int imt_debug = 0;
+int imt_debug = 2;	/* XXX on by default while bringing the driver up */
 int imt_motion_div = IMT_MOTION_DIV_DEFAULT;
 int imt_scroll_div = IMT_SCROLL_DIV_DEFAULT;
 int imt_scroll_invert = 0;
@@ -238,6 +240,38 @@ imt_sysctl_setup(void)
 	    NULL, 0, &imt_debug, 0, CTL_CREATE, CTL_EOL);
 }
 
+/*
+ * Put the pad into Precision Touchpad mode.  This must be redone every time
+ * the device is opened, not only at attach: the pad is reset when ihidev
+ * brings it up, and a mode set before that is forgotten, leaving it in
+ * mouse-emulation mode where the multitouch report is never sent at all.
+ */
+static int
+imt_set_ptp_mode(struct imt_softc *sc)
+{
+	uint8_t rep[8];
+	int len, err;
+
+	/*
+	 * Send the whole feature report, not a single byte.  The report is
+	 * "input mode" plus a device index, and a short write is accepted
+	 * without complaint while leaving the pad in mouse-emulation mode,
+	 * so the multitouch report never arrives.
+	 */
+	len = sc->sc_cfg_size;
+	if (len <= 0 || len > (int)sizeof(rep))
+		len = 2;
+	memset(rep, 0, sizeof(rep));
+	rep[0] = IMT_INPUT_MODE_PTP;
+
+	err = ihidev_set_report((device_t)sc->sc_hdev.sc_parent, hid_feature,
+	    sc->sc_cfg_rid, rep, len);
+	if (imt_debug)
+		printf("imt: set input mode rid %d len %d -> %d (err %d)\n",
+		    sc->sc_cfg_rid, len, rep[0], err);
+	return err;
+}
+
 static int
 imt_match(device_t parent, cfdata_t match, void *aux)
 {
@@ -295,7 +329,6 @@ imt_attach(device_t parent, device_t self, void *aux)
 	struct imt_softc *sc = device_private(self);
 	struct ihidev_attach_arg *iha = aux;
 	struct wsmousedev_attach_args a;
-	uint8_t mode = IMT_INPUT_MODE_PTP;
 	void *desc;
 	int size, repid;
 
@@ -318,16 +351,12 @@ imt_attach(device_t parent, device_t self, void *aux)
 		aprint_error_dev(self, "no Input Mode report\n");
 		return;
 	}
-
-	/*
-	 * Switch the pad from mouse emulation to Precision Touchpad mode.
-	 * Until this succeeds the multitouch report stays silent.
-	 */
-	if (ihidev_set_report((device_t)sc->sc_hdev.sc_parent, hid_feature,
-	    sc->sc_cfg_rid, &mode, sizeof(mode))) {
-		aprint_error_dev(self, "could not enable touchpad mode\n");
-		return;
-	}
+	sc->sc_cfg_size = hid_report_size(desc, size, hid_feature,
+	    sc->sc_cfg_rid);
+	if (imt_debug)
+		printf("imt: input report %d size %d, config report %d size %d\n",
+		    repid, sc->sc_hdev.sc_isize, sc->sc_cfg_rid,
+		    sc->sc_cfg_size);
 
 	aprint_normal(": %d contacts%s, two-finger scrolling\n",
 	    sc->sc_nslots, sc->sc_have_btn ? ", clickpad" : "");
@@ -337,6 +366,7 @@ imt_attach(device_t parent, device_t self, void *aux)
 
 	imt_sysctl_setup();
 
+	printf("imt: attach complete, awaiting open\n");
 	a.accessops = &imt_accessops;
 	a.accesscookie = sc;
 	sc->sc_wsmousedev = config_found(self, &a, wsmousedevprint, CFARGS_NONE);
@@ -403,9 +433,11 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 			dx = dy = 0;
 	}
 
-	if (imt_debug > 1)
+	if (imt_debug > 1 && sc->sc_traced < 40) {
+		sc->sc_traced++;
 		printf("imt: down=%d x=%d y=%d dx=%d dy=%d acc=%d btn=%u\n",
 		    down, x, y, dx, dy, sc->sc_acc_y, btn);
+	}
 
 	s = spltty();
 	if (down == 2) {
@@ -462,10 +494,16 @@ imt_enable(void *v)
 	struct imt_softc *sc = v;
 	int error;
 
+	printf("imt: enable called\n");
 	if (sc->sc_enabled)
 		return EBUSY;
-	if ((error = ihidev_open(&sc->sc_hdev)) != 0)
+	if ((error = ihidev_open(&sc->sc_hdev)) != 0) {
+		if (imt_debug)
+			printf("imt: ihidev_open failed %d\n", error);
 		return error;
+	}
+	/* The pad has just been reset; ask for multitouch reports again. */
+	(void)imt_set_ptp_mode(sc);
 	sc->sc_prev_down = 0;
 	sc->sc_prev_btn = 0;
 	sc->sc_enabled = true;
