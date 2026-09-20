@@ -379,6 +379,45 @@ remains unaligned, so the coalescing grid still cannot guarantee synchronized
 physical wake times -- a correct scheme must return the unelapsed part of a
 cancelled interval to the carry.
 
+* ENERGY RESULT (2026-09-20, kernel #98, RAPL, 3x interleaved) -- NULL
+
+The deliverable the whole exercise was waiting for.  EPP fixed at 240, panel
+pinned off, daemon stopped, 4 pollers at a 200 ms period with staggered phase,
+60 s samples, three interleaved stock/pack2 pairs.
+
+| config  | package W            | deep/s | ints/s | batches/s | J/batch |
+|---------+----------------------+--------+--------+-----------+---------|
+| stock   | 0.889, 0.890, 0.893  |  20.03 |   70.5 |     20.00 |    0.04 |
+| pack=2  | 0.890, 0.902, 0.886  |  21.53 |   80.1 |     20.00 |    0.04 |
+
+Validity: every configuration completed 20.00 batches/s with 0 missed
+deadlines, so they did equal work; all snapshots were fresh (4/4) with ~0.15 s
+worker skew.
+
+*Packing does not save energy on this machine.*  Mean package power is 0.8907 W
+stock against 0.8927 W packed -- packing is 0.002 W HIGHER, and pack=2's own
+spread (0.016 W) is eight times that difference.  Energy per completed batch is
+identical at 0.04 J.  This is a null result from a trustworthy instrument, not
+another inconclusive one.
+
+Two consistent secondary effects, where every packed sample beats every stock
+sample:
+- deep tickless skips rise 20.0 -> 21.5 /s (+7.5%): the mechanism does do what
+  it was built to do.
+- interrupts rise 70.5 -> 80.1 /s (+13.6%).  That is the likely explanation for
+  the null: the IPIs and reschedules that packing costs offset the deeper idle
+  it buys.
+
+Context for scale: package power is 0.89 W while the battery reads ~2.56 W, so
+the package is about a third of system draw.  Even a 10% package saving would
+be ~0.09 W at the wall; the measured effect is 0%.
+
+*Conclusion.*  lpsched's mechanisms are correct, correctly instrumented and
+measurably active, and the policy does not pay on this hardware.  The only
+watt-class lever remains EPP, which lpschedd already automates.  Keep the
+mechanisms (gated, default-off via the governor's AC=perf profile); do not
+expect power from packing.
+
 * Fourth review: benchmark repairs and the energy harness (2026-09-20)
 
 ** Two interrupt-ordering bugs remain, carried as failing regression tests
