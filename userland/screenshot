@@ -1,0 +1,34 @@
+#!/bin/sh
+# screenshot - freeze the screen, select a region, save it timestamped and put
+# it on the clipboard.
+#
+# The freeze matters: scrot -f grabs the screen FIRST and lets you crop the
+# frozen image, so nothing moves or disappears while you are selecting.  This
+# is the hacksaw+shotgun behaviour; scrot(1) 2.x does both natively here, so
+# no extra Rust tooling is needed.
+#
+# usage: screenshot [area|full|window]      (default: area)
+
+PATH=/usr/pkg/bin:/usr/X11R7/bin:/usr/local/bin:/bin:/usr/bin; export PATH
+DIR=${SCREENSHOT_DIR:-$HOME}
+OUT="$DIR/screenshot-$(date +%Y-%m-%d_%H-%M-%S).png"
+
+# Dashed accent-coloured selection box, matching the status bar's palette.
+SELOPTS='--line style=dash,width=2,color=#E46876'
+
+case "${1:-area}" in
+area)	# freeze, then crop; scrot exits non-zero if the selection is cancelled
+	scrot -f -s $SELOPTS "$OUT" || exit 1 ;;
+window)	scrot -u "$OUT" || exit 1 ;;
+full)	scrot "$OUT" || exit 1 ;;
+*)	echo "usage: screenshot [area|full|window]" >&2; exit 2 ;;
+esac
+
+[ -s "$OUT" ] || { echo "screenshot: capture produced nothing" >&2; exit 1; }
+
+# Clipboard: xclip must keep running to own the selection, so detach it.
+if command -v xclip >/dev/null 2>&1; then
+	nohup xclip -selection clipboard -t image/png -i "$OUT" \
+	    >/dev/null 2>&1 &
+fi
+echo "$OUT"
