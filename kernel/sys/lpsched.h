@@ -39,17 +39,6 @@
  */
 #define	LPSCHED_ESTCPU_SHIFT	11
 
-/*
- * Per-CPU idle depth, one cache line each: a bare uint8_t[] puts every CPU's
- * byte in the same line, so each idle entry and exit would invalidate the
- * line for all the others -- contention introduced by the observer.
- */
-struct lpsched_cpu {
-	volatile uint8_t	depth;
-} __aligned(COHERENCY_UNIT);
-
-extern struct lpsched_cpu lpsched_cpu[MAXCPUS];
-
 extern int	lpsched_enabled;	/* master switch */
 extern int	lpsched_pack;		/* 0 off, 1 mild, 2 aggressive */
 extern int	lpsched_coalesce_ms;	/* callout slack grid in ms, 0 off */
@@ -59,31 +48,54 @@ extern int	lpsched_estcpu_thresh;	/* 0 = off; else estcpu>>11 below this
 extern volatile int	lpsched_last_input;	/* getticks() at last input */
 
 /*
- * Counters.  Only ever touched while lpsched is enabled, so a disabled
- * kernel keeps stock behaviour and stock cache traffic.  Without these
- * there is no way to tell a mechanism that did nothing from one that never
- * ran: the first round of measurements could not distinguish them.
+ * Counters.  Per-CPU and cache-line separated: a set of global counters
+ * atomically incremented from every CPU adds exactly the cross-CPU shared
+ * writes this code exists to avoid, and it does so in the power-saving
+ * configuration only -- i.e. it would tax the arm under test.  Aggregated on
+ * read.  lpsched_stats_enabled turns them off so their own cost can be
+ * measured.
  */
-extern uint64_t	lpsched_st_considered;	/* placement decisions seen */
-extern uint64_t	lpsched_st_exempt_class;	/* not SCHED_OTHER */
-extern uint64_t	lpsched_st_exempt_fg;		/* focused process */
-extern uint64_t	lpsched_st_exempt_estcpu;	/* interactive by estcpu */
-extern uint64_t	lpsched_st_pack_sibling;	/* onto an awake core's sibling */
-extern uint64_t	lpsched_st_pack_shallow;	/* onto a shallow-idle CPU */
-extern uint64_t	lpsched_st_pack_deep;		/* had to wake a deep CPU */
-extern uint64_t	lpsched_st_pack_busy;		/* queued behind a runner */
-extern uint64_t	lpsched_st_pack_none;		/* fell back to stock */
-extern uint64_t	lpsched_st_pack_held;		/* migration away suppressed */
-extern uint64_t	lpsched_st_catch_held;		/* steal held back */
-extern uint64_t	lpsched_st_coal_applied;	/* callout delayed onto grid */
-extern uint64_t	lpsched_st_coal_short;		/* too short to coalesce */
-extern uint64_t	lpsched_st_coal_precise;	/* CALLOUT_PRECISE */
+enum {
+	LPSCHED_ST_CONSIDERED,		/* exemption decisions made */
+	LPSCHED_ST_EXEMPT_CLASS,	/* not SCHED_OTHER */
+	LPSCHED_ST_EXEMPT_FG,		/* focused process */
+	LPSCHED_ST_EXEMPT_ESTCPU,	/* interactive by estcpu */
+	LPSCHED_ST_PACK_SIBLING,	/* onto an awake core's idle sibling */
+	LPSCHED_ST_PACK_SHALLOW,	/* onto a shallow-idle CPU */
+	LPSCHED_ST_PACK_DEEP,		/* had to wake a deep-idle CPU */
+	LPSCHED_ST_PACK_BUSY,		/* queued behind a running LWP */
+	LPSCHED_ST_PACK_NONE,		/* fell back to stock placement */
+	LPSCHED_ST_PACK_HELD,		/* cross-core migration suppressed */
+	LPSCHED_ST_CATCH_HELD,		/* steal of available work held back */
+	LPSCHED_ST_COAL_APPLIED,	/* callout delayed onto the grid */
+	LPSCHED_ST_COAL_NOSLACK,	/* callout did not opt in to slack */
+	LPSCHED_ST_COAL_SHORT,		/* opted in but shorter than the grid */
+	LPSCHED_ST_COAL_PRECISE,	/* CALLOUT_PRECISE */
+	LPSCHED_NSTAT
+};
+
+/*
+ * Per-CPU idle depth and counters, one cache line group each: a bare
+ * uint8_t[] put every CPU's byte in the same line, so each idle entry and
+ * exit invalidated the line for all the others -- contention introduced by
+ * the observer.
+ */
+struct lpsched_cpu {
+	volatile uint8_t	depth;
+	uint64_t		st[LPSCHED_NSTAT];
+} __aligned(COHERENCY_UNIT);
+
+extern struct lpsched_cpu lpsched_cpu[MAXCPUS];
+extern int	lpsched_stats_enabled;
+
+void	lpsched_stat_bump(u_int);
 
 static inline void
-lpsched_stat(uint64_t *counter)
+lpsched_stat(u_int idx)
 {
 
-	atomic_inc_64((volatile uint64_t *)counter);
+	if (__predict_false(lpsched_stats_enabled != 0))
+		lpsched_stat_bump(idx);
 }
 
 static inline bool

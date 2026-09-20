@@ -571,19 +571,19 @@ static inline bool
 lpsched_exempt(const struct lwp *l)
 {
 
-	lpsched_stat(&lpsched_st_considered);
+	lpsched_stat(LPSCHED_ST_CONSIDERED);
 	if (l->l_class != SCHED_OTHER) {
-		lpsched_stat(&lpsched_st_exempt_class);
+		lpsched_stat(LPSCHED_ST_EXEMPT_CLASS);
 		return true;
 	}
 	if (lpsched_fgpid != 0 && l->l_proc->p_pid == lpsched_fgpid) {
-		lpsched_stat(&lpsched_st_exempt_fg);
+		lpsched_stat(LPSCHED_ST_EXEMPT_FG);
 		return true;
 	}
 	if (lpsched_estcpu_thresh > 0 &&
 	    (l->l_estcpu >> LPSCHED_ESTCPU_SHIFT) <
 	    (fixpt_t)lpsched_estcpu_thresh) {
-		lpsched_stat(&lpsched_st_exempt_estcpu);
+		lpsched_stat(LPSCHED_ST_EXEMPT_ESTCPU);
 		return true;
 	}
 	return false;
@@ -605,6 +605,44 @@ lpsched_wake_cost(struct cpu_info *ci)
 			return 0;
 	}
 	return 1 + lpsched_idle_depth(cpu_index(ci));
+}
+
+/*
+ * lpsched: do "a" and "b" share a physical core?  Moving between SMT threads
+ * of one core wakes nothing, so it is never worth suppressing.
+ */
+static inline bool
+lpsched_same_core(struct cpu_info *a, struct cpu_info *b)
+{
+	struct cpu_info *t;
+
+	if (a == b)
+		return true;
+	for (t = a->ci_sibling[CPUREL_CORE]; t != a;
+	    t = t->ci_sibling[CPUREL_CORE]) {
+		if (t == b)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * lpsched: is this CPU actually carrying packed work, i.e. sharing its
+ * physical core with other running threads?  If the core is ours alone then
+ * moving off it is core-count neutral and there is nothing to protect -- so
+ * this doubles as the escape hatch when load changes and the core empties.
+ */
+static inline bool
+lpsched_is_packed(struct cpu_info *ci)
+{
+	struct cpu_info *t;
+
+	for (t = ci->ci_sibling[CPUREL_CORE]; t != ci;
+	    t = t->ci_sibling[CPUREL_CORE]) {
+		if ((t->ci_schedstate.spc_flags & SPCF_IDLE) == 0)
+			return true;
+	}
+	return false;
 }
 
 /*
@@ -644,7 +682,7 @@ lpsched_pack_pick(struct lwp *l, struct cpu_info *pivot)
 	} while (outer = outer->ci_sibling[CPUREL_PACKAGE1ST], outer != first);
 
 	if (best != NULL && bestcost == 0) {
-		lpsched_stat(&lpsched_st_pack_sibling);
+		lpsched_stat(LPSCHED_ST_PACK_SIBLING);
 		return best;
 	}
 
@@ -660,7 +698,7 @@ lpsched_pack_pick(struct lwp *l, struct cpu_info *pivot)
 				    spc->spc_curpriority > MAXPRI_USER) {
 					continue;
 				}
-				lpsched_stat(&lpsched_st_pack_busy);
+				lpsched_stat(LPSCHED_ST_PACK_BUSY);
 				return ci;
 			} while (ci = ci->ci_sibling[CPUREL_PACKAGE],
 			    ci != outer);
@@ -669,11 +707,11 @@ lpsched_pack_pick(struct lwp *l, struct cpu_info *pivot)
 	}
 
 	if (best == NULL)
-		lpsched_stat(&lpsched_st_pack_none);
+		lpsched_stat(LPSCHED_ST_PACK_NONE);
 	else if (bestcost > 1 + LPSCHED_IDLE_SHALLOW)
-		lpsched_stat(&lpsched_st_pack_deep);
+		lpsched_stat(LPSCHED_ST_PACK_DEEP);
 	else
-		lpsched_stat(&lpsched_st_pack_shallow);
+		lpsched_stat(LPSCHED_ST_PACK_SHALLOW);
 	return best;
 }
 
@@ -685,10 +723,10 @@ lpsched_pack_pick(struct lwp *l, struct cpu_info *pivot)
  * the only place realtime and kernel work can be protected from it.
  */
 static inline u_int
-lpsched_min_catch(struct cpu_info *local,
-    const struct schedstate_percpu *remote)
+lpsched_min_catch(struct cpu_info *local, struct schedstate_percpu *remote)
 {
 	struct cpu_info *tci;
+	u_int raised, have;
 
 	if (!lpsched_packing())
 		return min_catch;
@@ -699,8 +737,16 @@ lpsched_min_catch(struct cpu_info *local,
 		if ((tci->ci_schedstate.spc_flags & SPCF_IDLE) == 0)
 			return min_catch;
 	}
-	lpsched_stat(&lpsched_st_catch_held);
-	return min_catch + lpsched_pack;
+	raised = min_catch + lpsched_pack;
+	/*
+	 * Only a hold if the threshold actually rejects work that was there
+	 * to take.  sched_idle() calls this while scanning every CPU, so
+	 * counting unconditionally recorded a "hold" for each empty queue.
+	 */
+	have = atomic_load_relaxed(&remote->spc_mcount);
+	if (have > 0 && have < raised)
+		lpsched_stat(LPSCHED_ST_CATCH_HELD);
+	return raised;
 }
 
 /*
@@ -1072,20 +1118,6 @@ sched_preempted(struct lwp *l)
 	KASSERT(tspc->spc_count >= 1);
 
 	/*
-	 * lpsched: packing deliberately placed this LWP on a secondary SMT
-	 * CPU.  Everything below exists to move such threads onto an idle
-	 * first-class CPU, which would wake the very core packing avoided
-	 * waking -- so leave packed work where it is.  vfork() children
-	 * (LP_TELEPORT) still scatter: that is a correctness path, not a
-	 * placement preference.
-	 */
-	if (lpsched_packing() && (l->l_pflag & LP_TELEPORT) == 0 &&
-	    !lpsched_exempt(l)) {
-		lpsched_stat(&lpsched_st_pack_held);
-		return;
-	}
-
-	/*
 	 * Try to select another CPU if:
 	 *
 	 * - there is no migration pending already
@@ -1139,6 +1171,22 @@ sched_preempted(struct lwp *l)
 		 */
 		tci = sched_bestcpu(l, l->l_cpu);
 		if (tci != ci && cpu_is_idle_1stclass(tci)) {
+			/*
+			 * lpsched: this is the move that wakes a core packing
+			 * deliberately left idle -- and the only place in this
+			 * function where one certainly would have happened, so
+			 * it is the only honest place to suppress and count.
+			 * The same-core sibling case above is left alone: it
+			 * shares the core and wakes nothing.  Threads whose
+			 * core has since emptied are no longer packed and are
+			 * released to the stock policy.
+			 */
+			if (lpsched_packing() &&
+			    !lpsched_same_core(ci, tci) &&
+			    lpsched_is_packed(ci) && !lpsched_exempt(l)) {
+				lpsched_stat(LPSCHED_ST_PACK_HELD);
+				return;
+			}
 			l->l_target_cpu = tci;
 		}
 	}

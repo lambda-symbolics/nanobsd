@@ -511,6 +511,29 @@ lapic_gettick(void)
 uint32_t lapic_tval;
 
 /*
+ * Tickless accounting state, one cache line per CPU.
+ *
+ * frac:   sub-tick LAPIC counts that a tickless wake could not credit as a
+ *         whole hardclock tick.  Carried to the next wake instead of being
+ *         discarded, which otherwise loses a fraction of a tick on EVERY
+ *         wake and makes the replayed hardclock count drift slow.
+ * Phase alignment was attempted here and REMOVED.  Restarting as a short
+ * one-shot to land on the original tick boundary is correct only if that
+ * one-shot survives to fire: lapic_oneshot() reprograms the timer whenever
+ * the CPU re-enters tickless idle, which on this machine happens tens of
+ * thousands of times a minute, so the short interval was usually cancelled
+ * and the tick it owed was never delivered.  Measured: hardclock -3.3%
+ * against the monotonic clock.  Carrying the remainder without reprogramming
+ * is rate-exact, which timekeeping and callouts depend on; cross-CPU tick
+ * PHASE therefore remains unaligned, and a correct scheme would have to
+ * return the unelapsed part of a cancelled interval to frac.
+ */
+struct lapic_tlstate {
+	uint32_t	frac;
+} __aligned(COHERENCY_UNIT);
+static struct lapic_tlstate lapic_tlstate[MAXCPUS];
+
+/*
  * this gets us up to a 4GHz busclock....
  */
 uint32_t lapic_per_second;
@@ -638,21 +661,30 @@ lapic_oneshot_done(uint32_t nticks, int *pendingp)
 {
 	struct cpu_info *ci = curcpu();
 	uint16_t irr = LAPIC_IRR + LAPIC_TIMER_VECTOR / 32 * 16;
+	u_int idx = ci->ci_index;
 	uint64_t counted;
-	uint32_t rem;
+	uint32_t rem, frac;
 	unsigned elapsed;
 	int pending;
 
 	pending = (lapic_readreg(irr) & (1u << (LAPIC_TIMER_VECTOR % 32))) != 0;
-	if (pending) {
-		elapsed = nticks;
-	} else {
+	counted = (uint64_t)lapic_tval * nticks;
+	if (!pending) {
 		rem = lapic_readreg(LAPIC_CCR_TIMER);
-		counted = (uint64_t)lapic_tval * nticks;
-		if ((uint64_t)rem <= counted)
-			counted -= rem;
-		elapsed = (unsigned)(counted / lapic_tval);
+		counted = ((uint64_t)rem <= counted) ? counted - rem : 0;
 	}
+
+	/*
+	 * Credit whole ticks and CARRY the sub-tick remainder.  Truncating it
+	 * away here discarded up to a tick of real time on every wake, so the
+	 * replayed hardclock count ran slow by a fraction of a tick per wake.
+	 */
+	frac = (idx < MAXCPUS) ? lapic_tlstate[idx].frac : 0;
+	counted += frac;
+	elapsed = (unsigned)(counted / lapic_tval);
+	frac = (uint32_t)(counted % lapic_tval);
+	if (idx < MAXCPUS)
+		lapic_tlstate[idx].frac = frac;
 
 	/* Restore the periodic tick. */
 	lapic_writereg(LAPIC_LVT_TIMER,

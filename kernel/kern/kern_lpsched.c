@@ -24,6 +24,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/inttypes.h>
+#include <sys/cpu.h>
 #include <sys/sysctl.h>
 #include <sys/lpsched.h>
 
@@ -43,22 +44,44 @@ int	lpsched_estcpu_thresh = 0;
 volatile int		lpsched_last_input;
 struct lpsched_cpu	lpsched_cpu[MAXCPUS] __cacheline_aligned;
 
-uint64_t	lpsched_st_considered;
-uint64_t	lpsched_st_exempt_class;
-uint64_t	lpsched_st_exempt_fg;
-uint64_t	lpsched_st_exempt_estcpu;
-uint64_t	lpsched_st_pack_sibling;
-uint64_t	lpsched_st_pack_shallow;
-uint64_t	lpsched_st_pack_deep;
-uint64_t	lpsched_st_pack_busy;
-uint64_t	lpsched_st_pack_none;
-uint64_t	lpsched_st_pack_held;
-uint64_t	lpsched_st_catch_held;
-uint64_t	lpsched_st_coal_applied;
-uint64_t	lpsched_st_coal_short;
-uint64_t	lpsched_st_coal_precise;
+int	lpsched_stats_enabled = 1;
 
-static char	lpsched_stats_buf[512];
+static const char * const lpsched_stat_name[LPSCHED_NSTAT] = {
+	[LPSCHED_ST_CONSIDERED]		= "considered",
+	[LPSCHED_ST_EXEMPT_CLASS]	= "exempt_class",
+	[LPSCHED_ST_EXEMPT_FG]		= "exempt_fg",
+	[LPSCHED_ST_EXEMPT_ESTCPU]	= "exempt_estcpu",
+	[LPSCHED_ST_PACK_SIBLING]	= "pack_sibling",
+	[LPSCHED_ST_PACK_SHALLOW]	= "pack_shallow",
+	[LPSCHED_ST_PACK_DEEP]		= "pack_deep",
+	[LPSCHED_ST_PACK_BUSY]		= "pack_busy",
+	[LPSCHED_ST_PACK_NONE]		= "pack_none",
+	[LPSCHED_ST_PACK_HELD]		= "pack_held",
+	[LPSCHED_ST_CATCH_HELD]		= "catch_held",
+	[LPSCHED_ST_COAL_APPLIED]	= "coal_applied",
+	[LPSCHED_ST_COAL_NOSLACK]	= "coal_noslack",
+	[LPSCHED_ST_COAL_SHORT]		= "coal_short",
+	[LPSCHED_ST_COAL_PRECISE]	= "coal_precise",
+};
+
+/*
+ * Bump a counter on the running CPU.  Deliberately not atomic: the value is
+ * diagnostic, it is only ever written by its own CPU, and an atomic here
+ * would reintroduce the cross-CPU traffic the per-CPU layout removes.
+ */
+void
+lpsched_stat_bump(u_int idx)
+{
+	u_int i;
+
+	if (__predict_false(idx >= LPSCHED_NSTAT))
+		return;
+	i = cpu_index(curcpu());
+	if (__predict_true(i < MAXCPUS))
+		lpsched_cpu[i].st[idx]++;
+}
+
+static char	lpsched_stats_buf[640];
 
 /*
  * Generic clamped integer handler: rnode->sysctl_data points at the
@@ -136,24 +159,29 @@ static int
 lpsched_sysctl_stats(SYSCTLFN_ARGS)
 {
 	struct sysctlnode node = *rnode;
+	uint64_t total[LPSCHED_NSTAT];
+	size_t len = 0;
+	u_int i, c;
 
-	snprintf(lpsched_stats_buf, sizeof(lpsched_stats_buf),
-	    "considered=%" PRIu64 " exempt_class=%" PRIu64
-	    " exempt_fg=%" PRIu64 " exempt_estcpu=%" PRIu64
-	    " pack_sibling=%" PRIu64 " pack_shallow=%" PRIu64
-	    " pack_deep=%" PRIu64 " pack_busy=%" PRIu64
-	    " pack_none=%" PRIu64 " pack_held=%" PRIu64
-	    " catch_held=%" PRIu64 " coal_applied=%" PRIu64
-	    " coal_short=%" PRIu64 " coal_precise=%" PRIu64,
-	    lpsched_st_considered, lpsched_st_exempt_class,
-	    lpsched_st_exempt_fg, lpsched_st_exempt_estcpu,
-	    lpsched_st_pack_sibling, lpsched_st_pack_shallow,
-	    lpsched_st_pack_deep, lpsched_st_pack_busy,
-	    lpsched_st_pack_none, lpsched_st_pack_held,
-	    lpsched_st_catch_held, lpsched_st_coal_applied,
-	    lpsched_st_coal_short, lpsched_st_coal_precise);
+	memset(total, 0, sizeof(total));
+	for (c = 0; c < MAXCPUS; c++)
+		for (i = 0; i < LPSCHED_NSTAT; i++)
+			total[i] += lpsched_cpu[c].st[i];
+
+	for (i = 0; i < LPSCHED_NSTAT && len < sizeof(lpsched_stats_buf); i++) {
+		len += snprintf(lpsched_stats_buf + len,
+		    sizeof(lpsched_stats_buf) - len, "%s%s=%" PRIu64,
+		    (i == 0) ? "" : " ", lpsched_stat_name[i], total[i]);
+	}
 	node.sysctl_data = lpsched_stats_buf;
 	return sysctl_lookup(SYSCTLFN_CALL(&node));
+}
+
+static int
+lpsched_sysctl_stats_enabled(SYSCTLFN_ARGS)
+{
+
+	return lpsched_sysctl_clamp(SYSCTLFN_CALL(rnode), 0, 1);
 }
 
 SYSCTL_SETUP(sysctl_lpsched_setup, "sysctl machdep.lpsched subtree setup")
@@ -199,6 +227,11 @@ SYSCTL_SETUP(sysctl_lpsched_setup, "sysctl machdep.lpsched subtree setup")
 	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_INT, "idle_ms",
 	    SYSCTL_DESCR("milliseconds since the last keyboard/mouse input"),
 	    lpsched_sysctl_idle_ms, 0, NULL, 0,
+	    CTL_CREATE, CTL_EOL);
+	sysctl_createv(clog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "stats_enabled",
+	    SYSCTL_DESCR("count placement/coalescing events (0 to measure their cost)"),
+	    lpsched_sysctl_stats_enabled, 0, &lpsched_stats_enabled, 0,
 	    CTL_CREATE, CTL_EOL);
 	sysctl_createv(clog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING, "stats",

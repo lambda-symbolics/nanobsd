@@ -58,6 +58,11 @@ typedef struct callout {
 /* End-user flags. */
 #define	CALLOUT_MPSAFE		0x0100	/* does not need kernel_lock */
 #define	CALLOUT_PRECISE		0x0200	/* lpsched: never coalesce/delay */
+#define	CALLOUT_SLACK		0x0400	/* lpsched: may be delayed onto the
+					   coalescing grid.  Opt-in: without
+					   it the requested timing stands, so
+					   an unaudited timeout is never
+					   silently stretched. */
 #define	CALLOUT_FLAGMASK	0xff00
 
 #define CALLOUT_FMT	"\177\020\

@@ -272,6 +272,72 @@ elapsed time to whole ticks and restarts a fresh interval after an early
 wake, and =woke_early= does not identify what woke the CPU -- so the earlier
 "~300/s early wakes are X/StumpWM IPIs" claim was inference, not attribution.
 
+* Second review and repairs (2026-09-20, review of 51ab864)
+
+A second external review found the instrumentation itself misleading.  All
+four findings verified in source before changing anything.
+
+1. *=pack_held= counted non-events.*  The suppression sat BEFORE the stock
+   early return, so it fired for threads already on a first-class CPU that
+   stock would have left alone anyway, and it also suppressed the *same-core*
+   sibling move, which shares the core and wakes nothing.  Fixed: the check
+   now sits at the one place a migration certainly would have happened -- the
+   =sched_bestcpu()= cross-core move -- and only when =lpsched_same_core()= is
+   false.  =lpsched_is_packed()= additionally releases a thread once its core
+   has emptied, so suppression ends when the load it was protecting does.
+2. *Placement counters were summed.*  =pack_sibling + shallow + deep + busy=
+   hides that a "packed" decision may have WOKEN a deep-idle core.  They are
+   now reported separately, and the first run showed exactly why: 131
+   =pack_deep= events were previously being counted as consolidation.
+3. *The counters were global atomics.*  Every event was an atomic increment on
+   a line shared by all CPUs -- the same cross-CPU traffic this code exists to
+   avoid, added only in the power-saving configuration, i.e. taxing the arm
+   under test.  Now per-CPU inside the cache-line-aligned =struct lpsched_cpu=,
+   summed on read, with =machdep.lpsched.stats_enabled= to measure their cost.
+   =catch_held= also fired while scanning CPUs with EMPTY queues; it now only
+   counts when the raised threshold actually rejects work that was there.
+4. *The coalescing benchmark could not exercise coalescing.*  The pollers slept
+   20 ms = 2 ticks, below the 10-tick cutoff, so the =coal/s= reported came
+   from unrelated callouts.  =poller(1)= now takes a period, and uses ABSOLUTE
+   deadlines: the old fixed-work-then-relative-sleep loop let the period
+   stretch with scheduling, so neither phase nor duty cycle was constant
+   across the configurations being compared.  It reports batches completed and
+   deadlines missed so a run that quietly did less work cannot read as a win.
+
+** Coalescing is now opt-in, and therefore inert
+=CALLOUT_SLACK= (0x0400) must be set by the callout's owner.  A duration
+threshold bounds how far a timeout is stretched but says nothing about whether
+its caller tolerates the delay, and callout(9) documents the requested time as
+the time requested.  Nothing in the tree sets the flag, so =coal_applied= is 0
+and =coal_noslack= counts thousands of declined callouts -- inert by design
+until specific housekeeping timers are audited and marked.
+
+** Tickless accounting: measured, partly repaired
+=lapic_oneshot_done()= floored =counted / lapic_tval= and discarded the
+sub-tick remainder on every wake.  Measured with =tickrate(1)= (nanosecond
+monotonic clock against =kern.hardclock_ticks=; shell sampling quantises to
+whole seconds, far coarser than the error):
+
+| kernel                  | tickless ON | tickless OFF |
+|-------------------------+-------------+--------------|
+| #94 before the repair   |     -4.412% |      -0.003% |
+| #97 carry of remainder  |     -1.036% |      -0.003% |
+
+So hardclock really was running 4.4% slow whenever tickless idle was enabled --
+a 60 s sleep took 62.7 s -- and carrying the remainder cuts that four-fold.
+~1% remains, most likely the =pending= path crediting exactly =nticks= and
+ignoring time spent asleep past expiry.
+
+*Phase alignment was attempted and reverted, with evidence.*  Restarting as a
+short one-shot to land on the original tick boundary is correct only if that
+one-shot survives to fire; =lapic_oneshot()= reprograms the timer on every
+re-entry to tickless idle (tens of thousands per minute here), so it was
+usually cancelled and the tick it owed was lost.  Measured -3.3%.  Carry-only
+is rate-exact by construction and was kept.  Cross-CPU tick PHASE therefore
+remains unaligned, so the coalescing grid still cannot guarantee synchronized
+physical wake times -- a correct scheme must return the unelapsed part of a
+cancelled interval to the carry.
+
 * Files
 - kernel/sys/lpsched.h, kernel/kern/kern_lpsched.c (new), kernel/kern/files.kern
 - kernel/kern/kern_runq.c, kernel/kern/kern_timeout.c, kernel/sys/callout.h

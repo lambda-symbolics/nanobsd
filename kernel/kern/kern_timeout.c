@@ -427,7 +427,19 @@ lpsched_coalesce(const callout_impl_t *c, int to_ticks, int now)
 	    to_ticks == 0)
 		return abs;
 	if ((c->c_flags & CALLOUT_PRECISE) != 0) {
-		lpsched_stat(&lpsched_st_coal_precise);
+		lpsched_stat(LPSCHED_ST_COAL_PRECISE);
+		return abs;
+	}
+	/*
+	 * Opt-in.  A duration threshold bounds how much a timeout is stretched
+	 * but says nothing about whether its caller tolerates the delay, and
+	 * callout(9) documents the requested time as the time requested.  Only
+	 * callouts whose owner asked for slack are moved; nothing in the tree
+	 * asks yet, so coalescing is inert until specific housekeeping timers
+	 * are audited and marked.
+	 */
+	if ((c->c_flags & CALLOUT_SLACK) == 0) {
+		lpsched_stat(LPSCHED_ST_COAL_NOSLACK);
 		return abs;
 	}
 	grid = mstohz(lpsched_coalesce_ms);
@@ -443,7 +455,7 @@ lpsched_coalesce(const callout_impl_t *c, int to_ticks, int now)
 	 * original request.
 	 */
 	if (to_ticks < 2 * grid) {
-		lpsched_stat(&lpsched_st_coal_short);
+		lpsched_stat(LPSCHED_ST_COAL_SHORT);
 		return abs;
 	}
 
@@ -460,7 +472,7 @@ lpsched_coalesce(const callout_impl_t *c, int to_ticks, int now)
 	rem = (u_int)(getticks() + to_ticks) % (u_int)grid;
 	delta = (rem != 0) ? grid - (int)rem : 0;
 	if (delta != 0)
-		lpsched_stat(&lpsched_st_coal_applied);
+		lpsched_stat(LPSCHED_ST_COAL_APPLIED);
 	return abs + delta;
 }
 

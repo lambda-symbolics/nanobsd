@@ -1,37 +1,38 @@
 #!/bin/sh
 # lpsched-ab -- A/B the lpsched mechanisms in isolation (LISPBSD).
 #
-# Run as root, on battery, with the machine otherwise idle.  Stops lpschedd,
-# cycles through configurations with the SAME EPP so only pack/coalesce vary,
-# then a full powersave profile, and restores everything (and the daemon).
+# Run as root with the machine otherwise untouched: opening a window or
+# restarting the daemon mid-run invalidates the comparison, and the panel
+# blanking mid-sample shifts the baseline by over a watt.
 #
-# Per configuration it prints: battery draw, cidle deep-skips/s (full tickless
-# windows reached), woke_early/s, and total interrupts/s.
+# Modes:
+#   quick     short, rough
+#   loadab    stock/pack=2 interleaved A/B/A/B under background pollers.
+#             Interleaving is mandatory, not optional: a single pass cannot
+#             separate an effect from drift in the EC discharge average, and
+#             has twice produced a "saving" that alternation then refuted.
+#   load      stock/pack=1/pack=2 single pass under pollers (exploratory only)
+#   coalesce  stock/coalesce alternated -- now expected to show coal_applied=0
+#             and coal_noslack>0, because coalescing is opt-in (CALLOUT_SLACK)
+#             and nothing in the tree marks it yet.
 #
-#   SETTLE  seconds to wait after a change (EC discharge rate is a slow
-#           average; <45 s gives stale numbers)           default 50
-#   SAMPLE  seconds to sample counters                    default 20
-#   EPP     fixed EPP for the mechanism runs              default: current
+# Placement categories are reported SEPARATELY: summing them hides that a
+# "packed" decision may have woken a deep-idle core, or chosen the CPU stock
+# would have chosen anyway.  Neither is consolidation.
 #
-# usage: lpsched-ab [quick|coalesce]
-#   quick     SETTLE=20 SAMPLE=10, rough numbers
-#   coalesce  stock/coalesce=50 alternated twice + pack=2, SETTLE=60 SAMPLE=30
-#             (to confirm or refute a single coalesce reading)
-#   load      stock/pack=1/pack=2 under NPOLL low-duty-cycle background
-#             pollers.  Static idle has nothing to pack, so it cannot show
-#             the mechanism working either way; this is the workload the
-#             packing policy actually targets.
+# env: SETTLE SAMPLE EPP NPOLL PERIOD_MS
 
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin:/usr/local/bin; export PATH
 
-MODE=${1:-full}
+MODE=${1:-loadab}
 case $MODE in
 quick)    SETTLE=${SETTLE:-20}; SAMPLE=${SAMPLE:-10} ;;
-load)     SETTLE=${SETTLE:-40}; SAMPLE=${SAMPLE:-20}; NPOLL=${NPOLL:-4} ;;
-loadab)   SETTLE=${SETTLE:-50}; SAMPLE=${SAMPLE:-20}; NPOLL=${NPOLL:-4} ;;
 coalesce) SETTLE=${SETTLE:-60}; SAMPLE=${SAMPLE:-30} ;;
 *)        SETTLE=${SETTLE:-50}; SAMPLE=${SAMPLE:-20} ;;
 esac
+NPOLL=${NPOLL:-4}
+PERIOD_MS=${PERIOD_MS:-200}
+BATCHDIR=/tmp/lpsched-ab.$$
 
 if ! sysctl -q machdep.lpsched.enabled >/dev/null 2>&1; then
 	echo "machdep.lpsched not present in this kernel" >&2; exit 1
@@ -54,14 +55,19 @@ if /etc/rc.d/lpschedd status >/dev/null 2>&1; then
 fi
 
 restore() {
+	pkill -x poller 2>/dev/null
 	sysctl -qw machdep.lpsched.enabled=$ORIG_EN machdep.lpsched.pack=$ORIG_PACK \
 	    machdep.lpsched.coalesce_ms=$ORIG_COAL machdep.hwp.epp=$ORIG_EPP
 	[ $DAEMON = 1 ] && /etc/rc.d/lpschedd start >/dev/null 2>&1
+	rm -rf "$BATCHDIR"
 }
 trap 'restore; exit 1' INT TERM
 
-field() {	# field <tlstats-string> <key>
+field() {	# field <string> <key>
 	echo "$1" | sed -n "s/.*$2=\([0-9]*\).*/\1/p"
+}
+d() {		# d <after> <before> <key>
+	echo $(( $(field "$1" $3) - $(field "$2" $3) ))
 }
 
 measure() {	# measure <label>
@@ -77,31 +83,22 @@ measure() {	# measure <label>
 	if [ "$ONAC" = 1 ]; then W=""; else
 		W=$(envstat -d acpibat0 | awk '/discharge rate/{print $3}')
 	fi
-	# Rates use MEASURED elapsed time: sleep(1) plus the sysctl/vmstat calls
-	# overrun the request, and tick accounting is not trustworthy enough to
-	# assume otherwise.
+	# Measured elapsed, not the requested sleep.
 	EL=$(( T2 - T1 )); [ "$EL" -le 0 ] && EL=$SAMPLE
-	D=$(( $(field "$S2" deep) - $(field "$S1" deep) ))
-	E=$(( $(field "$S2" woke_early) - $(field "$S1" woke_early) ))
-	I=$(( I2 - I1 ))
-	awk -v l="$1" -v w="$W" -v d=$D -v e=$E -v i=$I -v s=$EL 'BEGIN {
-		if (w == "") ws = "    --  "; else ws = sprintf("%6.2f W", w)
-		printf "%-18s %s   deep/s %6.1f   early/s %7.1f   ints/s %6.1f",
-		    l, ws, d/s, e/s, i/s }'
-	# Did the mechanism actually run?  Without this a mechanism that never
-	# executed is indistinguishable from one that executed and did nothing.
-	PL=$(( ($(field "$L2" pack_sibling) - $(field "$L1" pack_sibling)) \
-	     + ($(field "$L2" pack_shallow) - $(field "$L1" pack_shallow)) \
-	     + ($(field "$L2" pack_deep)    - $(field "$L1" pack_deep)) \
-	     + ($(field "$L2" pack_busy)    - $(field "$L1" pack_busy)) ))
-	XM=$(( ($(field "$L2" exempt_class)  - $(field "$L1" exempt_class)) \
-	     + ($(field "$L2" exempt_fg)     - $(field "$L1" exempt_fg)) \
-	     + ($(field "$L2" exempt_estcpu) - $(field "$L1" exempt_estcpu)) ))
-	HL=$(( $(field "$L2" pack_held) - $(field "$L1" pack_held) ))
-	CO=$(( $(field "$L2" coal_applied) - $(field "$L1" coal_applied) ))
-	awk -v p=$PL -v x=$XM -v h=$HL -v c=$CO -v s=$EL 'BEGIN {
-		printf "   packed/s %6.1f  exempt/s %6.1f  held/s %5.1f  coal/s %6.1f\n",
-		    p/s, x/s, h/s, c/s }'
+	awk -v l="$1" -v w="$W" -v dp=$(d "$S2" "$S1" deep) \
+	    -v e=$(d "$S2" "$S1" woke_early) -v i=$(( I2 - I1 )) -v s=$EL 'BEGIN {
+		if (w == "") ws = "   --   "; else ws = sprintf("%6.2f W", w)
+		printf "%-12s %s  deep/s %5.1f  early/s %6.1f  ints/s %6.1f\n",
+		    l, ws, dp/s, e/s, i/s }'
+	awk -v sib=$(d "$L2" "$L1" pack_sibling) -v sh=$(d "$L2" "$L1" pack_shallow) \
+	    -v dee=$(d "$L2" "$L1" pack_deep) -v bu=$(d "$L2" "$L1" pack_busy) \
+	    -v no=$(d "$L2" "$L1" pack_none) -v he=$(d "$L2" "$L1" pack_held) \
+	    -v ca=$(d "$L2" "$L1" catch_held) -v ap=$(d "$L2" "$L1" coal_applied) \
+	    -v ns=$(d "$L2" "$L1" coal_noslack) -v s=$EL 'BEGIN {
+		printf "             place/s: sibling %5.1f shallow %5.1f deep %5.1f busy %5.1f none %5.1f\n",
+		    sib/s, sh/s, dee/s, bu/s, no/s
+		printf "             held/s %5.1f  catch_held/s %5.1f  coal/s applied %5.1f noslack %6.1f\n",
+		    he/s, ca/s, ap/s, ns/s }'
 }
 
 run() {		# run <label> <enabled> <pack> <coalesce_ms> <epp>
@@ -111,45 +108,54 @@ run() {		# run <label> <enabled> <pack> <coalesce_ms> <epp>
 	measure "$1"
 }
 
-echo "lpsched A/B ($MODE): settle ${SETTLE}s, sample ${SAMPLE}s, EPP $EPP (daemon was ${DAEMON})"
-if [ $MODE = loadab ]; then
-	# Interleaved A/B/A/B under load.  A single pass through the configs
-	# cannot separate a real effect from slow drift in the EC discharge
-	# average (which reads monotonically downward for minutes after an
-	# unplug or a panel blank); alternating does.
-	command -v poller >/dev/null 2>&1 || { echo "poller(1) not installed" >&2; restore; exit 1; }
-	DUR=$(( (SETTLE + SAMPLE + 5) * 5 ))
-	echo "starting $NPOLL background pollers (~5% duty each) for ${DUR}s"
-	i=0; while [ $i -lt "$NPOLL" ]; do poller $DUR >/dev/null 2>&1 & i=$((i+1)); done
+start_load() {	# start_load <duration_s>
+	command -v poller >/dev/null 2>&1 || { echo "poller(1) missing" >&2; restore; exit 1; }
+	mkdir -p "$BATCHDIR"
+	echo "load: $NPOLL pollers, ${PERIOD_MS}ms period, staggered phase, ${1}s"
+	i=0
+	while [ $i -lt "$NPOLL" ]; do
+		poller -p "$PERIOD_MS" -d "$1" -s $(( i * PERIOD_MS / NPOLL )) \
+		    > "$BATCHDIR/$i" 2>/dev/null &
+		i=$((i+1))
+	done
+}
+
+report_work() {
+	[ -d "$BATCHDIR" ] || return 0
+	wait 2>/dev/null
+	awk '{ for (i=1;i<=NF;i++) { split($i,kv,"="); t[kv[1]] += kv[2] } }
+	     END { printf "work done: batches=%d missed=%d (equal work across configs = valid comparison)\n",
+	           t["batches"], t["missed"] }' "$BATCHDIR"/* 2>/dev/null
+}
+
+echo "lpsched A/B ($MODE): settle ${SETTLE}s sample ${SAMPLE}s EPP $EPP (daemon was $DAEMON)"
+case $MODE in
+loadab)
+	start_load $(( (SETTLE + SAMPLE + 5) * 5 ))
 	run "stock"      0 0 0 $EPP
 	run "pack=2"     1 2 0 $EPP
 	run "stock(2)"   0 0 0 $EPP
 	run "pack=2(2)"  1 2 0 $EPP
-	pkill -x poller 2>/dev/null
-elif [ $MODE = load ]; then
-	command -v poller >/dev/null 2>&1 || { echo "poller(1) not installed" >&2; restore; exit 1; }
-	DUR=$(( (SETTLE + SAMPLE + 5) * 4 ))
-	echo "starting $NPOLL background pollers (~5% duty each) for ${DUR}s"
-	i=0; while [ $i -lt "$NPOLL" ]; do poller $DUR >/dev/null 2>&1 & i=$((i+1)); done
-	POLLPIDS=$(jobs -p 2>/dev/null)
-	run "stock"          0 0 0 $EPP
-	run "pack=1"         1 1 0 $EPP
-	run "pack=2"         1 2 0 $EPP
-	run "pack2+coal50"   1 2 50 $EPP
-	pkill -x poller 2>/dev/null
-elif [ $MODE = coalesce ]; then
-	run "stock"            0 0  0 $EPP
-	run "coalesce=50"      1 0 50 $EPP
-	run "stock(2)"         0 0  0 $EPP
-	run "coalesce=50(2)"   1 0 50 $EPP
-	run "pack=2"           1 2  0 $EPP
-else
-	run "stock"            0 0  0 $EPP
-	run "pack=1"           1 1  0 $EPP
-	run "pack=2"           1 2  0 $EPP
-	run "coalesce=50"      1 0 50 $EPP
-	run "pack2+coal50"     1 2 50 $EPP
-	run "powersave(240)"   1 2 50 240
-fi
+	report_work
+	;;
+load)
+	start_load $(( (SETTLE + SAMPLE + 5) * 4 ))
+	run "stock"      0 0 0 $EPP
+	run "pack=1"     1 1 0 $EPP
+	run "pack=2"     1 2 0 $EPP
+	report_work
+	;;
+coalesce)
+	run "stock"        0 0  0 $EPP
+	run "coalesce=50"  1 0 50 $EPP
+	run "stock(2)"     0 0  0 $EPP
+	run "coal=50(2)"   1 0 50 $EPP
+	;;
+*)
+	run "stock"   0 0 0 $EPP
+	run "pack=1"  1 1 0 $EPP
+	run "pack=2"  1 2 0 $EPP
+	;;
+esac
 restore
 echo "restored: enabled=$ORIG_EN pack=$ORIG_PACK coalesce=$ORIG_COAL epp=$ORIG_EPP daemon=$DAEMON"
