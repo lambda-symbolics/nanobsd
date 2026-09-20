@@ -623,6 +623,27 @@ ihidev_poweron(struct ihidev_softc *sc, bool poll)
 	return (0);
 }
 
+/*
+ * Power the device back on and reset it, from a sysctl.  A reset makes the
+ * pad raise its interrupt to acknowledge, so this also tests the interrupt
+ * path live rather than only at boot: if the count moves, the line still
+ * works and the pad is simply not reporting touches.
+ */
+int
+ihidev_kick(device_t dev)
+{
+	struct ihidev_softc *sc = (struct ihidev_softc *)dev;
+	int err;
+
+	printf("ihidev: kick: refcnt %d isize %u suspended %d nrepid %d\n",
+	    sc->sc_refcnt, sc->sc_isize, sc->sc_suspended, sc->sc_nrepid);
+	err = ihidev_poweron(sc, false);
+	printf("ihidev: poweron -> %d\n", err);
+	err = ihidev_reset(sc, false);
+	printf("ihidev: reset -> %d\n", err);
+	return err;
+}
+
 static int
 ihidev_reset(struct ihidev_softc *sc, bool poll)
 {

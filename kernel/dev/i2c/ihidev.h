@@ -183,6 +183,7 @@ void ihidev_close(struct ihidev *);
 
 int ihidev_set_report(device_t, int, int, void *, int);
 int ihidev_get_report(device_t, int, int, void *, int);
+int ihidev_kick(device_t);
 int ihidev_report_type_conv(int);
 
 #endif	/* _DEV_I2C_IHIDEV_H_ */

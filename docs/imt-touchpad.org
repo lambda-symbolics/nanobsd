@@ -128,3 +128,32 @@ carries a one-byte report ID.  =ihidev_get_report()= conflated the two, so it
 parsed the response ID as a 16-bit value, rejected every extended-ID report
 and would have skipped a payload byte.  Fixed by tracking the command
 extension and the response prefix separately.
+
+* The interrupt line is not the problem (kernel #116)
+
+=machdep.imt.kick= powers the device on, resets it and re-runs the handshake.
+A reset makes the pad raise its interrupt to acknowledge, so it doubles as a
+live test of the interrupt path:
+
+: ihidev: kick: refcnt 2 isize 14 suspended 0 nrepid 15
+: ihidev: poweron -> 0
+: ihidev: reset -> 0
+: ioapic0 pin 118    1*   ...   ihidev0     (was 0)
+
+Three things follow.
+
+- The interrupt is established, unmasked and delivering *now*, not only at
+  boot.  Every "the IRQ was never wired up" theory is dead.
+- =refcnt 2= means both =ims0= and =imt0= hold the device open, so
+  =ihidev_close()='s SET_POWER OFF has not run.  The pad is powered.
+- With a finger on the pad the count does not move at all.
+
+The pad therefore answers every command we send it, acknowledges resets on the
+interrupt line, and reports nothing whatsoever when touched.  The remaining
+question is no longer about the driver's plumbing but about why the sensor
+stays quiet, and the next discriminator is whether it is quiet in mouse mode
+too, which the =machdep.imt.ptp= toggle can answer without a rebuild.
+
+Note for the earlier note in this file: =vmstat -i= omits zero-count rows, so
+"no line for irq 118" there meant only that it had not fired.  =intrctl list=
+shows established interrupts regardless of count and is the right tool.

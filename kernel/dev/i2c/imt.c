@@ -331,6 +331,24 @@ imt_poll_thread(void *arg)
 }
 
 static int
+imt_sysctl_kick(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	int val = 0, error;
+
+	node.sysctl_data = &val;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error || newp == NULL)
+		return error;
+	if (imt_instance == NULL)
+		return ENXIO;
+
+	(void)ihidev_kick((device_t)imt_instance->sc_hdev.sc_parent);
+	(void)imt_ptp_init(imt_instance);
+	return 0;
+}
+
+static int
 imt_sysctl_poll(SYSCTLFN_ARGS)
 {
 	struct sysctlnode node = *rnode;
@@ -388,6 +406,10 @@ imt_sysctl_setup(void)
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "scroll_invert",
 	    SYSCTL_DESCR("reverse the two-finger scroll direction"),
 	    NULL, 0, &imt_scroll_invert, 0, CTL_CREATE, CTL_EOL);
+	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "kick",
+	    SYSCTL_DESCR("power on, reset and re-run the PTP handshake"),
+	    imt_sysctl_kick, 0, NULL, 0, CTL_CREATE, CTL_EOL);
 	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "poll_ms",
 	    SYSCTL_DESCR("diagnostic: poll the input report every N ms, 0 = off"),
