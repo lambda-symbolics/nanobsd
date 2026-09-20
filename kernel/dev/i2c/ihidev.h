@@ -118,6 +118,8 @@ struct ihidev_softc {
 	i2c_addr_t	sc_addr;
 	uint64_t	sc_phandle;
 	kmutex_t	sc_lock;
+	kcondvar_t	sc_reset_cv;
+	bool		sc_reset_pending;
 
 	void *		sc_ih;
 	void *		sc_ih_gpio;

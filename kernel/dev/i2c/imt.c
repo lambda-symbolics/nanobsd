@@ -199,6 +199,9 @@ imt_parse_input(struct imt_softc *sc, const void *desc, int dlen, uint8_t repid)
 	while (hid_get_item(hd, &h)) {
 		if (h.kind != hid_input || h.report_ID != repid)
 			continue;
+		/* Padding carries stale usage labels; see imt_scan_features. */
+		if ((h.flags & HIO_CONST) != 0)
+			continue;
 		switch (h.usage) {
 		case HID_USAGE2(HUP_DIGITIZERS, HUD_TIP_SWITCH):
 			if (nslots < IMT_MAX_CONTACTS) {
@@ -443,29 +446,75 @@ imt_put_udata(uint8_t *buf, const struct hid_location *loc, u_long val)
 }
 
 /*
- * Read-modify-write one field of a feature report.  Reading first matters:
- * zeroing the bytes we do not own would clear whatever else shares the
- * report, and on this collection that includes the other switches.
+ * Read-modify-write fields of a feature report, verifying the result.
+ *
+ * Reading first matters: zeroing the bytes we do not own would clear whatever
+ * else shares the report, and Surface and Button Switch share one.  A failed
+ * read is therefore fatal rather than an excuse to write zeroes - doing that
+ * would clear the field written by the previous call.  Both fields are set in
+ * one read-modify-write for the same reason.
  */
 static int
-imt_set_field(struct imt_softc *sc, int rid, const struct hid_location *loc,
-    u_long val, const char *what)
+imt_set_fields(struct imt_softc *sc, int rid,
+    const struct hid_location *loc1, u_long val1,
+    const struct hid_location *loc2, u_long val2, bool complete,
+    const char *what)
 {
 	device_t parent = (device_t)sc->sc_hdev.sc_parent;
 	uint8_t rep[32];
-	int len, err;
+	int len, err = 0;
 
 	len = hid_report_size(sc->sc_desc, sc->sc_dlen, hid_feature, rid);
-	if (len <= 0 || len > (int)sizeof(rep))
+	if (len <= 0 || len > (int)sizeof(rep)) {
+		printf("imt: %s: rid %d has implausible length %d\n", what,
+		    rid, len);
 		return EINVAL;
+	}
 
 	memset(rep, 0, sizeof(rep));
-	if (ihidev_get_report(parent, hid_feature, rid, rep, len) != 0)
+	if (ihidev_get_report(parent, hid_feature, rid, rep, len) != 0) {
+		/*
+		 * This pad refuses GET_REPORT on its configuration reports.
+		 * Starting from zeroes is only safe when this one write
+		 * covers every writable field of the report, which is why
+		 * both switches are set together; otherwise skip the write
+		 * rather than clear a field belonging to someone else.
+		 */
+		if (!complete) {
+			printf("imt: %s: rid %d unreadable, skipping\n", what,
+			    rid);
+			return 0;
+		}
+		printf("imt: %s: rid %d unreadable, writing from zeroes\n",
+		    what, rid);
 		memset(rep, 0, sizeof(rep));
-	imt_put_udata(rep, loc, val);
+	}
+	if (loc1 != NULL)
+		imt_put_udata(rep, loc1, val1);
+	if (loc2 != NULL)
+		imt_put_udata(rep, loc2, val2);
 	err = ihidev_set_report(parent, hid_feature, rid, rep, len);
-	printf("imt: %s (rid %d len %d) = %lu -> err %d\n", what, rid, len,
-	    val, err);
+
+	/*
+	 * Report what the field actually became where the device allows it to
+	 * be read, and say so plainly when it does not, rather than echoing
+	 * the value we asked for and calling that confirmation.
+	 */
+	{
+		uint8_t back[32];
+
+		memset(back, 0, sizeof(back));
+		if (ihidev_get_report(parent, hid_feature, rid, back, len) == 0)
+			printf("imt: %s rid %d -> err %d, now %lu/%lu "
+			    "(raw %02x %02x)\n", what, rid, err,
+			    loc1 != NULL ? hid_get_udata(back, loc1) : 0,
+			    loc2 != NULL ? hid_get_udata(back, loc2) : 0,
+			    back[0], back[1]);
+		else
+			printf("imt: %s rid %d -> err %d, wrote %02x %02x "
+			    "(unverifiable, not readable)\n", what, rid, err,
+			    rep[0], rep[1]);
+	}
 	return err;
 }
 
@@ -493,7 +542,25 @@ imt_scan_features(struct imt_softc *sc, const void *desc, int dlen)
 	if (hd == NULL)
 		return;
 	while (hid_get_item(hd, &h)) {
-		if (h.kind != hid_feature)
+		/*
+		 * Skip constant (padding) items.  NetBSD's parser keeps the
+		 * usage array after an item ends, so constant padding that
+		 * declares no usage of its own comes back labelled with the
+		 * *previous* field's usage.  Report 5 on this pad really does
+		 * look like
+		 *
+		 *   usage 0x000d0057 pos 0   <- Surface Switch
+		 *   usage 0x000d0058 pos 1   <- Button Switch
+		 *   usage 0x000d0057 pos 2   <- padding, stale label
+		 *   usage 0x000d0058 pos 3   <- padding, stale label
+		 *
+		 * so a scanner that takes the last match writes bits 2 and 3
+		 * and leaves the two real enable bits clear.  Those switches
+		 * gate which inputs raise an interrupt, which is exactly why
+		 * the pad worked in mouse mode and went silent in Precision
+		 * Touchpad mode.
+		 */
+		if (h.kind != hid_feature || (h.flags & HIO_CONST) != 0)
 			continue;
 		/*
 		 * The certification blob is hundreds of single-byte fields;
@@ -501,8 +568,8 @@ imt_scan_features(struct imt_softc *sc, const void *desc, int dlen)
 		 */
 		if (h.report_ID != last_rid || h.usage != last_usage) {
 			printf("imt: feature rid %d usage 0x%08x pos %u "
-			    "size %u\n", h.report_ID, h.usage, h.loc.pos,
-			    h.loc.size);
+			    "size %u flags 0x%x\n", h.report_ID, h.usage,
+			    h.loc.pos, h.loc.size, h.flags);
 			last_rid = h.report_ID;
 			last_usage = h.usage;
 		}
@@ -523,16 +590,22 @@ imt_scan_features(struct imt_softc *sc, const void *desc, int dlen)
 			sc->sc_contactmax_rid = h.report_ID;
 			break;
 		case IMT_USAGE_SURFACE_SW:
-			sc->sc_surface_rid = h.report_ID;
-			sc->sc_loc_surface = h.loc;
+			if (sc->sc_surface_rid < 0) {
+				sc->sc_surface_rid = h.report_ID;
+				sc->sc_loc_surface = h.loc;
+			}
 			break;
 		case IMT_USAGE_BUTTON_SW:
-			sc->sc_button_rid = h.report_ID;
-			sc->sc_loc_button = h.loc;
+			if (sc->sc_button_rid < 0) {
+				sc->sc_button_rid = h.report_ID;
+				sc->sc_loc_button = h.loc;
+			}
 			break;
 		case IMT_USAGE_LATENCY:
-			sc->sc_latency_rid = h.report_ID;
-			sc->sc_loc_latency = h.loc;
+			if (sc->sc_latency_rid < 0) {
+				sc->sc_latency_rid = h.report_ID;
+				sc->sc_loc_latency = h.loc;
+			}
 			break;
 		default:
 			break;
@@ -552,7 +625,7 @@ imt_ptp_init(struct imt_softc *sc)
 {
 	device_t parent = (device_t)sc->sc_hdev.sc_parent;
 	uint8_t blob[512];
-	int len, err;
+	int len, err = 0;
 
 	/*
 	 * Read the vendor certification blob.  Linux does this with the
@@ -592,21 +665,42 @@ imt_ptp_init(struct imt_softc *sc)
 		}
 	}
 
-	/* Surface and button reporting; these should already be on. */
-	if (sc->sc_surface_rid >= 0)
-		(void)imt_set_field(sc, sc->sc_surface_rid,
-		    &sc->sc_loc_surface, 1, "surface switch");
-	if (sc->sc_button_rid >= 0)
-		(void)imt_set_field(sc, sc->sc_button_rid,
-		    &sc->sc_loc_button, 1, "button switch");
+	/*
+	 * Surface and button reporting.  These gate which inputs raise an
+	 * interrupt, so getting them wrong looks exactly like a dead pad.
+	 */
+	if (sc->sc_surface_rid >= 0 &&
+	    sc->sc_surface_rid == sc->sc_button_rid)
+		(void)imt_set_fields(sc, sc->sc_surface_rid,
+		    &sc->sc_loc_surface, 1, &sc->sc_loc_button, 1, true,
+		    "surface+button switch");
+	else {
+		if (sc->sc_surface_rid >= 0)
+			(void)imt_set_fields(sc, sc->sc_surface_rid,
+			    &sc->sc_loc_surface, 1, NULL, 0, false,
+			    "surface switch");
+		if (sc->sc_button_rid >= 0)
+			(void)imt_set_fields(sc, sc->sc_button_rid,
+			    &sc->sc_loc_button, 1, NULL, 0, false,
+			    "button switch");
+	}
+	/*
+	 * Setting Input Mode is the step that matters most, so press on even
+	 * if the switches could not be written.
+	 */
 
 	err = imt_set_mode(sc, imt_ptp ? IMT_INPUT_MODE_PTP :
 	    IMT_INPUT_MODE_MOUSE);
 
 	/* Normal latency, not the high-latency power saving mode. */
+	/*
+	 * Normal latency is the power-on default, and report 7 also carries
+	 * Button Type, which is not ours to overwrite, so this is skipped
+	 * rather than forced when the report cannot be read back.
+	 */
 	if (sc->sc_latency_rid >= 0)
-		(void)imt_set_field(sc, sc->sc_latency_rid,
-		    &sc->sc_loc_latency, 0, "latency mode");
+		(void)imt_set_fields(sc, sc->sc_latency_rid,
+		    &sc->sc_loc_latency, 0, NULL, 0, false, "latency mode");
 
 	return err;
 }
@@ -635,7 +729,7 @@ static int
 imt_set_mode(struct imt_softc *sc, uint8_t want)
 {
 	uint8_t rep[8];
-	int len, err;
+	int len, err = 0;
 
 	/*
 	 * Send the whole feature report, not a single byte.  The report is

@@ -170,6 +170,7 @@ ihidev_attach(device_t parent, device_t self, void *aux)
 	sc->sc_tag = ia->ia_tag;
 	sc->sc_addr = ia->ia_addr;
 	mutex_init(&sc->sc_lock, MUTEX_DEFAULT, IPL_NONE);
+	cv_init(&sc->sc_reset_cv, "ihidrst");
 
 	sc->sc_phandle = ia->ia_cookie;
 	if (ia->ia_cookietype != I2C_COOKIE_ACPI) {
@@ -290,6 +291,7 @@ ihidev_detach(device_t self, int flags)
 	if (sc->sc_report != NULL)
 		kmem_free(sc->sc_report, sc->sc_reportlen);
 
+	cv_destroy(&sc->sc_reset_cv);
 	mutex_destroy(&sc->sc_lock);
 
 	return 0;
@@ -647,10 +649,31 @@ ihidev_kick(device_t dev)
 static int
 ihidev_reset(struct ihidev_softc *sc, bool poll)
 {
+	bool wait;
+
 	DPRINTF(("%s: resetting\n", device_xname(sc->sc_dev)));
+
+	/*
+	 * The device acknowledges a reset by raising its interrupt and
+	 * returning a zero-length input report.  Mark the reset pending
+	 * *before* issuing it, or a prompt acknowledgement is missed.
+	 *
+	 * Only wait when the interrupt path exists: the reset during attach
+	 * runs before the handler and workqueue are set up, and nothing would
+	 * ever wake us.
+	 */
+	wait = !poll && sc->sc_ih != NULL && sc->sc_wq != NULL;
+
+	mutex_enter(&sc->sc_lock);
+	sc->sc_reset_pending = wait;
+	mutex_exit(&sc->sc_lock);
 
 	if (ihidev_hid_command(sc, I2C_HID_CMD_RESET, 0, poll)) {
 		aprint_error_dev(sc->sc_dev, "failed to reset hardware\n");
+
+		mutex_enter(&sc->sc_lock);
+		sc->sc_reset_pending = false;
+		mutex_exit(&sc->sc_lock);
 
 		ihidev_hid_command(sc, I2C_HID_CMD_SET_POWER,
 		    &I2C_HID_POWER_OFF, poll);
@@ -658,7 +681,28 @@ ihidev_reset(struct ihidev_softc *sc, bool poll)
 		return (1);
 	}
 
-	DELAY(1000);
+	if (!wait) {
+		DELAY(1000);
+		return (0);
+	}
+
+	/*
+	 * Bounded wait.  Feature requests issued while a reset is outstanding
+	 * can swallow the acknowledgement, so callers must not configure the
+	 * device until this returns.
+	 */
+	mutex_enter(&sc->sc_lock);
+	while (sc->sc_reset_pending) {
+		if (cv_timedwait(&sc->sc_reset_cv, &sc->sc_lock,
+		    mstohz(500)) == EWOULDBLOCK) {
+			sc->sc_reset_pending = false;
+			mutex_exit(&sc->sc_lock);
+			aprint_error_dev(sc->sc_dev,
+			    "timed out waiting for reset acknowledgement\n");
+			return (0);
+		}
+	}
+	mutex_exit(&sc->sc_lock);
 
 	return (0);
 }
@@ -924,6 +968,12 @@ ihidev_work(struct work *wk, void *arg)
 	 * than or equal to wMaxInputLength
 	 */
 	psize = sc->sc_ibuf[0] | sc->sc_ibuf[1] << 8;
+	if (psize == 0 && sc->sc_reset_pending) {
+		/* Reset acknowledgement; wake whoever issued it. */
+		sc->sc_reset_pending = false;
+		cv_broadcast(&sc->sc_reset_cv);
+		goto out;
+	}
 	if (!psize || psize > sc->sc_isize) {
 		DPRINTF(("%s: %s: invalid packet size (%d vs. %d)\n",
 		    device_xname(sc->sc_dev), __func__, psize, sc->sc_isize));

@@ -157,3 +157,52 @@ too, which the =machdep.imt.ptp= toggle can answer without a rebuild.
 Note for the earlier note in this file: =vmstat -i= omits zero-count rows, so
 "no line for irq 118" there meant only that it had not fired.  =intrctl list=
 shows established interrupts regardless of count and is the right tool.
+
+* Root cause: the reporting switches were written into padding (kernel #119)
+
+The discriminating test was to put the pad back in mouse mode and touch it.
+It worked: the interrupt count went from 1 to 573 and the pointer moved.  The
+pad is healthy, and Precision Touchpad mode specifically is what silenced it.
+
+The cause was in this driver's own descriptor scan, and it is visible in the
+log it printed:
+
+: imt: feature rid 5 usage 0x000d0057 pos 0 size 1   <- real Surface Switch
+: imt: feature rid 5 usage 0x000d0058 pos 1 size 1   <- real Button Switch
+: imt: feature rid 5 usage 0x000d0057 pos 2 size 1   <- padding, stale label
+: imt: feature rid 5 usage 0x000d0058 pos 3 size 1   <- padding, stale label
+
+NetBSD's parser clears its usage count after a Main item but keeps the usage
+array, so constant padding that declares no usage of its own is returned
+carrying the *previous* field's usage.  =imt_scan_features()= kept the last
+match, so it saved bit 2 and bit 3 and wrote 0x0c.  Both real enable bits
+stayed clear.  Microsoft specifies that these switches control which touchpad
+inputs generate interrupts, which is exactly the observed symptom: fine in
+mouse mode, completely silent in Precision Touchpad mode.
+
+The fix is to skip =HIO_CONST= items in both =imt_scan_features()= and
+=imt_parse_input()=, and to keep the first match rather than the last.  The
+scan now selects only pos 0 and pos 1, and the driver writes 0x03.
+=tests/imt-padding-reproducer.c= captures the mechanism.
+
+** The configuration reports are write-only on this pad
+
+GET_REPORT fails for report 5, in every mode.  The old code read it, silently
+substituted zeroes on failure and wrote anyway, then logged "surface switch =
+1 -> err 0" - which was the value requested, not the value achieved.
+
+Both switches are now set in a single read-modify-write, so a failed read
+cannot clear the switch written by a previous call.  Falling back to zeroes is
+allowed only when the one write covers every writable field of the report,
+which is true for report 5 and is why the two switches must be written
+together.  Latency Mode is skipped instead of forced, because report 7 also
+carries Button Type, which is not ours to overwrite.  The log now distinguishes
+a verified value from an unverifiable write.
+
+** Reset is now a transaction
+
+=ihidev_reset()= marks the reset pending before issuing it, and the input
+worker recognises the zero-length packet as the acknowledgement and wakes the
+waiter.  Feature requests issued while a reset is outstanding can swallow that
+acknowledgement.  The wait is bounded at 500 ms and is skipped for the reset
+during attach, which runs before the handler and workqueue exist.
