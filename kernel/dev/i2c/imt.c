@@ -234,7 +234,7 @@ imt_sysctl_setup(void)
 	    NULL, 0, &imt_scroll_invert, 0, CTL_CREATE, CTL_EOL);
 	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "debug",
-	    SYSCTL_DESCR("report what each HID report id contains at attach"),
+	    SYSCTL_DESCR("1 = log emitted scrolls, 2 = log every report"),
 	    NULL, 0, &imt_debug, 0, CTL_CREATE, CTL_EOL);
 }
 
@@ -360,7 +360,7 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 	struct imt_softc *sc = (struct imt_softc *)addr;
 	uint8_t *data = buf;
 	uint32_t btn = 0;
-	int i, down = 0, x = 0, y = 0, dx, dy, s;
+	int i, down = 0, x = 0, y = 0, dx, dy, s, sumx, sumy;
 
 	if (!sc->sc_enabled || sc->sc_wsmousedev == NULL)
 		return;
@@ -371,19 +371,26 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 		btn = 1;
 
 	/*
-	 * Take the first contact whose tip is down as the one that drives
-	 * motion or scrolling, and count how many are down to choose which.
+	 * Track the CENTROID of the contacts that are down, not the first one
+	 * found.  The order contacts appear in a report is not stable, so with
+	 * two fingers "the first one down" alternates between them and the
+	 * position jumps back and forth by the distance between the fingers:
+	 * every delta then looks like a huge jump, gets discarded below, and
+	 * nothing ever scrolls.  The centroid is stable under reordering.
 	 */
+	sumx = sumy = 0;
 	for (i = 0; i < sc->sc_nslots; i++) {
 		if (!sc->sc_contacts[i].valid)
 			continue;
 		if (!hid_get_udata(data, &sc->sc_contacts[i].loc_tip))
 			continue;
-		if (down == 0) {
-			x = (int)hid_get_udata(data, &sc->sc_contacts[i].loc_x);
-			y = (int)hid_get_udata(data, &sc->sc_contacts[i].loc_y);
-		}
+		sumx += (int)hid_get_udata(data, &sc->sc_contacts[i].loc_x);
+		sumy += (int)hid_get_udata(data, &sc->sc_contacts[i].loc_y);
 		down++;
+	}
+	if (down > 0) {
+		x = sumx / down;
+		y = sumy / down;
 	}
 
 	dx = dy = 0;
@@ -395,6 +402,10 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 		    dy > IMT_JUMP_LIMIT || dy < -IMT_JUMP_LIMIT)
 			dx = dy = 0;
 	}
+
+	if (imt_debug > 1)
+		printf("imt: down=%d x=%d y=%d dx=%d dy=%d acc=%d btn=%u\n",
+		    down, x, y, dx, dy, sc->sc_acc_y, btn);
 
 	s = spltty();
 	if (down == 2) {
@@ -417,9 +428,12 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 			z = -z;
 			w = -w;
 		}
-		if (z != 0 || w != 0 || btn != sc->sc_prev_btn)
+		if (z != 0 || w != 0 || btn != sc->sc_prev_btn) {
+			if (imt_debug)
+				printf("imt: scroll z=%d w=%d\n", z, w);
 			wsmouse_input(sc->sc_wsmousedev, btn, 0, 0, z, w,
 			    WSMOUSE_INPUT_DELTA);
+		}
 	} else if (down == 1 || btn != sc->sc_prev_btn) {
 		/* One finger (or a button change): ordinary pointer motion. */
 		if (imt_motion_div > 0) {

@@ -29,13 +29,27 @@ PATH=/sbin:/usr/sbin:/bin:/usr/bin; export PATH
 DEV=${1:-/dev/hdaudio0}
 OLD=0x3211020		# as printed by hdaudioctl (no leading zero)
 NEW=0x321101f
+# The speaker association is FOUR channels: pin 0x14 (seq 0) and pin 0x17
+# (seq 1).  A headphone redirected into a 4-channel group is fed a channel
+# pair of that group rather than the full stereo mix, which sounds thin and
+# treble-heavy.  Retiring the second speaker pin makes the group plain 2ch
+# stereo, so the jack carries the whole mix.  Set IMT_KEEP_4CH=1 to skip
+# this and keep both speaker pins instead.
+SPK2_OLD=0x90170111
+SPK2_NEW=0x411111f0	# "no physical connection"
 
 hdaudioctl -f "$DEV" get 0 0x01 > /tmp/hdafg-pincfg.$$ 2>/dev/null || exit 0
-if ! grep -q "<integer>$OLD</integer>" /tmp/hdafg-pincfg.$$; then
+if ! grep -qE "<integer>($OLD|$SPK2_OLD)</integer>" /tmp/hdafg-pincfg.$$; then
 	rm -f /tmp/hdafg-pincfg.$$
 	exit 0			# already patched, or a different codec
 fi
-sed "s|<integer>$OLD</integer>|<integer>$NEW</integer>|" \
-    /tmp/hdafg-pincfg.$$ > /tmp/hdafg-pincfg-hp.$$
+if [ "${IMT_KEEP_4CH:-0}" = 1 ]; then
+	sed "s|<integer>$OLD</integer>|<integer>$NEW</integer>|" \
+	    /tmp/hdafg-pincfg.$$ > /tmp/hdafg-pincfg-hp.$$
+else
+	sed -e "s|<integer>$OLD</integer>|<integer>$NEW</integer>|" \
+	    -e "s|<integer>$SPK2_OLD</integer>|<integer>$SPK2_NEW</integer>|" \
+	    /tmp/hdafg-pincfg.$$ > /tmp/hdafg-pincfg-hp.$$
+fi
 hdaudioctl -f "$DEV" set 0 0x01 /tmp/hdafg-pincfg-hp.$$ >/dev/null 2>&1
 rm -f /tmp/hdafg-pincfg.$$ /tmp/hdafg-pincfg-hp.$$
