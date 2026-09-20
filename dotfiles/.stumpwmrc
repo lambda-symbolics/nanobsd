@@ -55,15 +55,16 @@
 
 (defcommand volume-up () ()
   "Raise the master volume."
-  (run-shell-command "mixerctl -w outputs.master=+16"))
+  (run-shell-command "mixerctl -w outputs.master+=16"))
 
 (defcommand volume-down () ()
   "Lower the master volume."
-  (run-shell-command "mixerctl -w outputs.master=-16"))
+  (run-shell-command "mixerctl -w outputs.master-=16"))
 
 (defcommand volume-mute () ()
-  "Toggle master mute."
-  (run-shell-command "mixerctl -w outputs.master.mute=toggle"))
+  "Toggle output mute for the speaker and headphone paths."
+  (run-shell-command
+   "if mixerctl -n outputs.master3.mute | grep -q '^on$' && mixerctl -n outputs.master4.mute | grep -q '^on$'; then mixerctl -w outputs.master3.mute=off outputs.master4.mute=off; else mixerctl -w outputs.master3.mute=on outputs.master4.mute=on; fi"))
 
 (defcommand microphone-mute () ()
   "Toggle microphone mute."

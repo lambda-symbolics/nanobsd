@@ -32,7 +32,11 @@ paths.
   (`statusbar`/`statusbard`), `screentemp` (static 4000K), `s3diag`.
 - `dotfiles/` — `.stumpwmrc` (waybar-style bar, no-busy-loop mode-line refresh),
   `.xinitrc`.
-- `etc/boot.cfg`, `docs/LISPBSD.org` — boot menu and running notes.
+- `etc/boot.cfg`, `etc/rc.conf`, `etc/sysctl.conf`, `etc/modules.conf`,
+  `etc/rc.d/`, `etc/powerd/` — boot menu, enabled services (`lpschedd`),
+  persisted sysctls (HWP EPP, tickless idle) and autoloaded modules.
+- `docs/` — running notes, including `lpsched-design.org` (design, review,
+  repairs and measurements) and `rpm-s0ix-findings.org`.
 
 Power tuning highlights: fixed a StumpWM mode-line busy-loop (~2.5 W), enabled
 deep C-states + RC6, HWP EPP bias, and ACPI backlight control → idle ~5 W
