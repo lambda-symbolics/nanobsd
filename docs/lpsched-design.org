@@ -332,8 +332,10 @@ Measured with the corrected probe, pinned to CPU 0 (=schedctl -A 0=):
 | #97 carry of remainder only   |     -0.816% |      +0.003% |
 | #98 carry + entry capture     |     -0.041% |      -0.001% |
 
-So hardclock went from 4.4% slow under tickless idle to within 0.04% of the
-periodic control.  "Rate-exact by construction" in the previous section was
+Confirmed by three independent pinned runs on #98: -0.041%, -0.051%, -0.038%
+(mean -0.043%, spread 0.013%), so hardclock went from 4.4% slow under tickless
+idle to within 0.05% of the periodic control -- about a hundredfold
+improvement on where this started.  "Rate-exact by construction" in the previous section was
 WRONG: carrying the remainder is only half the accounting.
 
 The probe was also defective and was fixed first: =clock_nanosleep(2)= returns
