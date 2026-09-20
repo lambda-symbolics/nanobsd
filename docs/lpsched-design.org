@@ -379,6 +379,50 @@ remains unaligned, so the coalescing grid still cannot guarantee synchronized
 physical wake times -- a correct scheme must return the unelapsed part of a
 cancelled interval to the carry.
 
+* Fourth review: benchmark repairs and the energy harness (2026-09-20)
+
+** Two interrupt-ordering bugs remain, carried as failing regression tests
+The reviewer supplied a register-level reproducer, kept verbatim at
+=tests/timer-reproducer.c=.  Built and run against the committed arithmetic it
+confirms two cases the entry-capture fix does NOT address:
+
+| case                                             | due | credited |
+|--------------------------------------------------+-----+----------|
+| entry capture + early wake (fixed in #98)        |   1 |  1 PASS  |
+| old periodic IRQ pending before arming a one-shot|   1 |  4 BUG   |
+| expiry racing the IRR/CCR reads at exit          |   4 |  5 BUG   |
+
+Both OVER-credit, which is exactly why the good average-rate result (-0.041%)
+does not prove interrupt accounting: rare over-credits offset residual
+under-credit in the mean.  =lapic_oneshot_done()= reads IRR before CCR and
+treats a pending vector as completion of the interval it programmed, without
+checking whether that vector was already pending from the previous periodic
+timer.  The repair must account for an old pending event, and for an expiry
+racing the exit snapshot, exactly once.  =tests/tickless-model.py= cannot
+exercise either case -- it supplies elapsed time directly and never models the
+counter/pending inference -- so it stays as a fractional-accounting test only.
+Deferred deliberately: the reviewer's direction is to get an energy result
+first, and the clock path has already been destabilised twice today.
+
+** Benchmark defects fixed
+- =lpsched-ab= overwrote its configuration label: =set -- $(work_snapshot)=
+  replaces the positional parameters, so =$1= became a batch count and every
+  row was labelled with a number.  The label is now saved first.
+- Work counts and elapsed time covered different intervals.  The snapshots
+  bracket the timed window, so dividing work by the sample elapsed divided
+  ~21 s of work by 20 s, a ~5% rate error.  =poller(1)= now reports a sequence
+  number and a monotonic timestamp on SIGUSR1; the harness proves freshness by
+  sequence, divides work by the WORKERS' own interval, and prints snapshot
+  freshness and skew instead of assuming them.
+
+** Energy harness
+=machdep.cidle.rapl= exposes the RAPL package energy counter (MSR 0x611) and
+unit exponent (MSR 0x606), added to the cidle module so it needs only a module
+reload, no kernel rebuild.  The harness reports package watts and joules per
+completed batch alongside the battery figure.  Package energy integrates
+exactly and has no averaging lag, unlike the EC discharge average whose drift
+(0.3 W between identical idle samples) exceeded the effects under test.
+
 * Files
 - kernel/sys/lpsched.h, kernel/kern/kern_lpsched.c (new), kernel/kern/files.kern
 - kernel/kern/kern_runq.c, kernel/kern/kern_timeout.c, kernel/sys/callout.h

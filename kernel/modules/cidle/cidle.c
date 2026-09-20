@@ -100,6 +100,15 @@ static uint8_t		cidle_cf[256] __aligned(16);
 #define MSR_PKG_C10_RES	0x632
 #define MSR_PKG_CST_CFG	0x0e2
 #define MSR_SMI_COUNT	0x34
+/*
+ * RAPL package energy.  Exposed so a benchmark can integrate package energy
+ * directly instead of differencing the EC's slow battery-discharge average,
+ * whose drift (0.3 W between identical idle samples) exceeded the effects
+ * under test.  Raw 32-bit counter plus the unit exponent; the reader does the
+ * wrap-safe subtraction.
+ */
+#define MSR_RAPL_POWER_UNIT	0x606
+#define MSR_PKG_ENERGY_STATUS	0x611
 
 static void
 cidle_xc_resid(void *arg1, void *arg2)
@@ -126,6 +135,25 @@ cidle_sysctl_resid(SYSCTLFN_ARGS)
 	xc = xc_unicast(0, cidle_xc_resid, NULL, NULL, cpu_lookup(0));
 	xc_wait(xc);
 	node.sysctl_data = cidle_resid;
+	return sysctl_lookup(SYSCTLFN_CALL(&node));
+}
+
+static char	cidle_rapl[128];
+
+static int
+cidle_sysctl_rapl(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	uint64_t units;
+	uint32_t raw, esu;
+
+	units = rdmsr(MSR_RAPL_POWER_UNIT);
+	esu = (uint32_t)((units >> 8) & 0x1f);
+	raw = (uint32_t)rdmsr(MSR_PKG_ENERGY_STATUS);
+	snprintf(cidle_rapl, sizeof(cidle_rapl),
+	    "raw=%u esu=%u uj_per_unit=%u", raw, esu,
+	    (esu < 31) ? (1000000u >> esu) : 0);
+	node.sysctl_data = cidle_rapl;
 	return sysctl_lookup(SYSCTLFN_CALL(&node));
 }
 
@@ -405,6 +433,11 @@ cidle_sysctl_setup(void)
 	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING, "tlstats",
 	    SYSCTL_DESCR("tickless idle counters"),
 	    cidle_sysctl_tlstats, 0, NULL, sizeof(cidle_tlstats),
+	    CTL_CREATE, CTL_EOL);
+	sysctl_createv(&cidle_sysctl_log, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING, "rapl",
+	    SYSCTL_DESCR("RAPL package energy counter and unit exponent"),
+	    cidle_sysctl_rapl, 0, NULL, sizeof(cidle_rapl),
 	    CTL_CREATE, CTL_EOL);
 	sysctl_createv(&cidle_sysctl_log, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING, "residency",

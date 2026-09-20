@@ -70,51 +70,98 @@ d() {		# d <after> <before> <key>
 	echo $(( $(field "$1" $3) - $(field "$2" $3) ))
 }
 
-work_snapshot() {	# sum batches/missed across pollers, on demand
-	[ -d "$BATCHDIR" ] || { echo "0 0"; return; }
+SNAPSEQ=0
+# Ask every poller for a fresh count.  The caller passes the expected sequence
+# number: each SIGUSR1 bumps a worker's seq by one, so a response is only
+# accepted once its seq has reached that value.  Without it a stale file (or a
+# worker that never answered) is silently counted as current.
+# Echoes: batches missed tmin tmax fresh total
+work_snapshot() {
+	[ -d "$BATCHDIR" ] || { echo "0 0 0 0 0 0"; return; }
 	pkill -USR1 -x poller 2>/dev/null
-	sleep 1
-	awk '{ for (i=1;i<=NF;i++) { split($i,kv,"="); t[kv[1]] += kv[2] } }
-	     END { printf "%d %d\n", t["batches"], t["missed"] }' \
-	    "$BATCHDIR"/*.stat 2>/dev/null || echo "0 0"
+	i=0
+	while [ $i -lt 5 ]; do
+		sleep 1
+		ok=$(awk -v w="$1" '{for(j=1;j<=NF;j++){split($j,kv,"=");
+		     if(kv[1]=="seq"&&kv[2]>=w)c++}} END{print c+0}' \
+		    "$BATCHDIR"/*.stat 2>/dev/null)
+		[ "$ok" -ge "$NPOLL" ] 2>/dev/null && break
+		i=$((i+1))
+	done
+	awk -v w="$1" '
+	  { b=0;m=0;t=0;sq=0
+	    for(j=1;j<=NF;j++){split($j,kv,"=")
+	      if(kv[1]=="seq")sq=kv[2]; else if(kv[1]=="t")t=kv[2]
+	      else if(kv[1]=="batches")b=kv[2]; else if(kv[1]=="missed")m=kv[2]}
+	    tot++
+	    if (sq>=w) { fresh++; B+=b; M+=m
+	      if(tmin==0||t<tmin)tmin=t; if(t>tmax)tmax=t } }
+	  END{ printf "%d %d %.6f %.6f %d %d\n", B+0, M+0, tmin+0, tmax+0,
+	       fresh+0, tot+0 }' "$BATCHDIR"/*.stat 2>/dev/null
 }
 
+# RAPL package energy counter (raw 32-bit) and unit exponent.
+rapl_raw() { sysctl -n machdep.cidle.rapl 2>/dev/null | sed -n 's/.*raw=\([0-9]*\).*/\1/p'; }
+rapl_esu() { sysctl -n machdep.cidle.rapl 2>/dev/null | sed -n 's/.*esu=\([0-9]*\).*/\1/p'; }
+
 measure() {	# measure <label>
-	set -- $(work_snapshot); WB1=$1; WM1=$2
+	label=$1			# saved BEFORE any `set --`, which
+					# replaces the positional parameters
+	SNAPSEQ=$((SNAPSEQ + 1))
+	set -- $(work_snapshot $SNAPSEQ)
+	WB1=$1; WM1=$2; WT1=$3; WTX1=$4; WF1=$5; WN1=$6
+	R1=$(rapl_raw); ESU=$(rapl_esu)
 	S1=$(sysctl -n machdep.cidle.tlstats)
 	L1=$(sysctl -n machdep.lpsched.stats)
 	I1=$(vmstat -i | awk '/^Total/{print $2}')
 	T1=$(date +%s)
+
 	sleep $SAMPLE
+
 	T2=$(date +%s)
-	S2=$(sysctl -n machdep.cidle.tlstats)
-	L2=$(sysctl -n machdep.lpsched.stats)
 	I2=$(vmstat -i | awk '/^Total/{print $2}')
-	set -- $(work_snapshot); WB2=$1; WM2=$2
+	L2=$(sysctl -n machdep.lpsched.stats)
+	S2=$(sysctl -n machdep.cidle.tlstats)
+	R2=$(rapl_raw)
+	SNAPSEQ=$((SNAPSEQ + 1))
+	set -- $(work_snapshot $SNAPSEQ)
+	WB2=$1; WM2=$2; WT2=$3; WTX2=$4; WF2=$5; WN2=$6
+
 	if [ "$ONAC" = 1 ]; then W=""; else
 		W=$(envstat -d acpibat0 | awk '/discharge rate/{print $3}')
 	fi
-	# Measured elapsed, not the requested sleep.
 	EL=$(( T2 - T1 )); [ "$EL" -le 0 ] && EL=$SAMPLE
-	awk -v l="$1" -v w="$W" -v dp=$(d "$S2" "$S1" deep) \
-	    -v e=$(d "$S2" "$S1" woke_early) -v i=$(( I2 - I1 )) -v s=$EL 'BEGIN {
+
+	awk -v l="$label" -v w="$W" -v r1="$R1" -v r2="$R2" -v esu="$ESU" \
+	    -v dp=$(d "$S2" "$S1" deep) -v e=$(d "$S2" "$S1" woke_early) \
+	    -v i=$(( I2 - I1 )) -v s=$EL 'BEGIN {
 		if (w == "") ws = "   --   "; else ws = sprintf("%6.2f W", w)
-		printf "%-12s %s  deep/s %5.1f  early/s %6.1f  ints/s %6.1f\n",
-		    l, ws, dp/s, e/s, i/s }'
+		dr = r2 - r1; if (dr < 0) dr += 4294967296
+		j = (esu > 0) ? dr / (2 ^ esu) : 0
+		printf "%-12s bat %s  pkg %6.3f W (%7.2f J)  deep/s %5.1f  ints/s %6.1f\n",
+		    l, ws, j/s, j, dp/s, i/s }'
 	awk -v sib=$(d "$L2" "$L1" pack_sibling) -v sh=$(d "$L2" "$L1" pack_shallow) \
 	    -v dee=$(d "$L2" "$L1" pack_deep) -v bu=$(d "$L2" "$L1" pack_busy) \
 	    -v no=$(d "$L2" "$L1" pack_none) -v he=$(d "$L2" "$L1" pack_held) \
 	    -v ca=$(d "$L2" "$L1" catch_held) -v ap=$(d "$L2" "$L1" coal_applied) \
-	    -v ns=$(d "$L2" "$L1" coal_noslack) -v s=$EL 'BEGIN {
-		printf "             place/s: sibling %5.1f shallow %5.1f deep %5.1f busy %5.1f none %5.1f\n",
-		    sib/s, sh/s, dee/s, bu/s, no/s
-		printf "             held/s %5.1f  catch_held/s %5.1f  coal/s applied %5.1f noslack %6.1f\n",
-		    he/s, ca/s, ap/s, ns/s }'
-	# Work done DURING this sample only: a single total over the whole
-	# A/B/A/B run also covers settling and the tail, so it cannot show the
-	# configurations did equal work.
-	awk -v b=$(( WB2 - WB1 )) -v m=$(( WM2 - WM1 )) -v s=$EL 'BEGIN {
-		printf "             work: batches %d (%.1f/s) missed %d\n", b, b/s, m }'
+	    -v s=$EL 'BEGIN {
+		printf "             place/s: sibling %5.1f shallow %5.1f deep %5.1f busy %5.1f none %5.1f  held %5.1f catch %5.1f coal %4.1f\n",
+		    sib/s, sh/s, dee/s, bu/s, no/s, he/s, ca/s, ap/s }'
+	# Work is divided by the WORKERS' own interval, not the sample window:
+	# the two snapshots bracket the sample, so using the sample elapsed
+	# would divide ~21 s of work by 20 s.  Skew and freshness are printed
+	# rather than assumed.
+	awk -v b=$(( WB2 - WB1 )) -v m=$(( WM2 - WM1 )) \
+	    -v t1="$WT1" -v t2="$WT2" -v x1="$WTX1" -v x2="$WTX2" \
+	    -v f1=$WF1 -v f2=$WF2 -v n=$WN2 -v r1="$R1" -v r2="$R2" -v esu="$ESU" 'BEGIN {
+		wi = t2 - t1
+		if (wi <= 0) { printf "             work: NO WORKER INTERVAL (stale snapshots)\n"; exit }
+		dr = r2 - r1; if (dr < 0) dr += 4294967296
+		j = (esu > 0) ? dr / (2 ^ esu) : 0
+		printf "             work: %d batches over %.2fs = %.2f/s, missed %d, %.2f J/batch\n",
+		    b, wi, b/wi, m, (b > 0 ? j/b : 0)
+		printf "             snapshots: fresh %d/%d and %d/%d, worker skew %.3fs / %.3fs\n",
+		    f1, n, f2, n, x1 - t1, x2 - t2 }'
 }
 
 run() {		# run <label> <enabled> <pack> <coalesce_ms> <epp>
@@ -146,11 +193,14 @@ report_work() {
 echo "lpsched A/B ($MODE): settle ${SETTLE}s sample ${SAMPLE}s EPP $EPP (daemon was $DAEMON)"
 case $MODE in
 loadab)
-	start_load $(( (SETTLE + SAMPLE + 5) * 5 ))
-	run "stock"      0 0 0 $EPP
-	run "pack=2"     1 2 0 $EPP
-	run "stock(2)"   0 0 0 $EPP
-	run "pack=2(2)"  1 2 0 $EPP
+	REPS=${REPS:-2}
+	start_load $(( (SETTLE + SAMPLE + 8) * (REPS * 2 + 1) ))
+	r=1
+	while [ $r -le $REPS ]; do
+		run "stock#$r"  0 0 0 $EPP
+		run "pack2#$r"  1 2 0 $EPP
+		r=$((r+1))
+	done
 	report_work
 	;;
 load)

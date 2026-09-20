@@ -97,7 +97,7 @@ main(int argc, char **argv)
 {
 	struct timespec next, now, end;
 	long period_ms = 200, work = 60000, duration_s = 120, phase_ms = 0;
-	unsigned long batches = 0, missed = 0;
+	unsigned long batches = 0, missed = 0, seq = 0;
 	const char *statusfile = NULL;
 	volatile double x = 0;
 	long i;
@@ -154,11 +154,24 @@ main(int argc, char **argv)
 		}
 
 		if (report_now && statusfile != NULL) {
+			struct timespec rt;
 			FILE *fp;
 
 			report_now = 0;
+			/*
+			 * A sequence number lets the reader prove the response
+			 * is fresh rather than a stale file, and the timestamp
+			 * gives it the interval the counts actually cover --
+			 * otherwise work measured over one window is divided by
+			 * a different window's elapsed time.
+			 */
+			seq++;
+			if (clock_gettime(CLOCK_MONOTONIC, &rt) != 0)
+				rt.tv_sec = rt.tv_nsec = 0;
 			if ((fp = fopen(statusfile, "w")) != NULL) {
-				fprintf(fp, "batches=%lu missed=%lu\n",
+				fprintf(fp, "seq=%lu t=%lld.%09ld batches=%lu "
+				    "missed=%lu\n", seq,
+				    (long long)rt.tv_sec, rt.tv_nsec,
 				    batches, missed);
 				fclose(fp);
 			}
