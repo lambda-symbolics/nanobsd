@@ -399,6 +399,13 @@ ihidev_hid_command(struct ihidev_softc *sc, int hidcmd, void *arg, bool poll)
 		int cmdlen = 7;
 		int dataoff = 4;
 		int report_id = rreq->id;
+		/*
+		 * 7.2.2.4 lets a report ID >= 15 escape into a third command
+		 * byte, but that escape applies to the command only: the
+		 * response still carries a one-byte report ID.  Conflating the
+		 * two made this read the ID as a 16-bit value, reject every
+		 * extended-ID report and skip a payload byte.
+		 */
 		int report_id_len = 1;
 		int report_len = rreq->len + 2;
 		int d;
@@ -418,7 +425,6 @@ ihidev_hid_command(struct ihidev_softc *sc, int hidcmd, void *arg, bool poll)
 		if (report_id >= 15) {
 			cmd[dataoff++] = report_id;
 			report_id = 15;
-			report_id_len = 2;
 		} else
 			cmdlen--;
 
@@ -454,12 +460,13 @@ ihidev_hid_command(struct ihidev_softc *sc, int hidcmd, void *arg, bool poll)
 			    device_xname(sc->sc_dev), d, report_len));
 		}
 
-		if (report_id_len == 2)
-			d = tmprep[2] | tmprep[3] << 8;
-		else
-			d = tmprep[2];
+		d = tmprep[2];
 
-		if (d != rreq->id) {
+		/*
+		 * An extended-ID report may echo either the real ID or the
+		 * 15 escape, depending on the device.
+		 */
+		if (d != rreq->id && !(rreq->id >= 15 && d == 15)) {
 			DPRINTF(("%s: response report id %d != %d\n",
 			    device_xname(sc->sc_dev), d, rreq->id));
 			iic_release_bus(sc->sc_tag, 0);

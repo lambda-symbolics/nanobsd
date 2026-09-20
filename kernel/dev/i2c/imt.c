@@ -36,6 +36,8 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/device.h>
 #include <sys/ioctl.h>
 #include <sys/sysctl.h>
+#include <sys/kthread.h>
+#include <sys/pmf.h>
 
 #include <dev/i2c/i2cvar.h>
 #include <dev/i2c/ihidev.h>
@@ -46,7 +48,19 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <dev/wscons/wsmousevar.h>
 
 #define IMT_MAX_CONTACTS	10
+#define IMT_INPUT_MODE_MOUSE	0x00
 #define IMT_INPUT_MODE_PTP	0x03
+
+/*
+ * Windows Precision Touchpad configuration usages.  Digitizers page unless
+ * noted; the certification blob lives on a vendor page and Linux reads it
+ * purely for the side effect of unlocking reporting on some devices.
+ */
+#define IMT_USAGE_SURFACE_SW	HID_USAGE2(HUP_DIGITIZERS, 0x57)
+#define IMT_USAGE_BUTTON_SW	HID_USAGE2(HUP_DIGITIZERS, 0x58)
+#define IMT_USAGE_LATENCY	HID_USAGE2(HUP_DIGITIZERS, 0x60)
+#define IMT_USAGE_CONTACTMAX	HID_USAGE2(HUP_DIGITIZERS, 0x55)
+#define IMT_USAGE_CERT		0xff0000c5
 
 /*
  * Touchpad coordinates are far finer than screen pixels (a few thousand
@@ -97,6 +111,21 @@ struct imt_softc {
 	/* sub-click scroll remainder, so slow drags still scroll */
 	int			sc_acc_x, sc_acc_y;
 	int			sc_traced;
+
+	/* descriptor, kept for the descriptor-driven PTP handshake */
+	void			*sc_desc;
+	int			sc_dlen;
+
+	int			sc_cert_rid;	/* Win8 certification blob */
+	int			sc_contactmax_rid;
+	int			sc_surface_rid;
+	struct hid_location	sc_loc_surface;
+	int			sc_button_rid;
+	struct hid_location	sc_loc_button;
+	int			sc_latency_rid;
+	struct hid_location	sc_loc_latency;
+
+	uint32_t		sc_prev_ids;	/* which contact IDs were down */
 };
 
 static int	imt_match(device_t, cfdata_t, void *);
@@ -104,6 +133,10 @@ static void	imt_attach(device_t, device_t, void *);
 static int	imt_detach(device_t, int);
 static void	imt_intr(struct ihidev *, void *, u_int);
 
+static int	imt_set_mode(struct imt_softc *, uint8_t);
+static void	imt_scan_features(struct imt_softc *, const void *, int);
+static int	imt_ptp_init(struct imt_softc *);
+static bool	imt_resume(device_t, const pmf_qual_t *);
 static int	imt_enable(void *);
 static void	imt_disable(void *);
 static int	imt_ioctl(void *, u_long, void *, int, struct lwp *);
@@ -123,6 +156,20 @@ int imt_scroll_div = IMT_SCROLL_DIV_DEFAULT;
 int imt_scroll_invert = 0;
 
 static struct sysctllog *imt_sysctllog;
+static struct imt_softc *imt_instance;	/* for the live mode toggle */
+
+/*
+ * Diagnostic polling path.  The pad answers I2C happily but its interrupt
+ * has never fired since the switch to Precision Touchpad mode, and those are
+ * two very different bugs.  Fetching the input report over I2C on a timer
+ * asks the pad directly whether it has anything to say, independent of the
+ * interrupt line.  I2C transfers can sleep, so this has to be a kthread and
+ * not a callout.
+ */
+int imt_poll_ms = 0;
+static lwp_t *imt_poll_lwp;
+static volatile int imt_poll_stop;
+static void	imt_poll_thread(void *);
 
 static const struct wsmouse_accessops imt_accessops = {
 	imt_enable,
@@ -215,6 +262,100 @@ imt_find_config(const void *desc, int dlen, int *ridp)
 }
 
 /*
+ * Writing machdep.imt.ptp switches the pad NOW rather than at the next open.
+ * The pad keeps its mode across a warm reboot, so without this a pad left in
+ * Precision Touchpad mode stays silent no matter what the driver does next,
+ * and the only way back is a full power cycle.
+ */
+static int
+imt_sysctl_ptp(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	int error, val;
+
+	val = imt_ptp;
+	node.sysctl_data = &val;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error != 0 || newp == NULL)
+		return error;
+	if (val != 0 && val != 1)
+		return EINVAL;
+	imt_ptp = val;
+	/*
+	 * Re-run the whole handshake, not just the mode write: the point of
+	 * the toggle is to compare the two bring-ups.
+	 */
+	if (imt_instance != NULL)
+		(void)imt_ptp_init(imt_instance);
+	return 0;
+}
+
+/*
+ * Ask the pad for its input report over I2C, on a timer, and log whatever
+ * comes back.  This deliberately bypasses the interrupt: if a finger on the
+ * pad shows up here while the interrupt count stays at zero, the reports are
+ * being produced and only the interrupt is lost; if nothing shows up here
+ * either, the pad really has gone quiet and the mode switch is at fault.
+ */
+static void
+imt_poll_thread(void *arg)
+{
+	struct imt_softc *sc = arg;
+	uint8_t buf[64];
+	int size, i, err;
+
+	size = sc->sc_hdev.sc_isize;
+	if (size <= 0 || size > (int)sizeof(buf))
+		size = (int)sizeof(buf);
+
+	while (!imt_poll_stop && imt_poll_ms > 0) {
+		memset(buf, 0, size);
+		err = ihidev_get_report((device_t)sc->sc_hdev.sc_parent,
+		    hid_input, sc->sc_hdev.sc_report_id, buf, size);
+		if (err == 0) {
+			for (i = 0; i < size; i++)
+				if (buf[i] != 0)
+					break;
+			if (i < size) {
+				printf("imt: poll rep %d:", sc->sc_hdev.sc_report_id);
+				for (i = 0; i < size; i++)
+					printf(" %02x", buf[i]);
+				printf("\n");
+			}
+		} else
+			printf("imt: poll get_report failed\n");
+		kpause("imtpoll", false, MAX(1, mstohz(imt_poll_ms)), NULL);
+	}
+	imt_poll_lwp = NULL;
+	kthread_exit(0);
+}
+
+static int
+imt_sysctl_poll(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	int val = imt_poll_ms, error;
+
+	node.sysctl_data = &val;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error || newp == NULL)
+		return error;
+	if (val < 0 || val > 10000)
+		return EINVAL;
+
+	imt_poll_ms = val;
+	if (val == 0) {
+		imt_poll_stop = 1;
+		return 0;
+	}
+	if (imt_instance == NULL || imt_poll_lwp != NULL)
+		return 0;
+	imt_poll_stop = 0;
+	return kthread_create(PRI_NONE, KTHREAD_MPSAFE, NULL,
+	    imt_poll_thread, imt_instance, &imt_poll_lwp, "imtpoll");
+}
+
+/*
  * Pointer and scroll sensitivity are a matter of taste, and the useful
  * values depend on the pad's resolution, so expose them rather than baking
  * them in: machdep.imt.motion_div, machdep.imt.scroll_div.
@@ -241,16 +382,225 @@ imt_sysctl_setup(void)
 	    NULL, 0, &imt_scroll_div, 0, CTL_CREATE, CTL_EOL);
 	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "ptp",
-	    SYSCTL_DESCR("switch the pad to Precision Touchpad mode (experimental)"),
-	    NULL, 0, &imt_ptp, 0, CTL_CREATE, CTL_EOL);
+	    SYSCTL_DESCR("1 = Precision Touchpad mode, 0 = mouse mode; applied at once"),
+	    imt_sysctl_ptp, 0, &imt_ptp, 0, CTL_CREATE, CTL_EOL);
 	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "scroll_invert",
 	    SYSCTL_DESCR("reverse the two-finger scroll direction"),
 	    NULL, 0, &imt_scroll_invert, 0, CTL_CREATE, CTL_EOL);
 	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "poll_ms",
+	    SYSCTL_DESCR("diagnostic: poll the input report every N ms, 0 = off"),
+	    imt_sysctl_poll, 0, &imt_poll_ms, 0, CTL_CREATE, CTL_EOL);
+	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "debug",
 	    SYSCTL_DESCR("1 = log emitted scrolls, 2 = log every report"),
 	    NULL, 0, &imt_debug, 0, CTL_CREATE, CTL_EOL);
+}
+
+/*
+ * hid(9) can read a field out of a report but not write one, and the
+ * configuration reports pack several unrelated switches into shared bytes, so
+ * they have to be modified in place rather than rebuilt from zeroes.  Bit
+ * order matches hid_get_udata(): little-endian from loc->pos.
+ */
+static void
+imt_put_udata(uint8_t *buf, const struct hid_location *loc, u_long val)
+{
+	u_int i, bit;
+
+	if (loc->size == 0 || loc->size > 32)
+		return;
+	for (i = 0; i < loc->size; i++) {
+		bit = loc->pos + i;
+		if (val & (1UL << i))
+			buf[bit / 8] |= 1 << (bit % 8);
+		else
+			buf[bit / 8] &= ~(1 << (bit % 8));
+	}
+}
+
+/*
+ * Read-modify-write one field of a feature report.  Reading first matters:
+ * zeroing the bytes we do not own would clear whatever else shares the
+ * report, and on this collection that includes the other switches.
+ */
+static int
+imt_set_field(struct imt_softc *sc, int rid, const struct hid_location *loc,
+    u_long val, const char *what)
+{
+	device_t parent = (device_t)sc->sc_hdev.sc_parent;
+	uint8_t rep[32];
+	int len, err;
+
+	len = hid_report_size(sc->sc_desc, sc->sc_dlen, hid_feature, rid);
+	if (len <= 0 || len > (int)sizeof(rep))
+		return EINVAL;
+
+	memset(rep, 0, sizeof(rep));
+	if (ihidev_get_report(parent, hid_feature, rid, rep, len) != 0)
+		memset(rep, 0, sizeof(rep));
+	imt_put_udata(rep, loc, val);
+	err = ihidev_set_report(parent, hid_feature, rid, rep, len);
+	printf("imt: %s (rid %d len %d) = %lu -> err %d\n", what, rid, len,
+	    val, err);
+	return err;
+}
+
+/*
+ * Log every feature field the pad advertises and remember the ones the
+ * Precision Touchpad handshake needs.  The logging is the point as much as
+ * the lookup: which of these reports the device actually implements is the
+ * open question, and guessing report IDs is what went wrong before.
+ */
+static void
+imt_scan_features(struct imt_softc *sc, const void *desc, int dlen)
+{
+	struct hid_data *hd;
+	struct hid_item h;
+	int last_rid = -1;
+	uint32_t last_usage = 0xffffffff;
+
+	sc->sc_cert_rid = -1;
+	sc->sc_contactmax_rid = -1;
+	sc->sc_surface_rid = -1;
+	sc->sc_button_rid = -1;
+	sc->sc_latency_rid = -1;
+
+	hd = hid_start_parse(desc, dlen, hid_feature);
+	if (hd == NULL)
+		return;
+	while (hid_get_item(hd, &h)) {
+		if (h.kind != hid_feature)
+			continue;
+		/*
+		 * The certification blob is hundreds of single-byte fields;
+		 * log one line per (report, usage) run instead of per byte.
+		 */
+		if (h.report_ID != last_rid || h.usage != last_usage) {
+			printf("imt: feature rid %d usage 0x%08x pos %u "
+			    "size %u\n", h.report_ID, h.usage, h.loc.pos,
+			    h.loc.size);
+			last_rid = h.report_ID;
+			last_usage = h.usage;
+		}
+		switch (h.usage) {
+		case IMT_USAGE_CERT:
+			/*
+			 * Only the report that *opens* with the blob usage is
+			 * the certification report; the usage also appears
+			 * mid-report elsewhere.  This is the same test Linux
+			 * makes with usage_index == 0, and taking the first
+			 * match in parse order instead picked a four-byte
+			 * report that returned different garbage on each read.
+			 */
+			if (h.loc.pos == 0)
+				sc->sc_cert_rid = h.report_ID;
+			break;
+		case IMT_USAGE_CONTACTMAX:
+			sc->sc_contactmax_rid = h.report_ID;
+			break;
+		case IMT_USAGE_SURFACE_SW:
+			sc->sc_surface_rid = h.report_ID;
+			sc->sc_loc_surface = h.loc;
+			break;
+		case IMT_USAGE_BUTTON_SW:
+			sc->sc_button_rid = h.report_ID;
+			sc->sc_loc_button = h.loc;
+			break;
+		case IMT_USAGE_LATENCY:
+			sc->sc_latency_rid = h.report_ID;
+			sc->sc_loc_latency = h.loc;
+			break;
+		default:
+			break;
+		}
+	}
+	hid_end_parse(hd);
+}
+
+/*
+ * The full Precision Touchpad bring-up, in the order Windows performs it.
+ * Setting Input Mode alone left this pad in a state where it acknowledged
+ * the mode and then reported nothing at all, so the steps around it are the
+ * candidates for whatever it is waiting on.
+ */
+static int
+imt_ptp_init(struct imt_softc *sc)
+{
+	device_t parent = (device_t)sc->sc_hdev.sc_parent;
+	uint8_t blob[512];
+	int len, err;
+
+	/*
+	 * Read the vendor certification blob.  Linux does this with the
+	 * comment "retrieve the Win8 blob once to enable some devices" and
+	 * discards the contents; the read itself is the operation.
+	 */
+	if (sc->sc_cert_rid >= 0) {
+		len = hid_report_size(sc->sc_desc, sc->sc_dlen, hid_feature,
+		    sc->sc_cert_rid);
+		if (len > (int)sizeof(blob))
+			len = (int)sizeof(blob);
+		if (len > 0) {
+			memset(blob, 0, sizeof(blob));
+			err = ihidev_get_report(parent, hid_feature,
+			    sc->sc_cert_rid, blob, len);
+			printf("imt: cert blob rid %d len %d -> err %d, "
+			    "%02x %02x %02x %02x\n", sc->sc_cert_rid, len,
+			    err, blob[0], blob[1], blob[2], blob[3]);
+		}
+	} else
+		printf("imt: no certification report in descriptor\n");
+
+	/*
+	 * Linux reads Contact Max as a feature too.  Its value is not used
+	 * here (the slot count comes from the input report), but the read is
+	 * part of the sequence a Windows host performs.
+	 */
+	if (sc->sc_contactmax_rid >= 0) {
+		len = hid_report_size(sc->sc_desc, sc->sc_dlen, hid_feature,
+		    sc->sc_contactmax_rid);
+		if (len > 0 && len <= (int)sizeof(blob)) {
+			memset(blob, 0, sizeof(blob));
+			err = ihidev_get_report(parent, hid_feature,
+			    sc->sc_contactmax_rid, blob, len);
+			printf("imt: contact max rid %d -> err %d, %02x %02x\n",
+			    sc->sc_contactmax_rid, err, blob[0], blob[1]);
+		}
+	}
+
+	/* Surface and button reporting; these should already be on. */
+	if (sc->sc_surface_rid >= 0)
+		(void)imt_set_field(sc, sc->sc_surface_rid,
+		    &sc->sc_loc_surface, 1, "surface switch");
+	if (sc->sc_button_rid >= 0)
+		(void)imt_set_field(sc, sc->sc_button_rid,
+		    &sc->sc_loc_button, 1, "button switch");
+
+	err = imt_set_mode(sc, imt_ptp ? IMT_INPUT_MODE_PTP :
+	    IMT_INPUT_MODE_MOUSE);
+
+	/* Normal latency, not the high-latency power saving mode. */
+	if (sc->sc_latency_rid >= 0)
+		(void)imt_set_field(sc, sc->sc_latency_rid,
+		    &sc->sc_loc_latency, 0, "latency mode");
+
+	return err;
+}
+
+/*
+ * ihidev resets the device on resume, and a host-initiated reset discards
+ * the selected input mode, so the handshake has to be redone.
+ */
+static bool
+imt_resume(device_t self, const pmf_qual_t *qual)
+{
+	struct imt_softc *sc = device_private(self);
+
+	if (sc->sc_enabled)
+		(void)imt_ptp_init(sc);
+	return true;
 }
 
 /*
@@ -260,7 +610,7 @@ imt_sysctl_setup(void)
  * mouse-emulation mode where the multitouch report is never sent at all.
  */
 static int
-imt_set_ptp_mode(struct imt_softc *sc)
+imt_set_mode(struct imt_softc *sc, uint8_t want)
 {
 	uint8_t rep[8];
 	int len, err;
@@ -275,13 +625,25 @@ imt_set_ptp_mode(struct imt_softc *sc)
 	if (len <= 0 || len > (int)sizeof(rep))
 		len = 2;
 	memset(rep, 0, sizeof(rep));
-	rep[0] = IMT_INPUT_MODE_PTP;
+	rep[0] = want;
 
 	err = ihidev_set_report((device_t)sc->sc_hdev.sc_parent, hid_feature,
 	    sc->sc_cfg_rid, rep, len);
-	if (imt_debug)
-		printf("imt: set input mode rid %d len %d -> %d (err %d)\n",
-		    sc->sc_cfg_rid, len, rep[0], err);
+	printf("imt: set input mode rid %d len %d -> %d (err %d)\n",
+	    sc->sc_cfg_rid, len, rep[0], err);
+
+	/*
+	 * Read the mode back.  A SET_REPORT that the pad NAKs internally
+	 * still returns success here, so the write returning 0 is not
+	 * evidence that the pad actually changed mode.
+	 */
+	memset(rep, 0, sizeof(rep));
+	if (ihidev_get_report((device_t)sc->sc_hdev.sc_parent, hid_feature,
+	    sc->sc_cfg_rid, rep, len) == 0)
+		printf("imt: input mode reads back %d %d\n", rep[0], rep[1]);
+	else
+		printf("imt: input mode readback failed\n");
+
 	return err;
 }
 
@@ -351,6 +713,8 @@ imt_attach(device_t parent, device_t self, void *aux)
 	sc->sc_hdev.sc_report_id = iha->reportid;
 
 	ihidev_get_report_desc(iha->parent, &desc, &size);
+	sc->sc_desc = desc;
+	sc->sc_dlen = size;
 	repid = iha->reportid;
 	sc->sc_hdev.sc_isize = hid_report_size(desc, size, hid_input, repid);
 	sc->sc_hdev.sc_osize = hid_report_size(desc, size, hid_output, repid);
@@ -366,6 +730,7 @@ imt_attach(device_t parent, device_t self, void *aux)
 	}
 	sc->sc_cfg_size = hid_report_size(desc, size, hid_feature,
 	    sc->sc_cfg_rid);
+	imt_scan_features(sc, desc, size);
 	if (imt_debug)
 		printf("imt: input report %d size %d, config report %d size %d\n",
 		    repid, sc->sc_hdev.sc_isize, sc->sc_cfg_rid,
@@ -374,9 +739,10 @@ imt_attach(device_t parent, device_t self, void *aux)
 	aprint_normal(": %d contacts%s, two-finger scrolling\n",
 	    sc->sc_nslots, sc->sc_have_btn ? ", clickpad" : "");
 
-	if (!pmf_device_register(self, NULL, NULL))
+	if (!pmf_device_register(self, NULL, imt_resume))
 		aprint_error_dev(self, "couldn't establish power handler\n");
 
+	imt_instance = sc;
 	imt_sysctl_setup();
 
 	printf("imt: attach complete, awaiting open\n");
@@ -404,6 +770,8 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 	uint8_t *data = buf;
 	uint32_t btn = 0;
 	int i, down = 0, x = 0, y = 0, dx, dy, s, sumx, sumy;
+	int nvalid, cnt;
+	uint32_t ids = 0;
 
 	if (!sc->sc_enabled || sc->sc_wsmousedev == NULL)
 		return;
@@ -421,14 +789,30 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 	 * every delta then looks like a huge jump, gets discarded below, and
 	 * nothing ever scrolls.  The centroid is stable under reordering.
 	 */
+	/*
+	 * Contact Count says how many of the slots in this report carry a real
+	 * contact; the rest are stale padding that still has Tip set on some
+	 * pads.  Counting every tip-set slot therefore overcounts fingers and
+	 * turns a one-finger drag into a phantom two-finger scroll.
+	 */
+	nvalid = sc->sc_nslots;
+	if (sc->sc_loc_count.size > 0) {
+		cnt = (int)hid_get_udata(data, &sc->sc_loc_count);
+		if (cnt > 0 && cnt < nvalid)
+			nvalid = cnt;
+	}
+
 	sumx = sumy = 0;
-	for (i = 0; i < sc->sc_nslots; i++) {
+	for (i = 0; i < nvalid; i++) {
 		if (!sc->sc_contacts[i].valid)
 			continue;
 		if (!hid_get_udata(data, &sc->sc_contacts[i].loc_tip))
 			continue;
 		sumx += (int)hid_get_udata(data, &sc->sc_contacts[i].loc_x);
 		sumy += (int)hid_get_udata(data, &sc->sc_contacts[i].loc_y);
+		if (sc->sc_contacts[i].loc_id.size > 0)
+			ids |= 1U << (hid_get_udata(data,
+			    &sc->sc_contacts[i].loc_id) & 31);
 		down++;
 	}
 	if (down > 0) {
@@ -436,8 +820,13 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 		y = sumy / down;
 	}
 
+	/*
+	 * A delta only means anything if it is between the same fingers.  The
+	 * finger count staying equal is not enough: one finger can lift while
+	 * another lands in the same report, and the centroid then jumps.
+	 */
 	dx = dy = 0;
-	if (down > 0 && down == sc->sc_prev_down) {
+	if (down > 0 && down == sc->sc_prev_down && ids == sc->sc_prev_ids) {
 		dx = x - sc->sc_prev_x;
 		dy = y - sc->sc_prev_y;
 		/* A lift-and-replace looks like a huge jump; ignore it. */
@@ -493,8 +882,9 @@ imt_intr(struct ihidev *addr, void *buf, u_int len)
 	}
 	splx(s);
 
-	if (down != sc->sc_prev_down)
+	if (down != sc->sc_prev_down || ids != sc->sc_prev_ids)
 		sc->sc_acc_x = sc->sc_acc_y = 0;
+	sc->sc_prev_ids = ids;
 	sc->sc_prev_x = x;
 	sc->sc_prev_y = y;
 	sc->sc_prev_down = down;
@@ -515,13 +905,10 @@ imt_enable(void *v)
 			printf("imt: ihidev_open failed %d\n", error);
 		return error;
 	}
-	/* Only switch modes when explicitly asked; see imt_ptp. */
-	if (imt_ptp)
-		(void)imt_set_ptp_mode(sc);
-	else if (imt_debug)
-		printf("imt: leaving the pad in mouse mode (machdep.imt.ptp=0)\n");
+	(void)imt_ptp_init(sc);
 	sc->sc_prev_down = 0;
 	sc->sc_prev_btn = 0;
+	sc->sc_prev_ids = 0;
 	sc->sc_enabled = true;
 	return 0;
 }

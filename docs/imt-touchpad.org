@@ -67,3 +67,64 @@ plain mouse while this is investigated.
 - =kernel/dev/i2c/imt.c= (new), =kernel/dev/i2c/files.i2c= (drop the
   nonexistent =hidmt= dependency), =kernel/arch/amd64/conf/GENERIC=
 - =kernel/dev/i2c/ihidev.c= carries a temporary report-id/raw-read probe
+
+* Findings after the descriptor-driven handshake (kernel #115)
+
+Three of the earlier hypotheses are now settled by measurement rather than
+argument.
+
+** The pad really does enter Precision Touchpad mode
+
+=imt_set_mode()= now reads the Input Mode feature back after writing it.  It
+reads 3 after the write and 0 after a write of 0, so the mode switch takes
+effect.  The earlier worry that a short write was being accepted and silently
+ignored is refuted: =err 0= was not the only evidence, the readback agrees.
+
+** The input buffer is large enough
+
+=ihidev= reports =isize=14= and the report-4 payload is 11 bytes, which with
+the report ID and the two-byte length prefix is exactly 14.  Hypothesis 3 in
+the list above is refuted.
+
+** GET_REPORT on an input report is not supported by this pad
+
+A polling path (=machdep.imt.poll_ms=) that fetches the input report over I2C
+on a timer fails on every attempt, in both mouse and Precision Touchpad mode,
+while feature reports read back fine.  Polling therefore cannot be used as a
+substitute for the interrupt, and cannot be used to distinguish "no reports"
+from "no interrupts" either.
+
+** The full Windows handshake now runs and succeeds
+
+Enumerating the feature reports gave, for this ELAN0670:
+
+| report | usage      | meaning                    |
+|--------+------------+----------------------------|
+|      2 | 0x000d0055 | Contact Count Maximum (5)  |
+|      3 | 0x000d0052 | Input Mode                 |
+|      5 | 0x000d0057 | Surface Switch             |
+|      5 | 0x000d0058 | Button Switch              |
+|      6 | 0xff0000c5 | Win8 certification blob    |
+|      7 | 0x000d0060 | Latency Mode               |
+
+The blob at report 6 reads back =fc 28 fe 84 ...=, the standard Microsoft
+certification signature, which confirms both the report choice and that
+=GET_REPORT= works for large feature reports.
+
+Picking that report needs Linux's rule: the certification report is the one
+whose *first* field carries usage 0xff0000c5.  Taking the first match in
+descriptor order instead selects report 14, a four-byte report that returns
+different bytes on each read.
+
+The bring-up now performs, in order: read the certification blob, read Contact
+Max, enable Surface and Button Switch, set Input Mode, set Latency Mode to
+normal.  Every step returns success.  Whether the pad now actually reports is
+still open and needs a finger on the pad.
+
+** Corrected in =ihidev=
+
+A report ID >= 15 escapes into a third command byte, but the *response* still
+carries a one-byte report ID.  =ihidev_get_report()= conflated the two, so it
+parsed the response ID as a 16-bit value, rejected every extended-ID report
+and would have skipped a payload byte.  Fixed by tracking the command
+extension and the response prefix separately.
