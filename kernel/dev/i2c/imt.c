@@ -108,7 +108,16 @@ static int	imt_enable(void *);
 static void	imt_disable(void *);
 static int	imt_ioctl(void *, u_long, void *, int, struct lwp *);
 
-int imt_debug = 2;	/* XXX on by default while bringing the driver up */
+int imt_debug = 1;
+/*
+ * Switching the pad into Precision Touchpad mode makes it stop sending the
+ * mouse report -- and on this Elan pad it then sends NOTHING AT ALL, not even
+ * the multitouch report, so the pointer dies completely.  Until that is
+ * understood the switch is opt-in: left off, the pad keeps working normally
+ * through ims(4) and imt just sits idle.
+ *	sysctl -w machdep.imt.ptp=1	(then replug/restart X to re-open)
+ */
+int imt_ptp = 1;	/* pushing on it: leave PTP mode enabled */
 int imt_motion_div = IMT_MOTION_DIV_DEFAULT;
 int imt_scroll_div = IMT_SCROLL_DIV_DEFAULT;
 int imt_scroll_invert = 0;
@@ -230,6 +239,10 @@ imt_sysctl_setup(void)
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "scroll_div",
 	    SYSCTL_DESCR("pad units per scroll unit (higher = slower)"),
 	    NULL, 0, &imt_scroll_div, 0, CTL_CREATE, CTL_EOL);
+	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "ptp",
+	    SYSCTL_DESCR("switch the pad to Precision Touchpad mode (experimental)"),
+	    NULL, 0, &imt_ptp, 0, CTL_CREATE, CTL_EOL);
 	sysctl_createv(&imt_sysctllog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "scroll_invert",
 	    SYSCTL_DESCR("reverse the two-finger scroll direction"),
@@ -502,8 +515,11 @@ imt_enable(void *v)
 			printf("imt: ihidev_open failed %d\n", error);
 		return error;
 	}
-	/* The pad has just been reset; ask for multitouch reports again. */
-	(void)imt_set_ptp_mode(sc);
+	/* Only switch modes when explicitly asked; see imt_ptp. */
+	if (imt_ptp)
+		(void)imt_set_ptp_mode(sc);
+	else if (imt_debug)
+		printf("imt: leaving the pad in mouse mode (machdep.imt.ptp=0)\n");
 	sc->sc_prev_down = 0;
 	sc->sc_prev_btn = 0;
 	sc->sc_enabled = true;

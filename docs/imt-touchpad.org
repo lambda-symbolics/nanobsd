@@ -1,0 +1,69 @@
+#+TITLE: imt(4) — I2C precision touchpad for NetBSD (LISPBSD)
+#+DATE: 2026-09-20
+
+* Why this exists
+
+NetBSD 11 declares an =imt= device in =dev/i2c/files.i2c= but ships neither
+=dev/i2c/imt.c= nor the =dev/hid/hidmt.c= layer that declaration names, so the
+device can never be configured and the Elan I2C touchpad attaches only as
+=ims(4)= — a two-button mouse with no scrolling.
+
+OpenBSD's =hidmt= cannot be ported across directly: it is written against
+OpenBSD's wsmouse multitouch framework (=wsmouse_mtstate=,
+=wsmouse_id_to_slot=, =wsmouse_configure=, =wsmouse_input_sync=,
+=wsmouse_set_mode=), none of which exists in NetBSD's wscons.  Acquiring that
+framework means replacing the shared mouse layer used by every pointing
+device — far larger and riskier than the driver itself.
+
+So =imt.c= here is NetBSD-native: it decodes the Windows Precision Touchpad
+reports itself and drives the existing wsmouse interface.
+
+* What works
+
+- Attaches on the right report: =imt0 at ihidev0 reportid 4: 3 contacts,
+  clickpad, two-finger scrolling=.  It parses the per-contact tip/id/x/y
+  locations, the contact-count field and the button, and finds the Input Mode
+  feature report (rid 3, 2 bytes including the report id).
+- =machdep.imt.{ptp,motion_div,scroll_div,scroll_invert,debug}= tunables.
+- Scrolling is emitted as z/w wheel deltas via =wsmouse_input()=, NOT
+  =wsmouse_precision_scroll()=: this X configuration consumes the wheel axes
+  ("ZAxisMapping 4 5 6 7"), which is also how =pms(4)= delivers the
+  TrackPoint's working middle-button scroll.  =wsmouse_precision_scroll()=
+  emits =WSCONS_EVENT_[HV]SCROLL=, which that path ignores entirely.
+- Position is tracked as the CENTROID of the contacts that are down.  The
+  order contacts appear in a report is not stable, so "the first contact
+  down" alternates between fingers and the position jumps by the finger
+  spacing every report.
+
+* The open problem
+
+Writing Input Mode = 3 (Precision Touchpad) to feature report 3 is accepted
+(=err 0=, tried with both a 1-byte and a 2-byte payload; =ihidev_set_report=
+prepends the report id itself, so 1 byte is the correct payload length).
+
+After that write the pad stops sending the mouse report — so the pointer dies
+— and sends NOTHING in its place.  Instrumenting =ihidev_work()= showed no
+input reports of any id arriving at all, and the pad's interrupt does not
+appear to fire.  So the mode change is taken, but the device then goes silent
+rather than producing multitouch reports.
+
+Unverified hypotheses, in rough order of suspicion:
+
+1. The PTP initialisation is incomplete.  Windows also writes the Latency
+   Mode feature report and reads the Certification/Capabilities feature
+   report; the pad may refuse to stream until that handshake is done.
+2. The report is arriving but is being discarded before it can be logged.
+   The first probe was placed after =ihidev_work()='s packet-length
+   validation, so an oversized/short packet would =goto out= and look exactly
+   like "no reports".  The probe has since been moved to immediately after
+   the I2C read to settle this — result not yet observed.
+3. =sc_isize= (=wMaxInputLength=) may be too small for the multitouch report,
+   so the read itself truncates or fails.
+
+=machdep.imt.ptp= gates the mode switch so the pad can be left working as a
+plain mouse while this is investigated.
+
+* Files
+- =kernel/dev/i2c/imt.c= (new), =kernel/dev/i2c/files.i2c= (drop the
+  nonexistent =hidmt= dependency), =kernel/arch/amd64/conf/GENERIC=
+- =kernel/dev/i2c/ihidev.c= carries a temporary report-id/raw-read probe

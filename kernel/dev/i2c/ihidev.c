@@ -852,6 +852,13 @@ ihidev_intr(void *arg)
 	return 1;
 }
 
+/*
+ * XXX temporary: log the next N input reports so we can see which report
+ * ids the touchpad actually sends.  Reset with
+ * "sysctl -w hw.ihidev_repdebug=40".
+ */
+int ihidev_repdebug = 40;
+
 static void
 ihidev_work(struct work *wk, void *arg)
 {
@@ -874,6 +881,13 @@ ihidev_work(struct work *wk, void *arg)
 	res = iic_exec(sc->sc_tag, I2C_OP_READ_WITH_STOP, sc->sc_addr, NULL, 0,
 	    sc->sc_ibuf, sc->sc_isize, 0);
 	iic_release_bus(sc->sc_tag, 0);
+	if (ihidev_repdebug > 0) {
+		printf("ihidev: raw res=%d isize=%u buf %02x %02x %02x %02x "
+		    "%02x %02x %02x %02x\n", res, sc->sc_isize,
+		    sc->sc_ibuf[0], sc->sc_ibuf[1], sc->sc_ibuf[2],
+		    sc->sc_ibuf[3], sc->sc_ibuf[4], sc->sc_ibuf[5],
+		    sc->sc_ibuf[6], sc->sc_ibuf[7]);
+	}
 	if (res != 0)
 		goto out;
 
@@ -905,6 +919,14 @@ ihidev_work(struct work *wk, void *arg)
 	for (i = 0; i < sc->sc_isize; i++)
 		DPRINTF((" %.2x", sc->sc_ibuf[i]));
 	DPRINTF(("\n"));
+
+	if (ihidev_repdebug > 0) {
+		ihidev_repdebug--;
+		printf("ihidev: dispatch rep %u psize %u sub %p open %d\n", rep,
+		    psize, sc->sc_subdevs[rep],
+		    sc->sc_subdevs[rep] ?
+		    (sc->sc_subdevs[rep]->sc_state & IHIDEV_OPEN) : -1);
+	}
 
 	scd = sc->sc_subdevs[rep];
 	if (scd == NULL || !(scd->sc_state & IHIDEV_OPEN))

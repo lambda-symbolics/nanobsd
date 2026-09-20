@@ -40,6 +40,16 @@ hdaudioctl -f "$DEV" get 0 0x01 > "$CUR" 2>/dev/null || exit 0
 
 # 0x21: headphones -> association 1, sequence 15 (redirection)
 sed -e 's|<integer>0x3211020</integer>|<integer>0x321101f</integer>|' "$CUR" > "$NEW"
+# The jack sits at sequence 15 and mirrors the sequence-0 speaker pin, which
+# is 0x14 -- and 0x14 is evidently the SMALL driver (retiring 0x17 made the
+# speakers sound as thin as the headphones did).  Swapping the two speaker
+# pins' sequence numbers makes the jack mirror 0x17, the full-range driver,
+# while both speakers stay driven.  IMT_NO_SWAP_SPK=1 turns this off.
+if [ "${IMT_NO_SWAP_SPK:-0}" != 1 ]; then
+	sed -i -e 's|<integer>0x90170110</integer>|<integer>0xSWAPTMP</integer>|' \
+	       -e 's|<integer>0x90170111</integer>|<integer>0x90170110</integer>|' \
+	       -e 's|<integer>0xSWAPTMP</integer>|<integer>0x90170111</integer>|' "$NEW"
+fi
 if [ "${IMT_DROP_SPK2:-0}" = 1 ]; then
 	# 0x90170111 is pin 0x17 alone; pin 0x14 is 0x90170110.
 	sed -i -e 's|<integer>0x90170111</integer>|<integer>0x411111f0</integer>|' "$NEW"
