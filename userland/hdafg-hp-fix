@@ -1,0 +1,41 @@
+#!/bin/sh
+# hdafg-hp-fix - make the headphone jack usable on the X1 Nano's ALC287.
+#
+# The codec describes pin 0x21 (the 3.5mm jack) as its own association
+# (As=2 Seq=0).  hdafg(4) then tries to give that association its own DAC,
+# but the 4-channel speaker association has already claimed both DACs the
+# codec has, so the trace fails and the jack is dropped entirely:
+#
+#   hdafg0: depth 2 nid 02 busy by assoc 0
+#   hdafg0: depth 2 nid 03 busy by assoc 0
+#   hdafg0:   trace failed as=1 seq=0 pin=21 hpredir=-1 minassoc=0
+#
+# hdafg already implements headphone redirection -- sharing the speakers'
+# DAC and switching on jack sense -- but only enables it for a headphone pin
+# that sits INSIDE the speaker association at sequence 15:
+#
+#   /* Headphones with seq=15 may mean redirection */
+#   if (type == COP_DEVICE_HP_OUT && seq == 15)
+#
+# So rewrite the pin's configuration default from association 2 / sequence 0
+# to association 1 / sequence 15, i.e. 0x03211020 -> 0x0321101f, and hand it
+# back through the pin-config property.  hdafg re-attaches and reports
+#
+#   DAC00 4ch: Speaker [...], HP Out [Jack Black(21)]
+#
+# The codec forgets this over a power cycle, so it is reapplied at boot.
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin; export PATH
+DEV=${1:-/dev/hdaudio0}
+OLD=0x3211020		# as printed by hdaudioctl (no leading zero)
+NEW=0x321101f
+
+hdaudioctl -f "$DEV" get 0 0x01 > /tmp/hdafg-pincfg.$$ 2>/dev/null || exit 0
+if ! grep -q "<integer>$OLD</integer>" /tmp/hdafg-pincfg.$$; then
+	rm -f /tmp/hdafg-pincfg.$$
+	exit 0			# already patched, or a different codec
+fi
+sed "s|<integer>$OLD</integer>|<integer>$NEW</integer>|" \
+    /tmp/hdafg-pincfg.$$ > /tmp/hdafg-pincfg-hp.$$
+hdaudioctl -f "$DEV" set 0 0x01 /tmp/hdafg-pincfg-hp.$$ >/dev/null 2>&1
+rm -f /tmp/hdafg-pincfg.$$ /tmp/hdafg-pincfg-hp.$$

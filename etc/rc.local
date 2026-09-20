@@ -39,3 +39,7 @@ sysctl -w machdep.cidle.tickless=1 >/dev/null 2>&1
 
 # Wait for lid/button wake; set a positive timeout for bounded suspend tests.
 sysctl -w hw.acpi.sleep.freeze_timeout=0 >/dev/null 2>&1
+
+# Headphone jack: re-associate pin 0x21 so hdafg enables headphone
+# redirection (see the script for the full reasoning).
+[ -x /usr/local/sbin/hdafg-hp-fix ] && /usr/local/sbin/hdafg-hp-fix
