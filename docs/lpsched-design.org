@@ -137,6 +137,96 @@ test windows.  Only the first three rows are clean.
   the EC discharge figure needs >=50 s settle; the panel blanks after 5 min
   idle (=xset dpms 300=) and shifts the baseline by ~1.4 W.
 
+* Results (2026-09-20, kernel #94, repaired, =lpsched-ab load=)
+
+Four =poller(1)= background tasks (~5% duty each), on AC so watts are not
+measurable; EPP fixed at 32 throughout, so only pack/coalesce vary.
+
+| config       | deep/s | early/s | ints/s | packed/s | held/s | coal/s |
+|--------------+--------+---------+--------+----------+--------+--------|
+| stock        |    0.6 |   137.8 |  147.4 |      0.0 |    0.0 |    0.0 |
+| pack=1       |    7.6 |   206.9 |  130.0 |    253.4 |   39.0 |    0.0 |
+| pack=2       |    7.5 |   291.6 |  124.2 |    238.7 |   26.3 |    0.0 |
+| pack2+coal50 |    5.8 |   221.7 |  132.1 |    263.1 |   44.5 |   17.9 |
+
+- *The mechanism now runs*: 238-263 placements/s against 0 for stock.  On
+  kernel #93 the estcpu exemption suppressed almost all of these, which is why
+  the first round measured nothing -- it was not measuring a weak effect, it
+  was measuring an inactive mechanism.
+- *Full tickless windows rise 0.6 -> 7.6 /s* (~12x) with pack=1, and device
+  interrupts fall 147 -> 130 /s.  A static-idle test cannot show this: there
+  is no background work to gather.
+- =held/s= 26-45 shows the =sched_preempted= repair firing tens of times a
+  second; without it each of those would have migrated packed work onto an
+  idle core and woken it.
+- pack=1 and pack=2 reach the same deep/s, but pack=2 has markedly more early
+  wakes (292 vs 207/s), so the aggressive busy-CPU branch is not earning its
+  extra risk here.  pack=1 is the better default on this evidence.
+- Adding coalescing *lowered* deep/s (7.5 -> 5.8) even though it applied
+  (17.9/s).  Worth investigating rather than shipping; the residual per-CPU
+  tick phase skew is the obvious suspect.
+- STILL MISSING: watts.  This run was on AC.  The same comparison on battery
+  is required before claiming any power result, and the pack=2 latency cost
+  under load is still unmeasured.
+
+* Review and repairs (2026-09-20, external review of 8a7cf67)
+
+An external review found seven defects; all seven were verified against the
+source before any change.  The important consequence is that the earlier
+"no measurable idle-power improvement" result **does not establish that the
+mechanisms are useless** -- the classifier exempted the workload they target,
+the "stock" baseline was not clean, and there were no counters to show
+whether packing ever executed.  Treat the first round as "untested".
+
+1. *Stock migration undid packing.*  =sched_preempted()= exists to move a
+   thread off a secondary SMT CPU onto an idle first-class CPU -- exactly
+   where packing had just placed it, waking the core packing avoided.  It had
+   no lpsched check.  Fixed: packed, non-exempt LWPs are left in place
+   (vfork LP_TELEPORT still scatters, that is correctness not preference).
+   Counter: =pack_held=.
+2. *=pack=2= could strand work.*  It queued behind any running thread with an
+   empty queue, with no priority check, while =lpsched_min_catch()= raised the
+   steal threshold to 3 -- so a background LWP could sit behind realtime work
+   that it cannot preempt on a CPU an idle core declines to rescue.  Fixed:
+   only queue behind timeshare work (=spc_curpriority <= MAXPRI_USER=), and
+   never raise the steal threshold when the remote queue holds anything above
+   timeshare.  The threshold is applied before the candidate LWP is examined,
+   so that guard is the only place realtime work can be protected there.
+3. *The coalescing grid was per-CPU.*  It rounded on =cc_ticks=, which each
+   callout_cpu advances itself, so "multiples of 5" on different CPUs are
+   different instants and wakeups never clustered across the package -- the
+   entire point.  Fixed: align on =getticks()=, which is advanced only under
+   =CPU_IS_PRIMARY= and is therefore shared, then apply the resulting delay in
+   the local domain.  Residual per-CPU tick *phase* is still uncorrected, as
+   are the pre-existing =lapic_oneshot_done()= rounding issues.
+4. *The classifier exempted the target workload.*  =estcpu>>11 < 2= exempts
+   every LWP under 4096 estcpu, i.e. precisely the low-duty-cycle background
+   pollers packing exists to gather; and =l_estcpu= is SCHED_4BSD-only, so
+   under SCHED_M2 it reads 0 and exempts everything.  Fixed: threshold
+   defaults to 0 (test disabled); latency protection now rests on scheduling
+   class and =fgpid=.  Counters split exemptions by reason.
+5. *Coalescing applied to every unmarked callout.*  =CALLOUT_PRECISE= is
+   opt-out and nothing marks it, so a one-tick timeout could become five.
+   Fixed: bounded slack -- only timers already longer than the grid are
+   relaxed (=to_ticks >= 2 * grid=), keeping added delay under half the
+   request.  Counters: =coal_applied=, =coal_short=, =coal_precise=.
+6. *The idle-depth array was measurement-induced contention.*  A bare
+   =uint8_t[MAXCPUS]= put all 8 CPUs' bytes in one 64-byte line and was
+   written on every idle entry and exit even with lpsched disabled, so
+   "disabled" was not a stock baseline.  Fixed: =struct lpsched_cpu= is
+   =__aligned(COHERENCY_UNIT)=, one line per CPU, and writes are gated on
+   =lpsched_enabled=.
+7. *Rates divided by requested sleep.*  =lpsched-ab= now divides by measured
+   elapsed time and prints the counters, so a mechanism that never ran is
+   distinguishable from one that ran and did nothing.  It also tolerates AC
+   (printing =--= for watts) and gained a =load= mode driving =poller(1)=
+   low-duty-cycle background tasks, because static idle has nothing to pack.
+
+Not addressed (pre-existing, outside lpsched): =lapic_oneshot_done()= floors
+elapsed time to whole ticks and restarts a fresh interval after an early
+wake, and =woke_early= does not identify what woke the CPU -- so the earlier
+"~300/s early wakes are X/StumpWM IPIs" claim was inference, not attribution.
+
 * Files
 - kernel/sys/lpsched.h, kernel/kern/kern_lpsched.c (new), kernel/kern/files.kern
 - kernel/kern/kern_runq.c, kernel/kern/kern_timeout.c, kernel/sys/callout.h

@@ -17,12 +17,17 @@
 #   quick     SETTLE=20 SAMPLE=10, rough numbers
 #   coalesce  stock/coalesce=50 alternated twice + pack=2, SETTLE=60 SAMPLE=30
 #             (to confirm or refute a single coalesce reading)
+#   load      stock/pack=1/pack=2 under NPOLL low-duty-cycle background
+#             pollers.  Static idle has nothing to pack, so it cannot show
+#             the mechanism working either way; this is the workload the
+#             packing policy actually targets.
 
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin:/usr/local/bin; export PATH
 
 MODE=${1:-full}
 case $MODE in
 quick)    SETTLE=${SETTLE:-20}; SAMPLE=${SAMPLE:-10} ;;
+load)     SETTLE=${SETTLE:-40}; SAMPLE=${SAMPLE:-20}; NPOLL=${NPOLL:-4} ;;
 coalesce) SETTLE=${SETTLE:-60}; SAMPLE=${SAMPLE:-30} ;;
 *)        SETTLE=${SETTLE:-50}; SAMPLE=${SAMPLE:-20} ;;
 esac
@@ -30,8 +35,11 @@ esac
 if ! sysctl -q machdep.lpsched.enabled >/dev/null 2>&1; then
 	echo "machdep.lpsched not present in this kernel" >&2; exit 1
 fi
+ONAC=0
 if envstat -d acpiacad0 2>/dev/null | grep -q 'connected: *TRUE'; then
-	echo "on AC: discharge numbers are meaningless, unplug first" >&2; exit 1
+	ONAC=1
+	echo "NOTE: on AC -- the W column is meaningless and prints as \"--\"."
+	echo "      Counters, deep/s and ints/s are still valid; unplug for power."
 fi
 
 ORIG_EN=$(sysctl -n machdep.lpsched.enabled)
@@ -57,17 +65,42 @@ field() {	# field <tlstats-string> <key>
 
 measure() {	# measure <label>
 	S1=$(sysctl -n machdep.cidle.tlstats)
+	L1=$(sysctl -n machdep.lpsched.stats)
 	I1=$(vmstat -i | awk '/^Total/{print $2}')
+	T1=$(date +%s)
 	sleep $SAMPLE
+	T2=$(date +%s)
 	S2=$(sysctl -n machdep.cidle.tlstats)
+	L2=$(sysctl -n machdep.lpsched.stats)
 	I2=$(vmstat -i | awk '/^Total/{print $2}')
-	W=$(envstat -d acpibat0 | awk '/discharge rate/{print $3}')
+	if [ "$ONAC" = 1 ]; then W=""; else
+		W=$(envstat -d acpibat0 | awk '/discharge rate/{print $3}')
+	fi
+	# Rates use MEASURED elapsed time: sleep(1) plus the sysctl/vmstat calls
+	# overrun the request, and tick accounting is not trustworthy enough to
+	# assume otherwise.
+	EL=$(( T2 - T1 )); [ "$EL" -le 0 ] && EL=$SAMPLE
 	D=$(( $(field "$S2" deep) - $(field "$S1" deep) ))
 	E=$(( $(field "$S2" woke_early) - $(field "$S1" woke_early) ))
 	I=$(( I2 - I1 ))
-	awk -v l="$1" -v w="$W" -v d=$D -v e=$E -v i=$I -v s=$SAMPLE 'BEGIN {
-		printf "%-18s %6.2f W   deep/s %6.1f   early/s %7.1f   ints/s %6.1f\n",
-		    l, w, d/s, e/s, i/s }'
+	awk -v l="$1" -v w="$W" -v d=$D -v e=$E -v i=$I -v s=$EL 'BEGIN {
+		if (w == "") ws = "    --  "; else ws = sprintf("%6.2f W", w)
+		printf "%-18s %s   deep/s %6.1f   early/s %7.1f   ints/s %6.1f",
+		    l, ws, d/s, e/s, i/s }'
+	# Did the mechanism actually run?  Without this a mechanism that never
+	# executed is indistinguishable from one that executed and did nothing.
+	PL=$(( ($(field "$L2" pack_sibling) - $(field "$L1" pack_sibling)) \
+	     + ($(field "$L2" pack_shallow) - $(field "$L1" pack_shallow)) \
+	     + ($(field "$L2" pack_deep)    - $(field "$L1" pack_deep)) \
+	     + ($(field "$L2" pack_busy)    - $(field "$L1" pack_busy)) ))
+	XM=$(( ($(field "$L2" exempt_class)  - $(field "$L1" exempt_class)) \
+	     + ($(field "$L2" exempt_fg)     - $(field "$L1" exempt_fg)) \
+	     + ($(field "$L2" exempt_estcpu) - $(field "$L1" exempt_estcpu)) ))
+	HL=$(( $(field "$L2" pack_held) - $(field "$L1" pack_held) ))
+	CO=$(( $(field "$L2" coal_applied) - $(field "$L1" coal_applied) ))
+	awk -v p=$PL -v x=$XM -v h=$HL -v c=$CO -v s=$EL 'BEGIN {
+		printf "   packed/s %6.1f  exempt/s %6.1f  held/s %5.1f  coal/s %6.1f\n",
+		    p/s, x/s, h/s, c/s }'
 }
 
 run() {		# run <label> <enabled> <pack> <coalesce_ms> <epp>
@@ -78,7 +111,18 @@ run() {		# run <label> <enabled> <pack> <coalesce_ms> <epp>
 }
 
 echo "lpsched A/B ($MODE): settle ${SETTLE}s, sample ${SAMPLE}s, EPP $EPP (daemon was ${DAEMON})"
-if [ $MODE = coalesce ]; then
+if [ $MODE = load ]; then
+	command -v poller >/dev/null 2>&1 || { echo "poller(1) not installed" >&2; restore; exit 1; }
+	DUR=$(( (SETTLE + SAMPLE + 5) * 4 ))
+	echo "starting $NPOLL background pollers (~5% duty each) for ${DUR}s"
+	i=0; while [ $i -lt "$NPOLL" ]; do poller $DUR >/dev/null 2>&1 & i=$((i+1)); done
+	POLLPIDS=$(jobs -p 2>/dev/null)
+	run "stock"          0 0 0 $EPP
+	run "pack=1"         1 1 0 $EPP
+	run "pack=2"         1 2 0 $EPP
+	run "pack2+coal50"   1 2 50 $EPP
+	pkill -x poller 2>/dev/null
+elif [ $MODE = coalesce ]; then
 	run "stock"            0 0  0 $EPP
 	run "coalesce=50"      1 0 50 $EPP
 	run "stock(2)"         0 0  0 $EPP

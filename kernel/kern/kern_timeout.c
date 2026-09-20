@@ -409,30 +409,59 @@ callout_destroy(callout_t *cs)
 /*
  * lpsched_coalesce:
  *
- *	Callout coalescing.  While the governor has a slack grid set, round
- *	the absolute expiry of a non-precise callout up to the grid so that
- *	timers fire in clusters and idle CPUs see longer uninterrupted gaps
- *	(callout_next_ticks() reports the rounded time, so the tickless idle
- *	path skips further too).  Only ever delays, never fires early.
+ *	Callout coalescing.  While the governor has a slack grid set, delay a
+ *	long, non-precise callout so that it expires on a grid boundary that
+ *	is common to every CPU: timers then fire in clusters and idle CPUs see
+ *	longer uninterrupted gaps (callout_next_ticks() reports the delayed
+ *	time, so the tickless idle path skips further too).  Only ever delays,
+ *	never fires early.
  */
 static inline int
 lpsched_coalesce(const callout_impl_t *c, int to_ticks, int now)
 {
-	int abs, grid;
+	int abs, grid, delta;
 	u_int rem;
 
 	abs = to_ticks + now;
 	if (__predict_true(lpsched_enabled == 0 || lpsched_coalesce_ms == 0) ||
-	    to_ticks == 0 || (c->c_flags & CALLOUT_PRECISE) != 0)
+	    to_ticks == 0)
 		return abs;
+	if ((c->c_flags & CALLOUT_PRECISE) != 0) {
+		lpsched_stat(&lpsched_st_coal_precise);
+		return abs;
+	}
 	grid = mstohz(lpsched_coalesce_ms);
 	if (grid <= 1)
 		return abs;
-	/* Unsigned modulus so a wrapped tick counter still rounds upward. */
-	rem = (u_int)abs % (u_int)grid;
-	if (rem != 0)
-		abs += grid - (int)rem;
-	return abs;
+
+	/*
+	 * Bounded slack.  Rounding every timeout onto the grid turns a
+	 * one-tick timeout into a grid-length one, and nothing in the tree
+	 * marks CALLOUT_PRECISE, so that would silently change the contract
+	 * for every timeout user in the kernel.  Relax only timers already
+	 * longer than the grid, keeping the added delay under half the
+	 * original request.
+	 */
+	if (to_ticks < 2 * grid) {
+		lpsched_stat(&lpsched_st_coal_short);
+		return abs;
+	}
+
+	/*
+	 * Align on the GLOBAL tick epoch, not this CPU's cc_ticks.  Each
+	 * callout_cpu advances its own counter from its own callout_hardclock,
+	 * so rounding local counters to a common multiple lands on different
+	 * instants per CPU and never clusters wakeups across the package --
+	 * which is the whole purpose.  hardclock_ticks is advanced only under
+	 * CPU_IS_PRIMARY, so getticks() is shared by every CPU: derive the
+	 * delay that aligns the shared deadline, then apply it in this CPU's
+	 * own domain.  (Residual per-CPU tick phase is not corrected here.)
+	 */
+	rem = (u_int)(getticks() + to_ticks) % (u_int)grid;
+	delta = (rem != 0) ? grid - (int)rem : 0;
+	if (delta != 0)
+		lpsched_stat(&lpsched_st_coal_applied);
+	return abs + delta;
 }
 
 /*

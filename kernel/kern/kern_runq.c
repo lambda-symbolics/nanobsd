@@ -561,20 +561,32 @@ sched_bestcpu(struct lwp *l, struct cpu_info *pivot)
 }
 
 /*
- * lpsched: is this LWP exempt from power packing?  Interactive threads
- * (low estcpu), the focused process and anything that is not timeshared
- * keep the stock latency-first placement below.
+ * lpsched: is this LWP exempt from power packing?  Threads that are not
+ * timeshared, and the focused process, keep the stock latency-first
+ * placement.  The estcpu test is opt-in (lpsched_estcpu_thresh, default 0)
+ * because it exempted the low-duty-cycle background work packing exists to
+ * gather, and because only SCHED_4BSD maintains l_estcpu.
  */
 static inline bool
 lpsched_exempt(const struct lwp *l)
 {
 
-	if (l->l_class != SCHED_OTHER)
+	lpsched_stat(&lpsched_st_considered);
+	if (l->l_class != SCHED_OTHER) {
+		lpsched_stat(&lpsched_st_exempt_class);
 		return true;
-	if (lpsched_fgpid != 0 && l->l_proc->p_pid == lpsched_fgpid)
+	}
+	if (lpsched_fgpid != 0 && l->l_proc->p_pid == lpsched_fgpid) {
+		lpsched_stat(&lpsched_st_exempt_fg);
 		return true;
-	return (l->l_estcpu >> LPSCHED_ESTCPU_SHIFT) <
-	    (fixpt_t)lpsched_estcpu_thresh;
+	}
+	if (lpsched_estcpu_thresh > 0 &&
+	    (l->l_estcpu >> LPSCHED_ESTCPU_SHIFT) <
+	    (fixpt_t)lpsched_estcpu_thresh) {
+		lpsched_stat(&lpsched_st_exempt_estcpu);
+		return true;
+	}
+	return false;
 }
 
 /*
@@ -592,15 +604,18 @@ lpsched_wake_cost(struct cpu_info *ci)
 		if ((tci->ci_schedstate.spc_flags & SPCF_IDLE) == 0)
 			return 0;
 	}
-	return 1 + lpsched_idle_depth[cpu_index(ci)];
+	return 1 + lpsched_idle_depth(cpu_index(ci));
 }
 
 /*
  * lpsched: power packing.  For a non-exempt LWP find the cheapest idle CPU
  * to wake: an idle SMT sibling of a busy core first, then shallow-idle,
  * then tickless-deep.  With pack >= 2, rather than wake a sleeping core at
- * all, queue behind a running LWP on an awake CPU whose run queue is empty.
- * Returns NULL to fall back to the stock placement.
+ * all, queue behind a running LWP on an awake CPU whose run queue is empty
+ * -- but only behind timeshare work.  Queuing behind a realtime or kernel
+ * priority thread could strand the LWP: it cannot preempt it, and an idle
+ * core may decline to steal a one-entry queue.  Returns NULL to fall back
+ * to the stock placement.
  */
 static struct cpu_info * __noinline
 lpsched_pack_pick(struct lwp *l, struct cpu_info *pivot)
@@ -628,8 +643,10 @@ lpsched_pack_pick(struct lwp *l, struct cpu_info *pivot)
 		} while (ci = ci->ci_sibling[CPUREL_PACKAGE], ci != outer);
 	} while (outer = outer->ci_sibling[CPUREL_PACKAGE1ST], outer != first);
 
-	if (best != NULL && bestcost == 0)
+	if (best != NULL && bestcost == 0) {
+		lpsched_stat(&lpsched_st_pack_sibling);
 		return best;
+	}
 
 	if (lpsched_pack >= 2) {
 		outer = first;
@@ -639,9 +656,11 @@ lpsched_pack_pick(struct lwp *l, struct cpu_info *pivot)
 				spc = &ci->ci_schedstate;
 				if (!sched_migratable(l, ci) ||
 				    (spc->spc_flags & SPCF_IDLE) != 0 ||
-				    spc->spc_count != 0) {
+				    spc->spc_count != 0 ||
+				    spc->spc_curpriority > MAXPRI_USER) {
 					continue;
 				}
+				lpsched_stat(&lpsched_st_pack_busy);
 				return ci;
 			} while (ci = ci->ci_sibling[CPUREL_PACKAGE],
 			    ci != outer);
@@ -649,25 +668,38 @@ lpsched_pack_pick(struct lwp *l, struct cpu_info *pivot)
 		    outer != first);
 	}
 
+	if (best == NULL)
+		lpsched_stat(&lpsched_st_pack_none);
+	else if (bestcost > 1 + LPSCHED_IDLE_SHALLOW)
+		lpsched_stat(&lpsched_st_pack_deep);
+	else
+		lpsched_stat(&lpsched_st_pack_shallow);
 	return best;
 }
 
 /*
- * lpsched: while packing, an idle CPU whose whole core is asleep should
- * not wake the core to steal one stray LWP; demand more backlog first.
+ * lpsched: while packing, an idle CPU whose whole core is asleep should not
+ * wake the core to steal one stray LWP; demand more backlog first.  Never
+ * hold back when the remote queue holds anything above timeshare priority:
+ * this threshold is applied before the candidate LWP is examined, so it is
+ * the only place realtime and kernel work can be protected from it.
  */
 static inline u_int
-lpsched_min_catch(struct cpu_info *ci)
+lpsched_min_catch(struct cpu_info *local,
+    const struct schedstate_percpu *remote)
 {
 	struct cpu_info *tci;
 
 	if (!lpsched_packing())
 		return min_catch;
-	for (tci = ci->ci_sibling[CPUREL_CORE]; tci != ci;
+	if (remote->spc_maxpriority > MAXPRI_USER)
+		return min_catch;
+	for (tci = local->ci_sibling[CPUREL_CORE]; tci != local;
 	    tci = tci->ci_sibling[CPUREL_CORE]) {
 		if ((tci->ci_schedstate.spc_flags & SPCF_IDLE) == 0)
 			return min_catch;
 	}
+	lpsched_stat(&lpsched_st_catch_held);
 	return min_catch + lpsched_pack;
 }
 
@@ -790,7 +822,7 @@ sched_catchlwp(struct cpu_info *ci)
 	gentle = !cpu_is_better(curci, ci);
 
 	if (atomic_load_relaxed(&spc->spc_mcount) <
-	    (gentle ? lpsched_min_catch(curci) : 1) ||
+	    (gentle ? lpsched_min_catch(curci, spc) : 1) ||
 	    curspc->spc_psid != spc->spc_psid) {
 		spc_unlock(ci);
 		return NULL;
@@ -942,7 +974,6 @@ sched_idle(void)
 	struct cpu_info *ci, *inner, *outer, *first, *tci, *mci;
 	struct schedstate_percpu *spc, *tspc;
 	struct lwp *l;
-	u_int mincatch;
 
 	ci = curcpu();
 	spc = &ci->ci_schedstate;
@@ -995,7 +1026,6 @@ sched_idle(void)
 		return;
 	}
 	spc->spc_nextskim = getticks() + mstohz(skim_interval);
-	mincatch = lpsched_min_catch(ci);
 
 	/* In the outer loop scroll through all CPU packages, starting here. */
 	first = ci->ci_package1st;
@@ -1008,7 +1038,8 @@ sched_idle(void)
 			tspc = &inner->ci_schedstate;
 			if (ci == inner || ci == mci ||
 			    spc->spc_psid != tspc->spc_psid ||
-			    atomic_load_relaxed(&tspc->spc_mcount) < mincatch) {
+			    atomic_load_relaxed(&tspc->spc_mcount) <
+			    lpsched_min_catch(ci, tspc)) {
 				continue;
 			}
 			spc_dlock(ci, inner);
@@ -1039,6 +1070,20 @@ sched_preempted(struct lwp *l)
 	tspc = &ci->ci_schedstate;
 
 	KASSERT(tspc->spc_count >= 1);
+
+	/*
+	 * lpsched: packing deliberately placed this LWP on a secondary SMT
+	 * CPU.  Everything below exists to move such threads onto an idle
+	 * first-class CPU, which would wake the very core packing avoided
+	 * waking -- so leave packed work where it is.  vfork() children
+	 * (LP_TELEPORT) still scatter: that is a correctness path, not a
+	 * placement preference.
+	 */
+	if (lpsched_packing() && (l->l_pflag & LP_TELEPORT) == 0 &&
+	    !lpsched_exempt(l)) {
+		lpsched_stat(&lpsched_st_pack_held);
+		return;
+	}
 
 	/*
 	 * Try to select another CPU if:
