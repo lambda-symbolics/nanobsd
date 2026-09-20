@@ -16,18 +16,45 @@
  *   - a settable period, so the workload can be placed above or below the
  *     coalescing grid on purpose instead of by accident.
  *   - a settable start phase, to stagger or align instances deliberately.
+ *   - on SIGUSR1 it writes its running counts to -f <file>, so a benchmark
+ *     can take per-configuration DELTAS at each measurement boundary.  A
+ *     single total at the end of an A/B/A/B run also covers the settling
+ *     intervals and the tail after the last sample, so it cannot show that
+ *     the configurations did equal work.  Writing only on demand keeps the
+ *     workload's own I/O out of the samples.
  *
  * usage: poller [-p period_ms] [-w work_iters] [-d duration_s] [-s phase_ms]
+ *               [-f statusfile]
  * prints: "batches=N missed=M period_ms=P"
  */
 
 #include <sys/time.h>
 
 #include <err.h>
+#include <signal.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+
+static volatile sig_atomic_t report_now;
+
+static void
+on_usr1(int sig)
+{
+
+	report_now = 1;
+}
+
+/* True when "a" is strictly after "b". */
+static int
+ts_after(const struct timespec *a, const struct timespec *b)
+{
+
+	return a->tv_sec > b->tv_sec ||
+	    (a->tv_sec == b->tv_sec && a->tv_nsec > b->tv_nsec);
+}
 
 static void
 ts_add_ms(struct timespec *ts, long ms)
@@ -71,21 +98,24 @@ main(int argc, char **argv)
 	struct timespec next, now, end;
 	long period_ms = 200, work = 60000, duration_s = 120, phase_ms = 0;
 	unsigned long batches = 0, missed = 0;
+	const char *statusfile = NULL;
 	volatile double x = 0;
 	long i;
 	int c;
 
-	while ((c = getopt(argc, argv, "p:w:d:s:")) != -1) {
+	while ((c = getopt(argc, argv, "p:w:d:s:f:")) != -1) {
 		switch (c) {
 		case 'p': period_ms = atol(optarg); break;
 		case 'w': work = atol(optarg); break;
 		case 'd': duration_s = atol(optarg); break;
 		case 's': phase_ms = atol(optarg); break;
+		case 'f': statusfile = optarg; break;
 		default:
 			errx(1, "usage: poller [-p period_ms] [-w work_iters] "
-			    "[-d duration_s] [-s phase_ms]");
+			    "[-d duration_s] [-s phase_ms] [-f statusfile]");
 		}
 	}
+	signal(SIGUSR1, on_usr1);
 	if (period_ms <= 0)
 		errx(1, "period must be positive");
 
@@ -109,17 +139,29 @@ main(int argc, char **argv)
 		batches++;
 
 		/*
-		 * Advance the deadline by exactly one period.  If we are
-		 * already past it the batch overran: count it and resync, so
-		 * one slow batch cannot shift the whole schedule.
+		 * Advance along the ORIGINAL timeline by whole periods until
+		 * the deadline is in the future, counting each release that
+		 * was skipped.  Resetting to "now + period" instead would move
+		 * the phase by however long the scheduler delayed us, which is
+		 * exactly the variable under test.
 		 */
 		ts_add_ms(&next, period_ms);
-		if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 &&
-		    (now.tv_sec > next.tv_sec ||
-		    (now.tv_sec == next.tv_sec && now.tv_nsec > next.tv_nsec))) {
-			missed++;
-			next = now;
-			ts_add_ms(&next, period_ms);
+		if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+			while (ts_after(&now, &next)) {
+				missed++;
+				ts_add_ms(&next, period_ms);
+			}
+		}
+
+		if (report_now && statusfile != NULL) {
+			FILE *fp;
+
+			report_now = 0;
+			if ((fp = fopen(statusfile, "w")) != NULL) {
+				fprintf(fp, "batches=%lu missed=%lu\n",
+				    batches, missed);
+				fclose(fp);
+			}
 		}
 	}
 

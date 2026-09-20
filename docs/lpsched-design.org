@@ -312,7 +312,46 @@ the time requested.  Nothing in the tree sets the flag, so =coal_applied= is 0
 and =coal_noslack= counts thousands of declined callouts -- inert by design
 until specific housekeeping timers are audited and marked.
 
-** Tickless accounting: measured, partly repaired
+** Tickless accounting: measured and repaired (third review)
+
+A third review showed the carry alone could not be right, with a
+counterexample: =lapic_oneshot()= overwrites the timer without accounting for
+how far the CURRENT periodic interval has already progressed, so that time
+never enters =lapic_oneshot_done()='s measurement and no amount of carrying
+the remainder recovers it.  Modelled first, per the reviewer's advice, in
+=tests/tickless-model.py=: the constructed case (0.3 tick awake, 0.7 tick
+asleep, x100) loses 30%; a mixed workload loses 2.8%; adding entry capture
+takes both to exactly 0.  =lapic_oneshot()= now banks =lapic_tval - CCR= into
+the carry before reprogramming.
+
+Measured with the corrected probe, pinned to CPU 0 (=schedctl -A 0=):
+
+| kernel                        | tickless ON | tickless OFF |
+|-------------------------------+-------------+--------------|
+| #94 before any repair         |     -4.412% |      -0.003% |
+| #97 carry of remainder only   |     -0.816% |      +0.003% |
+| #98 carry + entry capture     |     -0.041% |      -0.001% |
+
+So hardclock went from 4.4% slow under tickless idle to within 0.04% of the
+periodic control.  "Rate-exact by construction" in the previous section was
+WRONG: carrying the remainder is only half the accounting.
+
+The probe was also defective and was fixed first: =clock_nanosleep(2)= returns
+the error number directly, so testing for -1 never retried an interrupted
+sleep.  It must be run pinned, because only the primary CPU advances
+=hardclock_ticks= and sampling elsewhere can read outstanding-but-uncredited
+time as lost.  Pinning did not shrink the #97 residual, confirming that part
+was genuinely lost time.
+
+*Known and unfixed:* =lapic_oneshot_done()= still treats a pending timer
+vector as completion of the interval it programmed, without checking whether
+that vector was already pending from the previous periodic timer.  A unified
+accounting path (=ticks_due = floor(elapsed_from_epoch x hz)= over a
+free-running source, shared by periodic entry, one-shot entry and one-shot
+exit) would remove the ambiguity.  With the measured error now at 0.04% that
+rewrite is not justified by evidence yet; revisit if a case appears.
+
+** Superseded: earlier partial repair
 =lapic_oneshot_done()= floored =counted / lapic_tval= and discarded the
 sub-tick remainder on every wake.  Measured with =tickrate(1)= (nanosecond
 monotonic clock against =kern.hardclock_ticks=; shell sampling quantises to

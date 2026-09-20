@@ -517,6 +517,14 @@ uint32_t lapic_tval;
  *         whole hardclock tick.  Carried to the next wake instead of being
  *         discarded, which otherwise loses a fraction of a tick on EVERY
  *         wake and makes the replayed hardclock count drift slow.
+ * Entry capture: lapic_oneshot() records how far the current periodic
+ * interval has already progressed before it overwrites the timer.  Without
+ * that, the time between the last tick and going idle never reaches
+ * lapic_oneshot_done()'s measurement at all, so no amount of carrying the
+ * remainder can recover it -- modelled at -2.8% on a mixed workload and -30%
+ * on a short-sleep one (tests/tickless-model.py).  Carrying the remainder
+ * alone is therefore NOT rate-exact; both halves are needed.
+ *
  * Phase alignment was attempted here and REMOVED.  Restarting as a short
  * one-shot to land on the original tick boundary is correct only if that
  * one-shot survives to fire: lapic_oneshot() reprograms the timer whenever
@@ -643,7 +651,23 @@ unsigned lapic_oneshot_done(uint32_t, int *);
 void
 lapic_oneshot(uint32_t nticks)
 {
+	struct cpu_info *ci = curcpu();
+	u_int idx = ci->ci_index;
 	uint64_t count;
+	uint32_t ccr, used;
+
+	/*
+	 * Bank the part of the current periodic interval that has already
+	 * elapsed: reprogramming the timer below throws that progress away.
+	 * The periodic timer counts down from lapic_tval, so the consumed
+	 * part is lapic_tval - CCR.  It may push frac past a whole tick,
+	 * which lapic_oneshot_done() credits normally.
+	 */
+	if (idx < MAXCPUS) {
+		ccr = lapic_readreg(LAPIC_CCR_TIMER);
+		used = (ccr < lapic_tval) ? lapic_tval - ccr : 0;
+		lapic_tlstate[idx].frac += used;
+	}
 
 	count = (uint64_t)lapic_tval * nticks;
 	if (count == 0)

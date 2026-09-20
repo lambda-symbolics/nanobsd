@@ -8,12 +8,22 @@
  * coarser than the error being looked for; this reads a nanosecond monotonic
  * clock either side instead.
  *
+ * Run it PINNED to the CPU that owns hardclock:  schedctl -A 0 tickrate 120
+ * Only the primary CPU advances hardclock_ticks, and the sysctl returns the
+ * stored value without forcing that CPU to complete any deferred tickless
+ * accounting.  Sampling from another CPU can therefore catch CPU 0 partway
+ * through a tickless interval and count outstanding-but-not-yet-credited
+ * time as if it were lost: 0.6 s outstanding at the endpoint reads as -1%
+ * over a 60 s run.  Pinning forces CPU 0 out of idle to run the sampler.
+ *
  * usage: tickrate [seconds]     (default 60)
  */
 
 #include <sys/sysctl.h>
 
 #include <err.h>
+#include <errno.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -49,9 +59,19 @@ main(int argc, char **argv)
 		err(1, "sample 1");
 	deadline = t1;
 	deadline.tv_sec += secs;
-	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline,
-	    NULL) == -1)
-		continue;
+	/*
+	 * clock_nanosleep(2) returns the error number directly, not -1 with
+	 * errno.  Testing for -1 therefore never retried an interrupted
+	 * sleep, it just fell through and measured a short interval.
+	 */
+	for (;;) {
+		int e = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME,
+		    &deadline, NULL);
+		if (e == 0)
+			break;
+		if (e != EINTR)
+			errx(1, "clock_nanosleep: %s", strerror(e));
+	}
 	if (clock_gettime(CLOCK_MONOTONIC, &t2) != 0 || read_ticks(&k2) != 0)
 		err(1, "sample 2");
 

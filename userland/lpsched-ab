@@ -70,7 +70,17 @@ d() {		# d <after> <before> <key>
 	echo $(( $(field "$1" $3) - $(field "$2" $3) ))
 }
 
+work_snapshot() {	# sum batches/missed across pollers, on demand
+	[ -d "$BATCHDIR" ] || { echo "0 0"; return; }
+	pkill -USR1 -x poller 2>/dev/null
+	sleep 1
+	awk '{ for (i=1;i<=NF;i++) { split($i,kv,"="); t[kv[1]] += kv[2] } }
+	     END { printf "%d %d\n", t["batches"], t["missed"] }' \
+	    "$BATCHDIR"/*.stat 2>/dev/null || echo "0 0"
+}
+
 measure() {	# measure <label>
+	set -- $(work_snapshot); WB1=$1; WM1=$2
 	S1=$(sysctl -n machdep.cidle.tlstats)
 	L1=$(sysctl -n machdep.lpsched.stats)
 	I1=$(vmstat -i | awk '/^Total/{print $2}')
@@ -80,6 +90,7 @@ measure() {	# measure <label>
 	S2=$(sysctl -n machdep.cidle.tlstats)
 	L2=$(sysctl -n machdep.lpsched.stats)
 	I2=$(vmstat -i | awk '/^Total/{print $2}')
+	set -- $(work_snapshot); WB2=$1; WM2=$2
 	if [ "$ONAC" = 1 ]; then W=""; else
 		W=$(envstat -d acpibat0 | awk '/discharge rate/{print $3}')
 	fi
@@ -99,6 +110,11 @@ measure() {	# measure <label>
 		    sib/s, sh/s, dee/s, bu/s, no/s
 		printf "             held/s %5.1f  catch_held/s %5.1f  coal/s applied %5.1f noslack %6.1f\n",
 		    he/s, ca/s, ap/s, ns/s }'
+	# Work done DURING this sample only: a single total over the whole
+	# A/B/A/B run also covers settling and the tail, so it cannot show the
+	# configurations did equal work.
+	awk -v b=$(( WB2 - WB1 )) -v m=$(( WM2 - WM1 )) -v s=$EL 'BEGIN {
+		printf "             work: batches %d (%.1f/s) missed %d\n", b, b/s, m }'
 }
 
 run() {		# run <label> <enabled> <pack> <coalesce_ms> <epp>
@@ -115,17 +131,16 @@ start_load() {	# start_load <duration_s>
 	i=0
 	while [ $i -lt "$NPOLL" ]; do
 		poller -p "$PERIOD_MS" -d "$1" -s $(( i * PERIOD_MS / NPOLL )) \
-		    > "$BATCHDIR/$i" 2>/dev/null &
+		    -f "$BATCHDIR/$i.stat" > "$BATCHDIR/$i.final" 2>/dev/null &
 		i=$((i+1))
 	done
 }
 
 report_work() {
 	[ -d "$BATCHDIR" ] || return 0
-	wait 2>/dev/null
 	awk '{ for (i=1;i<=NF;i++) { split($i,kv,"="); t[kv[1]] += kv[2] } }
-	     END { printf "work done: batches=%d missed=%d (equal work across configs = valid comparison)\n",
-	           t["batches"], t["missed"] }' "$BATCHDIR"/* 2>/dev/null
+	     END { printf "run total: batches=%d missed=%d (per-config deltas are above)\n",
+	           t["batches"], t["missed"] }' "$BATCHDIR"/*.stat 2>/dev/null
 }
 
 echo "lpsched A/B ($MODE): settle ${SETTLE}s sample ${SAMPLE}s EPP $EPP (daemon was $DAEMON)"
