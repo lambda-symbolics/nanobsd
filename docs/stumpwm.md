@@ -8,8 +8,9 @@ Install `userland/statusbard` as `/usr/local/bin/statusbard`.
 Reload the rc file with StumpWM's `loadrc` command.
 
 Each of the six workspaces has its own ordered columns and viewport offset.
-Open a window to insert a column after the focused column. Columns keep their
-width when more windows open; focus a column beyond the panel edge to scroll.
+Open a window to insert a column after the focused column and focus it, the way
+Niri does. Columns keep their width when more windows open; focus a column
+beyond the panel edge to scroll.
 Stack windows vertically using consume/expel. The viewport targets the Nano's
 single panel. Focus changes and geometry updates are instantaneous.
 Moving a column between workspaces preserves its width and each window's height
@@ -33,7 +34,7 @@ Use Super as Mod.
 | Super + comma | Consume the first window of the next column |
 | Super + period | Expel the focused window into a new column |
 | Super + R | Cycle widths: one third, one half, two thirds |
-| Super + D/W | Decrease/increase column width by 5 percentage points |
+| Super + D/W | Narrow/widen the column by one twentyfourth of the row |
 | Super + Shift + D/W | Decrease/increase window height share by 5 percentage points |
 | Super + F | Toggle full-width column |
 | Super + Shift + F | Toggle fullscreen window |
@@ -42,7 +43,24 @@ Use Super as Mod.
 | Super + O / Shift + O | Panel on/off |
 | Super + Shift + P | Panel off |
 
-Default column width is 30%, with 16-pixel gaps and one-pixel borders.
+## Column widths
+
+Widths are exact fractions of one row, as in Niri, and a set of them that adds
+up to 1 tiles the row precisely: two halves, three thirds, or a third beside
+two thirds leave no strip of wallpaper and no scrolling. A column is charged
+one gap and its fraction pays back the one a row of n columns does not have,
+which is what makes the sums come out; the pixel width is floored, so a row is
+at most n-1 pixels short and never a pixel over, because one pixel over would
+make the viewport scroll.
+
+The default is one half, the presets are 1/3, 1/2 and 2/3, and narrowing or
+widening moves by 1/24 after snapping the current width onto that lattice.
+Twentyfourths hold every useful arrangement - halves, thirds, quarters, sixths,
+eighths, twelfths - so widths adjusted by hand still add up to a full row
+instead of drifting further out with every press. Widths set before this scheme
+existed are snapped when the file is loaded.
+
+Gaps are 16 pixels and borders one pixel.
 Focus follows the cursor (`:sloppy`); entering a window focuses it and reveals
 its column as needed. Use uppercase keysyms for shifted letters in the rc, for
 example `s-F` for Super+Shift+F.

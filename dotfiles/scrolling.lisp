@@ -1,9 +1,22 @@
 ;;;; Instant, event-driven scrolling columns for StumpWM 24.11.
 (in-package :stumpwm)
 
+(defparameter *strip-gap* 16)
+
+;;; Widths are exact fractions of one row, the way Niri states them: a set of
+;;; fractions adding up to 1 tiles the row precisely, gaps included. They are
+;;; kept as ratios rather than floats so that arithmetic on them stays exact
+;;; however many times it is redone.
+(defparameter *strip-default-width* 1/2)
+(defparameter *strip-width-presets* '(1/3 1/2 2/3))
+(defparameter *strip-width-step* 1/24
+  "One press of the widen or narrow key.  Twentyfourths, because every useful
+arrangement - halves, thirds, quarters, sixths, eighths, twelfths - is a whole
+number of them, so adjusted widths can still add up to a full row.")
+
 (defstruct strip-column
   windows
-  (width 0.3)
+  (width *strip-default-width*)
   saved-width)
 
 (define-swm-class strip-group (float-group)
@@ -11,8 +24,10 @@
    (offset :initform 0 :accessor strip-offset)
    (weights :initform (make-hash-table :test #'eq) :reader strip-weights)))
 
-(defparameter *strip-gap* 16)
 (defvar *strip-layout-active* nil)
+(defvar *strip-adopting* nil
+  "True only while strip-enable takes over pre-existing windows, which must not
+each grab the focus on their way in.")
 
 (defun strip-column-for (group window)
   (find window (strip-columns group) :key #'strip-column-windows :test #'member))
@@ -44,7 +59,14 @@
             (max 1 (- (head-height head) bar (* 2 gap))))))
 
 (defun strip-pixel-width (column width)
-  (max 80 (round (* width (strip-column-width column)))))
+  "Pixels for COLUMN's fraction of a row spanning WIDTH between the outer gaps.
+A row of n columns holds n-1 inner gaps, so each column is charged one gap and
+the fraction pays back the one the row does not have.  Fractions summing to 1
+then tile the row exactly: 1/2 + 1/2, or three 1/3s, cover the panel with no
+leftover.  Flooring keeps the total at or just below the row, because a column
+one pixel short is invisible while one pixel over would scroll the viewport."
+  (max 80 (- (floor (* (strip-column-width column) (+ width *strip-gap*)))
+             *strip-gap*)))
 
 (defun strip-place (window x y width height)
   "Configure changed geometry and return true when the window changed."
@@ -129,6 +151,7 @@
                 (strip-request-redraw window)))))))))
 
 (defmethod group-add-window ((group strip-group) window &key raise &allow-other-keys)
+  (declare (ignore raise))
   (let ((previous (strip-current-column group)))
     (dynamic-mixins-swm:replace-class window 'strip-window)
     (float-window-align window)
@@ -137,7 +160,10 @@
       (setf (strip-columns group)
             (strip-insert-after (make-strip-column :windows (list window))
                                 previous (strip-columns group))))
-    (if (and raise (eq group (current-group)))
+    ;; Niri focuses whatever it just opened.  StumpWM passes :raise only when a
+    ;; window-placement rule asked for it, and there are no rules here, so
+    ;; obeying raise alone left every new column unfocused and often offscreen.
+    (if (and (eq group (current-group)) (not *strip-adopting*))
         (group-focus-window group window)
         (strip-layout group))))
 
@@ -245,20 +271,30 @@
             (setf (strip-columns group) items))
         (strip-layout group)))))
 
+(defun strip-snap-width (width &optional (delta 0))
+  "WIDTH moved by DELTA steps and snapped onto the lattice of exact fractions.
+Snapping means a width arrived at by any route - a preset, maximize, a run of
+adjustments, an older version of this file - lands back on a whole number of
+steps, so columns keep adding up to a full row instead of drifting a few pixels
+further out with every press."
+  (max *strip-width-step*
+       (min 1 (* *strip-width-step* (+ (round width *strip-width-step*) delta)))))
+
 (defcommand strip-width (action) ((:string "Width: "))
-  "Cycle Niri widths, maximize, or adjust by five percent."
+  "Cycle Niri widths, maximize, or adjust by one step."
   (let* ((group (current-group)) (column (strip-current-column group)))
     (when column
       (let ((width (strip-column-width column)))
         (setf (strip-column-width column)
               (cond ((string= action "preset")
-                     (or (find-if (lambda (p) (> p (+ width 0.01))) '(0.33333 0.5 0.66667)) 0.33333))
+                     (or (find-if (lambda (p) (> p (+ width 1/100))) *strip-width-presets*)
+                         (first *strip-width-presets*)))
                     ((string= action "max")
                      (if (strip-column-saved-width column)
                          (prog1 (strip-column-saved-width column)
                            (setf (strip-column-saved-width column) nil))
-                         (progn (setf (strip-column-saved-width column) width) 1.0)))
-                    (t (max 0.1 (min 1.0 (+ width (if (string= action "+") 0.05 -0.05)))))))
+                         (progn (setf (strip-column-saved-width column) width) 1)))
+                    (t (strip-snap-width width (if (string= action "+") 1 -1)))))
         (unless (string= action "max") (setf (strip-column-saved-width column) nil)))
       (strip-layout group))))
 
@@ -339,8 +375,13 @@
       (let ((windows (sort (copy-list (group-windows group)) #'< :key #'window-number))
             (focus (group-current-window group)))
         (dynamic-mixins-swm:replace-class group 'strip-group)
-        (dolist (window windows) (group-add-window group window))
+        (let ((*strip-adopting* t))
+          (dolist (window windows) (group-add-window group window)))
         (setf (group-current-window group) (or focus (first windows)))))
+    ;; Columns that predate the fractions keep their old width across a reload;
+    ;; put them back on the lattice so the row adds up again. Idempotent.
+    (dolist (column (strip-columns group))
+      (setf (strip-column-width column) (strip-snap-width (strip-column-width column))))
     (strip-layout group))
   (group-wake-up (current-group))
   (sync-keys))
