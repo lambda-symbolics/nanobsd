@@ -186,6 +186,13 @@ one pixel short is invisible while one pixel over would scroll the viewport."
   (when window (focus-window window)))
 
 (defmethod (setf window-fullscreen) :after (value (window strip-window))
+  ;; StumpWM's float code moves the client to the parent's origin and grows the
+  ;; parent to the head, but leaves the parent's X border in place.  A fullscreen
+  ;; client therefore still showed a border line along the top and left edges
+  ;; while the other two fell off the panel.  Drop the border while fullscreen
+  ;; and give it back with the column.
+  (setf (xlib:drawable-border-width (window-parent window))
+        (if value 0 (default-border-width-for-type window)))
   (let ((group (window-group window)))
     (when (typep group 'strip-group)
       (when value (setf (group-current-window group) window))

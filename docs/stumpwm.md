@@ -37,7 +37,7 @@ Use Super as Mod.
 | Super + D/W | Narrow/widen the column by one twentyfourth of the row |
 | Super + Shift + D/W | Decrease/increase window height share by 5 percentage points |
 | Super + F | Toggle full-width column |
-| Super + Shift + F | Toggle fullscreen window |
+| Super + Shift + F | Toggle fullscreen window (no border; a client's own fullscreen request does the same) |
 | Super + Shift + C | Center the focused column |
 | Super + Q | Close window |
 | Super + O / Shift + O | Panel on/off |
