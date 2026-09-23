@@ -1,4 +1,0 @@
-#!/bin/sh
-# invoked as root by /etc/powerd/scripts/hotkey_button (the console is root-owned)
-# on the ThinkPad volume-down key; run as the X user so ~/.volume stays theirs.
-exec /usr/bin/su mag -c "/usr/local/bin/volume down"

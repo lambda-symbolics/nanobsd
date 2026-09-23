@@ -4,6 +4,13 @@ export PATH=/usr/local/bin:/usr/pkg/bin:/usr/X11R7/bin:$PATH
 # GPU: Mesa iris (Tiger Lake) lives in the pkgsrc Mesa, base libGL/EGL load it from here
 export LIBGL_DRIVERS_PATH=/usr/pkg/lib/dri
 setxkbmap -layout cz,us -option grp:alt_shift_toggle 2>/dev/null
+# The ThinkPad volume keys reach X as keycodes without keysyms (mute 141, down 142,
+# up 8; xkb also puts 8 in mod3), so StumpWM's XF86Audio* bindings never matched.
+# StumpWM grabs one keycode per keysym, so take the keysyms off the xkb defaults
+# (160/174/176, never sent by this keyboard) and put them on the real ones.
+xmodmap -e 'keycode 160 = NoSymbol' -e 'keycode 174 = NoSymbol' -e 'keycode 176 = NoSymbol' \
+        -e 'keycode 141 = XF86AudioMute' -e 'keycode 142 = XF86AudioLowerVolume' \
+        -e 'clear mod3' -e 'keycode 8 = XF86AudioRaiseVolume' 2>/dev/null
 xset r rate 300 40
 xset s off
 [ -r "$HOME/.Xresources" ] && xrdb -merge "$HOME/.Xresources"

@@ -45,14 +45,21 @@ Use Super as Mod.
 
 ## Media keys
 
-The ThinkPad's volume and brightness keys never reach X. The firmware routes
-them to the `thinkpad(4)` ACPI hotkey device, which reports them to `powerd`
-as `volume-up`, `volume-down`, `volume-mute`, `brightness-up` and
-`brightness-down`. `/etc/powerd/scripts/hotkey_button` runs the matching
-script in `/etc/powerd/actions/` (tracked under `etc/powerd/actions/`), so
-the volume keys call `/usr/local/bin/volume up|down|mute` as `mag`, which
-keeps `~/.volume` current for the restore at login. The `XF86Audio*` bindings
-in `.stumpwmrc` stay for an external keyboard, whose keys do arrive through X.
+The brightness keys never reach X: the firmware routes them to the
+`thinkpad(4)` ACPI hotkey device, powerd runs `/etc/powerd/scripts/hotkey_button`,
+and that runs `/etc/powerd/actions/brightness-{up,down}` (tracked under
+`etc/powerd/actions/`).
+
+The volume keys do reach X, but as keycodes with no keysym: mute is 141,
+volume down 142 and volume up 8, and xkb also lists keycode 8 as a `mod3`
+modifier. xkb puts the `XF86Audio*` keysyms on keycodes 160/174/176, which
+this keyboard never sends, and StumpWM grabs only the first keycode it finds
+per keysym, so the `.stumpwmrc` bindings never matched a real key. `.xinitrc`
+therefore clears `mod3`, blanks 160/174/176 and names 141/142/8 with xmodmap
+before StumpWM starts. Verified with XTEST on the raw keycodes: down, up and
+mute toggle all run the `volume` script. Note that one step moves
+`outputs.master` and `outputs.master2` by 16 each, and they alias the same
+amplifier, so a step is 32 of 255.
 
 ## Column widths
 
