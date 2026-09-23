@@ -1,0 +1,3 @@
+#!/bin/sh
+# invoked by /etc/powerd/scripts/hotkey_button on the ThinkPad brightness-up key
+exec /usr/local/bin/brightness +10

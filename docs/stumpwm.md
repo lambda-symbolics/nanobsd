@@ -43,6 +43,17 @@ Use Super as Mod.
 | Super + O / Shift + O | Panel on/off |
 | Super + Shift + P | Panel off |
 
+## Media keys
+
+The ThinkPad's volume and brightness keys never reach X. The firmware routes
+them to the `thinkpad(4)` ACPI hotkey device, which reports them to `powerd`
+as `volume-up`, `volume-down`, `volume-mute`, `brightness-up` and
+`brightness-down`. `/etc/powerd/scripts/hotkey_button` runs the matching
+script in `/etc/powerd/actions/` (tracked under `etc/powerd/actions/`), so
+the volume keys call `/usr/local/bin/volume up|down|mute` as `mag`, which
+keeps `~/.volume` current for the restore at login. The `XF86Audio*` bindings
+in `.stumpwmrc` stay for an external keyboard, whose keys do arrive through X.
+
 ## Column widths
 
 Widths are exact fractions of one row, as in Niri, and a set of them that adds
