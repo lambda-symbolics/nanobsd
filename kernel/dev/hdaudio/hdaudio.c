@@ -1419,6 +1419,32 @@ hdaudioioctl_fgrp_info(struct hdaudio_softc *sc, prop_dictionary_t request,
 	return 0;
 }
 
+/* LISPBSD: send one raw verb to a codec and return the response (diagnostics). */
+static int
+hdaudioioctl_fgrp_command(struct hdaudio_softc *sc,
+    prop_dictionary_t request, prop_dictionary_t response)
+{
+	struct hdaudio_function_group *fg;
+	uint32_t verb, param, result;
+	int16_t codecid, fgnid, nid;
+
+	if (!prop_dictionary_get_int16(request, "codecid", &codecid) ||
+	    !prop_dictionary_get_int16(request, "nid", &nid) ||
+	    !prop_dictionary_get_uint32(request, "verb", &verb) ||
+	    !prop_dictionary_get_uint32(request, "param", &param))
+		return EINVAL;
+	if (!prop_dictionary_get_int16(request, "fgnid", &fgnid))
+		fgnid = 1;
+
+	fg = hdaudioioctl_fgrp_lookup(sc, codecid, fgnid);
+	if (fg == NULL)
+		return ENODEV;
+
+	result = hdaudio_command(fg->fg_codec, nid, verb, param);
+	prop_dictionary_set_uint32(response, "result", result);
+	return 0;
+}
+
 static int
 hdaudioioctl_fgrp_getconfig(struct hdaudio_softc *sc,
     prop_dictionary_t request, prop_dictionary_t response)
@@ -1607,6 +1633,9 @@ hdaudioioctl(dev_t dev, u_long cmd, void *addr, int flag, struct lwp *l)
 		break;
 	case HDAUDIO_FGRP_GETCONFIG:
 		err = hdaudioioctl_fgrp_getconfig(sc, request, response);
+		break;
+	case HDAUDIO_FGRP_COMMAND:
+		err = hdaudioioctl_fgrp_command(sc, request, response);
 		break;
 	case HDAUDIO_FGRP_SETCONFIG:
 		err = hdaudioioctl_fgrp_setconfig(sc, request, response);
