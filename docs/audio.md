@@ -27,28 +27,31 @@ the controller's MSI vector stops for seconds at a time while interrupts are
 demonstrably being served; treat it as unreliable. The i915 vblank interrupt
 pauses whenever nothing repaints.
 
-## Cause
+## What is known so far
 
-`hdaudio_resume()` always pulled the link reset (`CRST`). That resets every
-codec, and `hdafg(4)` re-applies only what it knows: power state, pin
-configuration, amplifier and connection settings, stream formats. The
-vendor-specific initialisation the firmware performs at boot is gone after
-the reset, and the ALC287 buzzes without it. The reset also made the driver
-talk to the HDMI codec while the GPU was still dark, which cost twelve
-150 ms command timeouts per resume (`no response codec=2`).
+`hdaudio_resume()` used to pull the link reset (`CRST`) on every resume,
+which resets both codecs and made the driver talk to the HDMI codec while
+the GPU was still dark (twelve 150 ms command timeouts per resume). Kernel
+123 skips the reset when the controller kept its state, which it always
+does here: the audio controller is not in the s2idle power-down list and its
+PCI power capability sets No_Soft_Reset. That change is correct and stays,
+but it did not remove the buzz.
 
-The controller itself keeps its state across the sleep: the s2idle power-down
-list does not include the audio controller, and its PCI power capability sets
-No_Soft_Reset, so `GCTL` still has `CRST` set when the resume handler runs.
+Kernel 124 adds a raw-verb ioctl (`HDAUDIO_FGRP_COMMAND`) and
+`userland/hdaverb`. With it, every widget register and all 128 Realtek
+vendor coefficients were dumped before and after timed freezes, compared
+like-for-like (idle against idle, playing against playing): nothing changes.
+Coefficient `0x30` differs between idle and playing, `0x77`/`0x78` are
+volatile readbacks; neither is a resume effect. The PCH clock-gating bit the
+suspend hook sets (`CGCTL` bit 6) comes back in either state after a resume,
+but the controller's 24 MHz wall clock runs at exactly 24 MHz with the bit
+set or clear during playback, so gating does not stall the link.
 
-## Fix
-
-`kernel/dev/hdaudio/hdaudio.c`: on resume, read `GCAP` and `GCTL` first. If the
-controller answers and `CRST` is still set, stop the command rings and skip
-the reset; the rest of the resume (ring configuration, interrupt enable,
-`hdafg_resume`) runs unchanged. Only a controller that really lost its state
-is reset. Kernel #123 (`/netbsd.i915.rpm.123`) carries it, and it logs either
-`resume: controller state kept` or `resume: controller lost its state`.
+The internal microphones are not on the HDA codec, so the buzz cannot be
+detected remotely; the ear test is still needed. Open candidates: link or
+codec frame synchronisation after the S0ix clock stop, and platform power
+state of the codec after long sleeps (the reported buzzes followed long
+suspends; the automated freezes were short).
 
 ## Do not detach a live hdafg
 
