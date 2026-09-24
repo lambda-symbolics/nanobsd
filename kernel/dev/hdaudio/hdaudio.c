@@ -917,8 +917,31 @@ hdaudio_detach(struct hdaudio_softc *sc, int flags)
 bool
 hdaudio_resume(struct hdaudio_softc *sc)
 {
-	if (hdaudio_reset(sc) != 0)
-		return false;
+	uint32_t gctl;
+
+	/*
+	 * LISPBSD: if the controller kept its state across the sleep (it is
+	 * back from D3hot with CRST still set) do not pull the link reset.
+	 * A reset also resets every codec, and hdafg(4) cannot redo the
+	 * vendor-specific initialisation the firmware did at boot: after a
+	 * reset the ALC287 buzzed on every output until a cold boot, and the
+	 * HDMI codec in the still-dark GPU timed out on every verb.
+	 */
+	gctl = hda_read4(sc, HDAUDIO_MMIO_GCTL);
+	if (hda_read2(sc, HDAUDIO_MMIO_GCAP) != 0xffff &&
+	    (gctl & HDAUDIO_GCTL_CRST) != 0) {
+		aprint_normal_dev(sc->sc_dev,
+		    "resume: controller state kept (GCTL=0x%x), link not reset\n",
+		    gctl);
+		(void)hdaudio_rirb_stop(sc);
+		(void)hdaudio_corb_stop(sc);
+	} else {
+		aprint_normal_dev(sc->sc_dev,
+		    "resume: controller lost its state (GCTL=0x%x), resetting\n",
+		    gctl);
+		if (hdaudio_reset(sc) != 0)
+			return false;
+	}
 
 	hda_delay(HDAUDIO_CODEC_DELAY);
 	aprint_normal_dev(sc->sc_dev, "resume codec presence=0x%x\n",
