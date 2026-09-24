@@ -48,10 +48,24 @@ but the controller's 24 MHz wall clock runs at exactly 24 MHz with the bit
 set or clear during playback, so gating does not stall the link.
 
 The internal microphones are not on the HDA codec, so the buzz cannot be
-detected remotely; the ear test is still needed. Open candidates: link or
-codec frame synchronisation after the S0ix clock stop, and platform power
-state of the codec after long sleeps (the reported buzzes followed long
-suspends; the automated freezes were short).
+detected remotely. The decisive observation came from the user listening
+during a ten-minute automated freeze: the tone buzzed after the wake and
+became clean again while the post-resume codec dump ran. The dump only
+reads, except for the `SET_COEFFICIENT_INDEX` writes that walk the Realtek
+vendor coefficient interface, so that walk is the cure; the firmware gives
+the codec a similar nudge at boot.
+
+## Fix
+
+`kernel/dev/hdaudio/hdafg.c`: `hdafg_realtek_kick()` walks
+`SET_COEFFICIENT_INDEX` / `GET_PROCESSING_COEFFICIENT` over all 128 indices on
+the vendor node (0x20) at the end of `hdafg_resume()` for Realtek codecs and
+logs `resume: vendor coefficient interface walked`. Kernel 125
+(`/netbsd.i915.rpm.125`) carries it together with the kernel 123 and 124
+changes and is the default boot entry. Not yet confirmed by ear after a
+reboot; if the buzz survives a suspend on kernel 125, the bisect script
+`/var/tmp/bisect.sh` applies the candidate operations one per 15 s after a
+timed freeze so the exact step can be identified by listening.
 
 ## Do not detach a live hdafg
 
