@@ -29,4 +29,14 @@ export LC_CTYPE=${LC_CTYPE:-C.UTF-8}
 # Kill a stale display socket from a crashed session.
 rm -f "$XDG_RUNTIME_DIR"/wayland-0 "$XDG_RUNTIME_DIR"/wayland-0.lock
 
-exec /usr/local/bin/mahogany -l INFO "$@" >> "$HOME/.mahogany.log" 2>&1
+/usr/local/bin/mahogany -l INFO "$@" >> "$HOME/.mahogany.log" 2>&1
+rc=$?
+
+# libopeninput opens /dev/wskbd0 directly, which detaches it from the console
+# keyboard mux, and never reattaches it: after a session the console and X
+# have no keyboard. Put it back (doas rule in /usr/pkg/etc/doas.conf).
+doas /usr/sbin/wsmuxctl -a wskbd0 -f /dev/wskbd 2>/dev/null
+for m in wsmouse0 wsmouse1 wsmouse2; do
+	doas /usr/sbin/wsmuxctl -a $m -f /dev/wsmouse 2>/dev/null
+done
+exit $rc
