@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+
+# PROVIDE: ndevd devpubd
+# REQUIRE: root
+# KEYWORD: shutdown
+
+$_rc_subr_loaded . /etc/rc.subr
+
+name="ndevd"
+rcvar=$name
+command="/usr/pkg/sbin/${name}"
+start_precmd="checkdevpubd"
+
+checkdevpubd() {
+	# Die if devpubd is also set
+	if checkyesno devpubd ; then
+		warn "Disable 'devpubd' when enabling 'ndevd'!"
+		return 1
+	fi
+}
+
+load_rc_config $name
+run_rc_command "$1"
