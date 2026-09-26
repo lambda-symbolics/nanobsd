@@ -19,6 +19,10 @@ STEP=${VOL_STEP:-16}
 STATE="${HOME:-/home/mag}/.volume"
 
 vols() { mixerctl -a | sed -n 's/^\(outputs\.master[0-9]*\)=.*/\1/p'; }
+
+# Ask the bar's sampler to publish the new level now rather than on the
+# next minute.
+bar() { pkill -USR1 -f '^/bin/sh /usr/local/bin/statusbard$' 2>/dev/null; }
 mutes() { mixerctl -a | sed -n 's/^\(outputs\.master[0-9]*\.mute\)=.*/\1/p'; }
 
 save() {
@@ -43,10 +47,10 @@ restore() {
 case "${1:-get}" in
 up)
 	for c in $(vols); do mixerctl -w "$c+=$STEP" >/dev/null 2>&1; done
-	save ;;
+	bar; save ;;
 down)
 	for c in $(vols); do mixerctl -w "$c-=$STEP" >/dev/null 2>&1; done
-	save ;;
+	bar; save ;;
 mute)
 	# If anything is unmuted, mute everything; otherwise unmute everything.
 	want=on
@@ -55,13 +59,13 @@ mute)
 		want=off
 	done
 	for c in $(mutes); do mixerctl -w "$c=$want" >/dev/null 2>&1; done
-	save ;;
+	bar; save ;;
 get)
 	for c in $(vols); do printf '%s=%s ' "$c" "$(mixerctl -n "$c")"; done; echo ;;
 save)
 	save ;;
 restore)
-	restore ;;
+	restore; bar ;;
 *)
 	echo "usage: volume [up|down|mute|get|save|restore]" >&2; exit 2 ;;
 esac

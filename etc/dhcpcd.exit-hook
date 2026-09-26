@@ -1,0 +1,7 @@
+# dhcpcd exit hook (LISPBSD): the bar shows the WLAN name, so have its
+# sampler publish a fresh line when the link or lease changes, instead of
+# waiting for the minute.
+case "$reason" in
+BOUND|REBOOT|RENEW|CARRIER|NOCARRIER|EXPIRE|RELEASE|STOP|DEPARTED)
+	pkill -USR2 -f '^/bin/sh /usr/local/bin/statusbard$' 2>/dev/null ;;
+esac

@@ -3,12 +3,17 @@
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin:/usr/local/bin
 export PATH
 
+# Slow sections (envstat, ifconfig) come from the cache statusbard refreshes
+# on the minute and on AC or network events; a one-shot run without
+# statusbard fills the cache itself.
+SENS=/tmp/.statusbar.sensors WIFI=/tmp/.statusbar.wifi
+[ -s $SENS ] || { echo '@sensors'; envstat 2>/dev/null; } > $SENS
+[ -s $WIFI ] || { echo '@wifi'; ifconfig iwx0 2>/dev/null; } > $WIFI
+
 {
   echo '@ram'; vmstat -s 2>/dev/null
   echo '@cpu'; sysctl -n kern.cp_time 2>/dev/null
-  echo '@sensors'; envstat 2>/dev/null
   echo '@audio'; mixerctl -a 2>/dev/null
-  echo '@wifi'; ifconfig iwx0 2>/dev/null
   echo '@clock'; date +%H:%M
 } | awk -v state="${STATUSBAR_CPU_STATE:-/tmp/.statusbar.cp}" '
   BEGIN {
@@ -77,4 +82,4 @@ export PATH
     if (absent) bats="none"
     printf "ram=%s cpu=%s temp=%s vol=%s volm=%s mic=%s micm=%s bat=%s bats=%s ssid=%s clk=%s\n", ram,cpu,temp,vol,volm,mic,micm,bat,bats,ssid,clk
   }
-'
+' - "$SENS" "$WIFI"

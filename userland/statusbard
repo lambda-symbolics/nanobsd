@@ -1,11 +1,49 @@
 #!/bin/sh
-# statusbard: publish a status snapshot every three seconds. The StumpWM worker
-# reads it and queues changed snapshots through the WM's request pipe.
-# Started from ~/.xinitrc.
+# statusbard: publish a status snapshot when something shown on the bar
+# changes, instead of every few seconds.
+#   - every minute boundary: the clock, battery and WLAN are sampled
+#   - SIGUSR1 (volume changes): sample at once, reusing the cached sensors
+#   - SIGUSR2 (AC, network, panel back on): sample at once, sensors included
+# RAM, CPU and temperature ride along: they are fresh whenever a line is
+# published but never cause one, so a quiet desktop redraws once a minute.
+# A published line goes to /tmp/.statusline (read by the StumpWM worker) and
+# a running Mahogany is told to redraw through its control socket.
+# Started from ~/.xinitrc or the Mahogany session; paused while the panel is off.
 PATH=/usr/local/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin
 export PATH
 out=/tmp/.statusline
+sock=${XDG_RUNTIME_DIR:-/nonexistent}/mahogany.sock
+pending=0 slow=1 last=
+trap 'pending=1' USR1
+trap 'pending=1 slow=1' USR2
+
+sample_slow() {
+	# envstat evaluates ACPI methods for the battery and temperatures.
+	{ echo '@sensors'; envstat 2>/dev/null; } > /tmp/.statusbar.sensors.tmp &&
+	    mv /tmp/.statusbar.sensors.tmp /tmp/.statusbar.sensors
+	{ echo '@wifi'; ifconfig iwx0 2>/dev/null; } > /tmp/.statusbar.wifi.tmp &&
+	    mv /tmp/.statusbar.wifi.tmp /tmp/.statusbar.wifi
+}
+
 while :; do
-	statusbar > "$out.tmp" 2>/dev/null && mv "$out.tmp" "$out"
-	sleep 3
+	full=$slow; pending=0 slow=0	# reset first: a signal may land below
+	[ $full = 1 ] && sample_slow
+	line=$(statusbar 2>/dev/null)
+	# The line starts "ram=.. cpu=.. temp=.. "; the rest decides.
+	key=${line#* * * }
+	if [ -n "$line" ] && [ "$key" != "$last" ]; then
+		last=$key
+		printf '%s\n' "$line" > "$out.tmp" && mv "$out.tmp" "$out"
+		[ -S "$sock" ] && MAHOGANY_SOCKET=$sock \
+		    mahoganyctl '(bar-status-changed)' >/dev/null 2>&1
+	fi
+	# Sleep to the next minute boundary; a signal cuts the wait short, and
+	# one that came in while sampling means sampling again straight away.
+	s=$(date +%S); s=${s#0}
+	sleep $((60 - s)) & sp=$!
+	if [ $pending = 0 ] && wait $sp; then
+		slow=1			# the minute turned over
+	else
+		kill $sp 2>/dev/null
+	fi
 done

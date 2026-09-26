@@ -21,4 +21,6 @@ released)
 	    "AC disconnected: brightness $(brightness restore bat)"
 	;;
 esac
+# The bar shows the charging state: have its sampler publish it now.
+pkill -USR2 -f '^/bin/sh /usr/local/bin/statusbard$' 2>/dev/null
 exit 0
