@@ -1,7 +1,24 @@
 #!/bin/sh
 # powerd lid hook: pressed=closed, released=open. Kernel handles s2idle wake.
+#
+# While /etc/lid-nosuspend exists, closing the lid only turns the backlight
+# off and the machine keeps running (remote work over wg while it travels).
+# Remove the file to get s2idle suspend on lid close back.
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
 logger -p info -t lid "lid: $*"
+if [ -e /etc/lid-nosuspend ]; then
+	N15=hw.acpi.acpiout15.brightness N16=hw.acpi.acpiout16.brightness
+	case "$2" in
+	pressed)
+		sysctl -n $N15 > /var/run/lid-brightness 2>/dev/null
+		sysctl -w $N15=0 $N16=0 >/dev/null 2>&1
+		logger -p info -t lid "lid closed: backlight off, not suspending (/etc/lid-nosuspend)" ;;
+	released)
+		b=$(cat /var/run/lid-brightness 2>/dev/null); [ -n "$b" ] || b=50
+		sysctl -w $N15=$b $N16=$b >/dev/null 2>&1 ;;
+	esac
+	exit 0
+fi
 case "$2" in
 pressed)  /usr/local/bin/s0ix suspend ;;
 released) /usr/local/bin/s0ix resume  ;;

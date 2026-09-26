@@ -15,7 +15,8 @@
 (config-system:set-config keyboard-repeat-rate 40
                           keyboard-repeat-delay 300)
 (config-system:set-config touchpad-tap-to-click t)
-(config-system:set-config keyboard-focus-type :click-and-wheel)
+;; Focus follows the mouse, as *mouse-focus-policy* :sloppy did in StumpWM.
+(config-system:set-config keyboard-focus-type :sloppy)
 
 ;; C-t belongs to Firefox; the prefix map is hardly used anyway.
 (setf (state-prefix-key *compositor-state*) (kbd "s-z"))
@@ -190,7 +191,9 @@ every failure is swallowed."
 ;;;; -- Startup --
 
 (when *initializing*
-  (run-shell "pgrep -f statusbard >/dev/null || /usr/local/bin/statusbard &")
+  ;; The bracket keeps pgrep from matching this very shell, whose command
+  ;; line contains the pattern.
+  (run-shell "pgrep -f 'statusbar[d]' >/dev/null || /usr/local/bin/statusbard &")
   ;; A daemon from an earlier session died with its display; start a fresh one
   ;; on its own socket so the X daemon's socket is never reused.
   (run-shell "rm -f /tmp/alacritty-wl.sock; alacritty --daemon --socket /tmp/alacritty-wl.sock &")
