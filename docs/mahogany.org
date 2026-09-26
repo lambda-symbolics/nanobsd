@@ -140,6 +140,56 @@ packing.  Mahogany can do the same and better:
   exemption code.  Measure before believing it: packing was a null result on
   this machine, so the honest expectation is "less work", not "more idle".
 
+* Status (2026-09-26 evening): the fork is built and runs on the panel
+
+=lambda-symbolics/mahogany= master carries, on top of upstream:
+
+- =heart/src/lispbsd.c=: client pid (=hrt_view_pid=), the cairo/pango status
+  bar (=hrt_bar_set=), output power (=hrt_output_set_power=), idle-inhibit
+  and ext-idle-notify globals, activity notifications from the input
+  handlers, and xdg-decoration answered with server-side mode (no client
+  title bars).
+- =lisp/tree/strip.lisp=: the scrolling strip (columns, viewport offset,
+  width presets, height shares, consume/expel, cross-group column moves).
+  Off-viewport cells have their scene nodes disabled: no frame callbacks.
+- =lisp/group-strip.lisp=: the group functions dispatch on the layout; the
+  upstream tiled versions live on as =%tiled-...=. =*group-layout*= is
+  =:strip= by default, =:tiled= restores upstream behaviour.
+- =lisp/strip-commands.lisp=, =lisp/bar.lisp=, =lisp/idle.lisp=,
+  =lisp/heart/lispbsd-bindings.lisp=; =Makefile= defaults to clang on NetBSD.
+- Upstream fixes: =(setf state-prefix-key)= wrote a nonexistent slot; an init
+  file error no longer kills the session; pressed keys are logged at DEBUG.
+
+On the laptop: =/usr/local/bin/mahogany= (the SBCL image), =/usr/local/lib/libheart.so=,
+=/usr/local/bin/startmh= (session script), =~mag/.config/mahogany/init.lisp=
+(=dotfiles/mahogany/init.lisp=), =screenshot= with a grim/slurp branch, rofi
+2.0 (Wayland backend) as launcher and colon prompt, grim/slurp installed.
+
+Verified nested under X with injected keys and screenshots: columns, focus
+left/right with scrolling, width max toggle, consume, group switch, column
+move to another group, bar contents. Verified on the DRM backend: modeset at
+2160x1350, rendering, foot client. Fonts: pango 1.44+ ignores bitmap fonts,
+so the bar and rofi use =ProFontExtended 9= (the TrueType in X11R7), which is
+the dmenu font the X setup used.
+
+** Switching the console session
+
+=~mag/.config/cclsh/startup.lisp= starts =startmh= instead of =startx-safe=
+when =~/.config/mahogany/autostart= exists. =touch= it, log out of X
+(=s-E=), and the autologin comes back in Mahogany; remove it to return to X.
+Firefox and Emacs are X11 builds and will not start until gtk3 and they are
+rebuilt with Wayland support (or Xwayland is enabled in heart).
+
+** Not done
+
+- Screen sharing: needs xdg-desktop-portal-wlr and pipewire, neither of
+  which is packaged for NetBSD. Screenshots work (grim over wlr-screencopy).
+- Sloppy (mouse-follows) focus: Mahogany has click focus only.
+- The =eval= key (s-x) has no equivalent; =colon= (s-;) runs commands via rofi.
+- Media keys under wskbd/libopeninput are untested until someone presses them;
+  =Key pressed:= lines in =~/.mahogany.log= (run with =-l DEBUG=) show what
+  arrives.
+
 * Roadmap for the fork (lambda-symbolics/mahogany)
 
 In order of value and dependency.  Items 1-4 give a usable desktop.

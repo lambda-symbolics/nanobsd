@@ -16,6 +16,22 @@ OUT="$DIR/screenshot-$(date +%Y-%m-%d_%H-%M-%S).png"
 # Dashed accent-coloured selection box, matching the status bar's palette.
 SELOPTS='--line style=dash,width=2,color=#E46876'
 
+if [ -n "$WAYLAND_DISPLAY" ]; then
+	# Under Mahogany: grim captures through wlr-screencopy, slurp selects.
+	# The selection box uses the same accent colour as the X version.
+	case "${1:-area}" in
+	area)	region=$(slurp -d -b 00000044 -c E46876ff -w 2) || exit 1
+		grim -g "$region" "$OUT" || exit 1 ;;
+	window|full)
+		grim "$OUT" || exit 1 ;;
+	*)	echo "usage: screenshot [area|full|window]" >&2; exit 2 ;;
+	esac
+	[ -s "$OUT" ] || { echo "screenshot: capture produced nothing" >&2; exit 1; }
+	command -v wl-copy >/dev/null 2>&1 && wl-copy < "$OUT"
+	echo "$OUT"
+	exit 0
+fi
+
 case "${1:-area}" in
 area)	# freeze, then crop; scrot exits non-zero if the selection is cancelled
 	scrot -f -s $SELOPTS "$OUT" || exit 1 ;;

@@ -1,0 +1,32 @@
+#!/bin/sh
+# startmh - start a Mahogany (Wayland) session from the NetBSD console.
+#
+# Needs seatd running (seatd=YES in rc.conf, -g wheel) and the user in wheel.
+# The compositor renders with pixman: the Tiger Lake render engines are wedged
+# under this kernel, so there is no GL to use anyway. Logs go to ~/.mahogany.log.
+
+uid=$(id -u)
+export XDG_RUNTIME_DIR=/var/run/user/$uid
+if [ ! -d "$XDG_RUNTIME_DIR" ]; then
+	mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || {
+		export XDG_RUNTIME_DIR=/tmp/runtime-$(id -un)
+		mkdir -p "$XDG_RUNTIME_DIR"
+	}
+fi
+chmod 700 "$XDG_RUNTIME_DIR"
+
+export PATH=/usr/local/bin:/usr/pkg/bin:/usr/X11R7/bin:$PATH
+export LIBSEAT_BACKEND=seatd
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=mahogany
+export XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
+export WLR_RENDERER=pixman
+export XKB_DEFAULT_LAYOUT=cz,us
+export XKB_DEFAULT_OPTIONS=grp:alt_shift_toggle
+export MOZ_ENABLE_WAYLAND=1
+export LC_CTYPE=${LC_CTYPE:-C.UTF-8}
+
+# Kill a stale display socket from a crashed session.
+rm -f "$XDG_RUNTIME_DIR"/wayland-0 "$XDG_RUNTIME_DIR"/wayland-0.lock
+
+exec /usr/local/bin/mahogany -l INFO "$@" >> "$HOME/.mahogany.log" 2>&1
