@@ -104,10 +104,10 @@ config file is the durable fix.
 
 ** What it does not buy
 
-- The kernel-side power picture is unchanged: EPP remains the only watt-class
-  lever (lpsched result), the iGPU/RC6 and package C-state story is the same.
-  What changes is how much *work* userland asks for, which is what the
-  frame-callback gating and the absence of X reduce.
+- The kernel-side power picture was expected to be unchanged, and it was
+  not: under Mahogany the GPU's RC6 was never armed, because nothing submits
+  GPU work any more.  Kernel 129 fixes that; see "Power pass after the
+  switch" below, which is worth 1.3 W with the panel off.
 - Firefox and Emacs on this box are X11 builds (gtk3+ 3.24.52 was built with
   the =x11= option only; emacs30 links libX11).  Under Mahogany they need
   either Xwayland or a rebuild.  Under Xwayland Firefox keeps its own refresh
@@ -282,15 +282,133 @@ DRRS cannot see because its frames arrive every 33 ms. It then picks the
 Hz for two seconds every ten to re-measure, since the measured rate is
 capped at 30. 24 and 25 fps video stays at 60 Hz. =s-R= toggles it.
 
-** Not done: PSR
+** PSR: the panel has none
 
-PSR is off although the VBT enables it (=EDP_PSR_CTL= and =EDP_PSR2_CTL=
-enable bits clear, link fully on). Suspect: the PSR setup-time check against
-this panel's 17-line vertical blank. Check by setting =hw.drm2.__drm_debug=
-to 0x4 around a modeset. PSR would switch the link and scanout off entirely
-on a still screen, which beats 30 Hz, but it also stops the screen updating
-for anything that draws without frontbuffer flushes (the text console, X on
-wsfb), so it needs care.
+PSR stays off because the panel does not offer it: its PSR capability byte
+(DPCD 0x070, read at boot into =intel_dp->psr_dpcd=) is 0, so
+=intel_psr_init_dpcd= never registers the panel (=psr.dp= NULL,
+=psr.sink_support= false, read from the live kernel with gdb).  The VBT
+enables PSR for the platform, not for this Chimei Innolux 0x1301 panel.  The
+other DPCD blocks read normally (DPCD 1.2, eDP 1.3, =SET_POWER_CAP= set) and
+the boot shows no AUX errors, so the zero is real.  Seamless DRRS is the
+only display-side refresh lever on this machine.
+
+* Power pass after the switch (kernel 129, 2026-09-26 evening)
+
+** RC6 was never armed under Mahogany
+
+With the panel off, the package never left PC0 (every pc counter 0) while
+the cores sat in C7 99% of the time.  The GT was in RC0 with no forcewake
+held and =GEN6_RC_CONTROL= (0xA090) read 0, yet the driver believed RC6 was
+enabled, and every threshold register and =GEN9_PG_ENABLE= still held the
+values =gen11_rc6_enable= writes.  Cause: =intel_gt_resume= calls
+=intel_rc6_sanitize= (RC_CONTROL = 0), then =intel_rc6_enable= only
+computes =ctl_enable=; the hardware bit is written by =intel_rc6_unpark= on
+the next GT unpark.  In automatic mode (=rc6->manual= false, our TGL fix),
+=intel_rc6_park= writes nothing.  Under X, GL clients unparked the GT now and
+then, which armed RC6 by accident.  Mahogany renders with pixman and its
+clients use shm, so after boot nothing ever unparks the GT and RC6 stays off.
+
+Fix (kernel 129, =gt/intel_rc6.c=): =intel_rc6_park= also writes
+=ctl_enable= in automatic mode, with forcewake.  Verified after the reboot:
+=GT_CORE_STATUS= (0x138060) reports RC6 and the residency counter (0x138108)
+climbs in real time with no manual poke.
+
+| Lid closed, pipe off, 60 s | Battery | Package (RAPL) | Package C-states  |
+|----------------------------+---------+----------------+-------------------|
+| RC6 off (kernel 127)       | 4.24 W  | 2.22 W         | none              |
+| RC6 armed                  | 2.95 W  | 0.84 W         | PC10 43%, PC3 50% |
+
+With the panel on at 30 Hz the package now reaches PC8 63% (PC2 31%).
+Without PSR, PC8 is the floor while the pipe scans out.  =userland/rc6test=
+reproduces the measurement by arming RC_CONTROL from userland on kernel 127.
+
+** Display power with the pipe off
+
+DC6 works: the DMC's DC6 counter (0x101088) counts about 33 entries a second
+while blanked, and =DC_STATE_EN= allows DC6.
+
+** Idle wakeups
+
+Measured with =ps -o nvcsw= deltas, =vmstat -i= and =vmstat -e= while the
+desktop sat idle:
+
+| Source                       | Before      | After              |
+|------------------------------+-------------+--------------------|
+| waytemp                      | 10.1/s      | 0                  |
+| Mahogany                     | 2.6/s       | 0.2/s              |
+| lpschedd                     | 3.9/s       | 0.2/s (see below)  |
+| status sampler (statusbard)  | every 3 s   | once a minute      |
+| cclsh (per shell)            | 9.1/s       | 9.1/s, not fixed   |
+
+- *waytemp*: its accept loop woke every 100 ms to check a quit flag (my
+  sb-bsd-sockets port), and its main thread slept in =join-thread=.  Now the
+  daemon serves in the main thread and blocks, and the Wayland thread wakes
+  it through the socket when the compositor goes away (branch =netbsd=).
+- *Mahogany*: two libudev-bsd hotplug threads (wlroots and libopeninput)
+  retried =/var/run/ndevd.socket= every second because ndevd was not
+  running.  =ndevd=YES= (pkgsrc =sysutils/ndevd=, a drop-in for devpubd,
+  which is off here) lets them block, and gives Mahogany real monitor and
+  input hotplug.  The refresh policy also stopped treating the bar's
+  occasional redraw as animation, and its timer stops while the panel is off.
+- *lpschedd* polled idle_ms 2-4 times a second to catch the user coming
+  back.  Heart now sends =input <pid>= to =/var/run/lpsched.sock= when input
+  arrives after two quiet seconds, and once at startup.  While that
+  compositor lives lpschedd polls every 5 s, which is how often the kernel
+  recomputes the load anyway.  It falls back to fast polling when the
+  compositor exits.  Tested with a stand-in pid.  The running session got
+  its Lisp changes loaded live, so the heart part starts working at the
+  next session start.
+- *cclsh*: see the next section.
+
+The kernel side still shows about 45 timer softints a second.  iwx0 takes
+about 10 interrupts a second, which matches the beacon rate, each with a
+=bus_dma= bounce.  hdaudio0 interrupts 2.4 times a second with nothing
+playing (not investigated).
+
+** SBCL without futexes polls at 10 Hz (not fixed)
+
+SBCL 2.6.5 on NetBSD is built without =:sb-futex=.  There, any thread
+blocked on a mutex, a condition variable or =join-thread= waits in
+=%%wait-for=, which calls =nanosleep= with a backoff that settles at 100 ms.
+Every SBCL program with such a thread wakes about nine times a second.
+Here that is cclsh, in each terminal and in the session parent that runs
+startmh, and it was waytemp.  Application workarounds exist (block in a
+syscall, serve in the main thread).  The real fix is futex support for
+SBCL's NetBSD runtime, through NetBSD's native futex syscall
+(=SYS___futex= 166, =<sys/futex.h>=), followed by rebuilding every SBCL
+image.
+
+** Bar on demand
+
+statusbard sleeps to the next minute boundary.  SIGUSR1 (the volume script)
+makes it sample at once with the cached sensors.  SIGUSR2 (the AC hook, the
+new =/etc/dhcpcd.exit-hook=, and Mahogany unblanking the panel) makes it
+re-read envstat and ifconfig first.  It publishes only when a shown value
+other than RAM, CPU or temperature changed; those three ride along.  After
+publishing it calls =(bar-status-changed)= through =mahoganyctl=, and the bar
+thread that polled the file is gone.  A quiet desktop now redraws the bar
+once a minute, right on the minute, and volume, AC and network changes show
+within a second.
+
+** Lid shut at boot
+
+The lid only notifies changes, and the change at boot happens before powerd
+listens, so a machine booted with the lid shut used to light the panel.
+Kernel 129 adds =hw.acpi.lid_closed= (evaluates =_LID= on read).  rc.local
+replays a lid close when it is 1 and =/etc/lid-nosuspend= exists.
+Mahogany keeps outputs that appear while blanked turned off (new
+=*output-change-hook*=).  Opening the lid restores the brightness
+remembered for the supply.
+
+** Left to do
+
+- SBCL futex support (above): the largest remaining userland wakeup source.
+- iwx beacon filtering (=IWX_REPLY_BEACON_FILTERING_CMD=) would drop about
+  10 interrupts a second.  WiFi is the only link, so test it with a
+  watchdog.
+- PC3 still takes half the idle time with the panel off.  The next place to
+  look is timer softints, after the SBCL fix.
 
 * Roadmap for the fork (lambda-symbolics/mahogany)
 
