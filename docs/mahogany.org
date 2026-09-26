@@ -1,0 +1,202 @@
+#+TITLE: Mahogany on the Nano: Wayland instead of X, and what it buys in power
+#+DATE: 2026-09-26
+
+* Verdict
+
+Feasible, and cheaper than expected.  Everything builds and runs on the box
+today: wlroots 0.20.2, Mahogany (master of 2026-09-25, forked as
+=lambda-symbolics/mahogany=), and Wayland clients against it, all with the
+software (pixman) renderer that the wedged Tiger Lake render engines force on
+us.  What has *not* been run yet is the DRM backend on the real panel, because
+that needs X stopped for about five minutes.
+
+The desktop the user wants (same keys, six workspaces, scrolling columns, the
+same bar fed by =statusbard=, alacritty) is a port of ~720 lines of StumpWM
+config (=.stumpwmrc= 321, =scrolling.lisp= 396) plus features Mahogany lacks.
+The scrolling layout is the big item; the rest is small.
+
+* What is installed on the laptop now
+
+| what                                  | where                                   |
+|---------------------------------------+-----------------------------------------|
+| wlroots 0.20.2, pkgsrc NetBSD patches | =/usr/local/lib/libwlroots-0.20.so=     |
+| its source tree                       | =/root/common-lisp/wl/wlroots-0.20.2=   |
+| wlroots 0.19.3 + labwc 0.9.7 (binary) | =/usr/pkg= (pkgin; smoke test only)     |
+| Mahogany clone, origin = the fork     | =/root/common-lisp/mahogany=            |
+| its executable                        | =/root/common-lisp/mahogany/build/mahogany= (64 MB SBCL image) |
+| =libheart.so=                         | =/usr/local/lib= (copy of build/heart)  |
+| Quicklisp (root)                      | =/root/quicklisp=                       |
+| =/etc/ld.so.conf= (new, tracked)      | =/usr/pkg/lib=, =/usr/X11R7/lib=, =/usr/local/lib= |
+| seatd                                 | already =seatd=YES=, =-g wheel=; mag is in wheel |
+
+The binary wlroots 0.19.3 in =/usr/pkg= and the 0.20.2 in =/usr/local= do not
+clash (different sonames, different prefixes).  labwc was only used to prove
+the userland stack.
+
+** Build recipe (as done, reproducible)
+
+#+BEGIN_SRC sh
+  # wlroots 0.20.2: pkgsrc has this exact version in wayland/wlroots, but the
+  # pkgsrc build wants cairo>=1.18.4nb4 (installed nb3) and vulkan/glslang, so
+  # the tarball + pkgsrc's six patches were built by hand instead.
+  pkgin install libudev-bsd libliftoff xcb-util-errors hwdata
+  cd /root/common-lisp/wl/wlroots-0.20.2   # patches already applied, @X11BASE@ -> /usr/X11R7
+  meson setup build --prefix=/usr/local -Dbuildtype=release -Drenderers=gles2 \
+        -Dbackends=drm,libinput,x11 -Dxwayland=enabled -Dsession=enabled \
+        -Dallocators=gbm -Dexamples=false
+  ninja -C build && ninja -C build install
+  # (pixman renderer, shm and drm-dumb allocators are always built)
+
+  # Mahogany
+  export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/pkg/lib/pkgconfig:/usr/X11R7/lib/pkgconfig
+  export CC=clang            # heart is C23 (nullptr); base gcc 12.5 cannot, clang 21 can
+  cd /root/common-lisp/mahogany
+  git submodule update --init dependencies/cl-xkbcommon dependencies/cl-interactive
+  mkdir -p build/heart build/internal && meson setup build/heart heart/ && touch build/internal/wlroots-configured
+  gmake                       # builds libheart.so, quickloads deps, dumps build/mahogany
+#+END_SRC
+
+Without =/etc/ld.so.conf= SBCL's =dlopen= cannot find =libxkbcommon.so.0= in
+=/usr/pkg/lib= (NetBSD's =ld.elf_so= only searches =/usr/lib= by default) and
+the Lisp build dies in =cl-xkbcommon=.  =LD_LIBRARY_PATH= works too but the
+config file is the durable fix.
+
+** What was run
+
+- =labwc= (wlroots 0.19.3, =WLR_BACKENDS=x11 WLR_RENDERER=pixman=) nested in
+  the running X session: started, mapped an output, launched =foot=, started an
+  Xwayland on =:1=.
+- =mahogany -q= nested the same way: output =X11-1= added, =foot= connected and
+  ran.
+- =mahogany -q= on the headless backend for 3 s: 14 voluntary context switches,
+  0.0 % CPU.  That is the idle floor of the compositor: a handful of wakeups
+  per second, nothing periodic.
+
+* Why Wayland is a power win here (and what it is not)
+
+** Wins that come for free from wlroots
+
+- *Frame callbacks only reach visible surfaces.*  Mahogany renders through
+  =wlr_scene=; =wlr_scene_buffer_send_frame_done()= (wlroots
+  =types/scene/wlr_scene.c=) emits =frame_done= only when the buffer's
+  =node.visible= region is non-empty.  Visibility is computed against opaque
+  regions of everything above it and against the output boxes.  A window on
+  another workspace, scrolled off the strip, fully covered, or on a disabled
+  output never gets a frame callback, so a well-behaved client (alacritty,
+  foot, mpv, native-Wayland Firefox) stops rendering entirely.  This is
+  exactly the "limit callbacks for windows not on screen" idea, already
+  implemented in the library; the compositor only has to keep the scene graph
+  honest (disable the nodes of hidden groups and off-strip columns rather than
+  moving them off-screen).
+- *Nothing periodic in the compositor.*  Rendering happens only in the
+  output's =frame= listener, and the DRM backend emits =frame= only after a
+  page flip, which only happens when =wlr_scene_output_commit= finds damage.
+  No damage, no flip, no frame event, no wakeup.  Compare the X setup, where
+  the mode-line alone once cost ~1400 round trips/s and where X itself is a
+  second process to schedule.
+- *One process, one copy.*  Today: client renders, =XPutImage= to X, X's
+  =wsfb= copies into the framebuffer.  With Mahogany: client renders into shm,
+  pixman composites damaged rectangles straight into a DRM dumb buffer that is
+  scanned out.  With the GPU wedged this is the whole pipeline; there is no
+  GL anywhere to lose.
+- Gamma control exists (=wlr_gamma_control_manager_v1=), so the installed
+  =wlsunset= replaces the =redshift -m drm= / =screentemp= hack.
+
+** What it does not buy
+
+- The kernel-side power picture is unchanged: EPP remains the only watt-class
+  lever (lpsched result), the iGPU/RC6 and package C-state story is the same.
+  What changes is how much *work* userland asks for, which is what the
+  frame-callback gating and the absence of X reduce.
+- Firefox and Emacs on this box are X11 builds (gtk3+ 3.24.52 was built with
+  the =x11= option only; emacs30 links libX11).  Under Mahogany they need
+  either Xwayland or a rebuild.  Under Xwayland Firefox keeps its own refresh
+  timer and is invisible to the scene-visibility gating, so the biggest client
+  would gain little.  The user does not want Xwayland; the clean path is a
+  pkgsrc rebuild of =x11/gtk3= with the =wayland= option, then =www/firefox=
+  (toolkit becomes =cairo-gtk3-x11-wayland=, per =mozilla-common.mk=) and
+  =editors/emacs30= with =pgtk=.  Firefox from source on the Nano is a
+  multi-hour build; a build host would help.  alacritty 0.17 already has
+  Wayland support compiled in (=wl_compositor= strings in the binary).
+
+** Integrating the compositor with lpsched
+
+The StumpWM hook (=dotfiles/.stumpwm.d/lpsched.lisp=) sends =fgpid <pid>= to
+=/var/run/lpsched.sock= on focus change; the kernel exempts that process from
+packing.  Mahogany can do the same and better:
+
+- *pid of a view*: =wl_client_get_credentials(wl_resource_get_client(surface->resource), &pid, ...)=.
+  A ten-line =hrt_view_get_pid()= in heart plus a CFFI binding gives the
+  focus hook the same datagram as today.  No =_NET_WM_PID= guesswork; the
+  socket peer credentials are authoritative.
+- *visibility as a signal*: the compositor is the only place that knows which
+  clients are currently visible.  A =vispids <pid>...= datagram (or
+  =bgpid=) lets lpschedd treat hidden clients as background: pack them at
+  =pack=2= and coalesce their timers even in the balanced profile, while
+  visible ones stay on the stock path.  Frame-callback starvation already
+  stops their rendering; this would additionally stop their timers waking
+  cores.  It needs a small lpschedd extension (a set of pids instead of one)
+  and a kernel check of =l_proc->p_pid= against that set in the existing
+  exemption code.  Measure before believing it: packing was a null result on
+  this machine, so the honest expectation is "less work", not "more idle".
+
+* Roadmap for the fork (lambda-symbolics/mahogany)
+
+In order of value and dependency.  Items 1-4 give a usable desktop.
+
+1. *NetBSD build glue* (small).  Default =CC=clang= on NetBSD in the Makefile,
+   document =/etc/ld.so.conf= and =PKG_CONFIG_PATH=, install target that
+   copies =libheart.so= and the image to =/usr/local=.  Replace the default
+   =rofi= input method (X11 rofi is what pkgsrc ships) with a Lisp-native
+   prompt or a =foot=-based one; the existing =foot-input-method= is Linux-only
+   because it reads =/proc=; port it with =sysctl kern.proc= or drop the pid
+   lookup.
+2. *Scrolling strip layout* (large).  Mahogany's tree is StumpWM-style
+   binary/poly frames (=lisp/tree/=).  Re-implement =scrolling.lisp= against
+   it: per-group ordered columns with viewport offset, consume/expel,
+   width presets and nudges, height shares, center, fullscreen, focus-follows
+   scroll.  Keep hidden columns' scene nodes *disabled* so they get no frame
+   callbacks.  The StumpWM version leaned on X window geometry; here the
+   compositor owns geometry, so this becomes simpler in places.
+3. *Config port* (medium).  Six groups, the Super top-map bindings, prefix
+   off =C-t= (Mahogany defaults to =C-t= like StumpWM), terminal =alacritty
+   msg= / daemon, launcher, screenshot (=grim= + =slurp= are in pkgsrc),
+   =volume= / =brightness= scripts on =XF86Audio*= / =XF86MonBrightness*=.
+   Check what wskbd gives for the ThinkPad volume keys through libopeninput;
+   under X they arrived as bare keycodes 141/142/8 and needed xmodmap.
+4. *Bar* (medium).  Mahogany has no mode-line.  heart already draws borders
+   and toast messages with cairo/pango into =wlr_scene_buffer= nodes, so a
+   bottom layer that renders the text of =/tmp/.statusline= is the same
+   mechanism; =statusbard= stays as is.  Repaint only when the text changes
+   (the =x11-efficiency.lisp= lesson).  =s-o= / =s-O= toggle it.
+5. *Idle and blanking* (medium).  Upstream lacks ext-idle-notify (#393),
+   idle-inhibit, session-lock and output power management.  Needed: an idle
+   timer in Lisp that disables the output (=wlr_output_state_set_enabled=
+   already exists in heart) and re-enables on input; =zwp_idle_inhibit_v1= so
+   a native Firefox playing video holds it (the Xss trick is X-only); lid
+   close disables the output (upstream #378).  The s2idle path
+   (powerd, =s0ix=) is below the compositor and unchanged.
+6. *lpsched hook* (small): pid accessor + focus hook, then the visibility set.
+7. *Xwayland*: heart only detects it; no =wlr_xwayland= is created.  Skipped
+   by decision; revisit only if the gtk3/firefox/emacs rebuild is not wanted.
+8. *Session start*: a =startmh= that sets =XDG_RUNTIME_DIR=, runs
+   =seatd-launch= or relies on the running seatd, and replaces =startx= in the
+   cclsh autologin.
+
+* Next test (needs the user)
+
+Run the DRM backend on the panel once: stop X, on =ttyE1= as mag run
+=WLR_RENDERER=pixman /root/common-lisp/mahogany/build/mahogany= with
+=XDG_RUNTIME_DIR= set, open alacritty, then quit.  Five minutes, tells us
+whether modeset, the dumb-buffer allocator, wskbd/wsmouse via libopeninput and
+VT switching all work on this kernel.  Nobody has published a report of a
+wlroots compositor on NetBSD hardware; the pkgsrc maintainer's patches imply
+it works, and this box is the proof either way.
+
+* Sources
+
+wlroots =types/scene/wlr_scene.c= (0.20.2) for the visibility rule;
+pkgsrc =wayland/wlroots= (kikadf, 0.20.2nb1) patches; sway issue #6921 and
+wlroots MR !5378 for the state of BSD input backends; Mahogany issues #84
+(Xwayland), #393 (idle-notify), #378 (lid), #139/#140 (brightness/volume);
+=www/firefox/mozilla-common.mk= for the gtk3 wayland dependency.
