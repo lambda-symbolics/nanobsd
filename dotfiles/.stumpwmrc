@@ -154,6 +154,11 @@
  "XF86MonBrightnessUp"   "brightness-up"
  "XF86MonBrightnessDown" "brightness-down")
 
+;; C-t belongs to Firefox (new tab). Move the StumpWM prefix off it; the prefix
+;; map is hardly used since everything lives on the Super top map. s-z s-z is
+;; the old C-t C-t (last window) and s-z z sends a literal s-z to the client.
+(set-prefix-key (kbd "s-z"))
+
 ;; X translates Shift+letter to the uppercase keysym, without a Shift modifier.
 ;; Remove the old spellings and obsolete frame-deletion binding on live reload.
 (dolist (key '("s-S-f" "s-S-c" "s-S-d" "s-S-w" "s-S-e" "s-S-p" "s-S-o"

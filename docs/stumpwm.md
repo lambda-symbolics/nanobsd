@@ -43,6 +43,13 @@ Use Super as Mod.
 | Super + O / Shift + O | Panel on/off |
 | Super + Shift + P | Panel off |
 
+## Prefix key
+
+The StumpWM prefix is `s-z`, not the default `C-t`, so that `C-t` reaches
+Firefox for tab management. The prefix map is hardly used because every binding
+lives on the Super top map. `s-z s-z` is the old `C-t C-t` (last window) and
+`s-z z` sends a literal `s-z` to the client.
+
 ## Media keys
 
 The brightness keys never reach X: the firmware routes them to the
