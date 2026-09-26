@@ -2,7 +2,7 @@
 # Installed as /usr/local/bin/cclsh (mag's and root's login shell).
 # Interactive terminals share a per-user SBCL server. Scripts stay standalone.
 export CCLSH_LAUNCHER_PATH=/usr/local/bin/cclsh
-export CCLSH_SBCL=/usr/pkg/bin/sbcl
+export CCLSH_SBCL=/usr/local/bin/sbcl	# futex build (lambda-symbolics/sbcl); pkgsrc polls blocked threads at 10 Hz
 export CCLSH_QUICKLISP_SETUP=/usr/local/lib/cclsh/quicklisp/setup.lisp
 base=/usr/local/lib/cclsh
 fallback="$base/cclsh-image"

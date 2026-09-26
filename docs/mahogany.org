@@ -366,18 +366,45 @@ about 10 interrupts a second, which matches the beacon rate, each with a
 =bus_dma= bounce.  hdaudio0 interrupts 2.4 times a second with nothing
 playing (not investigated).
 
-** SBCL without futexes polls at 10 Hz (not fixed)
+** SBCL without futexes polled at 10 Hz (fixed: lambda-symbolics/sbcl)
 
-SBCL 2.6.5 on NetBSD is built without =:sb-futex=.  There, any thread
-blocked on a mutex, a condition variable or =join-thread= waits in
-=%%wait-for=, which calls =nanosleep= with a backoff that settles at 100 ms.
-Every SBCL program with such a thread wakes about nine times a second.
-Here that is cclsh, in each terminal and in the session parent that runs
-startmh, and it was waytemp.  Application workarounds exist (block in a
-syscall, serve in the main thread).  The real fix is futex support for
-SBCL's NetBSD runtime, through NetBSD's native futex syscall
-(=SYS___futex= 166, =<sys/futex.h>=), followed by rebuilding every SBCL
-image.
+SBCL on NetBSD was built without =:sb-futex=, because src/cold/shared.lisp
+enabled it only for Linux, FreeBSD, OpenBSD and ARM macOS.  Any thread
+blocked on a mutex, a condition variable, a semaphore or =join-thread= then
+waited in =%%wait-for=, which nanosleeps with a backoff that settles at
+100 ms.  Every such thread woke about nine times a second: cclsh in each
+terminal and in the session parent, the cclsh daemon, waytemp.
+
+The fork (master and branch netbsd-futex) adds it for NetBSD:
+
+- =src/runtime/bsd-os.c=: =futex_wait= and =futex_wake= through
+  =syscall(SYS___futex)=, since libc has no wrapper.  NetBSD's futex(2) is
+  Linux-compatible.  Timed waits use =FUTEX_WAIT_BITSET= with an absolute
+  CLOCK_MONOTONIC deadline: SBCL's handlers use =SA_RESTART=, and NetBSD
+  restarts an interrupted =FUTEX_WAIT= with its original relative timeout,
+  so every interrupt pushed a deadline back (measured: a 1 s wait
+  interrupted at 0.3 s ended after 1.32 s; with the deadline, 1.02 s).
+- =src/cold/shared.lisp= and two OS lists in =src/code/target-thread.lisp=
+  (=my-kernel-thread-id=, which reads the thread's =_lwp_self= id).
+
+| Three threads blocked 20 s | Wakeups | Wake after release |
+|----------------------------+---------+--------------------|
+| pkgsrc SBCL 2.6.5          | 546     | 37 to 57 ms        |
+| fork, 2.6.9.4 with futexes | 0       | under 0.3 ms       |
+
+SBCL's thread, deadline and timer tests pass.  Installed as
+=/usr/local/bin/sbcl= (pkgsrc's copy stays for pkgsrc's StumpWM); mag's
+PATH already puts =/usr/local/bin= first.  Rebuilt with it: the cclsh
+image, and cclsh's launcher and daemon point =CCLSH_SBCL= at it, plus
+waytemp, Mahogany and wifi.  Idle, waytemp, a headless Mahogany and the
+cclsh daemon each measured zero wakeups.  Build notes: a shallow clone
+needs a hand-written =version.lisp-expr=; the host must be
+=--xc-host="/usr/pkg/bin/sbcl --no-sysinit --no-userinit"= (with
+=--non-interactive= it quits before reading the build forms);
+=SBCL_PAXCTL="paxctl +m"=, =SBCL_CONTRIB_BLOCKLIST=sb-simd=, and =set -em=
+becomes =set -e= in the make scripts for detached builds.  Check for
+futexes with =/var/tmp/futex-idle-test.sh=, not =*features*=: the feature
+is not listed at run time.
 
 ** Bar on demand
 
@@ -403,7 +430,6 @@ remembered for the supply.
 
 ** Left to do
 
-- SBCL futex support (above): the largest remaining userland wakeup source.
 - iwx beacon filtering (=IWX_REPLY_BEACON_FILTERING_CMD=) would drop about
   10 interrupts a second.  WiFi is the only link, so test it with a
   watchdog.
