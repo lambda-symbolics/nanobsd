@@ -1,0 +1,16 @@
+#!/bin/sh
+# powermeas SECONDS LABEL: average battery discharge rate and RAPL package power.
+export PATH=/sbin:/usr/sbin:/usr/bin:/bin:$PATH
+n=${1:-60}; label=${2:-sample}
+rapl() { sysctl -n machdep.cidle.rapl | sed 's/.*raw=\([0-9]*\).*uj_per_unit=\([0-9]*\).*/\1 \2/'; }
+set -- $(rapl); r0=$1; u=$2; t0=$(date +%s)
+sum=0; k=0; i=0
+while [ $i -lt $n ]; do
+	sleep 5; i=$((i+5))
+	w=$(envstat -d acpibat0 2>/dev/null | awk '/discharge rate/ {print $3}')
+	[ -n "$w" ] && { sum=$(echo "$sum + $w" | bc); k=$((k+1)); }
+done
+set -- $(rapl); r1=$1; t1=$(date +%s)
+pkg=$(echo "scale=3; ($r1 - $r0) * $u / 1000000 / ($t1 - $t0)" | bc)
+bat=$(echo "scale=3; $sum / $k" | bc)
+echo "$label: battery $bat W (avg of $k), package $pkg W over $((t1 - t0)) s"

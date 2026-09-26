@@ -157,9 +157,13 @@
       *bar-background* "#000000"
       *bar-bottom* nil)
 
-;;;; -- Idle: panel off after five minutes without input --
+;;;; -- Idle: dim after two minutes, panel off after five --
+;;; Any input brings the panel back at once; a playing video (idle inhibitor)
+;;; keeps it on. Closing the lid turns the panel off through the lid script.
 
-(setf *idle-blank-seconds* 300)
+(setf *idle-dim-seconds* 120
+      *idle-dim-level* 15
+      *idle-blank-seconds* 300)
 
 ;;;; -- lpsched: tell the power governor which client has focus --
 
@@ -203,11 +207,14 @@ every failure is swallowed."
   ;; waytemp belongs to the session: one left over from a previous session
   ;; stays attached to that dead display, so always start a fresh one.
   (run-shell "pkill -x waytemp; sleep 0.3; waytemp daemon >/dev/null 2>&1 &")
-  (run-shell "/usr/local/bin/brightness restore >/dev/null 2>&1")
+  ;; Never light a panel whose lid is shut (the session can restart then).
+  (run-shell "[ -e /var/run/lid-closed ] || /usr/local/bin/brightness restore >/dev/null 2>&1")
   (run-shell "/usr/local/bin/volume restore >/dev/null 2>&1"))
 
 (bar-start)
 (idle-start)
+(when (and *initializing* (probe-file "/var/run/lid-closed"))
+  (lid-closed))
 
 ;;;; -- Dynamic refresh: the panel drops to 30 Hz when nothing changes --
 

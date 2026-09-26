@@ -1,0 +1,14 @@
+#!/bin/sh
+# fpsmon [SECONDS]: once a second print the pipe A frame rate from the hardware
+# frame counter, the link M value (which encodes the pixel clock) and whether
+# the counter ever restarted (a full modeset disables the pipe).
+B=0x603c000000
+rd() { /var/tmp/memread $(printf "0x%x" $(( B + ($1 & ~0xfff) ))) $(printf "0x%x" $(( $1 & 0xfff ))) | awk '{print $NF}'; }
+n=${1:-20}; prev=$(( $(rd 0x70040) )); i=0
+while [ $i -lt $n ]; do
+	sleep 1; cur=$(( $(rd 0x70040) )); d=$(( cur - prev ))
+	lm=$(rd 0x60040); ln=$(rd 0x60044)
+	state="ok"; [ $d -lt 0 ] && state="COUNTER RESTARTED (modeset)"
+	echo "$(date +%T) $d fps  link M/N $lm/$ln  $state"
+	prev=$cur; i=$((i+1))
+done
