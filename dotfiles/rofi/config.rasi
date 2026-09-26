@@ -1,0 +1,29 @@
+/* rofi in the niri/dmenu look used with StumpWM: one black line across the
+   top, white text, the accent colour for the selection. Installed as
+   ~/.config/rofi/config.rasi. */
+configuration {
+    font: "ProFontExtended 9";
+    show-icons: false;
+    terminal: "alacritty";
+}
+* {
+    background-color: #000000;
+    text-color: #ffffff;
+    border: 0;
+    margin: 0;
+    padding: 0;
+    spacing: 0;
+}
+window {
+    location: north;
+    anchor: north;
+    width: 100%;
+    background-color: #000000;
+}
+mainbox { children: [ inputbar, listview ]; orientation: horizontal; }
+inputbar { children: [ prompt, entry ]; padding: 2px 6px; width: 25%; }
+prompt { padding: 0 6px 0 0; }
+listview { layout: horizontal; lines: 1; columns: 12; spacing: 0; scrollbar: false; fixed-columns: true; }
+element { padding: 2px 8px; }
+element-text { background-color: inherit; text-color: inherit; }
+element selected { background-color: #E46876; text-color: #000000; }

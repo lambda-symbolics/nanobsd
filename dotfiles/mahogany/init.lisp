@@ -54,7 +54,7 @@
 (defcommand terminal ()
   (:documentation "Open a terminal window, reusing the alacritty daemon when it runs.")
   (:method ()
-    (run-shell "alacritty msg --socket /tmp/alacritty.sock create-window 2>/dev/null || alacritty")))
+    (run-shell "alacritty msg --socket /tmp/alacritty-wl.sock create-window 2>/dev/null || alacritty")))
 
 (defcommand terminal-dfly ()
   (:method ()
@@ -65,9 +65,9 @@
     (run-shell "if command -v e >/dev/null 2>&1; then e; else emacsclient -c -a emacs; fi")))
 
 (defcommand launcher ()
-  (:documentation "rofi in the niri wmenu look.")
+  (:documentation "wmenu, the same look as on the Linux niri setup.")
   (:method ()
-    (run-shell "rofi -show run -font 'ProFontExtended 9' -no-show-icons")))
+    (run-shell "wmenu-run -f 'ProFontExtended 9' -n '#ffffff' -N '#000000' -S '#E46876' -s '#000000'")))
 
 (defcommand screenshot ()
   (:method () (run-shell "screenshot area")))
@@ -180,7 +180,9 @@ every failure is swallowed."
           (funcall (intern "SOCKET-CLOSE" :sb-bsd-sockets) sock))))))
 
 (defun lpsched-focus-hook (view)
-  (lpsched-send-fgpid (or (hrt:view-pid view) 0)))
+  (let ((pid (or (hrt:view-pid view) 0)))
+    (log-string :debug "Focus: ~A (pid ~D)" (hrt:view-title view) pid)
+    (lpsched-send-fgpid pid)))
 
 (pushnew 'lpsched-focus-hook tree:*view-focus-hook*)
 
@@ -188,7 +190,9 @@ every failure is swallowed."
 
 (when *initializing*
   (run-shell "pgrep -f statusbard >/dev/null || /usr/local/bin/statusbard &")
-  (run-shell "pgrep -x alacritty >/dev/null || { rm -f /tmp/alacritty.sock; alacritty --daemon --socket /tmp/alacritty.sock & }")
+  ;; A daemon from an earlier session died with its display; start a fresh one
+  ;; on its own socket so the X daemon's socket is never reused.
+  (run-shell "rm -f /tmp/alacritty-wl.sock; alacritty --daemon --socket /tmp/alacritty-wl.sock &")
   (run-shell "pgrep -x swaybg >/dev/null || swaybg -c '#0A0A0A' &")
   (run-shell "pgrep -x wlsunset >/dev/null || wlsunset -t 4000 -T 4001 &")
   (run-shell "/usr/local/bin/brightness restore >/dev/null 2>&1")

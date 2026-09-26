@@ -50,3 +50,6 @@ sysctl -w hw.acpi.sleep.freeze_timeout=0 >/dev/null 2>&1
 # being re-enumerated later; doing it here as well means the console and
 # any non-X login get the right level too.
 [ -x /usr/local/bin/volume ] && HOME=/home/mag /usr/local/bin/volume restore
+
+# XDG runtime directory for the Wayland session (startmh).
+mkdir -p /var/run/user/1000 && chown mag:users /var/run/user/1000 && chmod 700 /var/run/user/1000

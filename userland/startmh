@@ -5,13 +5,13 @@
 # The compositor renders with pixman: the Tiger Lake render engines are wedged
 # under this kernel, so there is no GL to use anyway. Logs go to ~/.mahogany.log.
 
+# /var/run/user/UID is created at boot by /etc/rc.local; fall back to /tmp
+# when it is missing (mag cannot create it).
 uid=$(id -u)
 export XDG_RUNTIME_DIR=/var/run/user/$uid
-if [ ! -d "$XDG_RUNTIME_DIR" ]; then
-	mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || {
-		export XDG_RUNTIME_DIR=/tmp/runtime-$(id -un)
-		mkdir -p "$XDG_RUNTIME_DIR"
-	}
+if [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; then
+	export XDG_RUNTIME_DIR=/tmp/runtime-$(id -un)
+	mkdir -p "$XDG_RUNTIME_DIR"
 fi
 chmod 700 "$XDG_RUNTIME_DIR"
 

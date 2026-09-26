@@ -180,6 +180,33 @@ when =~/.config/mahogany/autostart= exists. =touch= it, log out of X
 Firefox and Emacs are X11 builds and will not start until gtk3 and they are
 rebuilt with Wayland support (or Xwayland is enabled in heart).
 
+** Alacritty and the memfd kernel fix (2026-09-26 evening)
+
+Alacritty renders with OpenGL, which on this box means Mesa's software
+rasterizer over =wl_shm=. It crashed at its first frame: =eglMakeCurrent=
+reported =EGL_BAD_ALLOC= ("failed to allocate color buffer") and the swrast
+path then dereferenced a NULL back buffer inside =dri2_wl_swrast_put_image2=.
+ktrace showed the real failure: Mesa allocates the buffer with
+=memfd_create= + =ftruncate(5489232)= and then =mmap(MAP_SHARED)= fails with
+EINVAL. A test program confirmed it: NetBSD's =memfd_mmap()= compares the
+page-rounded mapping length against the exact file size, so any memfd whose
+size is not a page multiple (every buffer of odd dimensions) is unmappable.
+Linux allows it. Fix: compare against =round_page(mfd->mfd_size)=
+(=kernel/kern/sys_memfd.c=, one condition). Kernel 126 carries it and is the
+default boot entry; it needs a reboot, which was left to the user. After the
+reboot =/var/tmp/memfdtest= must print =ok= for the odd length and alacritty
+must open under Mahogany. Every wl_shm client that uses memfd (Mesa,
+GTK4/GDK, SDL) hits the same bug, so this fix matters beyond alacritty.
+
+Also found: the LLVM JIT in Mesa's llvmpipe gets EACCES on its W+X mmap (PaX
+mprotect), so alacritty falls back to the slower softpipe. If the terminal
+feels slow, =paxctl +m /usr/pkg/bin/alacritty= (from pkgsrc =paxctl= or
+=sysctl security.pax.mprotect.enabled=0=) is the knob to try.
+
+Launcher: wmenu (already built on the box at =/usr/local/bin/wmenu-run=)
+with the same flags as the Linux niri config; rofi 2.0 (Wayland backend)
+stays installed for the colon prompt.
+
 ** Not done
 
 - Screen sharing: needs xdg-desktop-portal-wlr and pipewire, neither of
