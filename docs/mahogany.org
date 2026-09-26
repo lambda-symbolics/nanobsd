@@ -217,6 +217,81 @@ stays installed for the colon prompt.
   =Key pressed:= lines in =~/.mahogany.log= (run with =-l DEBUG=) show what
   arrives.
 
+* Seamless refresh switching (kernel 127, 2026-09-26)
+
+** What the machine supports
+
+- The BIOS video tables (VBT, found through the ACPI OpRegion 2.1 at a
+  relative RVDA offset) enable DRRS, PSR and DMRRS, and mark this panel
+  (panel type 2) as seamless DRRS. =userland/drm/vbtdump.c= and
+  =vbtparse.py= read them.
+- The panel's EDID lists two modes with identical timings, 2160x1350 with
+  htotal 2204 and vtotal 1367, at 180000 kHz (59.744 Hz) and 90400 kHz
+  (30.005 Hz): a textbook DRRS pair (=userland/drm/drmmodes.c=). The link
+  is two lanes at 2.7 GHz with 24 bpp either way.
+
+** Why it never switched
+
+- =intel_dp_compute_config= forced every eDP request back to the panel's
+  fixed (60 Hz) mode, so asking for 30 Hz did nothing at all: no blank, no
+  change. My earlier claim that it would blank was wrong.
+- The fastset path (=intel_crtc_copy_fastset=) copied the old M/N values
+  over the new ones, so even a correct request could not take effect.
+- Idleness DRRS was armed but only reacts to frontbuffer flushes, which a
+  text console and X on wsfb never produce. Under Mahogany, whose commits
+  are page flips, it works: one second after the last flip the pipe drops
+  to 30 Hz, and the next flip restores 60 Hz before it is shown.
+
+** The port (=kernel/external/bsd/drm2/dist/drm/i915/seamless-rr.diff=)
+
+Modelled on Linux 6.x seamless M/N. When userspace picks the downclock mode,
+the link configuration stays as computed for the fixed mode and only the
+pixel clock, and with it the M/N ratio, drops. Between two such states the
+fastset comparison ignores the pixel clock and M/N; the fastset writes the
+new M/N inside vblank evasion, where the double-buffered registers latch at
+the next vblank, and moves the vblank timestamping constants with it.
+Watermarks and cdclk stay sized for the fast mode, so a switch changes
+nothing else. Idleness DRRS restarts from the new state. Gated on the VBT's
+seamless DRRS flag, gen8+, and =hw.drm2.i915_modparams.lispbsd_seamless_rr=
+(1 by default; 0 restores the old behaviour at runtime). The boot log says
+=eDP: seamless refresh switching 60/30 Hz (180000/90400 kHz, VBT DRRS seamless)=.
+
+** Verified
+
+=/var/tmp/fpsmon.sh= (=userland/drm= has the tools) reads the pipe's
+hardware frame counter and link M/N once a second. A full modeset disables
+the pipe and restarts the counter; a seamless switch keeps it running.
+A busy terminal pushed the session up and back:
+
+| second | frames | link M  | state      |
+|--------+--------+---------+------------|
+| idle   |  30-31 | 0x2adb3 | continuous |
+| busy   |     61 | 0x55555 | continuous |
+| idle   |  30-31 | 0x2adb3 | continuous |
+
+No "pipe state doesn't match" warnings in the kernel log. Whether the panel
+itself shows any flicker at the switch still needs eyes on it.
+
+** Mahogany's part
+
+With idleness DRRS doing still screens better than any compositor timer,
+=lisp/refresh.lisp= now leaves the mode alone except for steady ~30 fps
+content (28-31 frames a second for four seconds, no input for two), which
+DRRS cannot see because its frames arrive every 33 ms. It then picks the
+30 Hz mode explicitly, returns to 60 Hz at once on input, and probes at 60
+Hz for two seconds every ten to re-measure, since the measured rate is
+capped at 30. 24 and 25 fps video stays at 60 Hz. =s-R= toggles it.
+
+** Not done: PSR
+
+PSR is off although the VBT enables it (=EDP_PSR_CTL= and =EDP_PSR2_CTL=
+enable bits clear, link fully on). Suspect: the PSR setup-time check against
+this panel's 17-line vertical blank. Check by setting =hw.drm2.__drm_debug=
+to 0x4 around a modeset. PSR would switch the link and scanout off entirely
+on a still screen, which beats 30 Hz, but it also stops the screen updating
+for anything that draws without frontbuffer flushes (the text console, X on
+wsfb), so it needs care.
+
 * Roadmap for the fork (lambda-symbolics/mahogany)
 
 In order of value and dependency.  Items 1-4 give a usable desktop.
