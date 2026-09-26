@@ -53,3 +53,11 @@ sysctl -w hw.acpi.sleep.freeze_timeout=0 >/dev/null 2>&1
 
 # XDG runtime directory for the Wayland session (startmh).
 mkdir -p /var/run/user/1000 && chown mag:users /var/run/user/1000 && chmod 700 /var/run/user/1000
+
+# The lid only reports changes, and the change at boot comes before powerd
+# listens.  With lid suspend off, replay a close when booting with the lid
+# shut, so the backlight goes off and the session starts with the panel off.
+if [ -e /etc/lid-nosuspend ] &&
+    [ "$(sysctl -n hw.acpi.lid_closed 2>/dev/null)" = 1 ]; then
+	/etc/powerd/scripts/lid_switch acpilid0 pressed
+fi

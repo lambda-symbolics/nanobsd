@@ -6,16 +6,36 @@
 # Remove the file to get s2idle suspend on lid close back.
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
 logger -p info -t lid "lid: $*"
+# /var/run/lid-closed exists while the lid is shut; the Wayland session checks
+# it at startup so it does not light a closed panel.
+case "$2" in
+pressed)  touch /var/run/lid-closed ;;
+released) rm -f /var/run/lid-closed ;;
+esac
+# Tell a running Mahogany: panel off while shut, on when opened.
+mahogany() {
+	MAHOGANY_SOCKET=/var/run/user/1000/mahogany.sock \
+	    /usr/local/bin/mahoganyctl "$1" >/dev/null 2>&1
+}
 if [ -e /etc/lid-nosuspend ]; then
 	N15=hw.acpi.acpiout15.brightness N16=hw.acpi.acpiout16.brightness
 	case "$2" in
 	pressed)
 		sysctl -n $N15 > /var/run/lid-brightness 2>/dev/null
 		sysctl -w $N15=0 $N16=0 >/dev/null 2>&1
-		logger -p info -t lid "lid closed: backlight off, not suspending (/etc/lid-nosuspend)" ;;
+		mahogany '(lid-closed)'
+		logger -p info -t lid "lid closed: panel off, not suspending (/etc/lid-nosuspend)" ;;
 	released)
-		b=$(cat /var/run/lid-brightness 2>/dev/null); [ -n "$b" ] || b=50
-		sysctl -w $N15=$b $N16=$b >/dev/null 2>&1 ;;
+		# The level remembered for this supply; the saved raw level
+		# is only a fallback (after a boot with the lid shut it holds
+		# the kernel's default, not the user's choice).
+		if [ -x /usr/local/bin/brightness ]; then
+			/usr/local/bin/brightness restore >/dev/null 2>&1
+		else
+			b=$(cat /var/run/lid-brightness 2>/dev/null); [ -n "$b" ] || b=50
+			sysctl -w $N15=$b $N16=$b >/dev/null 2>&1
+		fi
+		mahogany '(lid-opened)' ;;
 	esac
 	exit 0
 fi
