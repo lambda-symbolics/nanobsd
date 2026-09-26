@@ -191,16 +191,18 @@ every failure is swallowed."
 ;;;; -- Startup --
 
 (when *initializing*
-  ;; The bracket keeps pgrep from matching this very shell, whose command
-  ;; line contains the pattern.
-  (run-shell "pgrep -f 'statusbar[d]' >/dev/null || /usr/local/bin/statusbard &")
+  ;; Anchored at the interpreter so pgrep cannot match this very shell,
+  ;; whose command line names the script too.
+  (run-shell "pgrep -f '^/bin/sh /usr/local/bin/statusbard$' >/dev/null || /usr/local/bin/statusbard &")
   ;; A daemon from an earlier session died with its display; start a fresh one
   ;; on its own socket so the X daemon's socket is never reused.
   (run-shell "rm -f /tmp/alacritty-wl.sock; alacritty --daemon --socket /tmp/alacritty-wl.sock &")
   (run-shell "pgrep -x swaybg >/dev/null || swaybg -c '#0A0A0A' &")
   ;; 4000K through waytemp (luciusmagn/waytemp, netbsd branch); its config
   ;; ~/.config/waytemp/config.lisp holds the temperature.
-  (run-shell "pgrep -x waytemp >/dev/null || waytemp daemon >/dev/null 2>&1 &")
+  ;; waytemp belongs to the session: one left over from a previous session
+  ;; stays attached to that dead display, so always start a fresh one.
+  (run-shell "pkill -x waytemp; sleep 0.3; waytemp daemon >/dev/null 2>&1 &")
   (run-shell "/usr/local/bin/brightness restore >/dev/null 2>&1")
   (run-shell "/usr/local/bin/volume restore >/dev/null 2>&1"))
 
@@ -209,5 +211,6 @@ every failure is swallowed."
 
 ;;;; -- Dynamic refresh: the panel drops to 30 Hz when nothing changes --
 
-(setf *refresh-idle-seconds* 3)
+;; The kernel's seamless DRRS already drops a still screen to 30 Hz after
+;; a second; this only picks 30 Hz for steady ~30 fps content like video.
 (refresh-start)
