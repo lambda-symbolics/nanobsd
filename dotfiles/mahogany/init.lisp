@@ -194,7 +194,9 @@ every failure is swallowed."
   ;; on its own socket so the X daemon's socket is never reused.
   (run-shell "rm -f /tmp/alacritty-wl.sock; alacritty --daemon --socket /tmp/alacritty-wl.sock &")
   (run-shell "pgrep -x swaybg >/dev/null || swaybg -c '#0A0A0A' &")
-  (run-shell "pgrep -x wlsunset >/dev/null || wlsunset -t 4000 -T 4001 &")
+  ;; 4000K through waytemp (luciusmagn/waytemp, netbsd branch); its config
+  ;; ~/.config/waytemp/config.lisp holds the temperature.
+  (run-shell "pgrep -x waytemp >/dev/null || waytemp daemon >/dev/null 2>&1 &")
   (run-shell "/usr/local/bin/brightness restore >/dev/null 2>&1")
   (run-shell "/usr/local/bin/volume restore >/dev/null 2>&1"))
 
