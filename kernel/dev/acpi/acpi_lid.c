@@ -45,6 +45,7 @@ __KERNEL_RCSID(0, "$NetBSD: acpi_lid.c,v 1.45 2021/01/29 15:49:55 thorpej Exp $"
 #include <sys/param.h>
 #include <sys/device.h>
 #include <sys/module.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 
 #include <dev/acpi/acpireg.h>
@@ -59,6 +60,7 @@ struct acpilid_softc {
 	struct acpi_devnode	*sc_node;
 	struct sysmon_pswitch	 sc_smpsw;
 	uint64_t		 sc_status;
+	struct sysctllog	*sc_log;
 };
 
 static const struct device_compatible_entry compat_data[] = {
@@ -71,6 +73,7 @@ static void	acpilid_attach(device_t, device_t, void *);
 static int	acpilid_detach(device_t, int);
 static void	acpilid_status_changed(void *);
 static void	acpilid_notify_handler(ACPI_HANDLE, uint32_t, void *);
+static int	acpilid_sysctl_closed(SYSCTLFN_PROTO);
 
 CFATTACH_DECL_NEW(acpilid, sizeof(struct acpilid_softc),
     acpilid_match, acpilid_attach, acpilid_detach, NULL);
@@ -110,6 +113,37 @@ acpilid_attach(device_t parent, device_t self, void *aux)
 	(void)pmf_device_register(self, NULL, NULL);
 	(void)sysmon_pswitch_register(&sc->sc_smpsw);
 	(void)acpi_register_notify(sc->sc_node, acpilid_notify_handler);
+
+	/*
+	 * LISPBSD: hw.acpi.lid_closed.  The lid only notifies on changes,
+	 * and nobody listens yet when the machine boots with it shut, so
+	 * userland needs a way to ask.
+	 */
+	const struct sysctlnode *rnode;
+	if (sysctl_createv(&sc->sc_log, 0, NULL, &rnode,
+	    CTLFLAG_PERMANENT, CTLTYPE_NODE, "acpi", NULL, NULL, 0, NULL, 0,
+	    CTL_HW, CTL_CREATE, CTL_EOL) == 0)
+		(void)sysctl_createv(&sc->sc_log, 0, &rnode, NULL,
+		    CTLFLAG_READONLY, CTLTYPE_INT, "lid_closed",
+		    SYSCTL_DESCR("1 while the lid is closed (evaluates _LID)"),
+		    acpilid_sysctl_closed, 0, (void *)sc, 0,
+		    CTL_CREATE, CTL_EOL);
+}
+
+static int
+acpilid_sysctl_closed(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	struct acpilid_softc *sc = rnode->sysctl_data;
+	ACPI_INTEGER status;
+	int closed;
+
+	if (ACPI_FAILURE(acpi_eval_integer(sc->sc_node->ad_handle, "_LID",
+	    &status)))
+		return EIO;
+	closed = (status == 0);
+	node.sysctl_data = &closed;
+	return sysctl_lookup(SYSCTLFN_CALL(&node));
 }
 
 static int
@@ -117,6 +151,7 @@ acpilid_detach(device_t self, int flags)
 {
 	struct acpilid_softc *sc = device_private(self);
 
+	sysctl_teardown(&sc->sc_log);
 	pmf_device_deregister(self);
 	acpi_deregister_notify(sc->sc_node);
 	sysmon_pswitch_unregister(&sc->sc_smpsw);

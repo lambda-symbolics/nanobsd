@@ -1,0 +1,26 @@
+#!/bin/sh
+# rc6test: measure package residency and power with the GT's RC6 off, then
+# arm automatic RC6 (the value intel_rc6_unpark writes) and measure again.
+export PATH=/sbin:/usr/sbin:/usr/bin:/bin:/usr/pkg/bin
+m(){ /var/tmp/memread $1 0 | awk '{print $NF}'; }
+res(){ sysctl -n machdep.cidle.residency; }
+pcdelta(){
+	a=$(res); r0=$(m 0x603c138108); sleep 10; b=$(res); r1=$(m 0x603c138108)
+	echo "$a" > /tmp/rc6t.a; echo "$b" > /tmp/rc6t.b
+	awk 'NR==FNR{for(i=1;i<=NF;i++){split($i,x,"="); o[x[1]]=x[2]}; next}
+	     {for(i=1;i<=NF;i++){split($i,x,"="); n[x[1]]=x[2]}}
+	     END{dt=n["tsc"]-o["tsc"]; s=""; split("c7 pc2 pc3 pc6 pc7 pc8 pc9 pc10",k," ");
+	         for(j=1;j<=8;j++) s=s sprintf("%s %.1f%%  ", k[j], 100*(n[k[j]]-o[k[j]])/dt); print s}' /tmp/rc6t.a /tmp/rc6t.b
+	echo "rc6 residency $r0 -> $r1 (1.28 us units)"
+}
+{
+	echo "== $(date '+%H:%M:%S') baseline RC_CONTROL=$(m 0x603c00a090) GT_CORE_STATUS=$(m 0x603c138060)"
+	pcdelta
+	/var/tmp/powermeas.sh 60 "rc6 off, lid closed, pipe off"
+	/var/tmp/memrw 0x603c00a090 0 0x88040000
+	sleep 1
+	echo "== $(date '+%H:%M:%S') armed: GT_CORE_STATUS=$(m 0x603c138060)"
+	pcdelta
+	/var/tmp/powermeas.sh 60 "rc6 auto, lid closed, pipe off"
+	echo "== $(date '+%H:%M:%S') done GT_CORE_STATUS=$(m 0x603c138060)"
+} >> /var/tmp/rc6test.log 2>&1

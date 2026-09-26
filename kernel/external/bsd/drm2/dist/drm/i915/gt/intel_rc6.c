@@ -618,8 +618,18 @@ void intel_rc6_park(struct intel_rc6 *rc6)
 		return;
 	}
 
-	if (!rc6->manual)
+	if (!rc6->manual) {
+		/*
+		 * LISPBSD: automatic RC6 is armed only by intel_rc6_unpark, but
+		 * intel_gt_resume (via intel_rc6_sanitize) clears GEN6_RC_CONTROL
+		 * and nothing unparks the GT again while no client submits GPU
+		 * work (a Wayland compositor with the pixman renderer), so RC6
+		 * stayed off and the package never left PC0.  Arm the hardware
+		 * timers on every park as well.
+		 */
+		intel_uncore_write(uncore, GEN6_RC_CONTROL, rc6->ctl_enable);
 		return;
+	}
 
 	/* Turn off the HW timers and go directly to rc6 */
 	set(uncore, GEN6_RC_CONTROL, GEN6_RC_CTL_RC6_ENABLE);
