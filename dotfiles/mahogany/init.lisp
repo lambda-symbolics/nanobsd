@@ -141,6 +141,7 @@
  "s-O"              #'monitors-off
  "s-semicolon"      #'colon
  "s-b"              #'bar-toggle
+ "s-R"              #'refresh-toggle
  "XF86AudioRaiseVolume"  #'volume-up
  "XF86AudioLowerVolume"  #'volume-down
  "XF86AudioMute"         #'volume-mute
@@ -202,3 +203,8 @@ every failure is swallowed."
 
 (bar-start)
 (idle-start)
+
+;;;; -- Dynamic refresh: the panel drops to 30 Hz when nothing changes --
+
+(setf *refresh-idle-seconds* 3)
+(refresh-start)
