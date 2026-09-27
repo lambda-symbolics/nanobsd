@@ -70,14 +70,125 @@ coalescing (measured null, =lpsched-design.org=), SLP_S0 (firmware wall,
 =rpm-s0ix-findings.org=), NVMe APST and ASPM L1.2 (already on), hardware video
 decode (no Gen12 VA-API driver in pkgsrc).
 
+* Results (2026-09-27, kernel 130)
+
+** 1. Mahogany on the GPU: done
+heart creates =wl_drm= (lambda-symbolics/mahogany 5eb005a), =startmh=
+defaults to =WLR_RENDERER=gles2= and retries with pixman if the compositor
+dies within 15 s of starting, and sets =MOZ_DISABLE_WAYLAND_PROXY=1=:
+Firefox 153's own Wayland proxy loses its socket at exit under the GLES2
+compositor and GDK aborts the parent (pixman, or the proxy off, exit cleanly).
+Package power (RAPL), panel at brightness 15:
+
+| workload                       | pixman                 | GLES2                |
+|--------------------------------+------------------------+----------------------|
+| idle, panel on                 | 2.77 W                 | 2.55 W               |
+| alacritty, ~100 lines/s        | 4.78 W, alacritty 215% | 2.37 W, alacritty 10% |
+| Firefox, CSS animation         | 12.19 W                | 4.75 W, Firefox 30%  |
+
+The scanout buffer is now Y-tiled with render compression (=PLANE_CTL= A
+=0x8400b000=), which the display reads compressed.
+
+** 2. Firefox at idle: the guess was wrong
+With Firefox killed the package stayed at 2.0 W with the same ~50 % PC3.
+Firefox was most of the wakeups but not the cost; see 8.
+
+** 3. Lid suspend: back on, with Wi-Fi kept up
+=/etc/lid-nosuspend= is gone (a copy sits in =/var/tmp=), so closing the
+lid runs =s0ix suspend= again.  The freeze had only ever been tested under X;
+under Mahogany a timed freeze (=hw.acpi.sleep.freeze_timeout=) with the panel
+lit came back with the same compositor process, the pipe scanning out, and a
+new GPU-rendered terminal window.  =wsdisplay_handlex()= has nothing to hand
+off without an X-style VT process, so the freeze starts straight away.
+=hw.acpi.sleep.freeze_keep_net=1= (kernel 130, now in sysctl.conf) leaves
+iwx running through the freeze: resume needs no rescan, and see 9.
+
+** 4. iwx beacon filtering: done
+=hw.iwx.beacon_filter= (kernel 130) sends the firmware's beacon filter
+command at association and when set at runtime (no reassociation).  iwx
+interrupts went from 16.3/s to 1.1/s with the link up.  Beacon abort in power
+save now works too, since it depended on the filter being on.
+
+** 5. TLB IPIs to lazy CPUs: done
+=machdep.tlb_lazyskip= (kernel 130): the initiator CASes a lazy target from
+=TLBSTATE_LAZY= to the new =TLBSTATE_FLUSH= instead of interrupting it;
+=pmap_reactivate= claims its state with a CAS and flushes if it was marked;
+switching to another pmap reloads =%cr3= anyway (no PCID without SVS).
+Packets that free page-table pages or touch kernel VAs still go to every
+target, as in Linux.  =userland/tlbtest.c= remaps a page between two memfd
+pages (or revokes it) while the reader's CPU idles lazily, and checks what
+the reader sees: 700 000 checks, 0 stale, with 1.75 million lazy CPUs skipped
+in 4 s; the same with a spin that guarantees the reader's CPU is idle.  A
+30-minute soak (189 runs, about 26 million checks) found 0 stale reads.
+Idle with nothing running (panel blanked, on AC), interleaved off/on/off/on:
+shootdown rounds 2.0/s -> 1.6/s with about 6 lazy CPUs skipped per second,
+package 0.23 -> 0.19 W, which is inside the noise.  The saving scales with
+multithreaded programs: with Firefox open before the reboot, shootdowns ran at
+28-55 rounds a second.
+
+** 6. Framebuffer compression: not done, superseded
+The GPU session scans out a render-compressed surface, and FBC and render
+compression exclude each other, so FBC would only help the pixman fallback.
+For the record, NetBSD never registers stolen memory on Gen11+:
+=intel_gtt_get()= fills =intel_graphics_stolen_res= only via =agp_i810=,
+which does not attach on Tiger Lake, so =HAS_FBC= is cleared at init.
+
+** 7. Small ones: done
+=hw.drm2.i915_modparams.mmio_debug=0= in sysctl.conf.  ntpd is off; the
+dhcpcd exit hook runs ntpdate when a lease is bound and root's crontab runs it
+hourly.  hdafg rewrites the pin controls only when jack presence changes, and
+every 10 s as before otherwise, instead of every second.
+
+** 8. The sticky PC3 state (new)
+After the reboot into kernel 130 the blanked, idle package sits at 94-96 %
+PC10 and 0.19-0.23 W, with =hw.acpi.sleep.idle_d3= off or on alike (it only
+changes Thunderbolt DMA 1, the other driverless IPs already report D3).  The
+boot before had been at ~50 % PC3 and 1.4-2.0 W for hours, and killing Firefox
+did not change it: some event puts the platform into PC3 until the next
+reboot, like the repeat-cycle regression in =rpm-s0ix-findings.org= (U42).
+Or the power source does: the PC3 boot ran on battery, and the charger was
+connected at the kernel 130 boot, so the two measurements differ in that too.
+=/var/tmp/pclog.sh= samples residency every 5 minutes with the lid, USB,
+panel and process state to catch the trigger.
+
+** 9. SLP_S0 is reachable (new)
+Every timed freeze with Wi-Fi kept up reached S0ix, which no earlier
+experiment had (=rpm-s0ix-findings.org= concluded it was firmware-walled):
+
+| 120 s hold, Wi-Fi up          | PC10 | SLP_S0 residency | package |
+|-------------------------------+------+------------------+---------|
+| beacon filter on, idle_d3 on  | 96 % | 110 s            | 0.19 W  |
+| beacon filter off, idle_d3 on | 96 % | 109 s            | 0.22 W  |
+| beacon filter on, idle_d3 off | 97 % | 112 s            | 0.17 W  |
+
+(LPIT counter at 8197 Hz, from the kernel's =s2idle: slp_s0 delta= line.)
+The earlier attempts either suspended iwx for the hold, or ran while the
+package was in the PC3 state of 8.  Leaving the CNVi to its firmware power
+save appears to be what the PMC wanted.
+
+*Caveat:* the charger was connected for the whole kernel 130 session (AC
+from 13:35), both for 8 and for these holds.  The whole-machine power in
+S0ix and whether the battery case behaves the same still need a run on
+battery: close the lid unplugged for a few minutes and look for =slp_s0
+delta= in =/var/log/messages=, and the discharge rate before and after.
+
 * Status
 
-| lever | state   |
-|-------+---------|
-| 1     | planned |
-| 2     | planned |
-| 3     | planned |
-| 4     | planned |
-| 5     | planned |
-| 6     | planned |
-| 7     | planned |
+| lever                         | state                                              |
+|-------------------------------+----------------------------------------------------|
+| 1 Mahogany on the GPU         | done, measured                                     |
+| 2 Firefox at idle             | refuted, see 8                                     |
+| 3 lid suspend                 | done; Wi-Fi kept up in s2idle                      |
+| 4 iwx beacon filtering        | done, on at boot                                   |
+| 5 lazy TLB IPIs               | done, on at boot; tlbtest + 30 min soak clean      |
+| 6 FBC                         | not done: render compression covers it             |
+| 7 small ones                  | done                                               |
+| 8 sticky PC3 state            | open: logger running, trigger unknown, AC confound |
+| 9 SLP_S0                      | reached with Wi-Fi up; needs a battery run         |
+
+=userland/s0ix= logs the whole-machine power of every suspension of 2 minutes
+or more on battery (=s0ix: resumed after N s on battery: X -> Y Wh, Z W= in
+=/var/log/messages=), for the battery half of 8 and 9.
+
+Root's crontab runs =ntpdate -s -u pool.ntp.org= at minute 41 (not tracked
+here, it lives in =/var/cron/tabs/root=).

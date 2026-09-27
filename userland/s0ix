@@ -11,6 +11,8 @@ restore_tickless()
 	0|1) sysctl -w machdep.cidle.tickless="$TICKLESS" >/dev/null ;;
 	esac
 }
+charge() { envstat -d acpibat0 2>/dev/null | awk '/charge:/ {print $2; exit}'; }
+onac() { envstat -d acpiacad0 2>/dev/null | awk '/connected/ {print $2}'; }
 restore_brightness()
 {
 	b=$(cat "$BR" 2>/dev/null)
@@ -28,13 +30,20 @@ suspend)
 	sysctl -n hw.acpi.acpiout15.brightness > "$BR" || exit 1
 	sysctl -w hw.acpi.acpiout15.brightness=0 >/dev/null 2>&1
 	sysctl -w hw.acpi.acpiout16.brightness=0 >/dev/null 2>&1
+	# Whole-machine power over the suspension, from the battery gauge.
+	c0=$(charge); a0=$(onac); t0=$(date +%s)
 	if ! sysctl -w hw.acpi.sleep.freeze=1 >/dev/null; then
 		restore_brightness
 		exit 1
 	fi
 	while [ "$(sysctl -n hw.acpi.sleep.freeze)" = 1 ]; do sleep 1; done
 	restore_brightness
-	logger -t s0ix "resumed"
+	c1=$(charge); t1=$(date +%s)
+	if [ "$a0" = FALSE ] && [ "$(onac)" = FALSE ] && [ -n "$c0" ] && [ -n "$c1" ] && [ $((t1 - t0)) -ge 120 ]; then
+		logger -t s0ix "resumed after $((t1 - t0)) s on battery: $c0 -> $c1 Wh, $(echo "scale=2; ($c0 - $c1) * 3600 / ($t1 - $t0)" | bc) W"
+	else
+		logger -t s0ix "resumed after $((t1 - t0)) s"
+	fi
 	;;
 resume)
 	restore_brightness
