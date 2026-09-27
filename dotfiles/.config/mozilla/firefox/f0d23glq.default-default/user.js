@@ -1,8 +1,8 @@
 user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
 
 // --- power-saving knobs (added 2026-09-19) ---
-// Rendering / GPU repaint rate (targets the i915 msi5 interrupt storm)
-user_pref("layout.frame_rate", 30);
+// Frame rate follows the display again (-1); capped at 30 until 2026-09-27
+user_pref("layout.frame_rate", -1);
 user_pref("image.animation_mode", "once");
 user_pref("toolkit.cosmeticAnimations.enabled", false);
 // Background-tab timer throttling (fewer CPU wakeups)

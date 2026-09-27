@@ -98,6 +98,12 @@ Package power (RAPL), panel at brightness 15:
 The scanout buffer is now Y-tiled with render compression (=PLANE_CTL= A
 =0x8400b000=), which the display reads compressed.
 
+The benchmark profile has no frame-rate cap, so Firefox ran at 60 fps for
+those numbers.  The live profile's =user.js= capped it at 30 since 9/19 (to
+halve i915 repaint interrupts under X); the cap is gone, so animated pages
+run at the display's rate and keep the panel at 60 Hz, where a steady 30 fps
+could let =refresh.lisp= drop it to 30 Hz.
+
 ** 2. Firefox at idle: the guess was wrong
 With Firefox killed the package stayed at 2.0 W with the same ~50 % PC3.
 Firefox was most of the wakeups but not the cost; see 8.
