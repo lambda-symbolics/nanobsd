@@ -70,6 +70,7 @@ __KERNEL_RCSID(0, "$NetBSD: acpi_display.c,v 1.25 2024/08/18 00:43:07 riastradh 
 
 #include <sys/param.h>
 #include <sys/device.h>
+#include <sys/evcnt.h>
 #include <sys/kmem.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
@@ -301,6 +302,14 @@ struct acpidisp_out_softc {
 	kmutex_t		*sc_mtx;	/* Mutex (shared w/ adapter) */
 	uint16_t		 sc_caps;	/* Capabilities (methods) */
 	struct acpidisp_brctl	*sc_brctl;	/* Brightness control */
+	/*
+	 * LISPBSD: whether the firmware's brightness notifications (the
+	 * hotkeys) step the level here.  0 leaves the level to userland,
+	 * which gets the ThinkPad keys as PSWITCH events anyway; with both
+	 * acting, one key press moved the level twice.  Counted either way.
+	 */
+	int			 sc_hotkeys;
+	struct evcnt		 sc_ev_notify;
 };
 
 /*
@@ -705,6 +714,9 @@ acpidisp_out_attach(device_t parent, device_t self, void *aux)
 	osc->sc_mtx = aa->aa_mtx;
 	osc->sc_caps = acpidisp_out_capabilities(ad);
 	osc->sc_brctl = NULL;
+	osc->sc_hotkeys = 1;
+	evcnt_attach_dynamic(&osc->sc_ev_notify, EVCNT_TYPE_MISC, NULL,
+	    device_xname(self), "brightness notify");
 
 	acpidisp_out_print_capabilities(self, osc->sc_caps);
 
@@ -756,6 +768,7 @@ acpidisp_out_detach(device_t self, int flags)
 		sysctl_teardown(&osc->sc_log);
 
 	acpi_deregister_notify(osc->sc_node);
+	evcnt_detach(&osc->sc_ev_notify);
 
 	if (bc != NULL) {
 		kmem_free(bc->bc_level,
@@ -974,6 +987,9 @@ acpidisp_out_notify_handler(ACPI_HANDLE handle, uint32_t notify,
 	}
 
 	KASSERT(callback != NULL);
+	osc->sc_ev_notify.ev_count++;
+	if (!osc->sc_hotkeys)
+		return;
 	(void)AcpiOsExecute(OSL_NOTIFY_HANDLER, callback, osc);
 }
 
@@ -1270,6 +1286,12 @@ acpidisp_out_sysctl_setup(struct acpidisp_out_softc *osc)
 		    CTLFLAG_READWRITE, CTLTYPE_INT, "brightness",
 		    SYSCTL_DESCR("Current brightness level"),
 		    acpidisp_out_sysctl_brightness, 0, (void *)osc, 0,
+		    CTL_CREATE, CTL_EOL);
+		(void)sysctl_createv(&osc->sc_log, 0, &rnode, NULL,
+		    CTLFLAG_READWRITE, CTLTYPE_INT, "hotkeys",
+		    SYSCTL_DESCR("Step the brightness on the firmware's "
+			"hotkey notifications (0: leave it to userland)"),
+		    NULL, 0, &osc->sc_hotkeys, 0,
 		    CTL_CREATE, CTL_EOL);
 	}
 

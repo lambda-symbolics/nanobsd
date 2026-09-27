@@ -7199,6 +7199,14 @@ static void intel_edp_drrs_downclock_work(struct work_struct *work)
 	if (dev_priv->drrs.busy_frontbuffer_bits)
 		goto unlock;
 
+	/*
+	 * LISPBSD: idleness DRRS can be turned off at runtime, to tell its
+	 * refresh switches apart from anything else the panel shows.  The
+	 * next frontbuffer flush brings the high rate back as usual.
+	 */
+	if (!i915_modparams.lispbsd_idle_drrs)
+		goto unlock;
+
 	if (dev_priv->drrs.refresh_rate_type != DRRS_LOW_RR) {
 		struct drm_crtc *crtc = dp_to_dig_port(intel_dp)->base.base.crtc;
 
