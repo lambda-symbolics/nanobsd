@@ -21,9 +21,15 @@ if [ -e /etc/lid-nosuspend ]; then
 	N15=hw.acpi.acpiout15.brightness N16=hw.acpi.acpiout16.brightness
 	case "$2" in
 	pressed)
-		sysctl -n $N15 > /var/run/lid-brightness 2>/dev/null
-		sysctl -w $N15=0 $N16=0 >/dev/null 2>&1
-		mahogany '(lid-closed)'
+		if [ -S /var/run/user/1000/mahogany.sock ]; then
+			# Mahogany turns the output off, which turns the backlight
+			# off and keeps its level.  Zeroing the level too would make
+			# i915 light the panel at full brightness when it reopens.
+			mahogany '(lid-closed)'
+		else
+			sysctl -n $N15 > /var/run/lid-brightness 2>/dev/null
+			sysctl -w $N15=0 $N16=0 >/dev/null 2>&1
+		fi
 		logger -p info -t lid "lid closed: panel off, not suspending (/etc/lid-nosuspend)" ;;
 	released)
 		# The level remembered for this supply; the saved raw level

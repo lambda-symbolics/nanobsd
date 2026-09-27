@@ -1,2 +1,10 @@
 #!/bin/sh
-exec /usr/local/bin/brightness -10
+# invoked by /etc/powerd/scripts/hotkey_button on the ThinkPad brightness-down key
+# brightness-probe holds the key off to see what the kernel and firmware do alone.
+[ -e /var/run/brightness.hold ] && exit 0
+/usr/local/bin/brightness -10 >/dev/null
+# The key arrives through ACPI, not wskbd, so the session's idle timer never
+# saw it: tell Mahogany, which undims and counts its deadlines from now.
+MAHOGANY_SOCKET=/var/run/user/1000/mahogany.sock \
+    /usr/local/bin/mahoganyctl '(idle-poke)' >/dev/null 2>&1
+exit 0
