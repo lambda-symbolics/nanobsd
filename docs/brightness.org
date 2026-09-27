@@ -1,0 +1,129 @@
+#+TITLE: Brightness: who sets it, what went wrong, what changed
+#+DATE: 2026-09-27
+
+Reported: random brightness changes, flashes, and the panel at a different
+brightness than chosen.  Everything here comes from reading the scripts, the
+Mahogany idle code and the kernel sources; the laptop was off, so nothing is
+installed or measured yet (see the test plan at the end).  Branch =brightness=
+here and in lambda-symbolics/mahogany.
+
+* Who writes the backlight level
+
+The intended owner is =userland/brightness=.  It writes
+=hw.acpi.acpiout15.brightness= and =acpiout16=, which evaluate the panel's
+=_BCM=; the firmware passes the level to i915 through the opregion (ASLE),
+and i915 sets the PWM.  AC and battery levels are remembered separately in
+=/home/mag/.brightness.{ac,bat}=.  Its callers: the powerd brightness keys
+(+10/-10), =acadapter= (restore for the new supply), =lid_switch=, =s0ix=
+(save before the freeze, restore after), Mahogany's idle timer (dim after two
+minutes, restore on input) and the session start.
+
+Other writers the scripts did not account for:
+
+- *i915 itself*, whenever it turns the backlight on (a panel power-on after a
+  modeset, resume, an output enabled again).  It uses its cached level, and a
+  cached level at or below the panel minimum becomes the maximum
+  (=__intel_panel_enable_backlight=, intel_panel.c).
+- *The firmware's LPS0 display-off =_DSM=* (s2idle entry) drops its level to
+  the minimum, and display-on does not put it back (seen on 9/19: both outputs
+  read 1 after a resume).
+- *thinkpad(4)*: on every brightness key it asks the BIOS to step the level
+  through the CMOS interface (=\UCMS=), then sends the PSWITCH event that runs
+  the powerd action.  Under genfb that BIOS step was a no-op (9/16); with
+  i915's opregion it can land now.  Unverified.
+- *acpiout*: if the firmware sends the video output 0x86/0x87 notifications,
+  acpidisp steps the level by 5 on its own.  Unverified.
+
+* What was wrong
+
+1. *A full-brightness flash at every resume.*  =s0ix suspend= set both levels
+   to 0 before freezing.  i915 cached that as its minimum, and on resume it lit
+   the panel at full brightness until =s0ix= restored the level after
+   userspace thawed.  Zeroing was never needed with i915: the freeze suspends
+   i915drmkms, which turns the panel off.  Fixed: =s0ix= remembers the level
+   (the firmware's display-off call still lowers it) but no longer zeroes it.
+2. *Steps from a dimmed panel became the preference.*  After two idle minutes
+   the panel dims to 15.  The brightness keys arrive through ACPI, not wskbd,
+   so they did not count as input and did not undim; one press gave 15 + 10 =
+   25 and saved 25 as the level for the supply.  The next undim, AC change or
+   lid open then brought back a panel darker than chosen.  Fixed: steps start
+   from the remembered level, never from what the panel shows, and the keys
+   call Mahogany's new =idle-poke=, which undims and restarts the idle deadlines.
+3. *Back from blanking at the dim level.*  Dim at 2 min, blank at 5, then
+   input: the restore was spawned before the output came back on, and could
+   run while i915 was asleep.  The panel then came on at 15 and jumped, or
+   stayed dim.  Fixed: blanking puts the remembered level back while the panel
+   is off (i915 keeps it for the power-on), and unblanking asserts it once more
+   with the panel on.
+4. *Possibly two or three owners per key press* (the BIOS step and the acpiout
+   step next to the powerd action).  Kernel 131 adds switches and counters
+   for both; =brightness-probe= tells which ones act.
+5. The lid-nosuspend path zeroed the level as well, with the same flash as 1
+   when Mahogany turned the output back on.  It now leaves the backlight to
+   Mahogany when Mahogany runs (X still needs the zero).
+
+Working as designed, but easy to mistake for randomness: plugging in or
+unplugging changes the brightness (separate AC and battery levels), and the
+panel dims after two minutes without keyboard or pointer input.
+
+* The 30 Hz mode
+
+No brightness setting is tied to the refresh rate.  A seamless switch changes
+only the link M/N; the backlight PWM and i915's level are not touched.  But
+since the Mahogany switch (9/26) the kernel's idleness DRRS drops the panel to
+30 Hz one second after the last frame and returns to 60 Hz on the next, so in
+normal use it switches many times a minute.  That can show in two ways:
+
+- the panel's own luminance can differ at 30 Hz (an LCD holds each frame
+  twice as long), which would look like the brightness changing a second
+  after the screen goes still;
+- a glitch at the switch: idleness DRRS rewrites the four M/N registers from
+  a work item without vblank evasion (Mahogany's explicit switch does evade),
+  so a switch that straddles the start of vblank can show one bad frame.
+
+Kernel 131 adds =hw.drm2.i915_modparams.lispbsd_idle_drrs= (default 1) to turn
+idleness DRRS off at runtime; =s-R= turns off Mahogany's 30 fps matching.  If
+the flashes stop with both off, it is the switching.  Then either keep idleness
+DRRS off, or do its M/N write under vblank evasion and look again.  The power
+the 30 Hz drop saves has not been measured on its own; measure it in the same
+A/B.
+
+* Changes (branch =brightness=)
+
+- =userland/brightness=: the remembered level is the truth.  New =dim N= and
+  =undim= for the idle timer (dim marks the panel dimmed in
+  =/var/run/user/1000/brightness.dimmed= and leaves the remembered level
+  alone); a restore while dimmed leaves the panel dimmed; one =sysctl= call
+  for both outputs; a lock, since powerd and the compositor can run it at once.
+- =userland/s0ix=: no zeroing before the freeze.
+- =etc/powerd/actions/brightness-{up,down}=: poke Mahogany; skip while
+  =/var/run/brightness.hold= exists (for the probe).
+- =etc/powerd/scripts/lid_switch=: no zeroing when Mahogany runs.
+- Mahogany =lisp/idle.lisp=: dim, undim and restore through the script; undim
+  while blanked, restore after unblanking; =idle-poke=.
+- Kernel 131 (prepared, not built): =hw.acpi.acpiout{15,16}.hotkeys= (0: the
+  firmware's brightness notifications no longer step the level) with a
+  "brightness notify" event counter per output; =hw.acpi.thinkpad0.bios_brightness=
+  (0: no BIOS step on the keys) with a "brightness hotkey" counter;
+  =lispbsd_idle_drrs=.  All default to the old behaviour.  =acpi_display.c= and
+  =thinkpad_acpi.c= are the 11.0 release files; diff them against the laptop's
+  =/usr/src/sys= before installing.
+- =userland/brightness-probe=: samples both levels every 50 ms while you press
+  a key, with the powerd actions held off (or running, with =-a=), and prints
+  the kernel counters.
+
+* Test plan
+
+1. Install kernel 131, the scripts and Mahogany's =idle.lisp= (hot-load with
+   =mahoganyctl '(load ...)'=).
+2. =brightness-probe=, press up twice.  Any change means a kernel or firmware
+   owner: a "brightness notify" count means acpiout, so set
+   =hw.acpi.acpiout15.hotkeys=0= and =acpiout16=; a change with only the
+   thinkpad0 count means the BIOS step, so set =hw.acpi.thinkpad0.bios_brightness=0=.
+   Put what was needed in =etc/sysctl.conf=.
+3. =brightness-probe -a=: one press must give exactly one change of 10.
+4. Lid shut and open on battery: no flash when it opens.
+5. Wait 2 minutes (dim), press brightness up: the remembered level + 10, not
+   25.  Wait 5 minutes (blank), touch a key: the panel comes back at the
+   remembered level without a step.
+6. The 30 Hz A/B above, if flashes remain.

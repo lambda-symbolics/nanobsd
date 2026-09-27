@@ -1,0 +1,38 @@
+#!/bin/sh
+# brightness-probe [-a] [SECONDS]: what moves the backlight when a
+# brightness key is pressed.  Run as root, press the key once or twice
+# while it samples (8 s by default).
+#
+# By default powerd's brightness actions are held off, so any change comes
+# from the kernel (acpiout on the firmware's notifications, thinkpad(4)'s
+# BIOS step) or from the firmware itself.  With -a the actions run too, to
+# see the whole sequence a key press causes.  Prints every change of the
+# two ACPI outputs' levels, then the kernel's per-device counters (kernel
+# 131: "brightness notify" per acpiout, "brightness hotkey" on thinkpad0).
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin; export PATH
+hold=1
+[ "$1" = -a ] && { hold=0; shift; }
+secs=${1:-8}
+counters() { vmstat -e 2>/dev/null | grep -e 'brightness notify' -e 'brightness hotkey'; }
+if [ $hold = 1 ]; then
+	touch /var/run/brightness.hold
+	trap 'rm -f /var/run/brightness.hold' EXIT INT TERM
+fi
+before=$(counters)
+echo "powerd actions $([ $hold = 1 ] && echo held off || echo running);" \
+    "sampling $secs s: press a brightness key now"
+start=$(date +%s) last=
+while [ $(($(date +%s) - start)) -lt "$secs" ]; do
+	v="$(sysctl -n hw.acpi.acpiout15.brightness) $(sysctl -n hw.acpi.acpiout16.brightness)"
+	if [ "$v" != "$last" ]; then
+		echo "$(date +%T) acpiout15/16: $v"
+		last=$v
+	fi
+	sleep 0.05
+done
+echo "counters before:"; echo "$before"
+echo "counters after:"; counters
+for s in hw.acpi.thinkpad0.bios_brightness hw.acpi.acpiout15.hotkeys \
+    hw.acpi.acpiout16.hotkeys hw.drm2.i915_modparams.lispbsd_idle_drrs; do
+	sysctl "$s" 2>/dev/null
+done
