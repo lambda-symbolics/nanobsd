@@ -119,6 +119,8 @@ static int hdafg_debug = 0;
 #define HDAUDIO_UNSOLTAG_EVENT_DD	0x02
 
 #define HDAUDIO_HP_SENSE_PERIOD		hz
+/* LISPBSD: polls between pin-control rewrites while presence is unchanged */
+#define HDAFG_JACK_REFRESH		10
 
 const u_int hdafg_possible_rates[] = {
 	8000, 11025, 16000, 22050, 32000, 44100,
@@ -320,6 +322,8 @@ struct hdafg_softc {
 	bool				sc_jack_polling;
 	bool				sc_jack_suspended;
 	bool				sc_jack_dying;
+	uint32_t			sc_jack_last;	/* presence last applied */
+	int				sc_jack_quiet;	/* polls since */
 
 	struct {
 		uint32_t		afg_cap;
@@ -3582,6 +3586,17 @@ hdafg_hp_switch_handler(struct hdafg_softc *sc)
 		}
 	}
 
+	/*
+	 * LISPBSD: the pin controls follow the presence state, so rewrite them
+	 * when it changes, and every HDAFG_JACK_REFRESH polls in case the codec
+	 * lost them.  Rewriting every pin each second cost several codec round
+	 * trips, each with its own interrupt, per second.
+	 */
+	if (res == sc->sc_jack_last && ++sc->sc_jack_quiet < HDAFG_JACK_REFRESH)
+		return;
+	sc->sc_jack_last = res;
+	sc->sc_jack_quiet = 0;
+
 	for (i = 0; i < sc->sc_nassocs; i++) {
 		if (as[i].as_digital != HDAFG_AS_ANALOG &&
 		    as[i].as_digital != HDAFG_AS_SPDIF)
@@ -3715,6 +3730,7 @@ hdafg_hp_switch_init(struct hdafg_softc *sc)
 
 	mutex_init(&sc->sc_jack_lock, MUTEX_DEFAULT, IPL_NONE);
 	cv_init(&sc->sc_jack_cv, "hdafghp");
+	sc->sc_jack_last = ~0U;	/* apply on the first poll */
 	sc->sc_jack_polling = true;
 	error = kthread_create(PRI_NONE, KTHREAD_MPSAFE, /*ci*/NULL,
 	    hdafg_hp_switch_thread, sc, &sc->sc_jack_thread,
@@ -4016,6 +4032,7 @@ hdafg_resume(device_t self, const pmf_qual_t *qual)
 		mutex_enter(&sc->sc_jack_lock);
 		KASSERT(sc->sc_jack_suspended);
 		sc->sc_jack_suspended = false;
+		sc->sc_jack_last = ~0U;	/* reapply after resume */
 		cv_broadcast(&sc->sc_jack_cv);
 		mutex_exit(&sc->sc_jack_lock);
 	}

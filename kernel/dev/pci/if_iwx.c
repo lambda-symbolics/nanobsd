@@ -569,6 +569,7 @@ static int	iwx_disable_mgmt_queue(struct iwx_softc *);
 static int	iwx_flush_sta(struct iwx_softc *, struct iwx_node *);
 static int	iwx_set_pslevel(struct iwx_softc *, int, int, int);
 static int	iwx_disable_beacon_filter(struct iwx_softc *);
+static int	iwx_enable_beacon_filter(struct iwx_softc *, struct iwx_node *);
 static int	iwx_sf_config(struct iwx_softc *, int);
 static int	iwx_allow_mcast(struct iwx_softc *);
 static int	iwx_clear_statistics(struct iwx_softc *);
@@ -5609,6 +5610,37 @@ iwx_set_pslevel(struct iwx_softc *sc, int dtim, int level, int async)
 	    htole16(IWX_POWER_FLAGS_POWER_MANAGEMENT_ENA_MSK)));
 }
 
+/*
+ * LISPBSD: let the firmware drop beacons that carry nothing new, instead of
+ * interrupting the host for every one (about 10 a second).  Linux and FreeBSD
+ * do this on association; this driver never did, which also left beacon abort
+ * in power save disabled.  Off until hw.iwx.beacon_filter is set.
+ */
+static int iwx_beacon_filter = 0;
+
+static int
+iwx_enable_beacon_filter(struct iwx_softc *sc, struct iwx_node *in)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	int pm = (ic->ic_flags & IEEE80211_F_PMGTON) != 0;
+	struct iwx_beacon_filter_cmd cmd = {
+		IWX_BF_CMD_CONFIG_DEFAULTS,
+		.bf_enable_beacon_filter = htole32(1),
+		.ba_enable_beacon_abort = htole32(pm),
+	};
+	int err;
+
+	if (ic->ic_opmode != IEEE80211_M_STA || in->in_ni.ni_dtim_period == 0)
+		return 0;
+
+	err = iwx_beacon_filter_send_cmd(sc, &cmd);
+	if (err == 0) {
+		sc->sc_bf.bf_enabled = 1;
+		sc->sc_bf.ba_enabled = pm;
+	}
+	return err;
+}
+
 static int
 iwx_disable_beacon_filter(struct iwx_softc *sc)
 {
@@ -7412,6 +7444,13 @@ iwx_run(struct iwx_softc *sc)
 		printf("%s: could not send power command (error %d)\n",
 		    DEVNAME(sc), err);
 		/* LISPBSD: PS/power cmd is an optimization; never abort assoc */
+	}
+
+	if (iwx_beacon_filter) {
+		err = iwx_enable_beacon_filter(sc, in);
+		if (err)
+			printf("%s: could not enable beacon filter (error %d)\n",
+			    DEVNAME(sc), err);
 	}
 
 	if (ic->ic_opmode == IEEE80211_M_MONITOR)
@@ -10735,7 +10774,52 @@ iwx_init_task(void *arg1)
 CFATTACH_DECL_NEW(iwx, sizeof(struct iwx_softc), iwx_match, iwx_attach,
 	iwx_detach, NULL);
 
-#ifdef IWX_DEBUG
+extern struct cfdriver iwx_cd;
+
+/* LISPBSD: apply hw.iwx.beacon_filter to an associated interface at once. */
+static void
+iwx_apply_beacon_filter(struct iwx_softc *sc)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	int s, err;
+
+	rw_enter(&sc->ioctl_rwl, RW_WRITER);
+	s = splnet();
+	if ((sc->sc_flags & IWX_FLAG_MAC_ACTIVE) &&
+	    ic->ic_state == IEEE80211_S_RUN && ic->ic_bss != NULL) {
+		err = iwx_beacon_filter ?
+		    iwx_enable_beacon_filter(sc, (void *)ic->ic_bss) :
+		    iwx_disable_beacon_filter(sc);
+		if (err)
+			printf("%s: beacon filter %s failed (error %d)\n",
+			    DEVNAME(sc), iwx_beacon_filter ? "on" : "off", err);
+	}
+	splx(s);
+	rw_exit(&sc->ioctl_rwl);
+}
+
+static int
+iwx_sysctl_beacon_filter(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	struct iwx_softc *sc;
+	int val = iwx_beacon_filter, err, i;
+
+	node.sysctl_data = &val;
+	err = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (err || newp == NULL)
+		return err;
+	if (val != 0 && val != 1)
+		return EINVAL;
+	if (val == iwx_beacon_filter)
+		return 0;
+	iwx_beacon_filter = val;
+	for (i = 0; i < iwx_cd.cd_ndevs; i++)
+		if ((sc = device_lookup_private(&iwx_cd, i)) != NULL)
+			iwx_apply_beacon_filter(sc);
+	return 0;
+}
+
 SYSCTL_SETUP(sysctl_iwx, "sysctl iwx(4) subtree setup")
 {
 	const struct sysctlnode *rnode;
@@ -10748,19 +10832,27 @@ SYSCTL_SETUP(sysctl_iwx, "sysctl iwx(4) subtree setup")
 	    NULL, 0, NULL, 0, CTL_HW, CTL_CREATE, CTL_EOL)) != 0)
 		goto err;
 
+	if ((rc = sysctl_createv(clog, 0, &rnode, &cnode,
+	    CTLFLAG_PERMANENT|CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "beacon_filter",
+	    SYSCTL_DESCR("Firmware drops unchanged beacons (0/1)"),
+	    iwx_sysctl_beacon_filter, 0, NULL, 0, CTL_CREATE, CTL_EOL)) != 0)
+		goto err;
+
+#ifdef IWX_DEBUG
 	/* control debugging printfs */
 	if ((rc = sysctl_createv(clog, 0, &rnode, &cnode,
 	    CTLFLAG_PERMANENT|CTLFLAG_READWRITE, CTLTYPE_INT,
 	    "debug", SYSCTL_DESCR("Enable debugging output"),
 	    NULL, 0, &iwx_debug, 0, CTL_CREATE, CTL_EOL)) != 0)
 		goto err;
+#endif /* IWX_DEBUG */
 
 	return;
 
  err:
 	aprint_error("%s: sysctl_createv failed (rc = %d)\n", __func__, rc);
 }
-#endif /* IWX_DEBUG */
 
 MODULE(MODULE_CLASS_DRIVER, if_iwx, "pci");
 

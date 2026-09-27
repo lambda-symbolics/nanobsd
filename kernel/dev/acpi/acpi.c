@@ -269,6 +269,9 @@ static volatile int	acpi_freeze_busy;
 static int		acpi_freeze_timeout = 120;
 static int		acpi_freeze_ltr_ignore;
 static int		acpi_freeze_storage;
+static int		acpi_freeze_keep_net;
+static int		acpi_idle_d3;
+static int		sysctl_hw_acpi_idle_d3(SYSCTLFN_PROTO);
 static int		acpi_freeze_thread_started;
 static void		acpi_freeze_thread(void *);
 
@@ -1845,6 +1848,16 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 
 	(void)sysctl_createv(NULL, 0, &snode, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "freeze_keep_net", SYSCTL_DESCR("Keep Wi-Fi running during s2idle (test aid)"),
+	    NULL, 0, &acpi_freeze_keep_net, 0, CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "idle_d3", SYSCTL_DESCR("Power down driverless platform IPs while awake"),
+	    sysctl_hw_acpi_idle_d3, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
 	    "s0freeze", SYSCTL_DESCR("s2idle stage1 freeze-userspace test (write 1)"),
 	    sysctl_hw_acpi_s0freeze, 0, NULL, 0,
 	    CTL_CREATE, CTL_EOL);
@@ -2403,6 +2416,10 @@ acpi_s2idle_keep(device_t dev)
 		if (acpi_freeze_storage && device_is_a(ancestor, "nvme"))
 			return false;
 	}
+
+	/* Test aid: freeze and wake without dropping the Wi-Fi association. */
+	if (acpi_freeze_keep_net && strncmp(n, "iwx", 3) == 0)
+		return true;
 
 	/*
 	 * s2idle: suspend ONLY the display stack (biggest power/heat draw,
@@ -3150,6 +3167,61 @@ sysctl_hw_acpi_s0freeze(SYSCTLFN_ARGS)
  * previous state's references and invokes _PS3; it does not imply D3cold.
  * Restore resources before resuming drivers.  Storage is excluded.
  */
+/*
+ * Move the ACPI devices at ADRS (by _ADR) to STATE, remembering what changed
+ * in CHANGED/PREVIOUS so that a later call with ACPI_STATE_D0 restores exactly
+ * those.  Devices already in STATE are left alone and not restored.
+ */
+static void
+acpi_adr_power(struct acpi_softc *sc, const char *what, const uint32_t *adrs,
+    unsigned n, ACPI_HANDLE *changed, int *previous, int state)
+{
+	struct acpi_devnode *ad;
+	unsigned i;
+	int old;
+
+	if (state == ACPI_STATE_D0) {
+		for (i = 0; i < n; i++) {
+			if (changed[i] == NULL)
+				continue;
+			if (!acpi_power_get(changed[i], &old) || old != previous[i])
+				aprint_normal_dev(sc->sc_dev,
+				    "%s: restore adr=0x%x D%d -> %d\n", what,
+				    adrs[i], previous[i],
+				    (int)acpi_power_set(changed[i], previous[i]));
+			changed[i] = NULL;
+		}
+		return;
+	}
+	memset(changed, 0, n * sizeof(*changed));
+
+	SIMPLEQ_FOREACH(ad, &sc->sc_head, ad_list) {
+		if (ad->ad_devinfo->Type != ACPI_TYPE_DEVICE ||
+		    (ad->ad_devinfo->Valid & ACPI_VALID_ADR) == 0)
+			continue;
+		for (i = 0; i < n; i++) {
+			if ((uint32_t)ad->ad_devinfo->Address != adrs[i])
+				continue;
+			/* Do not power up devices on resume that were already off. */
+			old = ACPI_STATE_ERROR;
+			if (!acpi_power_get(ad->ad_handle, &old) || old == state) {
+				aprint_normal_dev(sc->sc_dev,
+				    "%s: ACPI adr=0x%x current=%d skipped\n",
+				    what, adrs[i], old);
+				break;
+			}
+			/* Retain the old state even if a resource operation fails partway. */
+			changed[i] = ad->ad_handle;
+			previous[i] = old;
+			aprint_normal_dev(sc->sc_dev,
+			    "%s: acpi_power_set adr=0x%x D%d -> %d\n",
+			    what, adrs[i], state,
+			    (int)acpi_power_set(ad->ad_handle, state));
+			break;
+		}
+	}
+}
+
 static void
 acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
 {
@@ -3168,50 +3240,62 @@ acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
 	};
 	static ACPI_HANDLE changed[__arraycount(adrs)];
 	static int previous[__arraycount(adrs)];
-	struct acpi_devnode *ad;
-	unsigned i;
-	int old;
 
-	if (state == ACPI_STATE_D0) {
-		for (i = 0; i < __arraycount(adrs); i++) {
-			if (changed[i] == NULL)
-				continue;
-			if (!acpi_power_get(changed[i], &old) || old != previous[i])
-				aprint_normal_dev(sc->sc_dev,
-				    "s2idle: restore adr=0x%x D%d -> %d\n",
-				    adrs[i], previous[i],
-				    (int)acpi_power_set(changed[i], previous[i]));
-			changed[i] = NULL;
-		}
-		return;
-	}
-	memset(changed, 0, sizeof(changed));
+	acpi_adr_power(sc, "s2idle", adrs, __arraycount(adrs), changed,
+	    previous, state);
+}
 
-	SIMPLEQ_FOREACH(ad, &sc->sc_head, ad_list) {
-		if (ad->ad_devinfo->Type != ACPI_TYPE_DEVICE ||
-		    (ad->ad_devinfo->Valid & ACPI_VALID_ADR) == 0)
-			continue;
-		for (i = 0; i < __arraycount(adrs); i++) {
-			if ((uint32_t)ad->ad_devinfo->Address != adrs[i])
-				continue;
-			/* Do not power up devices on resume that were already off. */
-			old = ACPI_STATE_ERROR;
-			if (!acpi_power_get(ad->ad_handle, &old) || old == state) {
-				aprint_normal_dev(sc->sc_dev,
-				    "s2idle: ACPI adr=0x%x current=%d skipped\n",
-				    adrs[i], old);
-				break;
-			}
-			/* Retain the old state even if a resource operation fails partway. */
-			changed[i] = ad->ad_handle;
-			previous[i] = old;
-			aprint_normal_dev(sc->sc_dev,
-			    "s2idle: acpi_power_set adr=0x%x D%d -> %d\n",
-			    adrs[i], state,
-			    (int)acpi_power_set(ad->ad_handle, state));
-			break;
-		}
-	}
+/*
+ * LISPBSD: the platform IPs NetBSD has no driver for stay in D0 with their
+ * power resources on while the machine runs.  With the Thunderbolt DMA
+ * resources on, an idle package spends about half its time in PC3 instead of
+ * PC10 (the same split the s2idle path used to show before its resource
+ * power-down).  hw.acpi.sleep.idle_d3 applies that power-down while awake.
+ * The Thunderbolt DMA functions share power with the USB-C host, so
+ * /usr/local/bin/usb clears this before it resumes USB.  The I2C controllers
+ * (touchpad) and xHCI have drivers and are left out.
+ */
+static void
+acpi_idle_powerdown(struct acpi_softc *sc, int state)
+{
+	static const uint32_t adrs[] = {
+		0x00050000,	/* IPU / image sensor */
+		0x00120000,	/* ISH (sensor hub) */
+		0x00160000,	/* HECI / CSME */
+		0x00080000,	/* GNA */
+		0x000d0002,	/* Thunderbolt DMA 1 */
+		0x000d0003,	/* Thunderbolt DMA 2 */
+	};
+	static ACPI_HANDLE changed[__arraycount(adrs)];
+	static int previous[__arraycount(adrs)];
+
+	acpi_adr_power(sc, "idle_d3", adrs, __arraycount(adrs), changed,
+	    previous, state);
+}
+
+static int
+sysctl_hw_acpi_idle_d3(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node;
+	int err, t;
+
+	if (acpi_softc == NULL)
+		return ENOSYS;
+	t = acpi_idle_d3;
+	node = *rnode;
+	node.sysctl_data = &t;
+	err = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (err || newp == NULL)
+		return err;
+	if (t != 0 && t != 1)
+		return EINVAL;
+	if (t == acpi_idle_d3)
+		return 0;
+	if (acpi_freeze_active)
+		return EBUSY;
+	acpi_idle_d3 = t;
+	acpi_idle_powerdown(acpi_softc, t ? ACPI_STATE_D3 : ACPI_STATE_D0);
+	return 0;
 }
 
 void

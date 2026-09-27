@@ -1,0 +1,17 @@
+#!/bin/sh
+# fztest.sh BF D3 SECONDS: one s2idle hold with Wi-Fi kept up; prints the hold summary.
+export PATH=/usr/local/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin
+bf=$1 d3=$2 secs=${3:-120}
+sysctl -w hw.iwx.beacon_filter=$bf hw.acpi.sleep.idle_d3=$d3 >/dev/null
+sysctl -w hw.acpi.sleep.freeze_keep_net=1 hw.acpi.sleep.freeze_timeout=$secs >/dev/null
+sleep 10
+n=$(dmesg | wc -l)
+/usr/local/bin/s0ix suspend
+sleep 5
+bat=$(envstat -d acpibat0 | awk '/discharge rate/ {print $3}')
+dmesg | tail -n +$((n+1)) | awk -v L="bf=$bf d3=$d3 ${secs}s" -v B="$bat" '
+    /hold pc10=/ {for(i=1;i<=NF;i++) if ($i ~ /^pc10=/) p=$i}
+    /slp_s0 delta=/ {for(i=1;i<=NF;i++) if ($i ~ /^delta=/) d=substr($i,7)}
+    /rapl_dE=/ {for(i=1;i<=NF;i++) if ($i ~ /^rapl_dE=/) e=substr($i,9)}
+    END {printf "%s: %s slp_s0 %.1f s, package %.3f W, battery after %s W\n", L, p, d/8197, e*61.035e-6/'$secs', B}'
+sysctl -w hw.acpi.sleep.freeze_keep_net=0 hw.acpi.sleep.freeze_timeout=0 >/dev/null
