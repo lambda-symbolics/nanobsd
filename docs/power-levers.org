@@ -73,11 +73,20 @@ decode (no Gen12 VA-API driver in pkgsrc).
 * Results (2026-09-27, kernel 130)
 
 ** 1. Mahogany on the GPU: done
-heart creates =wl_drm= (lambda-symbolics/mahogany 5eb005a), =startmh=
+heart creates =wl_drm= (lambda-symbolics/mahogany 5eb005a), and =startmh=
 defaults to =WLR_RENDERER=gles2= and retries with pixman if the compositor
-dies within 15 s of starting, and sets =MOZ_DISABLE_WAYLAND_PROXY=1=:
-Firefox 153's own Wayland proxy loses its socket at exit under the GLES2
-compositor and GDK aborts the parent (pixman, or the proxy off, exit cleanly).
+dies within 15 s of starting.
+
+An apparent Firefox crash at exit under the GLES2 compositor turned out to be
+the test harness.  Firefox rewrites its argv (the parent shows only
+=firefox URL=), so the harness's =pgrep -f "profile ..."= matched nothing,
+Firefox was never told to quit, and it was still running when the harness
+killed the compositor.  A GTK client that loses its display aborts; Firefox
+turns that into SIGSEGV after =WaylandMessage::Write() failed : Broken pipe=.
+Killing the compositor under Firefox reproduces it with pixman too, while
+SIGTERM to the Firefox PID exits cleanly with its Wayland proxy on (4 of 4).
+So Firefox keeps its proxy; a brief =MOZ_DISABLE_WAYLAND_PROXY=1= in =startmh=
+was reverted.
 Package power (RAPL), panel at brightness 15:
 
 | workload                       | pixman                 | GLES2                |

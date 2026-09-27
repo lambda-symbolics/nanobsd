@@ -25,9 +25,6 @@ export WLR_RENDERER=${WLR_RENDERER:-gles2}
 export XKB_DEFAULT_LAYOUT=cz,us
 export XKB_DEFAULT_OPTIONS=grp:alt_shift_toggle
 export MOZ_ENABLE_WAYLAND=1
-# Firefox 153's own Wayland proxy loses its socket at exit when Firefox renders
-# through dmabuf, and GDK then aborts the parent process.
-export MOZ_DISABLE_WAYLAND_PROXY=1
 export LC_CTYPE=${LC_CTYPE:-C.UTF-8}
 
 # Kill a stale display socket from a crashed session.
