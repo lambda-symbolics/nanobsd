@@ -1,0 +1,62 @@
+#!/bin/sh
+# bench.sh LABEL: screen-on package power for idle, terminal scrolling and a
+# Firefox animation inside the running Mahogany session.  Run as root.
+export PATH=/usr/local/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin:/usr/pkg/sbin
+L=${1:-run}
+MCTL() { MAHOGANY_SOCKET=/var/run/user/1000/mahogany.sock /usr/local/bin/mahoganyctl "$1"; }
+UENV="HOME=/home/mag XDG_RUNTIME_DIR=/var/run/user/1000 WAYLAND_DISPLAY=wayland-0 MOZ_ENABLE_WAYLAND=1 MOZ_DISABLE_WAYLAND_PROXY=1 MOZ_CRASHREPORTER_DISABLE=1 PATH=/usr/local/bin:/usr/pkg/bin:/usr/bin:/bin"
+B=0x603c000000
+rd() { /var/tmp/memread $(printf "0x%x" $(( B + ($1 & ~0xfff) ))) $(printf "0x%x" $(( $1 & 0xfff ))) | awk '{print $NF}'; }
+rapl() { sysctl -n machdep.cidle.rapl | sed 's/.*raw=\([0-9]*\).*/\1/'; }
+cpu() { # summed cputime in seconds of processes matching $1
+  for p in $(pgrep -f "$1"); do ps -o cputime= -p $p; done | awk -F'[:.]' '{ if (NF==3) s+=$1*60+$2+$3/100; else if (NF==4) s+=$1*3600+$2*60+$3+$4/100 } END {printf "%.2f", s}'; }
+measure() { # name seconds
+  r0=$(rapl); f0=$(( $(rd 0x70040) )); m0=$(cpu '/usr/local/bin/mahogany'); a0=$(cpu 'alacritty'); x0=$(cpu 'firefox'); t0=$(date +%s)
+  res0=$(sysctl -n machdep.cidle.residency)
+  sleep $2
+  r1=$(rapl); f1=$(( $(rd 0x70040) )); m1=$(cpu '/usr/local/bin/mahogany'); a1=$(cpu 'alacritty'); x1=$(cpu 'firefox'); t1=$(date +%s)
+  res1=$(sysctl -n machdep.cidle.residency)
+  pc=$(printf '%s\n%s\n' "$res0" "$res1" | awk '{for(i=1;i<=NF;i++){split($i,a,"="); v[NR,a[1]]=a[2]}} END {t=v[2,"tsc"]-v[1,"tsc"]; printf "pc2 %.0f%% pc3 %.0f%% pc8 %.0f%% pc10 %.0f%%", 100*(v[2,"pc2"]-v[1,"pc2"])/t, 100*(v[2,"pc3"]-v[1,"pc3"])/t, 100*(v[2,"pc8"]-v[1,"pc8"])/t, 100*(v[2,"pc10"]-v[1,"pc10"])/t}')
+  dt=$((t1-t0))
+  printf "%s %-10s pkg %s W  fps %s  cpu%%: mahogany %s alacritty %s firefox %s  %s\n" "$L" "$1" \
+    $(echo "scale=3; ($r1-$r0)*61.035/1000000/$dt" | bc) $(( (f1-f0)/dt )) \
+    $(echo "scale=1; 100*($m1-$m0)/$dt" | bc) $(echo "scale=1; 100*($a1-$a0)/$dt" | bc) $(echo "scale=1; 100*($x1-$x0)/$dt" | bc) "$pc"
+}
+MCTL '(progn (setf *idle-dim-seconds* 1800 *idle-blank-seconds* 1800 *idle-baseline-ms* (or (idle-ms) 0)) (idle-undim) (idle-unblank) (idle-schedule) :ok)' >/dev/null
+sysctl -w hw.acpi.acpiout15.brightness=15 hw.acpi.acpiout16.brightness=15 >/dev/null
+sleep 8
+measure idle 30
+rm -rf /tmp/bench-prof /tmp/bench; mkdir -p /tmp/bench-prof /tmp/bench
+cat > /tmp/bench/scroll.py <<'Y'
+import sys, time
+for i in range(4500):
+    sys.stdout.write("line %d the quick brown fox jumps over the lazy dog 0123456789\n" % i)
+    sys.stdout.flush()
+    time.sleep(0.01)
+Y
+cat > /tmp/bench/scroll.sh <<Y
+exec env $UENV /usr/pkg/bin/alacritty msg --socket /tmp/alacritty-wl.sock create-window -e /usr/pkg/bin/python3.13 /tmp/bench/scroll.py
+Y
+cat > /tmp/bench/ff.sh <<Y
+env $UENV /usr/pkg/bin/firefox -no-remote -profile /tmp/bench-prof --new-instance file:///tmp/bench/anim.html >/tmp/bench/ff.log 2>&1 &
+Y
+chown -R mag /tmp/bench-prof /tmp/bench
+su mag -c "/bin/sh /tmp/bench/scroll.sh"
+sleep 5; echo "alacritty devices: $(fstat -p $(pgrep -f 'alacritty --daemon') | grep -c -E 'renderD|card0')"; measure scroll 35
+i=0; while pgrep -f /tmp/bench/scroll.py >/dev/null && [ $i -lt 60 ]; do sleep 1; i=$((i+1)); done
+sleep 3
+cat > /tmp/bench-prof/user.js <<'U'
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("startup.homepage_welcome_url", "");
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("datareporting.policy.firstRunURL", "");
+user_pref("trailhead.firstrun.didSeeAboutWelcome", true);
+U
+echo '<html><body style="margin:0;background:#223"><div style="position:absolute;width:300px;height:300px;background:#e46;border-radius:40px;animation:m 3s linear infinite"></div><style>@keyframes m{50%{transform:translate(700px,600px) rotate(180deg)}}</style></body></html>' > /tmp/bench/anim.html
+chown -R mag /tmp/bench-prof /tmp/bench
+su mag -c "/bin/sh /tmp/bench/ff.sh"
+sleep 20; for p in $(pgrep -f firefox); do n=$(fstat -p $p 2>/dev/null | grep -c -E 'renderD|card0'); [ $n -gt 0 ] && echo "firefox $p render node fds $n"; done; measure firefox 30
+for p in $(pgrep -f bench-prof); do kill $p 2>/dev/null; done; sleep 5; for p in $(pgrep -f bench-prof); do kill -9 $p 2>/dev/null; done
+/usr/local/bin/brightness restore >/dev/null 2>&1
+MCTL '(progn (setf *idle-dim-seconds* 120 *idle-blank-seconds* 300) (idle-schedule) :ok)' >/dev/null

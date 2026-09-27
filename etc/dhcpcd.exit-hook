@@ -5,3 +5,10 @@ case "$reason" in
 BOUND|REBOOT|RENEW|CARRIER|NOCARRIER|EXPIRE|RELEASE|STOP|DEPARTED)
 	pkill -USR2 -f '^/bin/sh /usr/local/bin/statusbard$' 2>/dev/null ;;
 esac
+
+# ntpd is off (its once-a-second timer); set the clock when a lease arrives,
+# since the boot-time ntpdate runs before Wi-Fi is up.  Hourly cron covers drift.
+case "$reason" in
+BOUND|REBOOT)
+	/usr/sbin/ntpdate -s -u pool.ntp.org >/dev/null 2>&1 & ;;
+esac

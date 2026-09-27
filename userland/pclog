@@ -1,0 +1,25 @@
+#!/bin/sh
+# pclog.sh: every 5 minutes, log a 60 s sample of package C-state residency
+# and RAPL power with the state that might explain it, to catch whatever
+# pushes an idle package from PC10 into PC3 until the next reboot.
+export PATH=/usr/local/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin
+LOG=/var/tmp/pclog.txt
+B=0x603c000000
+rd() { /var/tmp/memread $(printf "0x%x" $(( B + ($1 & ~0xfff) ))) $(printf "0x%x" $(( $1 & 0xfff ))) | awk '{print $NF}'; }
+rapl() { sysctl -n machdep.cidle.rapl | sed 's/.*raw=\([0-9]*\).*/\1/'; }
+while :; do
+	r0=$(rapl); res0=$(sysctl -n machdep.cidle.residency); t0=$(date +%s)
+	sleep 60
+	r1=$(rapl); res1=$(sysctl -n machdep.cidle.residency); t1=$(date +%s)
+	pc=$(printf '%s\n%s\n' "$res0" "$res1" | awk '{for(i=1;i<=NF;i++){split($i,a,"="); v[NR,a[1]]=a[2]}}
+	    END {t=v[2,"tsc"]-v[1,"tsc"]; printf "pc2=%.0f pc3=%.0f pc8=%.0f pc10=%.0f", 100*(v[2,"pc2"]-v[1,"pc2"])/t, 100*(v[2,"pc3"]-v[1,"pc3"])/t, 100*(v[2,"pc8"]-v[1,"pc8"])/t, 100*(v[2,"pc10"]-v[1,"pc10"])/t}')
+	w=$(echo "scale=2; ($r1-$r0)*61.035/1000000/($t1-$t0)" | bc)
+	pipe=$(( ($(rd 0x70008) >> 31) & 1 ))
+	bat=$(envstat -d acpibat0 2>/dev/null | awk '/discharge rate/ {print $3}')
+	ac=$(envstat -d acpiacad0 2>/dev/null | awk '/connected/ {print $2}')
+	usb=$(/usr/local/bin/usb status 2>/dev/null | awk '{print $2}' | tr -d ,)
+	idle=$(( $(sysctl -n machdep.lpsched.idle_ms 2>/dev/null || echo 0) / 1000 ))
+	procs=$(pgrep -f /usr/pkg/lib/firefox >/dev/null && echo ff; pgrep -x alacritty >/dev/null && echo al)
+	echo "$(date '+%m-%d %H:%M') up=$(uptime | sed 's/.*up \([^,]*\),.*/\1/') pkg=${w}W $pc pipe=$pipe lid=$(sysctl -n hw.acpi.lid_closed) usb=$usb ac=$ac bat=${bat}W idle=${idle}s d3=$(sysctl -n hw.acpi.sleep.idle_d3) tlb=$(sysctl -n machdep.tlb_lazyskip) bf=$(sysctl -n hw.iwx.beacon_filter) $(echo $procs)" >> $LOG
+	sleep 240
+done
