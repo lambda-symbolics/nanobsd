@@ -1,0 +1,83 @@
+#+TITLE: Power levers left after the Wayland switch
+#+DATE: 2026-09-27
+
+What was still worth doing once the Mahogany session, RC6 re-arm, the
+on-demand bar and the futex SBCL were in (see =mahogany.org=).  Measured on
+battery, kernel 129, idle, screen blanked, before any change below.
+
+* Where the power went
+
+| what                              | measured                                   |
+|-----------------------------------+--------------------------------------------|
+| package (RAPL)                    | 1.40-1.46 W                                |
+| cores                             | C7 99 %                                    |
+| package states                    | PC3 about 50 %, PC10 about 44 %            |
+| same state on 9/26, no Firefox    | 0.84 W                                     |
+| wake events                       | about 100/s                                |
+| Firefox (all processes)           | about 46 wakeups/s, one tab about 14/s     |
+| TLB shootdown IPIs                | 28-55/s                                    |
+| iwx interrupts (beacons)          | about 10.5/s, each with a bounce copy      |
+| ntpd                              | 1.5 wakeups/s                              |
+| hdaudio                           | 1-2.5 interrupts/s (jack sense polling)    |
+| Mahogany, cclsh, waytemp          | about 0                                    |
+
+Cores sleep deeply but the package keeps waking: every wake event ends the
+package idle period, and with ~100/s the PCU often picks PC3 over PC10.
+
+Census method: =vmstat -e= and =vmstat -i= deltas, per-process =nvcsw+nivcsw=
+(=ps -o= needs one =-o= per keyword on NetBSD), =machdep.cidle.rapl= and
+=machdep.cidle.residency=, with every exec kept outside the sampling window
+(the probe's own execs showed up as TLB shootdowns and vmcmd events).
+
+* The levers
+
+1. *Mahogany on the GPU.*  =startmh= forced the pixman renderer because the
+   render engines were wedged; that stopped being true with the ELSP fix of
+   9/16.  A headless Mahogany with =WLR_RENDERER=gles2= comes up on "Mesa
+   Intel(R) Xe Graphics (TGL GT2)".  Clients still fell back to llvmpipe:
+   Mesa 21.3.9 binds =zwp_linux_dmabuf_v1= at version 3 only, so it cannot use
+   dmabuf feedback to find the GPU and needs a =wl_drm= global, which heart
+   never created.  Fix: =wlr_drm_create()= in =heart/src/server.c=.  llvmpipe
+   splits each frame across one thread per CPU, so today every keystroke in
+   alacritty wakes every core; Firefox renders with software WebRender.
+2. *Firefox at idle.*  The difference from the 9/26 measurement (0.6 W of
+   package) is probably Firefox: its wakeups, and its unmaps turning into
+   TLB shootdowns across CPUs.
+3. *Lid suspend.*  =/etc/lid-nosuspend= (temporary, for the Firefox build)
+   makes lid close only blank the panel: about 2.95 W instead of 2.02 W in
+   s2idle.
+4. *iwx beacon filtering.*  =if_iwx.c= never enables it: =sc_bf.bf_enabled=
+   is only ever cleared, so every beacon interrupts the host and
+   =iwx_update_beacon_abort= is a no-op.  Linux and FreeBSD enable it on
+   association.
+5. *TLB IPIs to idle CPUs.*  =x86_tlb.c= targets =pm_cpus=, which still
+   contains CPUs that went idle with the process's pmap loaded lazily; such a
+   CPU only leaves the set in =pmap_tlb_intr=, after the IPI woke it.  Linux
+   skips lazy CPUs and lets them flush when they switch back.
+6. *Framebuffer compression.*  =enable_fbc= sanitizes to 0 because
+   =HAS_FBC= is cleared when =mm.stolen= is uninitialized, and NetBSD fills
+   =intel_graphics_stolen_res= only through =agp_i810=, which never attaches
+   on Tiger Lake.  The GPU's own config space has it (BDSM 0xC0 =
+   0x9c800001, GGC 0x50 = 0x2c1: 64 MB).  The 5.6 FBC code also insists on a
+   CPU fence; Linux later made fences optional on gen9+.  PSR is impossible on
+   this panel, so this is the last display-side lever.
+7. *Small ones.*  i915 is a debug build that checks for unclaimed MMIO around
+   every register access (=mmio_debug=-1=); ntpd wakes 1.5/s; hdafg polls the
+   jacks.  Codec power-down is left alone (buzz risk).
+
+Not worth more time: PSR (panel DPCD 0), scheduler packing and timer
+coalescing (measured null, =lpsched-design.org=), SLP_S0 (firmware wall,
+=rpm-s0ix-findings.org=), NVMe APST and ASPM L1.2 (already on), hardware video
+decode (no Gen12 VA-API driver in pkgsrc).
+
+* Status
+
+| lever | state   |
+|-------+---------|
+| 1     | planned |
+| 2     | planned |
+| 3     | planned |
+| 4     | planned |
+| 5     | planned |
+| 6     | planned |
+| 7     | planned |
