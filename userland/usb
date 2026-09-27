@@ -1,0 +1,23 @@
+#!/bin/sh
+# usb on|off|status - suspend/resume BOTH USB xHCI controllers to save power.
+# "off" powers down all USB data (internal camera/BT/fingerprint + external
+# ports); USB-C charging (PD) is a separate controller and keeps working.
+# Keyboard/trackpoint are I2C-HID, not USB, so they are unaffected.
+# NetBSD has no per-device USB autosuspend, so this all-or-nothing gate is the
+# power lever; use webcam/bluetooth for granular control while usb is on.
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="doas"
+CTRLS="xhci0 xhci1"
+up(){ drvctl -p "$1" 2>/dev/null | grep -qi 'state.*resumed\|active' ; }
+state(){ # crude: if uhub children exist, controller is up
+  for c in $CTRLS; do drvctl -l "$c" 2>/dev/null | grep -q uhub && { echo on; return; }; done
+  echo off
+}
+case "${1:-status}" in
+  off)  for c in $CTRLS; do $SUDO drvctl -S "$c" 2>/dev/null; done
+        echo "usb: OFF (xhci suspended; charging unaffected)" ;;
+  on)   for c in $CTRLS; do $SUDO drvctl -R "$c" 2>/dev/null; done
+        echo "usb: ON" ;;
+  status) echo "usb: $(state)" ;;
+  *) echo "usage: usb [on|off|status]" >&2; exit 1 ;;
+esac

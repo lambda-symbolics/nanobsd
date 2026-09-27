@@ -2,8 +2,9 @@
 # startmh - start a Mahogany (Wayland) session from the NetBSD console.
 #
 # Needs seatd running (seatd=YES in rc.conf, -g wheel) and the user in wheel.
-# The compositor renders with pixman: the Tiger Lake render engines are wedged
-# under this kernel, so there is no GL to use anyway. Logs go to ~/.mahogany.log.
+# The compositor renders on the GPU (GLES2 on Mesa's iris driver). If it dies
+# within a few seconds of starting, the session is retried with the pixman
+# software renderer rather than leaving no desktop. Logs go to ~/.mahogany.log.
 
 # /var/run/user/UID is created at boot by /etc/rc.local; fall back to /tmp
 # when it is missing (mag cannot create it).
@@ -20,17 +21,27 @@ export LIBSEAT_BACKEND=seatd
 export XDG_SESSION_TYPE=wayland
 export XDG_CURRENT_DESKTOP=mahogany
 export XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
-export WLR_RENDERER=pixman
+export WLR_RENDERER=${WLR_RENDERER:-gles2}
 export XKB_DEFAULT_LAYOUT=cz,us
 export XKB_DEFAULT_OPTIONS=grp:alt_shift_toggle
 export MOZ_ENABLE_WAYLAND=1
+# Firefox 153's own Wayland proxy loses its socket at exit when Firefox renders
+# through dmabuf, and GDK then aborts the parent process.
+export MOZ_DISABLE_WAYLAND_PROXY=1
 export LC_CTYPE=${LC_CTYPE:-C.UTF-8}
 
 # Kill a stale display socket from a crashed session.
 rm -f "$XDG_RUNTIME_DIR"/wayland-0 "$XDG_RUNTIME_DIR"/wayland-0.lock
 
+started=$(date +%s)
 /usr/local/bin/mahogany -l INFO "$@" >> "$HOME/.mahogany.log" 2>&1
 rc=$?
+if [ $rc -ne 0 ] && [ "$WLR_RENDERER" = gles2 ] && [ $(($(date +%s) - started)) -lt 15 ]; then
+	echo "startmh: GLES2 session exited with $rc at start, retrying with pixman" >> "$HOME/.mahogany.log"
+	rm -f "$XDG_RUNTIME_DIR"/wayland-0 "$XDG_RUNTIME_DIR"/wayland-0.lock
+	WLR_RENDERER=pixman /usr/local/bin/mahogany -l INFO "$@" >> "$HOME/.mahogany.log" 2>&1
+	rc=$?
+fi
 
 # libopeninput opens /dev/wskbd0 directly, which detaches it from the console
 # keyboard mux, and never reattaches it: after a session the console and X
