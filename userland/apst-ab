@@ -1,0 +1,25 @@
+#!/bin/sh
+# apst-ab [minutes]: what the SSD's power states save.  Run on battery,
+# with the machine left alone: it alternates APST on and off
+# (hw.nvme0.apst), MINUTES each (default 5) after a minute to settle,
+# and prints the mean discharge rate of each half.  APST is left on.
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+m=${1:-5}
+trap 'sysctl -w hw.nvme0.apst=1 > /dev/null' EXIT INT TERM
+if envstat -d acpiacad0 | grep -q 'connected: *TRUE'; then
+	echo "apst-ab: on AC; unplug the charger first" >&2
+	exit 1
+fi
+for mode in 1 0 1 0; do
+	sysctl -w hw.nvme0.apst=$mode > /dev/null
+	sleep 60
+	i=0
+	while [ $i -lt $((m * 4)) ]; do
+		envstat -d acpibat0 | awk '/discharge rate/ { print $3 }'
+		sleep 15
+		i=$((i + 1))
+	done | awk -v mode=$mode -v m=$m '
+		$1 + 0 > 0 { s += $1; n++ }
+		END { printf "APST %s: %.2f W (mean of %d readings over %d min)\n",
+			(mode ? "on " : "off"), n ? s / n : 0, n, m }'
+done

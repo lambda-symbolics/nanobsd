@@ -211,7 +211,11 @@ stays installed for the colon prompt.
 
 - Screen sharing: needs xdg-desktop-portal-wlr and pipewire, neither of
   which is packaged for NetBSD. Screenshots work (grim over wlr-screencopy).
-- Sloppy (mouse-follows) focus: Mahogany has click focus only.
+- Sloppy focus has been in since 9/26 (=hrt_set_pointer_enter_callback=,
+  on pointer motion only).  Since 9/28 it also takes a column only partly
+  on the panel: =strip-layout= scrolls a newly selected column only as far
+  as the edge that cut it, so the pointer stays on it and the next motion
+  does not bounce focus back.
 - The =eval= key (s-x) has no equivalent; =colon= (s-;) runs commands via rofi.
 - Media keys under wskbd/libopeninput are untested until someone presses them;
   =Key pressed:= lines in =~/.mahogany.log= (run with =-l DEBUG=) show what
@@ -417,6 +421,15 @@ publishing it calls =(bar-status-changed)= through =mahoganyctl=, and the bar
 thread that polled the file is gone.  A quiet desktop now redraws the bar
 once a minute, right on the minute, and volume, AC and network changes show
 within a second.
+
+The bar hides over a fullscreen window (9/28).  heart draws it on the scene's
+top layer, which sits above the fullscreen layer, so a fullscreened video
+still had the bar across its top.  =bar-refresh= now clears the bar on an
+output whose current group shows a fullscreen view, and the strips keep the
+height they reserve for it, so nothing behind the fullscreen window resizes;
+fullscreen requests run =*fullscreen-change-hook*= to repaint.  Moving the
+fullscreen layer above the top one instead would have hidden layer-shell
+launchers (wmenu) under a fullscreen video.
 
 ** Lid shut at boot
 

@@ -187,6 +187,76 @@ S0ix and whether the battery case behaves the same still need a run on
 battery: close the lid unplugged for a few minutes and look for =slp_s0
 delta= in =/var/log/messages=, and the discharge rate before and after.
 
+* The SSD never slept (2026-09-28, kernel 131)
+
+NetBSD's nvme(4) never enabled autonomous power state transitions
+(APST): =NVM_FEAT_AUTONOMOUS_POWER_STATE_TRANSITION= is defined in
+=nvmereg.h= and nothing uses it, and APST is off after a controller reset,
+so the SK hynix HFM512GD3HX015N stayed in PS0 whatever it did (=nvmectl
+power nvme0= always said 0).  Its descriptors:
+
+| state | max power | kind            | entry + exit |
+|-------+-----------+-----------------+--------------|
+| PS0   | 6.3 W     | operational     |              |
+| PS1   | 2.4 W     | operational     |              |
+| PS2   | 1.9 W     | operational     |              |
+| PS3   | 50 mW     | non-operational | 1 + 1 ms     |
+| PS4   | 4 mW      | non-operational | 1 + 9 ms     |
+
+Kernel 131 (=kernel/dev/ic/nvme.c=) builds the APST table from them the way
+Linux does by default (the deepest state within 15 ms of entry plus exit
+latency after 100 ms idle, one within 100 ms after 2 s) and sends it at
+attach and after every resume: here =PS0-3 -> PS4 after 100 ms= (dmesg).
+=hw.nvme0.apst= turns it off (0) and on (1) at run time.  =nvmectl power
+nvme0= now reads 4 whenever the machine is quiet: sampled twice a second
+over 4 minutes of an idle desktop, the drive was in PS4 98 % of the time.
+
+What it saves is not measured yet: the charger was in and the battery full.
+=userland/apst-ab= (installed as =/usr/local/bin/apst-ab=) does it on
+battery: APST on and off in turn, 5 minutes each, the mean discharge rate
+of each.
+
+** The root file system
+
+=/etc/fstab= mounted the FFS root plain =rw=: no WAPBL journal, access times
+on, so every file read wrote its inode back, and creates, removes and renames
+wrote synchronously.  Now =rw,log,noatime= (the old file is
+=/etc/fstab.pre-log=).
+
+** gefs against it, measured
+
+With the swap partition lent to a 16 GB gefs volume (the gefs port, built
+against this tree as a module; swap is back), the same small loads ran for
+4 minutes each on the FFS root (=log,noatime=) and on gefs, while =iostat=
+counted the seconds with disk writes and =nvmectl power= sampled the
+drive's state twice a second:
+
+| load (4 min)                        | FFS: s with writes / ops | gefs: s with writes / ops / commits | PS4, FFS / gefs |
+|-------------------------------------+--------------------------+-------------------------------------+-----------------|
+| idle                                | 28 / 212                 | 26 / 102 / 0                        | 98 % / 99 %     |
+| a log line every 2 s                | 26 / 218                 | 33 / 338 / 8                        | 98 % / 99 %     |
+| a 4 KB file made, renamed, removed every 10 s | 26 / 144       | 37 / 416 / 8                        | 99 % / 99 %     |
+| 4 KB rewritten and fsync'd every 5 s | 33 / 691                | 72 / 1737 / 48 (96 cache flushes)   | 96 % / 97 %     |
+
+- With APST the drive is asleep 96-99 % of the time whatever the file
+  system does; the file system moves that by a few points.  APST was the
+  lever; the file system is not one, at this write rate.
+- The root's own background (about 7 wake-ups a minute) dominates the idle
+  and trickle rows.  On FFS the trickle loads ride in the root's syncer
+  passes and add nothing; on a separate gefs volume they add its commits (8
+  in 4 minutes), in other seconds.  As the root, gefs would batch the
+  background into one commit per 30 s too, fewer wake-ups than FFS's
+  staggered 10/15/30 s delays, worth a few mW at most.
+- Under fsync, gefs costs twice the wake-ups and 2.5 times the writes
+  (each fsync is a whole commit with two cache flushes; no journal), so a
+  browser profile would do worse on it.
+- Much of the background was the measurement's own ssh logins (authlog)
+  and dhcpcd: the router's advertisements expire every few minutes
+  ("part of a Router Advertisement expired"), and dhcpcd rewrites
+  =/etc/resolv.conf=, =/var/run/resolvconf= and its hook state each time.
+  Candidates if it matters: =/var/run= on tmpfs, and fewer resolvconf
+  rewrites.
+
 * Status
 
 | lever                         | state                                              |
@@ -200,6 +270,9 @@ delta= in =/var/log/messages=, and the discharge rate before and after.
 | 7 small ones                  | done                                               |
 | 8 sticky PC3 state            | open: logger running, trigger unknown, AC confound |
 | 9 SLP_S0                      | reached with Wi-Fi up; needs a battery run         |
+| 10 SSD power states (APST)    | done (kernel 131); drive in PS4 98 % when quiet    |
+| 11 root log,noatime           | done                                               |
+| 12 gefs for power             | measured: not a lever with APST on (see above)     |
 
 =userland/s0ix= logs the whole-machine power of every suspension of 2 minutes
 or more on battery (=s0ix: resumed after N s on battery: X -> Y Wh, Z W= in
