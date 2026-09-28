@@ -169,6 +169,10 @@ struct nvme_softc {
 #define	NVME_QUIRK_NOMSI		__BIT(1)
 
 	char			sc_modelname[81];
+
+	/* LISPBSD: autonomous power state transitions, hw.nvmeN.apst */
+	int			sc_apst;
+	struct sysctllog	*sc_sysctllog;
 };
 
 #define	lemtoh16(p)	le16toh(*((uint16_t *)(p)))

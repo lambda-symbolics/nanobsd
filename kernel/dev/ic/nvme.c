@@ -33,6 +33,7 @@ __KERNEL_RCSID(0, "$NetBSD: nvme.c,v 1.69 2024/03/11 21:10:46 riastradh Exp $");
 #include <sys/proc.h>
 #include <sys/queue.h>
 #include <sys/mutex.h>
+#include <sys/sysctl.h>
 
 #include <uvm/uvm_extern.h>
 
@@ -47,6 +48,25 @@ __KERNEL_RCSID(0, "$NetBSD: nvme.c,v 1.69 2024/03/11 21:10:46 riastradh Exp $");
 
 int nvme_adminq_size = 32;
 int nvme_ioq_size = 1024;
+
+/*
+ * LISPBSD: autonomous power state transitions (APST, NVMe 1.1).  NetBSD
+ * never enabled them, so a drive stayed in its highest power state, PS0,
+ * whatever it did.  With APST the controller drops by itself to a
+ * non-operational state after a spell of idleness, and comes back on the
+ * next command.  The table follows Linux's default: the deepest state whose
+ * entry plus exit latency is at most 15 ms after 100 ms of idleness, a
+ * deeper one of at most 100 ms after 2 s; states slower than that are not
+ * used.  hw.nvmeN.apst turns it off (0) and on (1).
+ */
+int nvme_apst_default = 1;
+#define NVME_APST_PRIMARY_MS		100
+#define NVME_APST_PRIMARY_TOL_US	15000
+#define NVME_APST_SECONDARY_MS		2000
+#define NVME_APST_SECONDARY_TOL_US	100000
+
+static int	nvme_apst(struct nvme_softc *, bool);
+static void	nvme_apst_sysctl_init(struct nvme_softc *);
 
 static int	nvme_print(void *, const char *);
 
@@ -465,6 +485,10 @@ nvme_attach(struct nvme_softc *sc)
 	if (!sc->sc_use_mq)
 		nvme_write4(sc, NVME_INTMC, 1);
 
+	sc->sc_apst = nvme_apst_default;
+	(void)nvme_apst(sc, true);
+	nvme_apst_sysctl_init(sc);
+
 	/* probe subdevices */
 	sc->sc_namespaces = kmem_zalloc(sizeof(*sc->sc_namespaces) * sc->sc_nn,
 	    KM_SLEEP);
@@ -570,6 +594,8 @@ nvme_detach(struct nvme_softc *sc, int flags)
 	if (error)
 		return error;
 
+	sysctl_teardown(&sc->sc_sysctllog);
+
 	error = nvme_shutdown(sc);
 	if (error)
 		return error;
@@ -626,6 +652,9 @@ nvme_resume(struct nvme_softc *sc)
 
 	if (!sc->sc_use_mq)
 		nvme_write4(sc, NVME_INTMC, 1);
+
+	/* a controller reset clears APST: set it again */
+	(void)nvme_apst(sc, false);
 
 	return 0;
 
@@ -2264,4 +2293,183 @@ nvmeioctl(dev_t dev, u_long cmd, void *data, int flag, struct lwp *l)
 	}
 
 	return ENOTTY;
+}
+
+/*
+ * LISPBSD: APST.  Build the transition table from the power state
+ * descriptors and hand it to the controller with Set Features 0x0c; with
+ * sc_apst clear, send an empty table with APST disabled.  VERBOSE prints
+ * the power states and the table (at attach).
+ */
+/* append to a buffer that never overflows: P stays below E */
+#define NVME_APPEND(p, e, ...) do {					\
+	int _n = snprintf((p), (e) - (p), __VA_ARGS__);			\
+	if (_n > 0)							\
+		(p) = ((p) + _n < (e)) ? (p) + _n : (e) - 1;		\
+} while (/*CONSTCOND*/0)
+
+static int
+nvme_apst(struct nvme_softc *sc, bool verbose)
+{
+	struct nvm_identify_controller *id = &sc->sc_identify;
+	struct nvm_identify_psd *psd;
+	struct nvme_dmamem *mem;
+	struct nvme_ccb *ccb;
+	struct nvme_sqe sqe;
+	uint64_t *table, target, total, ms;
+	u_int last = UINT_MAX, from = 0;
+	char buf[256], *p, *e;
+	int state, rv, npss;
+	bool enable;
+
+	if ((id->apsta & NVME_ID_CTRLR_APSTA_PRESENT) == 0) {
+		if (verbose)
+			aprint_verbose_dev(sc->sc_dev, "no APST\n");
+		return 0;
+	}
+	npss = MIN(id->npss, 31);
+
+	if (verbose) {
+		p = buf;
+		e = buf + sizeof(buf);
+		buf[0] = '\0';
+		for (state = 0; state <= npss; state++) {
+			psd = &id->psd[state];
+			/* max power in centiwatts, or 0.1 mW with MPS */
+			NVME_APPEND(p, e, " %d:%u.%04uW%s", state,
+			    (psd->flags & NVME_PSD_MPS) ?
+			    psd->mp / 10000 : psd->mp / 100,
+			    (psd->flags & NVME_PSD_MPS) ?
+			    psd->mp % 10000 : (psd->mp % 100) * 100,
+			    (psd->flags & NVME_PSD_NOPS) ? "(non-op)" : "");
+			if (psd->flags & NVME_PSD_NOPS)
+				NVME_APPEND(p, e, "%u+%uus",
+				    psd->enlat, psd->exlat);
+		}
+		aprint_normal_dev(sc->sc_dev, "power states%s\n", buf);
+	}
+
+	mem = nvme_dmamem_alloc(sc, PAGE_SIZE);
+	if (mem == NULL)
+		return ENOMEM;
+	table = NVME_DMA_KVA(mem);
+	memset(table, 0, PAGE_SIZE);
+
+	enable = sc->sc_apst != 0;
+	target = 0;
+	if (enable) {
+		/* from the lowest power state up, as Linux does */
+		for (state = npss; state >= 0; state--) {
+			if (target != 0)
+				table[state] = htole64(target);
+			psd = &id->psd[state];
+			if ((psd->flags & NVME_PSD_NOPS) == 0)
+				continue;
+			total = (uint64_t)psd->enlat + psd->exlat;	/* us */
+			if (total <= NVME_APST_PRIMARY_TOL_US) {
+				if (last == 1)
+					continue;
+				last = 1;
+				ms = NVME_APST_PRIMARY_MS;
+			} else if (total <= NVME_APST_SECONDARY_TOL_US) {
+				if (last <= 2)
+					continue;
+				last = 2;
+				ms = NVME_APST_SECONDARY_MS;
+			} else
+				continue;
+			target = ((uint64_t)state << 3) | (ms << 8);
+		}
+		if (target == 0)
+			enable = false;	/* no state worth it */
+	}
+
+	memset(&sqe, 0, sizeof(sqe));
+	sqe.opcode = NVM_ADMIN_SET_FEATURES;
+	htolem32(&sqe.cdw10, NVM_FEAT_AUTONOMOUS_POWER_STATE_TRANSITION);
+	htolem32(&sqe.cdw11, enable ? 1 : 0);
+	htolem64(&sqe.entry.prp[0], NVME_DMA_DVA(mem));
+
+	ccb = nvme_ccb_get(sc->sc_admin_q, false);
+	if (ccb == NULL) {
+		/* busy admin queue (only at run time, from the sysctl) */
+		nvme_dmamem_free(sc, mem);
+		return EBUSY;
+	}
+	ccb->ccb_done = nvme_empty_done;
+	ccb->ccb_cookie = &sqe;
+	nvme_dmamem_sync(sc, mem, BUS_DMASYNC_PREWRITE);
+	rv = nvme_poll(sc, sc->sc_admin_q, ccb, nvme_sqe_fill, NVME_TIMO_QOP);
+	nvme_dmamem_sync(sc, mem, BUS_DMASYNC_POSTWRITE);
+	nvme_ccb_put(sc->sc_admin_q, ccb);
+
+	if (rv != 0) {
+		aprint_error_dev(sc->sc_dev, "APST: set features failed\n");
+	} else if (verbose && enable) {
+		/* e.g. "PS0-2 -> PS3 after 100 ms, PS3 -> PS4 after 2000 ms" */
+		p = buf;
+		e = buf + sizeof(buf);
+		buf[0] = '\0';
+		for (state = 0; state <= npss; state++) {
+			uint64_t t = le64toh(table[state]);
+			uint64_t n = (state < npss) ? le64toh(table[state + 1]) : 0;
+
+			if (t == 0) {
+				from = state + 1;
+				continue;
+			}
+			if (n == t)
+				continue;	/* same target as the next: merge */
+			if (from == (u_int)state)
+				NVME_APPEND(p, e, "%sPS%d", p == buf ? "" : ", ",
+				    state);
+			else
+				NVME_APPEND(p, e, "%sPS%u-%d", p == buf ? "" : ", ",
+				    from, state);
+			NVME_APPEND(p, e, " -> PS%u after %u ms",
+			    (u_int)((t >> 3) & 0x1f), (u_int)(t >> 8));
+			from = state + 1;
+		}
+		aprint_normal_dev(sc->sc_dev, "APST: %s\n", buf);
+	} else if (verbose)
+		aprint_normal_dev(sc->sc_dev, "APST off\n");
+
+	nvme_dmamem_free(sc, mem);
+	return rv;
+}
+
+static int
+nvme_apst_sysctl(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	struct nvme_softc *sc = node.sysctl_data;
+	int val, error;
+
+	val = sc->sc_apst;
+	node.sysctl_data = &val;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error || newp == NULL)
+		return error;
+	if (val != 0 && val != 1)
+		return EINVAL;
+	sc->sc_apst = val;
+	error = nvme_apst(sc, true);
+	return (error == EBUSY || error == ENOMEM) ? error : (error ? EIO : 0);
+}
+
+static void
+nvme_apst_sysctl_init(struct nvme_softc *sc)
+{
+	const struct sysctlnode *rnode;
+
+	if ((sc->sc_identify.apsta & NVME_ID_CTRLR_APSTA_PRESENT) == 0)
+		return;
+	if (sysctl_createv(&sc->sc_sysctllog, 0, NULL, &rnode, 0,
+	    CTLTYPE_NODE, device_xname(sc->sc_dev), NULL, NULL, 0, NULL, 0,
+	    CTL_HW, CTL_CREATE, CTL_EOL) != 0)
+		return;
+	sysctl_createv(&sc->sc_sysctllog, 0, &rnode, NULL, CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "apst",
+	    SYSCTL_DESCR("autonomous power state transitions (0 off, 1 on)"),
+	    nvme_apst_sysctl, 0, (void *)sc, 0, CTL_CREATE, CTL_EOL);
 }
