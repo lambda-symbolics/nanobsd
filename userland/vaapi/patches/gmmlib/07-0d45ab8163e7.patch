@@ -1,0 +1,35 @@
+From 0d45ab8163e7f7ac0e9a3d2cf34f073175a13f2c Mon Sep 17 00:00:00 2001
+From: Jan Beich <jbeich@FreeBSD.org>
+Date: Sat, 11 Jan 2020 22:42:50 +0000
+Subject: [PATCH] Avoid __fastcall conflicting with system definition
+
+In file included from media_driver/agnostic/common/cm/cm_hal_hashtable.cpp:36:
+In file included from media_driver/agnostic/common/cm/cm_hal_hashtable.h:29:
+In file included from media_driver/agnostic/common/os/mos_os.h:31:
+In file included from media_driver/linux/common/os/media_skuwa_specific.h:32:
+In file included from media_driver/linux/common/os/linux_shadow_skuwa.h:31:
+In file included from /usr/local/include/igdgmm/GmmLib/inc/GmmLib.h:30:
+/usr/local/include/igdgmm/inc/portable_compiler.h:33:13: error: '__fastcall' macro redefined [-Werror,-Wmacro-redefined]
+    #define __fastcall
+            ^
+/usr/include/sys/cdefs.h:372:9: note: previous definition is here
+ #define __fastcall      __attribute__((__fastcall__))
+         ^
+---
+ Source/inc/portable_compiler.h | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/Source/inc/portable_compiler.h b/Source/inc/portable_compiler.h
+index a7156249..fbcbb7fd 100644
+--- a/Source/inc/portable_compiler.h
++++ b/Source/inc/portable_compiler.h
+@@ -30,6 +30,9 @@ OTHER DEALINGS IN THE SOFTWARE.
+     #endif
+ 
+     #define __noop
++    #ifdef __fastcall
++        #undef __fastcall
++    #endif
+     #define __fastcall
+     #if defined __x86_64__
+         #define __stdcall       // deprecated for x86-64

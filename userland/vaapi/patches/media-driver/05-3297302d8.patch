@@ -1,0 +1,25 @@
+From 3297302d81b5ced818d1c55aae6ed715ffd1a974 Mon Sep 17 00:00:00 2001
+From: Jan Beich <jbeich@FreeBSD.org>
+Date: Sat, 11 Jan 2020 21:04:51 +0000
+Subject: [PATCH] Clang forbids downcasting pthread_t if it's a pointer
+
+media_driver/media_driver_next/linux/common/os/mos_utilities_specific_next.cpp:1693:12: error: cast from pointer to smaller type 'uint32_t' (aka 'unsigned int') loses information
+    return (uint32_t)pthread_self();
+           ^~~~~~~~~~~~~~~~~~~~~~~~
+---
+ .../linux/common/os/osservice/mos_utilities_specific.cpp        | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/media_softlet/linux/common/os/osservice/mos_utilities_specific.cpp b/media_softlet/linux/common/os/osservice/mos_utilities_specific.cpp
+index 96785e21ec..1c207c5033 100644
+--- a/media_softlet/linux/common/os/osservice/mos_utilities_specific.cpp
++++ b/media_softlet/linux/common/os/osservice/mos_utilities_specific.cpp
+@@ -2170,7 +2170,7 @@ uint32_t MosUtilities::MosGetThreadId(
+ 
+ uint32_t MosUtilities::MosGetCurrentThreadId()
+ {
+-    return (uint32_t)pthread_self();
++    return (uintptr_t)pthread_self();
+ }
+ 
+ MOS_STATUS MosUtilities::MosWaitThread(

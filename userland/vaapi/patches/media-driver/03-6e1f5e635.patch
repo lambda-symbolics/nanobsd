@@ -1,0 +1,43 @@
+From 6e1f5e635cda39ee32029d77657ef2dc26b8f40c Mon Sep 17 00:00:00 2001
+From: Jan Beich <jbeich@FreeBSD.org>
+Date: Mon, 29 Nov 2021 23:05:27 +0000
+Subject: [PATCH] Avoid ALIGN conflicting with system definition
+
+In file included from media_driver/linux/gen12/ddi/media_libva_caps_g12.cpp:38:
+media_driver/linux/common/os/i915/include/mos_bufmgr_priv.h:351:9: error: 'ALIGN' macro redefined [-Werror,-Wmacro-redefined]
+ #define ALIGN(value, alignment)    ((value + alignment - 1) & ~(alignment - 1))
+         ^
+/usr/include/machine/param.h:79:9: note: previous definition is here
+ #define ALIGN(p)                _ALIGN(p)
+         ^
+
+In file included from media_driver/linux/gen12/ddi/media_libva_caps_g12.cpp:30:
+In file included from media_driver/linux/common/ddi/media_libva.h:52:
+In file included from media_driver/agnostic/common/codec/hal/codechal_decoder.h:40:
+In file included from media_driver/agnostic/common/cm/cm_wrapper.h:31:
+In file included from media_driver/linux/common/cm/hal/cm_wrapper_os.h:31:
+In file included from media_driver/agnostic/common/cm/cm_def.h:31:
+In file included from media_driver/agnostic/common/cm/cm_common.h:31:
+In file included from media_driver/linux/common/cm/hal/cm_innerdef_os.h:42:
+In file included from /usr/include/pthread_np.h:36:
+In file included from /usr/include/sys/param.h:162:
+/usr/include/machine/param.h:79:2: error: bootlegging test
+---
+ media_softlet/linux/common/os/i915/include/mos_bufmgr_priv.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/media_softlet/linux/common/os/i915/include/mos_bufmgr_priv.h b/media_softlet/linux/common/os/i915/include/mos_bufmgr_priv.h
+index 04f543946b..fb4a4ab500 100644
+--- a/media_softlet/linux/common/os/i915/include/mos_bufmgr_priv.h
++++ b/media_softlet/linux/common/os/i915/include/mos_bufmgr_priv.h
+@@ -425,6 +425,10 @@ struct mos_bufmgr {
+     uint64_t platform_information = 0;
+ };
+ 
++#ifdef ALIGN
++/* <sys/param.h> via <pthread_np.h> on FreeBSD also defines ALIGN */
++#undef ALIGN
++#endif
+ #define ALIGN(value, alignment)    ((value + alignment - 1) & ~(alignment - 1))
+ #define ROUND_UP_TO(x, y)    (((x) + (y) - 1) / (y) * (y))
+ #define ROUND_UP_TO_MB(x)    ROUND_UP_TO((x), 1024*1024)

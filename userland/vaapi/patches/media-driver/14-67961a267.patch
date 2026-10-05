@@ -1,0 +1,22 @@
+From 67961a26736d29b6d7ceef377a12f327bcfa84d6 Mon Sep 17 00:00:00 2001
+From: Rodrigo Osorio <rodrigo@FreeBSD.org>
+Date: Fri, 22 Mar 2024 22:16:36 +0100
+Subject: [PATCH] error: unknown type name 'drmDevicePtr'   608 |    
+ drmDevicePtr device;       |     ^
+
+---
+ media_softlet/linux/common/os/mos_interface.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/media_softlet/linux/common/os/mos_interface.cpp b/media_softlet/linux/common/os/mos_interface.cpp
+index 33270a172f..64abfd66be 100644
+--- a/media_softlet/linux/common/os/mos_interface.cpp
++++ b/media_softlet/linux/common/os/mos_interface.cpp
+@@ -34,6 +34,7 @@
+ #include "mos_os_virtualengine_scalability_specific_next.h"
+ #include "mos_graphicsresource_specific_next.h"
+ #include "mos_bufmgr_priv.h"
++#include "xf86drm.h"
+ #include "media_fourcc.h"
+ #include "mos_oca_rtlog_mgr.h"
+ 

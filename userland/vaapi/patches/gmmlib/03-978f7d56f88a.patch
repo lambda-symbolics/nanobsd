@@ -1,0 +1,23 @@
+From 978f7d56f88ad17d913a57575f8ff044ed39bc39 Mon Sep 17 00:00:00 2001
+From: Jan Beich <jbeich@FreeBSD.org>
+Date: Wed, 1 Jan 2020 11:02:37 +0000
+Subject: [PATCH] Avoid -ldl if not required or not supported
+
+ld: error: unable to find library -ldl
+---
+ Source/GmmLib/ULT/CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Source/GmmLib/ULT/CMakeLists.txt b/Source/GmmLib/ULT/CMakeLists.txt
+index 3fc34a41..72237ced 100644
+--- a/Source/GmmLib/ULT/CMakeLists.txt
++++ b/Source/GmmLib/ULT/CMakeLists.txt
+@@ -156,7 +156,7 @@ target_link_libraries(${EXE_NAME} igfx_gmmumd_dll)
+ 
+ target_link_libraries(${EXE_NAME}
+     pthread
+-    dl
++    ${CMAKE_DL_LIBS}
+ )
+ 
+ add_custom_target(Run_ULT ALL DEPENDS GMMULT)

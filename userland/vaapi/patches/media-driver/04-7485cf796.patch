@@ -1,0 +1,45 @@
+From 7485cf796b408ee55764f9091e415ee18671beae Mon Sep 17 00:00:00 2001
+From: Jan Beich <jbeich@FreeBSD.org>
+Date: Sat, 11 Jan 2020 22:25:22 +0000
+Subject: [PATCH] Avoid -ldl if not required or not supported
+
+ld: error: unable to find library -ldl
+---
+ cmrtlib/linux/CMakeLists.txt                  | 2 +-
+ media_driver/linux/ult/ult_app/CMakeLists.txt | 3 ++-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/cmrtlib/linux/CMakeLists.txt b/cmrtlib/linux/CMakeLists.txt
+index b066138d9d..c8f7e74f87 100644
+--- a/cmrtlib/linux/CMakeLists.txt
++++ b/cmrtlib/linux/CMakeLists.txt
+@@ -101,7 +101,7 @@ set(CMRT_VERSION ${CMRT_VERSION_MAJOR}.${CMRT_VERSION_MINOR}.${CMRT_VERSION_PATC
+ 
+ set_target_properties(igfxcmrt PROPERTIES VERSION ${CMRT_VERSION})
+ set_target_properties(igfxcmrt PROPERTIES SOVERSION ${CMRT_VERSION_MAJOR})
+-target_link_libraries( igfxcmrt dl va rt ${GCC_SECURE_LINK_FLAGS})
++target_link_libraries( igfxcmrt ${CMAKE_DL_LIBS} va rt ${GCC_SECURE_LINK_FLAGS})
+ 
+ include(GNUInstallDirs)
+ 
+diff --git a/media_driver/linux/ult/ult_app/CMakeLists.txt b/media_driver/linux/ult/ult_app/CMakeLists.txt
+index 1b24fed7fc..c588412049 100644
+--- a/media_driver/linux/ult/ult_app/CMakeLists.txt
++++ b/media_driver/linux/ult/ult_app/CMakeLists.txt
+@@ -59,7 +59,7 @@ else ()
+ endif ()
+ 
+ add_executable(devult ${SOURCES})
+-target_link_libraries(devult libgtest libdl.so)
++target_link_libraries(devult libgtest ${CMAKE_DL_LIBS})
+ target_include_directories(devult BEFORE PRIVATE
+     ${SOFTLET_MOS_PREPEND_INCLUDE_DIRS_}
+     ${MOS_PUBLIC_INCLUDE_DIRS_}     ${SOFTLET_MOS_PUBLIC_INCLUDE_DIRS_}
+@@ -68,6 +68,7 @@ target_include_directories(devult BEFORE PRIVATE
+     ${COMMON_CP_DIRECTORIES_}
+     ${SOFTLET_DDI_PUBLIC_INCLUDE_DIRS_} ${SOFTLET_MHW_PRIVATE_INCLUDE_DIRS_}
+ )
++
+ if (DEFINED BYPASS_MEDIA_ULT AND "${BYPASS_MEDIA_ULT}" STREQUAL "yes")
+     # must explictly pass along BYPASS_MEDIA_ULT as yes then could bypass the running of media ult
+     message("-- media -- BYPASS_MEDIA_ULT = ${BYPASS_MEDIA_ULT}")

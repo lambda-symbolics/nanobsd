@@ -24,3 +24,12 @@ user_pref("browser.newtabpage.activity-stream.showSponsored", false);
 user_pref("browser.newtabpage.activity-stream.showSponsoredTopSites", false);
 user_pref("network.prefetch-next", false);
 user_pref("network.predictor.enabled", false);
+
+// 2026-10-02: hardware video decoding through VA-API (intel-media-driver iHD
+// in /usr/local/lib/dri, kernel 133).  The NetBSD build has the RDD media
+// process off by default, and VA-API only runs there.  Revert: user.js.bak-20261002.
+user_pref("media.hardware-video-decoding.enabled", true);
+user_pref("media.hardware-video-decoding.force-enabled", true);
+user_pref("media.rdd-process.enabled", true);
+user_pref("media.rdd-ffvpx.enabled", true);
+user_pref("media.rdd-ffmpeg.enabled", true);

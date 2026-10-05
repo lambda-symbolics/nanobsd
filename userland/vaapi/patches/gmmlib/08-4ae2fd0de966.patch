@@ -1,0 +1,39 @@
+From 4ae2fd0de96640921ca77ecb1f1240b992077e27 Mon Sep 17 00:00:00 2001
+From: Jan Beich <jbeich@FreeBSD.org>
+Date: Mon, 13 Jan 2020 21:36:54 +0000
+Subject: [PATCH] Switch to optimized ffsl supported on more platforms
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+In file included from Source/GmmLib/TranslationTable/GmmAuxTable.cpp:30:
+Source/GmmLib/TranslationTable/../TranslationTable/GmmUmdTranslationTable.h: In function ‘int _BitScanForward(uint32_t*, uint32_t)’:
+Source/GmmLib/TranslationTable/../TranslationTable/GmmUmdTranslationTable.h:63:9: error: ‘ffsl’ was not declared in this scope
+     i = ffsl(mask);
+         ^~~~
+Source/GmmLib/TranslationTable/../TranslationTable/GmmUmdTranslationTable.h:63:9: note: suggested alternative: ‘ffs’
+     i = ffsl(mask);
+         ^~~~
+         ffs
+---
+ Source/GmmLib/TranslationTable/GmmUmdTranslationTable.h | 7 +------
+ 1 file changed, 1 insertion(+), 6 deletions(-)
+
+diff --git a/Source/GmmLib/TranslationTable/GmmUmdTranslationTable.h b/Source/GmmLib/TranslationTable/GmmUmdTranslationTable.h
+index dbc2ea98..07140535 100644
+--- a/Source/GmmLib/TranslationTable/GmmUmdTranslationTable.h
++++ b/Source/GmmLib/TranslationTable/GmmUmdTranslationTable.h
+@@ -60,12 +60,7 @@ static inline int _BitScanForward(uint32_t *index, uint32_t mask)
+ {
+     int i;
+ 
+-#ifdef __ANDROID__
+-    i = ffs(mask);
+-#else
+-    i = ffsl(mask);
+-#endif
+-
++    i = __builtin_ffsl(mask);
+     if(i > 0)
+     {
+         *index = (uint32_t)(i - 1);

@@ -1,0 +1,78 @@
+From 8ebe65625f719a0ca6024038231510ac22b2b2ce Mon Sep 17 00:00:00 2001
+From: Jan Beich <jbeich@FreeBSD.org>
+Date: Wed, 1 Jan 2020 10:42:29 +0000
+Subject: [PATCH] __sync* are GCC/Clang atomic builtins supported on any
+ platform
+
+In file included from Source/GmmLib/Platform/GmmGen11Platform.cpp:23:
+In file included from Source/GmmLib/inc/Internal/Common/GmmLibInc.h:35:
+In file included from Source/GmmLib/inc/External/Common/GmmCachePolicy.h:332:
+Source/GmmLib/inc/External/Common/GmmCachePolicyCommon.h:74:13: error: control reaches end of non-void function [-Werror,-Wreturn-type]
+            }
+            ^
+
+Source/GmmLib/GlobalInfo/GmmInfo.cpp:600:1: error: non-void function does not return a value in all control paths [-Werror,-Wreturn-type]
+}
+^
+Source/GmmLib/GlobalInfo/GmmInfo.cpp:635:5: error: expected 'while' in do/while loop
+    else
+    ^
+Source/GmmLib/GlobalInfo/GmmInfo.cpp:616:9: note: to match this 'do'
+        do
+        ^
+Source/GmmLib/GlobalInfo/GmmInfo.cpp:803:18: error: qualified reference to 'Context' is a constructor name rather than a type in this context
+GmmLib::Context::Context()
+                 ^
+Source/GmmLib/GlobalInfo/GmmInfo.cpp:804:5: error: expected ';' after expression
+    : ClientType(),
+    ^
+[...]
+---
+ Source/GmmLib/GlobalInfo/GmmInfo.cpp        | 4 ++--
+ Source/GmmLib/inc/External/Common/GmmInfo.h | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/Source/GmmLib/GlobalInfo/GmmInfo.cpp b/Source/GmmLib/GlobalInfo/GmmInfo.cpp
+index ec2be204..858701fb 100644
+--- a/Source/GmmLib/GlobalInfo/GmmInfo.cpp
++++ b/Source/GmmLib/GlobalInfo/GmmInfo.cpp
+@@ -937,7 +937,7 @@ int32_t GmmLib::Context::IncrementRefCount()
+ {
+     int32_t *Ref = &RefCount;
+ 
+-#if defined(__linux__)
++#if defined(__GNUC__)
+     // returns 0 only when registering the first client
+     return (__sync_fetch_and_add(Ref, 1));
+ #endif
+@@ -972,7 +972,7 @@ int32_t GmmLib::Context::DecrementRefCount()
+         {
+             break;
+         }
+-#if defined(__linux__)
++#if defined(__GNUC__)
+     } while(!__sync_bool_compare_and_swap(Ref, CurrentValue, TargetValue));
+ #endif
+     return TargetValue;
+diff --git a/Source/GmmLib/inc/External/Common/GmmInfo.h b/Source/GmmLib/inc/External/Common/GmmInfo.h
+index 95e3aa9b..822713ca 100644
+--- a/Source/GmmLib/inc/External/Common/GmmInfo.h
++++ b/Source/GmmLib/inc/External/Common/GmmInfo.h
+@@ -141,7 +141,7 @@ namespace GmmLib
+         {
+ #if defined(_WIN32)
+             return(InterlockedIncrement((LONG *)&RefCount) - 1);  //InterLockedIncrement() returns incremented value
+-#elif defined(__linux__)
++#elif defined(__GNUC__)
+             return(__sync_fetch_and_add(&RefCount, 1));
+ #endif
+         }
+@@ -163,7 +163,7 @@ namespace GmmLib
+                 }
+ #if defined(_WIN32)
+             } while (!(InterlockedCompareExchange((LONG *)&RefCount, TargetValue, CurrentValue) == CurrentValue));
+-#elif defined(__linux__)
++#elif defined(__GNUC__)
+             } while (!__sync_bool_compare_and_swap(&RefCount, CurrentValue, TargetValue));
+ #endif
+ 

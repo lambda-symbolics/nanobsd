@@ -1,0 +1,41 @@
+#+TITLE: Hardware video decoding (VA-API) on the Tiger Lake GPU
+#+DATE: 2026-10-02
+
+* Result
+
+Firefox playing a 1440p60 VP9 clip under Mahogany, panel on: package power
+7.5 W -> 3.0 W, the content process 33 % -> 5 % CPU, max 56 -> 37 C.  Decode
+alone (ffmpeg, 1440p60): software 2.5 W at 111 % CPU, iHD 1.6 W at 5 %.
+Hardware output is bit-exact with the software decoder (framemd5, 1080p30
+and 1440p60).  A busy YouTube tab still uses CPU on its main thread (page
+scripts); the decode itself runs in the RDD process at ~0 %.
+
+* Pieces
+
+- Kernel: NetBSD's i915 exposes both VCS engines and VECS, but nothing had
+  used them.  Two port bugs panicked on the first media context:
+  - kernel 132, =rcu_replace_pointer= assigned a local copy, so
+    =set_engines()= freed the live engine map;
+  - kernel 133, a NetBSD =rb_tree= needs its ops and Linux never initialises
+    the virtual-engine tree (zero is an empty Linux rbtree), so the
+    load-balanced VCS submission faulted.
+- =userland/vaapi/build.sh=: gmmlib 22.10.0 and intel-media-driver 26.1.5
+  with FreeBSD's port patches, two NetBSD fixes, installed in =/usr/local=.
+  It also links =iHD_drv_video.so= into =/usr/pkg/lib/dri= (libva's search
+  path) and =/usr/local/lib/libdrm.so.2= to NetBSD's =libdrm.so.3=: Firefox
+  dlopens the Linux soname, and without it its DMA-BUF device, and with it
+  VA-API, silently fails ("Failed to load libdrm.so.2").
+- Firefox (=user.js=): =media.hardware-video-decoding.enabled= and
+  =force-enabled=, and =media.rdd-process.enabled= with =rdd-ffvpx= and
+  =rdd-ffmpeg=: the NetBSD build has the RDD process off by default, and
+  VA-API only runs there.
+
+* Checking
+
+=about:support= (Compositing, Codec Support Information), =about:media=
+during playback, or =pmap= on Firefox's processes: =iHD_drv_video.so= in the
+RDD process means hardware decoding.  =/usr/pkg/lib/firefox/vaapitest -d
+/dev/dri/renderD128= is Firefox's own probe.  For logs:
+=MOZ_LOG=PlatformDecoderModule:5,FFmpegVideo:5,Dmabuf:5=.
+
+Not yet tested: AV1 content, the X11 session.

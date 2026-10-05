@@ -1,0 +1,24 @@
+From 4ec9b2bd6f0000a083f9020e79027fbfc5a5dca3 Mon Sep 17 00:00:00 2001
+From: Jan Beich <jbeich@FreeBSD.org>
+Date: Sat, 23 May 2020 03:49:30 +0000
+Subject: [PATCH] CI: add FreeBSD gmmlib workaround
+
+---
+ .travis.yml | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/.travis.yml b/.travis.yml
+index 929ebda2c2..4821b52e49 100644
+--- a/.travis.yml
++++ b/.travis.yml
+@@ -123,6 +123,10 @@ jobs:
+       install:
+         - sudo ln -sf /usr/local/libdata/pkgconfig /usr/local/lib/
+         - git clone https://github.com/intel/gmmlib.git
++        - | # Workaround until https://github.com/intel/gmmlib/pull/68 is merged
++          if ! fgrep -q freebsd gmmlib/.travis.yml; then
++            (cd gmmlib && git fetch origin pull/68/head:freebsd && git checkout freebsd)
++          fi
+         - (cd gmmlib && cmake -B _build -G Ninja && cmake --build _build && sudo cmake --install _build)
+         - git clone https://github.com/intel/libva.git
+         - (cd libva && meson _build && meson compile -C _build && sudo meson install -C _build)

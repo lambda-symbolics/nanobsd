@@ -1,0 +1,28 @@
+From d54347296503e9c8be8611d5cdc872298ec009ff Mon Sep 17 00:00:00 2001
+From: Jan Beich <jbeich@FreeBSD.org>
+Date: Sat, 11 Jan 2020 20:54:35 +0000
+Subject: [PATCH] -D__linux__ is predefined on Linux and illegal on non-Linux
+
+In file included from media_driver/agnostic/common/cm/cm_hal.cpp:26:
+In file included from media_driver/agnostic/common/os/mos_os.h:30:
+In file included from media_driver/agnostic/common/os/mos_defs.h:38:
+In file included from /usr/include/c++/v1/stdio.h:101:
+/usr/include/c++/v1/__config:219:12: fatal error: 'features.h' file not found
+ #  include <features.h>
+            ^~~~~~~~~~~~
+---
+ media_driver/cmake/linux/media_compile_flags_linux.cmake | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/media_driver/cmake/linux/media_compile_flags_linux.cmake b/media_driver/cmake/linux/media_compile_flags_linux.cmake
+index 0a211fdc7e..e307317aee 100755
+--- a/media_driver/cmake/linux/media_compile_flags_linux.cmake
++++ b/media_driver/cmake/linux/media_compile_flags_linux.cmake
+@@ -91,7 +91,6 @@ endif()
+ if(NOT ${PLATFORM} STREQUAL "android")
+     set(MEDIA_COMPILER_FLAGS_COMMON
+         ${MEDIA_COMPILER_FLAGS_COMMON}
+-        -D__linux__
+             -fno-tree-pre
+         -fPIC
+             -Wl,--no-as-needed

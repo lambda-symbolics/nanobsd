@@ -1,0 +1,32 @@
+From 7e26e598ecb2a91df10805c1bf8745f849f70383 Mon Sep 17 00:00:00 2001
+From: Jan Beich <jbeich@FreeBSD.org>
+Date: Sat, 11 Jan 2020 21:56:35 +0000
+Subject: [PATCH] Avoid __fastcall conflicting with system definition
+
+In file included from media_driver/agnostic/common/cm/cm_kernel_rt.cpp:35:
+In file included from media_driver/agnostic/common/cm/cm_mov_inst.h:31:
+In file included from media_driver/agnostic/common/cm/cm_mem.h:128:
+media_driver/linux/common/cm/hal/cm_mem_os.h:33:9: error: '__fastcall' macro redefined [-Werror,-Wmacro-redefined]
+ #define __fastcall
+         ^
+/usr/include/sys/cdefs.h:372:9: note: previous definition is here
+ #define __fastcall      __attribute__((__fastcall__))
+         ^
+---
+ media_driver/linux/common/cm/hal/osservice/cm_mem_os.h | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/media_driver/linux/common/cm/hal/osservice/cm_mem_os.h b/media_driver/linux/common/cm/hal/osservice/cm_mem_os.h
+index e911e4e7e4..fb95bf299c 100644
+--- a/media_driver/linux/common/cm/hal/osservice/cm_mem_os.h
++++ b/media_driver/linux/common/cm/hal/osservice/cm_mem_os.h
+@@ -30,6 +30,9 @@
+ #include <smmintrin.h>
+ 
+ typedef uintptr_t           UINT_PTR;
++#ifdef __fastcall
++    #undef __fastcall
++#endif
+ #define __fastcall
+ #define __noop
+ 

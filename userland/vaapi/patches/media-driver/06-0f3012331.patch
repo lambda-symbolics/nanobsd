@@ -1,0 +1,95 @@
+From 0f3012331a3a5d72f0b399807f0be609cd790301 Mon Sep 17 00:00:00 2001
+From: Jan Beich <jbeich@FreeBSD.org>
+Date: Sat, 11 Jan 2020 21:08:31 +0000
+Subject: [PATCH] makedev() is defined in <sys/types.h> on BSDs and
+ <sys/mkdev.h> on Solaris
+
+In file included from cmrtlib/linux/hardware/cm_device_os.cpp:24:
+cmrtlib/linux/../linux/hardware/drm_device.h:42:10: fatal error: 'sys/sysmacros.h' file not found
+ #include <sys/sysmacros.h>   //<sys/types.h>
+          ^~~~~~~~~~~~~~~~~
+media_driver/linux/common/os/i915/xf86drm.c:50:10: fatal error: 'sys/sysmacros.h' file not found
+ #include <sys/sysmacros.h>
+          ^~~~~~~~~~~~~~~~~
+media_driver/linux/ult/libdrm_mock/xf86drm_mock.c:50:10: fatal error: 'sys/sysmacros.h' file not found
+ #include <sys/sysmacros.h>
+          ^~~~~~~~~~~~~~~~~
+---
+ cmrtlib/linux/hardware/drm_device.h               | 6 +++---
+ media_driver/linux/ult/libdrm_mock/xf86drm_mock.c | 7 ++++---
+ media_softlet/linux/common/os/i915/xf86drm.c      | 6 ++++--
+ 3 files changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/cmrtlib/linux/hardware/drm_device.h b/cmrtlib/linux/hardware/drm_device.h
+index 99f330e674..c22ea17615 100644
+--- a/cmrtlib/linux/hardware/drm_device.h
++++ b/cmrtlib/linux/hardware/drm_device.h
+@@ -39,16 +39,16 @@
+ #include <limits.h>
+ #include <signal.h>
+ #include <time.h>
+-#include <sys/sysmacros.h>   //<sys/types.h>
++#include <sys/types.h>
+ #include <sys/stat.h>
+ #define stat_t struct stat
+ #include <sys/ioctl.h>
+ #include <sys/time.h>
+ #include <stdarg.h>
+-#ifdef MAJOR_IN_MKDEV
++#ifdef __sun //#ifdef MAJOR_IN_MKDEV
+ #include <sys/mkdev.h>
+ #endif
+-#ifdef MAJOR_IN_SYSMACROS
++#if defined(__GLIBC__) || defined(__linux__) //#ifdef MAJOR_IN_SYSMACROS
+ #include <sys/sysmacros.h>
+ #endif
+ #include <math.h>
+diff --git a/media_driver/linux/ult/libdrm_mock/xf86drm_mock.c b/media_driver/linux/ult/libdrm_mock/xf86drm_mock.c
+index 49d68b7cdb..5b97603a62 100644
+--- a/media_driver/linux/ult/libdrm_mock/xf86drm_mock.c
++++ b/media_driver/linux/ult/libdrm_mock/xf86drm_mock.c
+@@ -47,16 +47,17 @@
+ #include <signal.h>
+ #include <time.h>
+ #include <sys/types.h>
+-#include <sys/sysmacros.h>
+ #include <sys/stat.h>
+ #define stat_t struct stat
+ #include <sys/ioctl.h>
+ #include <sys/time.h>
+ #include <stdarg.h>
+-#ifdef HAVE_SYS_MKDEV_H
++#ifdef __sun //#ifdef MAJOR_IN_MKDEV
+ # include <sys/mkdev.h> /* defines major(), minor(), and makedev() on Solaris */
+ #endif
+-#include <sys/sysmacros.h>
++#if defined(__GLIBC__) || defined(__linux__) //#ifdef MAJOR_IN_SYSMACROS
++# include <sys/sysmacros.h>
++#endif
+ 
+ /* Not all systems have MAP_FAILED defined */
+ #ifndef MAP_FAILED
+diff --git a/media_softlet/linux/common/os/i915/xf86drm.c b/media_softlet/linux/common/os/i915/xf86drm.c
+index 9b2412c2d9..996126e4ac 100644
+--- a/media_softlet/linux/common/os/i915/xf86drm.c
++++ b/media_softlet/linux/common/os/i915/xf86drm.c
+@@ -47,15 +47,17 @@
+ #include <signal.h>
+ #include <time.h>
+ #include <sys/types.h>
+-#include <sys/sysmacros.h>
+ #include <sys/stat.h>
+ #define stat_t struct stat
+ #include <sys/ioctl.h>
+ #include <sys/time.h>
+ #include <stdarg.h>
+-#ifdef HAVE_SYS_MKDEV_H
++#ifdef __sun //#ifdef MAJOR_IN_MKDEV
+ # include <sys/mkdev.h> /* defines major(), minor(), and makedev() on Solaris */
+ #endif
++#if defined(__GLIBC__) || defined(__linux__) //#ifdef MAJOR_IN_SYSMACROS
++# include <sys/sysmacros.h>
++#endif
+ 
+ /* Not all systems have MAP_FAILED defined */
+ #ifndef MAP_FAILED
