@@ -1415,8 +1415,8 @@ static inline void write_desc(struct intel_engine_execlists *execlists, u64 desc
 {
 #ifdef __NetBSD__
 	if (execlists->ctrl_reg) {
-		bus_space_write_4(execlists->bst, execlists->bsh, execlists->submit_reg + port * 2, lower_32_bits(desc));
-		bus_space_write_4(execlists->bst, execlists->bsh, execlists->submit_reg + port * 2 + 1, upper_32_bits(desc));
+		bus_space_write_4(execlists->bst, execlists->bsh, execlists->submit_reg + port * 8, lower_32_bits(desc));
+		bus_space_write_4(execlists->bst, execlists->bsh, execlists->submit_reg + port * 8 + 4, upper_32_bits(desc));
 	} else {
 		bus_space_write_4(execlists->bst, execlists->bsh, execlists->submit_reg, upper_32_bits(desc));
 		bus_space_write_4(execlists->bst, execlists->bsh, execlists->submit_reg, lower_32_bits(desc));
