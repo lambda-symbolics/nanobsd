@@ -491,6 +491,9 @@ void intel_engine_init_execlists(struct intel_engine_cs *engine)
 
 	execlists->queue_priority_hint = INT_MIN;
 	i915_sched_init(execlists);
+#ifdef __NetBSD__
+	intel_execlists_init_virtual(execlists);
+#endif
 }
 
 static void cleanup_status_page(struct intel_engine_cs *engine)

@@ -225,6 +225,9 @@ void intel_engine_get_instdone(const struct intel_engine_cs *engine,
 			       struct intel_instdone *instdone);
 
 void intel_engine_init_execlists(struct intel_engine_cs *engine);
+#ifdef __NetBSD__
+void intel_execlists_init_virtual(struct intel_engine_execlists *);
+#endif
 
 void intel_engine_init_breadcrumbs(struct intel_engine_cs *engine);
 void intel_engine_fini_breadcrumbs(struct intel_engine_cs *engine);

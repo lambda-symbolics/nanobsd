@@ -267,6 +267,19 @@ static const rb_tree_ops_t ve_tree_ops = {
 	.rbto_compare_key = compare_ve_node_key,
 	.rbto_node_offset = offsetof(struct ve_node, rb),
 };
+
+/*
+ * LISPBSD: a zeroed Linux rb_root_cached is an empty tree, so Linux never
+ * initialises execlists->virtual; a NetBSD rb_tree needs its ops.  Without
+ * this the first virtual (load-balanced) engine submission, as media-driver
+ * does for the two video engines, faults in rb_tree_insert_node.
+ */
+void
+intel_execlists_init_virtual(struct intel_engine_execlists *execlists)
+{
+
+	rb_tree_init(&execlists->virtual.rb_root.rbr_tree, &ve_tree_ops);
+}
 #endif
 
 static struct virtual_engine *to_virtual_engine(struct intel_engine_cs *engine)
@@ -3750,7 +3763,7 @@ static void execlists_reset_cancel(struct intel_engine_cs *engine)
 	execlists->queue_priority_hint = INT_MIN;
 #ifdef __NetBSD__
 	i915_sched_init(execlists);
-	rb_tree_init(&execlists->virtual.rb_root.rbr_tree, &ve_tree_ops);
+	intel_execlists_init_virtual(execlists);
 #else
 	execlists->queue = RB_ROOT_CACHED;
 #endif
