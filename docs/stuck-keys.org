@@ -1,0 +1,44 @@
+#+TITLE: Stuck Ctrl/Shift under Mahogany
+#+DATE: 2026-10-05
+
+* Symptom
+
+Now and then Ctrl or Shift stays held under Mahogany until a reboot.
+Pressing the key again, or a suspend and resume, does not release it.
+Never seen under X (which reads wskbd through its own driver).
+
+* Mechanism
+
+Mahogany's wlroots reads input through pkgsrc's libopeninput 1.30.2, a
+wscons port of libinput (=/usr/pkg/lib/libinput.so.10=).  Its
+=wscons_process()= filtered wskbd's autorepeat with a single =old_value=
+that any key release reset, and had no case for =WSCONS_EVENT_ALL_KEYS_UP=
+(it printed "unkown event: 3").  wlroots' keyboard group counts presses
+per key, so one surplus press (a repeat that slipped through after another
+key was released) or one lost release leaves the key held, and every later
+press/release pair keeps the count off by one.  (Analysis by Astra.)
+
+* Fix
+
+=userland/libopeninput/patch-zz-src_wscons.{c,h}-keystate= give each
+keyboard a bitmap of held keys (one bit per Linux key code, KEY_MAX 0x2ff):
+only real transitions are passed on, a press of a held key and a release of
+a key that is not down are dropped, and ALL_KEYS_UP releases every key still
+held.  A key that sticks anyway clears with one press and release: the
+press is absorbed, the release goes through.  Dropped releases and
+ALL_KEYS_UP are logged on stderr (=~/.mahogany.log=, "libopeninput:
+/dev/wskbdN: ...").
+
+Install: copy both files to =/usr/pkgsrc/devel/libopeninput/patches/=, then
+=make makepatchsum && make && make replace=; Mahogany picks the library up
+at its next start.
+
+=keytest.c= checks the installed library without a keyboard: it hands
+libinput a pipe as =/dev/wskbd9= (an interposed =ioctl= answers
+WSKBDIO_GTYPE) and replays Ctrl/A/duplicate-Ctrl/stray-Shift/ALL_KEYS_UP
+sequences; every per-key press count must return to 0.
+
+#+begin_src sh
+cc -I/usr/pkg/include -o keytest keytest.c -L/usr/pkg/lib -Wl,-R/usr/pkg/lib -linput
+./keytest    # RESULT: all press counts back to 0
+#+end_src

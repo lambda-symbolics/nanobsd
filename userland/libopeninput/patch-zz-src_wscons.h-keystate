@@ -1,0 +1,25 @@
+$NetBSD$
+
+Per-device held-key bitmap for the key-state tracking in wscons.c.
+
+--- src/wscons.h.orig
++++ src/wscons.h
+@@ -14,11 +14,18 @@
+     uint32_t *map;
+ };
+ 
++/* One bit per Linux key code (KEY_MAX is 0x2ff). */
++#define WSCONS_KEY_SLOTS 0x300
++
+ struct wscons_device {
+ 	struct libinput_device base;
+ 	enum libinput_device_capability capability;
+ 	struct TransMapRec *scanCodeMap;
+ 	int old_value;
++	/* Keys this device has reported down and not yet up.  wskbd repeats
++	   held keys as more KEY_DOWN events; only state changes are passed
++	   on, so a compositor's per-key press count cannot drift. */
++	uint8_t keys_down[WSCONS_KEY_SLOTS / 8];
+ 	struct {
+ 		struct libinput_device_config_accel config;
+ 		struct motion_filter *filter;

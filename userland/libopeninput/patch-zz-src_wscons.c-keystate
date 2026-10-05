@@ -1,0 +1,114 @@
+$NetBSD$
+
+Track each keyboard's held keys and pass on only real state changes,
+so repeated or unmatched key events cannot leave a key down in a
+compositor's keyboard group; handle WSCONS_EVENT_ALL_KEYS_UP.
+
+--- src/wscons.c.orig
++++ src/wscons.c
+@@ -178,6 +178,46 @@
+ 	.device_change_seat = udev_device_change_seat,
+ };
+ 
++/*
++ * Per-device key state.  wskbd reports a held key again and again as
++ * KEY_DOWN (autorepeat), and a release that is lost or doubled must not
++ * leave a key down forever: wlroots' keyboard groups count presses per key,
++ * so one surplus press keeps a modifier held through every later press and
++ * release.  Pass on only real transitions, and turn ALL_KEYS_UP into
++ * releases of whatever this device still holds.
++ */
++static int
++wscons_key_is_down(struct wscons_device *dev, uint32_t code)
++{
++	return (dev->keys_down[code / 8] >> (code % 8)) & 1;
++}
++
++static void
++wscons_key_set(struct wscons_device *dev, uint32_t code, int down)
++{
++	if (down)
++		dev->keys_down[code / 8] |= 1 << (code % 8);
++	else
++		dev->keys_down[code / 8] &= ~(1 << (code % 8));
++}
++
++static void
++wscons_release_all_keys(struct libinput_device *device, uint64_t time)
++{
++	struct wscons_device *dev = wscons_device(device);
++	uint32_t code;
++
++	for (code = 0; code < WSCONS_KEY_SLOTS; code++) {
++		if (!wscons_key_is_down(dev, code))
++			continue;
++		wscons_key_set(dev, code, 0);
++		fprintf(stderr, "libopeninput: %s: releasing held key %u\n",
++		    device->devname, code);
++		keyboard_notify_key(device, time, keycode_from_uint32_t(code),
++		    LIBINPUT_KEY_STATE_RELEASED);
++	}
++}
++
+ static void
+ wscons_process(struct libinput_device *device, struct wscons_event *wsevent)
+ {
+@@ -196,23 +236,40 @@
+ 
+ 	switch (wsevent->type) {
+ 	case WSCONS_EVENT_KEY_UP:
+-	case WSCONS_EVENT_KEY_DOWN:
++	case WSCONS_EVENT_KEY_DOWN: {
++		uint32_t code;
++
+ 		key = wsevent->value;
+-		if (wsevent->type == WSCONS_EVENT_KEY_UP) {
++		code = wskey_transcode(dev->scanCodeMap, key);
++		if (wsevent->type == WSCONS_EVENT_KEY_UP)
+ 			kstate = LIBINPUT_KEY_STATE_RELEASED;
+-			dev->old_value = -1;
+-		} else {
++		else
+ 			kstate = LIBINPUT_KEY_STATE_PRESSED;
+-			/* ignore auto-repeat */
+-			if (key == dev->old_value)
++		if (code < WSCONS_KEY_SLOTS) {
++			int down = kstate == LIBINPUT_KEY_STATE_PRESSED;
++
++			if (wscons_key_is_down(dev, code) == down) {
++				/* A repeat of a held key is normal; a release
++				   of a key never seen down is worth a note. */
++				if (!down)
++					fprintf(stderr, "libopeninput: %s: "
++					    "release of key %u that is not "
++					    "down, ignored\n",
++					    device->devname, code);
+ 				return;
+-			dev->old_value = key;
++			}
++			wscons_key_set(dev, code, down);
+ 		}
+-		keycode = keycode_from_uint32_t(
+-		                wskey_transcode(
+-		                        wscons_device(device)->scanCodeMap, key));
++		keycode = keycode_from_uint32_t(code);
+ 		keyboard_notify_key(device, time, keycode, kstate);
+ 		break;
++	}
++
++	case WSCONS_EVENT_ALL_KEYS_UP:
++		fprintf(stderr, "libopeninput: %s: all keys up\n",
++		    device->devname);
++		wscons_release_all_keys(device, time);
++		break;
+ 
+ 	case WSCONS_EVENT_MOUSE_UP:
+ 	case WSCONS_EVENT_MOUSE_DOWN:
+@@ -622,6 +679,7 @@
+ 	struct libinput_device *device = &wscons_device->base;
+ 
+ 	wscons_device->old_value = -1;
++	memset(wscons_device->keys_down, 0, sizeof(wscons_device->keys_down));
+ 
+ 	if (strncmp(device->devname, "/dev/wsmouse", 12) == 0) {
+ 		/* XXX handle tablets and touchpanel */
