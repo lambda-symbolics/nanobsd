@@ -1,0 +1,38 @@
+#!/bin/sh
+# switch-to mahogany|stumpwm: pick the session the console
+# autologin starts (cclsh startup.lisp reads ~/.config/mahogany/autostart),
+# end the running one, and restart the console login so the other comes up.
+# Everything in the session you leave is closed.
+
+flag=/home/mag/.config/mahogany/autostart
+
+case $1 in
+mahogany) touch "$flag" || exit 1 ;;
+stumpwm) rm -f "$flag" || exit 1 ;;
+*) echo "usage: switch-to mahogany|stumpwm" >&2; exit 2 ;;
+esac
+
+# The terminal this runs in dies with the session: do the rest detached.
+if [ "$2" != --detached ]; then
+	nohup /usr/local/bin/switch-to "$1" --detached > /tmp/switch-to.log 2>&1 &
+	exit 0
+fi
+
+sleep 1
+pkill -TERM '(^|/)stumpwm$'
+pkill -TERM '(^|/)mahogany$'
+
+# startup.lisp starts nothing while an X server runs, and startmh reattaches
+# the keyboard to the console after Mahogany exits: wait for both.
+i=0
+while pgrep '(^|/)(X|Xorg)$' > /dev/null || pgrep '(^|/)xinit$' > /dev/null ||
+    pgrep '(^|/)mahogany$' > /dev/null ||
+    pgrep -f '^/bin/sh /usr/local/bin/startmh' > /dev/null; do
+	i=$((i + 1))
+	[ $i -gt 20 ] && { echo "switch-to: old session still running" >&2; exit 1; }
+	sleep 1
+done
+
+# End the console login shell (cclsh ignores SIGTERM, a hangup ends it);
+# init respawns the autologin getty on constty.
+pkill -HUP -u mag -t ttyE0 '(^|/)cclsh-image$'
