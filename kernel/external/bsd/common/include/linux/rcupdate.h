@@ -53,11 +53,17 @@
 	(P);								      \
 })
 
+/*
+ * LISPBSD: PTRP is the RCU pointer itself (an lvalue), as in Linux.
+ * The old version copied it into a local and assigned NEWPTR to the
+ * copy, so the pointer was never replaced: set_engines() then freed
+ * the still-installed i915 engine map and the context free walked
+ * freed memory (panic in __free_engines).
+ */
 #define	rcu_replace_pointer(PTRP, NEWPTR, C) ({				      \
-	__typeof__(PTRP) __rrp_ptrp = (PTRP);				      \
 	__typeof__(PTRP) __rrp_oldptr =					      \
-		rcu_dereference_protected(__rrp_ptrp, C);		      \
-	rcu_assign_pointer(__rrp_ptrp, NEWPTR);				      \
+		rcu_dereference_protected(PTRP, C);			      \
+	rcu_assign_pointer(PTRP, NEWPTR);				      \
 	__rrp_oldptr;							      \
 })
 
