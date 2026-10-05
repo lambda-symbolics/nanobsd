@@ -1,0 +1,37 @@
+#!/bin/sh
+# pmeas.sh LABEL SECONDS: package power (RAPL), CPU seconds per process
+# class, interrupt rates and temperatures over SECONDS; appends to
+# /var/tmp/pmeas.txt.
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/pkg/bin
+label=$1; secs=${2:-60}
+rapl() { sysctl -n machdep.cidle.rapl | sed 's/.*raw=\([0-9]*\).*/\1/'; }
+cpu() {
+	ps -axww -o pid,time,args | awk 'NR == 1 { next }
+	
+	function sec(t,  n,a,s,i) { n = split(t, a, /[:-]/); s = 0
+		for (i = 1; i <= n; i++) s = s * 60 + a[i]; return s }
+	{ t = sec($2); a = $0
+	  if (a ~ /firefox.*-contentproc.*-isForBrowser/ || a ~ /firefox: .*tab/) c = "ff-content"
+	  else if (a ~ /firefox.*-contentproc/) c = "ff-other"
+	  else if (a ~ /firefox/) c = "ff-main"
+	  else if (a ~ /mahogany/) c = "mahogany"
+	  else if (a ~ /X11R7\/bin\/X/) c = "X"
+	  else if (a ~ /stumpwm/) c = "stumpwm"
+	  else c = "other"
+	  s[c] += t }
+	END { for (c in s) printf "%s %.2f\n", c, s[c] }'
+}
+ints() { vmstat -i | awk 'NR > 1 && $NF ~ /^[0-9]+$/ { n = $(NF-1); $(NF-1) = ""; $NF = ""; print $0 "|" n }'; }
+temps() { envstat -d coretemp0 -d coretemp1 -d coretemp2 -d coretemp3 2>/dev/null | awk '/temperature/ { v = $3 + 0; if (v > m) m = v } END { print m }'; }
+r0=$(rapl); cpu > /tmp/pm.c0; ints > /tmp/pm.i0; t0=$(date +%s)
+tmax=0; tsum=0; tn=0
+while [ $(( $(date +%s) - t0 )) -lt $secs ]; do
+	sleep 5; t=$(temps); tn=$((tn + 1)); tsum=$((tsum + t)); [ $t -gt $tmax ] && tmax=$t
+done
+r1=$(rapl); cpu > /tmp/pm.c1; ints > /tmp/pm.i1; t1=$(date +%s)
+el=$((t1 - t0))
+w=$(echo "$r0 $r1 $el" | awk '{ d = $2 - $1; if (d < 0) d += 4294967296; printf "%.2f", d * 61 / 1e6 / $3 }')
+cpus=$(awk -v el=$el 'NR == FNR { a[$1] = $2; next } { d = $2 - a[$1]; if (d > 0.05) printf "%s=%.0f%% ", $1, 100 * d / el }' /tmp/pm.c0 /tmp/pm.c1)
+intr=$(awk -F'|' -v el=$el 'NR == FNR { a[$1] = $2; next } { d = $2 - a[$1]; if (d / el >= 20) printf "%s:%.0f/s ", $1, d / el }' /tmp/pm.i0 /tmp/pm.i1 | tr -s ' ')
+line="$(date +%T) [$label] ${el}s pkg=${w}W temp avg=$((tsum / tn)) max=$tmax cpu: $cpus| ints: $intr"
+echo "$line" | tee -a /var/tmp/pmeas.txt

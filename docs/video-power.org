@@ -1,0 +1,30 @@
+#+TITLE: Firefox video: Mahogany against X/StumpWM
+#+DATE: 2026-09-30
+
+The question was whether Mahogany runs hotter than X with Firefox playing
+video.  It does not.  Package power (RAPL), kernel 129, throwaway profile
+with the live user.js, local muted testsrc2 clips, panel state forced:
+
+| clip         | state                | X / StumpWM     | Mahogany        |
+|--------------+----------------------+-----------------+-----------------|
+| none         | idle, panel on       | 0.90 W          | 0.77 W          |
+| 1080p30 VP9  | visible              | 3.64 W          | 3.59 W          |
+| 1080p30      | other group          | 3.56 W          | 0.97 W          |
+| 1440p60 VP9  | visible              | 7.31 W (56 C)   | 7.40 W (49 C)   |
+| 1440p60      | other group          | 7.26 W          | 1.11 W          |
+| 1440p60      | panel off            | 7.24 W          | 0.52 W          |
+
+Firefox renders with iris (hardware WebRender) in both.  Under Wayland it
+stops decoding when its window is hidden or the panel is blanked (Mahogany
+marks views suspended); under X it decodes regardless.  The heat was the
+software VP9/AV1 decode, fixed by VA-API (see =vaapi.org=).
+
+Traps met on the way: a muted video takes no idle inhibitor, so both
+sessions blank the panel mid-test (hold it with =userland/fftest/xset.sh on=
+or =mh-on.lisp=); Firefox rewrites its argv, so stop the test instance
+through its profile lock (=ffkill.sh=); NetBSD's ps has no =pid== syntax.
+
+Tools: =userland/pmeas LABEL SECONDS= samples RAPL (=machdep.cidle.rapl=),
+per-class CPU, interrupt rates and temperatures into =/var/tmp/pmeas.txt=;
+=userland/fftest/run-matrix.sh x|wayland= runs the table above (expects the
+scripts and clips in =/var/tmp/fftest=).
