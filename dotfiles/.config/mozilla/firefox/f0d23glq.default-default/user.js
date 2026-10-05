@@ -33,3 +33,8 @@ user_pref("media.hardware-video-decoding.force-enabled", true);
 user_pref("media.rdd-process.enabled", true);
 user_pref("media.rdd-ffvpx.enabled", true);
 user_pref("media.rdd-ffmpeg.enabled", true);
+
+// 2026-10-06: tell pages the user prefers reduced motion.  Only pages that
+// honour prefers-reduced-motion change; nothing else is forced.
+// Revert: user.js.bak-20261006.
+user_pref("ui.prefersReducedMotion", 1);
