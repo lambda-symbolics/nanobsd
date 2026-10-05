@@ -35,8 +35,15 @@ paths.
 - `etc/boot.cfg`, `etc/rc.conf`, `etc/sysctl.conf`, `etc/modules.conf`,
   `etc/rc.d/`, `etc/powerd/` — boot menu, enabled services (`lpschedd`),
   persisted sysctls (HWP EPP, tickless idle) and autoloaded modules.
+- `userland/vaapi`, `userland/libopeninput`, `userland/wpa_supplicant`,
+  `userland/emacs-pgtk` — build scripts and patches for software built
+  outside pkgsrc or patched in it (hardware video decoding, the stuck-key
+  fix, Braiins-Public WiFi, Wayland Emacs); `switch-to-mahogany` /
+  `switch-to-stumpwm` switch the autologin session.
 - `docs/` — running notes, including `lpsched-design.org` (design, review,
-  repairs and measurements) and `rpm-s0ix-findings.org`.
+  repairs and measurements), `rpm-s0ix-findings.org`, `vaapi.org`,
+  `stuck-keys.org`, `braiins-wifi.org`, `emacs.org`, `video-power.org` and
+  `reboot-wedge.org`.
 
 Power tuning highlights: fixed a StumpWM mode-line busy-loop (~2.5 W), enabled
 deep C-states + RC6, HWP EPP bias, and ACPI backlight control → idle ~5 W
