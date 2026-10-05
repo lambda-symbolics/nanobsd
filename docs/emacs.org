@@ -1,0 +1,36 @@
+#+TITLE: Emacs on the Nano
+#+DATE: 2026-10-02
+
+* Two builds, one command
+
+- =/usr/pkg/bin/emacs=: pkgsrc emacs30, X11 + GTK3.  pkgsrc has no pgtk option.
+- =/usr/local/emacs-pgtk=: Emacs 30.2 built by =userland/emacs-pgtk/build.sh=
+  with =--with-pgtk= (native Wayland), native compilation (gcc14 libgccjit),
+  tree-sitter (pkgsrc's =patch-src_treesit.c= for tree-sitter 0.26), gnutls,
+  libxml2, webp.  The tarball is checked against pkgsrc's SHA512.
+
+=/usr/local/bin/emacs= is =userland/emacs-shim.c=.  It exists because Emacs
+started as the direct =posix_spawn= child of the threaded cclsh comes up with
+a corrupted runtime; one ordinary =execve= in between fixes that.  It runs the
+pgtk build when =WAYLAND_DISPLAY= is set (Mahogany) and the X11 build
+otherwise; =EMACS_X11=1= forces X11.
+
+* Configuration
+
+=dotfiles/.emacs.d= replaces the old EXWM configuration from the Guix
+machine.  Packages come from GNU ELPA and MELPA through =use-package= on
+first start (the archive index is refreshed once if anything is missing).
+
+- =meow-config.el= ports the workstation's Doom =lisp/init-meow.el= key for
+  key: +fold becomes hideshow, flycheck flymake, +format/buffer eglot or
+  rustfmt, the sexp motions stay smartparens.  =SPC= is a Doom-style leader
+  (=SPC f f=, =b b=, =p p=, =s s=, =w=, =c=, =t t= theme).
+- Rust: =rust-mode= deriving from =rust-ts-mode= when the pkgsrc grammar
+  loads, eglot with =/usr/pkg/bin/rust-analyzer=, format on save.
+- Org: org-appear tied to Meow insert state, org-auto-tangle, the C-s-1..4
+  source block keys.
+- Common Lisp: SLY on the futex SBCL (=/usr/local/bin/sbcl=);
+  C-j/C-k barf/slurp, C-l a REPL below fed with =.slyrc.lisp=.
+- ProFontExtended 9 pt (the size of the bar, wmenu and alacritty; DPI is 96
+  in both sessions), C-= C-- C-0 zoom globally, F9 toggles acme and
+  kanagawa-dragon.
