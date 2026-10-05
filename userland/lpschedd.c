@@ -21,10 +21,16 @@
  *   machdep.hwp.epp, machdep.lpsched.{enabled,pack,coalesce_ms,fgpid}
  *
  * Profiles
- *   perf        AC present, or heavy load on battery: EPP perf, no packing,
- *               no coalescing.
+ *   perf        AC present: EPP perf, no packing, no coalescing.
  *   balanced    battery + input within the interactive window.
+ *   load        battery + heavy load + input within the interactive window.
+ *   batch       battery + heavy load, no recent input.
  *   powersave   battery + idle.
+ * Heavy load on battery no longer means EPP perf.  Measured on the X1 Nano
+ * (docs/epp-load.org): a parallel build at EPP 32 or 128 took 25 s and the
+ * most energy; 192 took 12 % longer for 11 % less, 224 took 47 % longer for
+ * 27 % less, whole-machine energy over the same window.  EPP 32 was no
+ * faster than 128 at all.
  * Upshifts (toward perf) apply immediately; downshifts wait until the
  * condition has held for DOWNSHIFT_SAMPLES polls, load uses a hysteresis band.
  *
@@ -59,7 +65,8 @@
 #define	POLL_IDLE_MS		500	/* poll period in powersave */
 #define	POLL_SLOW_MS		5000	/* while a compositor reports input */
 
-enum profile { P_PERF = 0, P_BALANCED, P_POWERSAVE, P_COUNT };
+/* Ordered from most to least performance: a lower value is an upshift. */
+enum profile { P_PERF = 0, P_BALANCED, P_LOAD, P_BATCH, P_POWERSAVE, P_COUNT };
 
 static const struct {
 	const char *name;
@@ -67,11 +74,13 @@ static const struct {
 } profiles[P_COUNT] = {
 	[P_PERF]      = { "perf",       32, 0,  0 },
 	[P_BALANCED]  = { "balanced",  128, 1, 20 },
+	[P_LOAD]      = { "load",      192, 0,  0 },
+	[P_BATCH]     = { "batch",     224, 0,  0 },
 	[P_POWERSAVE] = { "powersave", 240, 2, 50 },
 };
 
 static int	 interactive_ms = 10000;	/* -i: input within this = interactive */
-static double	 load_hi = 1.5;			/* -H: above this on battery = perf */
+static double	 load_hi = 1.5;			/* -H: above this on battery = load/batch */
 static double	 load_lo = 1.0;			/* -L: below this releases the latch */
 static bool	 debug = false;			/* -d: foreground, log to stderr */
 static bool	 dryrun = false;		/* -n: don't write sysctls */
@@ -216,15 +225,12 @@ decide(int ac, double load, int idle_ms, bool *load_latched)
 
 	if (ac != 0)			/* AC, or unknown: do no harm */
 		return P_PERF;
-	if (*load_latched) {
-		if (load < load_lo)
-			*load_latched = false;
-		else
-			return P_PERF;
-	} else if (load > load_hi) {
+	if (*load_latched && load < load_lo)
+		*load_latched = false;
+	else if (!*load_latched && load > load_hi)
 		*load_latched = true;
-		return P_PERF;
-	}
+	if (*load_latched)
+		return idle_ms < interactive_ms ? P_LOAD : P_BATCH;
 	return idle_ms < interactive_ms ? P_BALANCED : P_POWERSAVE;
 }
 
@@ -293,7 +299,7 @@ poll_timeout(enum profile cur, int pending, int idle_ms)
 		return cur == P_POWERSAVE ? POLL_IDLE_MS : POLL_ACTIVE_MS;
 	if (pending > 0)
 		return POLL_IDLE_MS;
-	if (cur == P_BALANCED) {
+	if (cur == P_BALANCED || cur == P_LOAD) {
 		left = interactive_ms - idle_ms + 100;
 		if (left < POLL_ACTIVE_MS)
 			left = POLL_ACTIVE_MS;

@@ -1,0 +1,49 @@
+#+TITLE: EPP under load on battery
+#+DATE: 2026-10-06
+
+lpschedd used to answer heavy load on battery (1-minute load above 1.5)
+with its perf profile, EPP 32: finish fast, go back to idle sooner.  On the
+X1 Nano that is the most expensive choice and buys no speed over EPP 128.
+
+Measured on battery, panel off, kernel 133, lpschedd stopped, package energy
+from RAPL (=machdep.cidle.rapl=), runs interleaved in rotating order.
+=userland/epp-ab/=: =epp-ab.sh= (build + bursts, 3 repetitions),
+=epp-build.sh= (a clean =gmake -j8= of wpa_supplicant, six times per run,
+2 repetitions).  Raw lines in =/var/tmp/epp-ab.txt= on the laptop.
+
+| EPP | build x6 | package | whole machine* | 60 bursts / 120 s | burst mean / p95 |
+|-----+----------+---------+----------------+-------------------+------------------|
+|  32 | (= 128)  |         |                | 56.2 J            | 54 / 54 ms       |
+| 128 | 25.1 s   | 624 J   | ~669 J         | 56.0 J            | 56 / 57 ms       |
+| 160 | 26.0 s   | 605 J   | ~652 J         |                   |                  |
+| 192 | 27.9 s   | 545 J   | ~594 J         | 50.3 J            | 86 / 117 ms      |
+| 224 | 36.7 s   | 426 J   | ~488 J         |                   |                  |
+| 240 | 43.5 s   | 406 J   | ~478 J         | 52.8 J            | 150 / 151 ms     |
+
+\* package energy, plus the rest of the platform at ~1.65 W (1.88 W battery
+discharge at idle minus 0.22 W package) while the build runs, plus idle
+package power until the slowest run ends: the same 44 s window for all.
+
+The short single build of the first run agreed: EPP 32 and 128 both 4 s and
+~109 J, 192 4 s and 90 J, 240 7 s and 67 J.  Bursts are 25 M xorshift steps
+(~54 ms flat out) every 2 s; their energy over the window is dominated by
+idle, so they mostly show the latency cost of a high EPP.
+
+Race-to-idle does not hold here: the extra frequency costs more energy than
+the shorter run saves, even counting the platform.
+
+* What changed
+lpschedd (=userland/lpschedd.c=) has two new profiles for heavy load on
+battery:
+- =load=, EPP 192, while there was input in the last 10 s: 12 % slower, 11 %
+  less energy;
+- =batch=, EPP 224, with no recent input (a build left running): 47 %
+  slower, 27 % less energy.
+Both turn packing and coalescing off.  AC still gets perf (EPP 32), the
+interactive profile without load stays at 128.  Old binary:
+=/usr/local/sbin/lpschedd.pre-load=.
+
+* Also seen
+The 60 s idle sample before every run stayed at 93-95 % PC10 and
+0.21-0.32 W: a heavy load does not leave the package in the sticky PC3
+state (see =power-levers.org=, 8).
