@@ -1,0 +1,14 @@
+# Sourced at the end of /etc/rc.shutdown, after every rc.d script stopped.
+#
+# Some reboots wedge in the kernel's final phase (screen off, a core
+# spinning, fans on).  Arm the software watchdog without anyone to tickle
+# it: a shutdown that is still running in 3 minutes panics, the backtrace
+# lands in the message buffer (which survives the warm reboot: look in
+# dmesg), and the machine reboots instead of baking.  $1 is the action.
+# /var/tmp/rc.shutdown.final.ran records the last arming.
+case "$1" in
+*halt*) ;;
+*)	/sbin/wdogctl -x -p 180 swwdog0 >/dev/null 2>&1
+	{ date; echo "action: $1"; /sbin/wdogctl; } > /var/tmp/rc.shutdown.final.ran 2>&1
+	echo "rc.shutdown.final: swwdog armed (180 s) for the final phase" ;;
+esac

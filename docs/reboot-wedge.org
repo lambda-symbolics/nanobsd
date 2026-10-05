@@ -1,0 +1,45 @@
+#+TITLE: Reboots that wedge in the final shutdown phase
+#+DATE: 2026-10-02
+
+* Symptom
+
+Some reboots on kernel 131 (perhaps earlier) never finish: the screen goes
+dark, one core spins, the fans run until the power button is held.
+
+* What the logs show
+
+Every wedged shutdown gets through =rc.shutdown=: syslogd logs "Exiting on
+signal 15", and the next boot follows one to three hours later, where a
+clean reboot takes 35-40 s (Oct 1 10:34 -> 11:56, on battery; Oct 2 09:45 ->
+11:03, 10 s after the charger was connected).  One stop on Oct 2 left the
+tail of =/var/log/messages= filled with stale blocks of a Firefox =prefs.js=:
+the WAPBL journal covers metadata only, so a file that grew just before an
+unclean stop shows old disk contents.
+
+The hang therefore sits in the kernel's last phase.  =cpu_reboot()= on amd64
+loops
+
+#+begin_src c
+while (vfs_unmountall1(curlwp, false, false) ||
+       config_detach_all(boothowto) ||
+       vfs_unmount_forceone(curlwp))
+        ;
+#+end_src
+
+until neither an unmount nor a detach makes progress.  A detach or unmount
+that reports success forever spins here after the display is already gone,
+which matches "screen off, hot, fans".  Ruled out: =nvme_shutdown()= (bounded
+at 4 s), =hw.acpi.sleep.idle_d3= (off), gefs (not mounted).
+
+Four test reboots on 2026-10-02 were clean: fresh boot on battery, after a
+30 s timed s2idle, 20 s after plugging the charger in, and a plain one.
+
+* The safety net
+
+=etc/rc.shutdown.final= (sourced at the end of =rc.shutdown=, after every
+rc.d script has stopped) arms the software watchdog for 180 s with nobody to
+tickle it.  A shutdown still running then panics (=hw.swwdog.reboot=0=), and
+with =ddb.onpanic=0= and =ddb.dumpstack=1= the backtrace goes to the message
+buffer, which survives the warm reboot.  After the next wedge, read the end
+of the previous boot in =dmesg=; =/var/tmp/rc.shutdown.final.ran= records the
+last arming.  =wdogctl -x= is the mode that stays armed when wdogctl exits.
