@@ -1,0 +1,4 @@
+#!/bin/sh
+export CCLSH_SBCL=/usr/local/bin/sbcl
+export CCLSH_QUICKLISP_SETUP=/usr/local/lib/cclsh/quicklisp/setup.lisp
+exec /usr/local/lib/cclsh/src/cclsh/scripts/cclshd "$@"

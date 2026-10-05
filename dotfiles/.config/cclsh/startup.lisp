@@ -55,26 +55,36 @@
 (defun startup--starship-prompt
     (&key status duration-milliseconds columns job-count
      &allow-other-keys)
-  "Render this account's prompt with Starship, or request the default."
+  "Render this account's prompt with Starship, or request the default.
+Starship takes the directory to show from its working directory and PWD.
+Under the shared session server (cclshd) cd only changes the session's
+directory and environment, not the daemon process's, so Starship must be
+started through CCL:RUN-PROGRAM, cclsh's spawner, which passes the session's
+directory and environment; UIOP:RUN-PROGRAM would hand it the daemon's own
+and the prompt would always show the directory the server started in."
   (handler-case
-      (let ((prompt
-              (uiop:run-program
-               (list "/usr/bin/env"
-                     "STARSHIP_SHELL="
-                     "starship"
-                     "prompt"
-                     (format nil "--status=~d" status)
-                     (format nil "--cmd-duration=~d" duration-milliseconds)
-                     (format nil "--terminal-width=~d" columns)
-                     (format nil "--jobs=~d" job-count))
-               :input               nil
-               :output              '(:string :stripped nil)
-               :error-output        nil
-               :ignore-error-status nil
-               :external-format     ':utf-8)))
-        (and (stringp prompt)
-             (plusp (length prompt))
-             prompt))
+      (let* ((output (make-string-output-stream))
+             (process
+               (ccl::run-program
+                "/usr/bin/env"
+                (list "STARSHIP_SHELL="
+                      "starship"
+                      "prompt"
+                      (format nil "--status=~d" status)
+                      (format nil "--cmd-duration=~d" duration-milliseconds)
+                      (format nil "--terminal-width=~d" columns)
+                      (format nil "--jobs=~d" job-count))
+                :input  nil
+                :output output
+                :error  nil
+                :wait   t))
+             (prompt (get-output-stream-string output)))
+        (multiple-value-bind (state code)
+            (ccl::external-process-status process)
+          (and (eq state ':exited)
+               (eql code 0)
+               (plusp (length prompt))
+               prompt)))
     (error () nil)))
 
 (setf *prompt-function* 'startup--starship-prompt)
@@ -130,4 +140,9 @@
     ;; startx-safe first clears a stale ~/.Xauthority lock left by a killed
     ;; session, which otherwise fails every later startx with
     ;; "xauth: timeout in locking authority file".
-    (run "/usr/local/bin/startx-safe")))
+    ;; Touch ~/.config/mahogany/autostart to get the Wayland session
+    ;; (Mahogany, /usr/local/bin/startmh) instead of X; remove it to go back.
+    (if (probe-file (merge-pathnames ".config/mahogany/autostart"
+                                     (user-homedir-pathname)))
+        (run "/usr/local/bin/startmh")
+        (run "/usr/local/bin/startx-safe"))))
