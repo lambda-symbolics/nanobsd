@@ -1,0 +1,73 @@
+#+TITLE: Braiins-Public and the patched wpa_supplicant
+#+DATE: 2026-09-30
+
+* What went wrong
+
+At the office the laptop would associate with Braiins-Public and drop the
+link a few milliseconds later, over and over, falling back to whatever
+other network was in range.  The password was right: the access point only
+sends EAPOL-Key message 3 after it has checked the client's MIC in message
+2, which needs the correct PSK.  NetBSD's base =wpa_supplicant= 2.11 then
+aborted the handshake itself.  Captured with a passive =wpa_cli= event
+monitor (the base daemon logs nowhere by default):
+
+#+begin_example
+14:40:56.608: Trying to associate with 12:ea:14:26:b8:6a (SSID='Braiins-Public' freq=5500 MHz)
+14:40:56.667: Associated with 12:ea:14:26:b8:6a
+14:40:56.675: WPA: RSNXE mismatch between Beacon/ProbeResp and EAPOL-Key msg 3/4
+14:40:56.675: CTRL-EVENT-DISCONNECTED bssid=12:ea:14:26:b8:6a reason=17 locally_generated=1
+14:40:56.675: CTRL-EVENT-SSID-TEMP-DISABLED id=11 ssid="Braiins-Public" auth_failures=3 duration=30 reason=CONN_FAILED
+#+end_example
+
+The RSNXE (RSN Extension element, used by WPA3 features such as SAE H2E)
+in message 3/4 did not match the one in the beacon or probe response as
+the supplicant had them.  The beacons as NetBSD reports them carry plain
+=[WPA2-PSK-CCMP]= and no RSNXE, while the AP puts one into message 3/4.
+wpa_supplicant treats that as a possible downgrade attack and disconnects
+(reason 17, "IE in 4-way handshake differs").  The laptop's other networks
+were not affected.
+
+The network is trusted, so the check was simply switched off.  pkgsrc's
+=net/wpa_supplicant= is 2.6, older than the check, and connected at once;
+it served as the stopgap until the patched 2.11 was built.
+
+* The fix
+
+Upstream wpa_supplicant 2.11 (w1.fi tarball, SHA256 =912ea06f...fc0a=),
+built by =userland/wpa_supplicant/build.sh= (patch and =.config= next to it) and installed as
+=/usr/local/sbin/wpa_supplicant-2.11=:
+
+#+begin_src diff
+--- src/rsn_supp/wpa.c
++++ src/rsn_supp/wpa.c
+@@ -2177,7 +2177,7 @@
+-	if (sm->proto == WPA_PROTO_RSN &&
++	if (0 && sm->proto == WPA_PROTO_RSN &&
+ 	    ((sm->ap_rsnxe && !ie->rsnxe) ||
+ 	     (!sm->ap_rsnxe && ie->rsnxe) ||
+--- src/l2_packet/l2_packet_freebsd.c
++++ src/l2_packet/l2_packet_freebsd.c
+@@ -20,7 +20,11 @@
++#ifdef __NetBSD__
++#include <net/if_ether.h>
++#else
+ #include <net/ethernet.h>
++#endif
+#+end_src
+
+The =.config= mirrors the base build's options (=DRIVER_BSD=,
+=DRIVER_WIRED=, =CTRL_IFACE=, =BACKEND=file=, =MATCH_IFACE=, =DEBUG_FILE=,
+=DEBUG_SYSLOG=, OpenSSL, the EAP set); an earlier build with
+=ELOOP_KQUEUE= and =SME= on top is not needed.  Build with =gmake
+wpa_supplicant= in the =wpa_supplicant= directory.
+
+=/etc/rc.conf.d/wpa_supplicant= makes the stock =/etc/rc.d/wpa_supplicant=
+(and so boot, =service wpa_supplicant restart= and the wifi TUI) run the
+patched binary: it overrides =command=, and its =wpa_supplicant_precmd=
+runs =ifconfig iwx0 up= first and adds =-s= (log to syslog).  The =ifconfig=
+matters when another supplicant was stopped just before: stopping leaves
+=iwx0= down, and 2.11 never raises it ("wpa_driver_bsd_scan: interface is
+not up, cannot scan").  Verified at boot on 2026-10-02.
+
+To go back to the base supplicant, delete =/etc/rc.conf.d/wpa_supplicant=
+and run =service wpa_supplicant restart=.

@@ -1,0 +1,30 @@
+Skip the RSNXE consistency check between Beacon/ProbeResp and EAPOL-Key
+message 3/4 (Braiins-Public sends an RSNXE in 3/4 that the beacon as NetBSD
+reports it lacks, and the base supplicant disconnects with reason 17), and
+build l2_packet_freebsd.c on NetBSD, which has no <net/ethernet.h>.
+
+--- src/rsn_supp/wpa.c
++++ src/rsn_supp/wpa.c
+@@ -2177,7 +2177,7 @@
+ 		return -1;
+ 	}
+ 
+-	if (sm->proto == WPA_PROTO_RSN &&
++	if (0 && sm->proto == WPA_PROTO_RSN &&
+ 	    ((sm->ap_rsnxe && !ie->rsnxe) ||
+ 	     (!sm->ap_rsnxe && ie->rsnxe) ||
+ 	     (sm->ap_rsnxe && ie->rsnxe &&
+--- src/l2_packet/l2_packet_freebsd.c
++++ src/l2_packet/l2_packet_freebsd.c
+@@ -20,7 +20,11 @@
+ #include <sys/sysctl.h>
+ #endif /* __sun__ */
+ 
++#ifdef __NetBSD__
++#include <net/if_ether.h>
++#else
+ #include <net/ethernet.h>
++#endif
+ #include <net/if.h>
+ #include <net/if_dl.h>
+ #include <net/route.h>
