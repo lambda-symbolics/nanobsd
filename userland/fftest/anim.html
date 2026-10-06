@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>anim</title>
+<!-- A page that keeps drawing while nobody touches it, like a chat UI
+     streaming a reply: a requestAnimationFrame canvas that adds text and a
+     CSS spinner.  ?static draws once and stops. -->
+<style>
+body { margin: 0; background: #fff; font: 15px sans-serif; }
+.spin { width: 40px; height: 40px; border: 5px solid #ccc; border-top-color: #333;
+        border-radius: 50%; animation: s 0.8s linear infinite; margin: 20px; }
+@keyframes s { to { transform: rotate(360deg); } }
+canvas { display: block; }
+</style>
+<div class="spin" id="spin"></div>
+<canvas id="c" width="1400" height="900"></canvas>
+<script>
+const still = location.search.includes("static");
+if (still) document.getElementById("spin").style.animation = "none";
+const c = document.getElementById("c"), g = c.getContext("2d");
+const words = "the quick brown fox jumps over the lazy dog while the model streams a long answer".split(" ");
+let n = 0;
+function frame() {
+  g.fillStyle = "#fff"; g.fillRect(0, 0, c.width, c.height);
+  g.fillStyle = "#222"; g.font = "15px sans-serif";
+  for (let line = 0; line < 40; line++) {
+    let s = "";
+    for (let w = 0; w < 14; w++) s += words[(line * 14 + w + (n >> 3)) % words.length] + " ";
+    g.fillText(s, 10, 20 + line * 21);
+  }
+  n++;
+  if (!still) requestAnimationFrame(frame);
+}
+frame();
+</script>
