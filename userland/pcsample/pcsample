@@ -1,0 +1,36 @@
+#!/bin/sh
+# pcsample [-d DELAY] LABEL: after DELAY seconds (default 0), sample package
+# C-state residency and RAPL power for 60 s, with the state that explains
+# them, and append one line to /var/log/pcstate.log.
+#
+# The question it answers: does an event (charger plugged or pulled, lid
+# freeze and wake, a load) leave the package out of PC10 afterwards?  The
+# acadapter and lid_switch powerd hooks call it after each event, and cron
+# every 15 minutes for the baseline.  With the panel on the package cannot
+# reach PC10; a high pc3 share is the sign of the stuck state either way.
+export PATH=/usr/local/bin:/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin
+LOG=/var/log/pcstate.log
+delay=0
+[ "$1" = -d ] && { delay=$2; shift 2; }
+label=${1:-cron}
+sleep "$delay"
+# One sample at a time: a second caller waits for the first one.
+exec 9>/var/run/pcsample.lock
+flock 9 2>/dev/null || true
+
+B=0x603c000000	# i915 MMIO BAR
+rd() { /var/tmp/memread $(printf "0x%x" $(( B + ($1 & ~0xfff) ))) $(printf "0x%x" $(( $1 & 0xfff ))) 2>/dev/null | awk '{print $NF}'; }
+rapl() { sysctl -n machdep.cidle.rapl | sed 's/.*raw=\([0-9]*\).*/\1/'; }
+
+r0=$(rapl); s0=$(sysctl -n machdep.cidle.residency); t0=$(date +%s)
+sleep 60
+r1=$(rapl); s1=$(sysctl -n machdep.cidle.residency); t1=$(date +%s)
+pc=$(printf '%s\n%s\n' "$s0" "$s1" | awk '{for(i=1;i<=NF;i++){split($i,a,"="); v[NR,a[1]]=a[2]}}
+    END {t=v[2,"tsc"]-v[1,"tsc"]; printf "pc2=%.0f pc3=%.0f pc8=%.0f pc10=%.0f", 100*(v[2,"pc2"]-v[1,"pc2"])/t, 100*(v[2,"pc3"]-v[1,"pc3"])/t, 100*(v[2,"pc8"]-v[1,"pc8"])/t, 100*(v[2,"pc10"]-v[1,"pc10"])/t}')
+w=$(echo "$r0 $r1 $t0 $t1" | awk '{d=$2-$1; if (d<0) d+=4294967296; printf "%.2f", d*61.035/1e6/($4-$3)}')
+pipe=$(( ($(rd 0x70008) >> 31) & 1 ))
+ac=$(envstat -d acpiacad0 2>/dev/null | awk '/connected/ {print $2}')
+bat=$(envstat -d acpibat0 2>/dev/null | awk '/discharge rate/ {print $3}')
+idle=$(( $(sysctl -n machdep.lpsched.idle_ms 2>/dev/null || echo 0) / 1000 ))
+ff=$(pgrep -f /usr/pkg/lib/firefox >/dev/null && echo ff)
+echo "$(date '+%F %T') $label pkg=${w}W $pc pipe=$pipe ac=$ac bat=${bat}W idle=${idle}s lid=$(sysctl -n hw.acpi.lid_closed 2>/dev/null) epp=$(sysctl -n machdep.hwp.epp) $ff" >> $LOG

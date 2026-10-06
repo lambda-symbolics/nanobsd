@@ -10,7 +10,9 @@ logger -p info -t lid "lid: $*"
 # it at startup so it does not light a closed panel.
 case "$2" in
 pressed)  touch /var/run/lid-closed ;;
-released) rm -f /var/run/lid-closed ;;
+released) rm -f /var/run/lid-closed
+	# After the wake: is the package back in PC10 once the panel blanks?
+	/usr/local/sbin/pcsample -d 30 lid-open </dev/null >/dev/null 2>&1 & ;;
 esac
 # Tell a running Mahogany: panel off while shut, on when opened.
 mahogany() {

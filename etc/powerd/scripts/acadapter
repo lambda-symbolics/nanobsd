@@ -21,6 +21,12 @@ released)
 	    "AC disconnected: brightness $(brightness restore bat)"
 	;;
 esac
+# Sample package C-states once things settle: does plugging or pulling the
+# (USB-C) charger leave the package out of PC10?  See /var/log/pcstate.log.
+case "$2" in
+pressed)  /usr/local/sbin/pcsample -d 30 ac-on </dev/null >/dev/null 2>&1 & ;;
+released) /usr/local/sbin/pcsample -d 30 ac-off </dev/null >/dev/null 2>&1 & ;;
+esac
 # The bar shows the charging state: have its sampler publish it now.
 pkill -USR2 -f '^/bin/sh /usr/local/bin/statusbard$' 2>/dev/null
 exit 0
