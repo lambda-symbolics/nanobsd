@@ -286,6 +286,19 @@ DRRS cannot see because its frames arrive every 33 ms. It then picks the
 Hz for two seconds every ten to re-measure, since the measured rate is
 capped at 30. 24 and 25 fps video stays at 60 Hz. =s-R= toggles it.
 
+2026-10-06 (mahogany 1ba9ffe, f902487): the policy measured frames per
+poll, but polls come every 1 or 5 s, so the first sample after a 5 s poll
+was misread (a 2 Hz cursor blink counted as animation and flipped the
+period back and forth); it now divides by the elapsed time, and periods
+are times, not poll counts.  A stopped policy no longer rearms its timer.
+*Reading mode*: on battery, after 15 s without input
+(=*refresh-reading-seconds*=, NIL = off), content animating faster than
+30 fps is shown at 30 Hz too, with no probing, until the next input; it
+arms heart's one-shot input callback so pointer motion counts as well, and
+a client with an idle inhibitor (video) is never slowed.  A page animating
+at 60 fps (=userland/fftest/anim.html=, =refresh-ab.sh=): 2.88 W package at
+60 Hz, 2.35 W at 30 Hz, three interleaved repetitions within 0.03 W.
+
 ** PSR: the panel has none
 
 PSR stays off because the panel does not offer it: its PSR capability byte

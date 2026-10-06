@@ -2,7 +2,8 @@
 
 LISPBSD: a working **NetBSD 11.0/amd64** setup on the **Lenovo ThinkPad X1 Nano
 Gen 1** (Tiger Lake i7-1160G7, Iris Xe, AX201 WiFi, Elan I2C touchpad), with
-root running `cclsh` (SBCL) as its login shell and StumpWM as the WM.
+root running `cclsh` (SBCL) as its login shell, a Mahogany (Wayland) session
+and StumpWM on X as the fallback.
 
 This repo archives the out-of-tree kernel patches, loadable modules, userland
 helpers and dotfiles that make the machine usable — for posterity, not as a
@@ -42,8 +43,10 @@ paths.
   `switch-to-stumpwm` switch the autologin session.
 - `docs/` — running notes, including `lpsched-design.org` (design, review,
   repairs and measurements), `rpm-s0ix-findings.org`, `vaapi.org`,
-  `stuck-keys.org`, `braiins-wifi.org`, `emacs.org`, `video-power.org` and
-  `reboot-wedge.org`.
+  `stuck-keys.org`, `braiins-wifi.org`, `emacs.org`, `video-power.org`,
+  `reboot-wedge.org`, `epp-load.org` and `power-review-2026-10.org`.
+- `userland/lsblk` — `lsblk`/`lsblock`; `userland/pcsample` — package C-state
+  samples after charger/lid events (`/var/log/pcstate.log`).
 
 Power tuning highlights: fixed a StumpWM mode-line busy-loop (~2.5 W), enabled
 deep C-states + RC6, HWP EPP bias, and ACPI backlight control → idle ~5 W

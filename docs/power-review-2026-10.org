@@ -1,0 +1,91 @@
+#+TITLE: Power review, October 2026: what an outside review got right
+#+DATE: 2026-10-06
+
+An outside review (ChatGPT, given the repo) suggested where the remaining
+power is.  Each point was checked against the machine as it is now (kernel
+133, Mahogany, VA-API Firefox), and fixed or measured where that was
+possible without the user at the machine.  On battery throughout, panel
+state forced, no remote polling during samples.
+
+* 1. The sticky PC3 state
+Claim: some transition leaves the package out of PC10 (PC3 ~50 %, 1.4-2.0 W
+blanked) until reboot; test the transitions one at a time.
+
+Checked now:
+- Heavy load: an idle sample before each of 12 load runs
+  (=epp-load.org=) stayed at 93-95 % PC10, 0.21-0.32 W.
+- Firefox open, closed, blank and unblank (=refresh-ab.sh=): back to
+  91-93 % PC10 with the panel off each time.
+- Three timed s2idle freezes in a row (30 s each, Wi-Fi kept up): every
+  hold 96 % PC10 *with SLP_S0* (delta ~225 000 at 8197 Hz, ~27.5 s of 30),
+  94-95 % PC10 after each wake.  This is the battery confirmation the
+  2026-09-27 SLP_S0 result was missing, and the repeat-freeze PC3 of
+  =rpm-s0ix-findings.org= UPDATE 42 does not come back (fixed by kernel 85).
+- Firefox open with the panel off no longer pins the package: 0.25 W, PC10
+  93 %, where the 2026-09-27 log had 0.8 W and PC10 0 % (pre VA-API).
+
+Not testable remotely: plugging and pulling the charger.  It is the best
+remaining suspect: the charger is USB-C, and UPDATE 43 left "the general
+shared-power-resource accounting defect" (TDM0's identical _PR0/_PR3, the
+backend switching off shared entries) unrepaired.  =userland/pcsample=
+now logs a 60 s sample 30 s after every charger and lid event and every 15
+minutes to =/var/log/pcstate.log=; a PC3-heavy line after =ac-on= or
+=ac-off= names the trigger.
+
+* 2. Refresh policy
+Both code findings were real (mahogany 1ba9ffe): frames were counted per
+poll while polls alternate between 1 and 5 s, and =refresh-stop= left the
+timer rearming every 5 s.  Fixed; in a simulation a 2 Hz cursor blink now
+costs 24 wakeups in two minutes instead of 39, and 30 fps video switches
+after 4 s instead of 10.
+
+The suggested battery reading mode was measured first: a page animating at
+60 fps, panel on, EPP fixed at 240, three interleaved repetitions:
+
+| condition                      | package | fps | GT RC6 | notes                         |
+|--------------------------------+---------+-----+--------+-------------------------------|
+| desktop, nothing moving        | 0.90 W  |   0 | 100 %  | PC8 65 %                      |
+| animated page, 60 Hz           | 2.88 W  |  60 | 36 %   | Firefox content 36 %, main 21 % |
+| animated page, 30 Hz           | 2.35 W  |  30 | 64 %   | -0.53 W                       |
+| page in another group          | 0.80 W  |   0 | 100 %  | Firefox stops drawing         |
+| animated page, panel off       | 0.25 W  |   0 | 100 %  | PC10 93 %                     |
+| still page, panel on           | 0.89 W  |   0 | 100 %  |                               |
+| still page, panel off          | 0.31 W  |   0 | 100 %  | PC10 91 %                     |
+| no Firefox, panel off          | 0.22 W  |   0 | 100 %  | PC10 93 %                     |
+
+So reading mode went in (mahogany f902487, see =mahogany.org=): on
+battery, 15 s after the last input (pointer motion included), animation
+faster than 30 fps is shown at 30 Hz until the next input; never while a
+client holds an idle inhibitor (video).  An idle Firefox costs ~nothing;
+the extra watts of a busy page are its animation, and this takes about a
+quarter of them.
+
+Not done: the sustained low-clock 30 Hz configuration (watermarks and CDCLK
+sized for 30 Hz).  Speculative, needs a modeset per switch; later.
+
+* 3. Browser
+=ui.prefersReducedMotion=1= is in =user.js= (only pages that honour the
+media query change).  =layout.frame_rate=30= is not needed with reading
+mode, which gets the same halving without capping interactive use.
+Firefox renders on iris (WebRender), confirmed in the run.
+
+* 4. Peripherals
+USB (Bluetooth, camera, fingerprint reader) is already off at boot
+(=usb off=); Wi-Fi stays associated on purpose (SLP_S0 needs it).  Audio
+codec power-down is left until the hiss work, at the user's request.
+
+* 5. GEFS+
+Re-prioritised as suggested (=gefs-netbsd= doc/GEFSPLUS.org): fsync stays
+durable; =fsync=order= is an experimental opt-in at most.  Done in the VM:
+durable group commit (16 threads: 1.77 -> 8.54 fsyncs per commit), the
+commit interval as an upper bound (=vfs.gefs.interval=), crash tests (16
+kills, 60 961 acknowledged records, none lost), and a data-loss bug in the
+write-behind path found and fixed.  New finding: with any snapshot alive,
+commits after truncating old data cost ~2300 block writes; that, not fsync,
+is the next power item.  Not deployed; the laptop stays on FFS.
+
+* 6. Load: EPP
+Not in the review's list but its method: energy to finish fixed work.  EPP
+32 (lpschedd's old answer to load on battery) was no faster than 128 and
+the most expensive; lpschedd now uses 192 under load while in use and 224
+unattended (=epp-load.org=).
