@@ -16,3 +16,5 @@ Never run pkgin or pkg_add while a build runs.  Before and after, compare
 | adwaita-icon-theme | 2026-10-07 | installed and removed again (cursor test)      |
 | screenfetch-3.9.9  | 2026-10-07 | plain build; bash, curl, scrot already there   |
 | rsftch-0.7.7       | 2026-10-07 | plain build with the installed rust 1.96       |
+| unrar-7.2.7        | 2026-10-07 | non-free license, accepted for this build only: |
+|                    |            | =make package-install ACCEPTABLE_LICENSES+=unrar-license= |
