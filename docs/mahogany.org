@@ -298,6 +298,10 @@ arms heart's one-shot input callback so pointer motion counts as well, and
 a client with an idle inhibitor (video) is never slowed.  A page animating
 at 60 fps (=userland/fftest/anim.html=, =refresh-ab.sh=): 2.88 W package at
 60 Hz, 2.35 W at 30 Hz, three interleaved repetitions within 0.03 W.
+The bar shows the rate Mahogany selected (=60Hz=, green =30Hz=; mahogany
+da26228), repainting only when =%refresh-set= changes it.  The kernel's own
+idle drop to 30 Hz is not shown: repainting the bar to say so would bring
+60 Hz back at once.
 
 ** PSR: the panel has none
 
