@@ -1,0 +1,28 @@
+;;;; ~/.config/lithfetch/init.lisp
+;;;;
+;;;; LOADed raw into the LITHFETCH package after the defaults, so anything
+;;;; can change: facts, entries, their order, the palette, the logo, even the
+;;;; functions that draw them.  An error here is reported and the rest of the
+;;;; run goes on.  Try a change with: lithfetch --init this-file.lisp
+
+;;; A new fact and a line that shows it.
+(define-fact :load
+  (let ((l (sh "/sbin/sysctl" "-n" "vm.loadavg")))
+    (and l (words (trim (first (lines l)))))))  ; "0.42 0.31 0.25"
+
+(define-entry :load "load"
+  (let ((l (fact :load))) (and l (list (v "~{~A~^ ~}" l)))))
+
+;;; Where it goes, and what to leave out.
+(setf *herald* (append (remove :audio *herald*) '(:load)))
+
+;;; Lisp machine amber instead of green.
+;; (loop for role in '(:logo-1 :logo-2 :logo-3 :logo-4 :logo-5 :logo-6)
+;;       for index in '(229 228 221 220 214 208)
+;;       do (setf (style role) (indexed index :yellow :bold t)))
+
+;;; No logo, no status line.
+;; (setf *logo* nil *status* nil)
+
+;;; Or replace how anything is drawn.
+;; (defun status-line (width) nil)
