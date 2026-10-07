@@ -1,0 +1,16 @@
+#+TITLE: Packages built from the local pkgsrc tree
+#+DATE: 2026-10-07
+
+pkgin is not safe on this machine: it resolves against the binary
+repository's newer libraries and upgrades everything sharing them,
+including the locally built Wayland Firefox.  Packages are built from
+=/usr/pkgsrc= instead (=make package-install=), which only adds what is
+missing and stops with an error rather than replacing an installed package.
+Never run pkgin or pkg_add while a build runs.  Before and after, compare
+=pkg_info= output: nothing may show up as removed or changed.
+
+| package            | date       | notes                                         |
+|--------------------+------------+-----------------------------------------------|
+| mpv-0.41.0         | 2026-10-07 | =userland/mpv/build.sh= (local Makefile change) |
+| bsdfetch-1.1.2     | 2026-10-07 | plain =make package-install=, no dependencies  |
+| adwaita-icon-theme | 2026-10-07 | installed and removed again (cursor test)      |
