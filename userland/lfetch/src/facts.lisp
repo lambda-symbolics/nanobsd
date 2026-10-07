@@ -1,7 +1,7 @@
-;;;; Facts: what lithfetch knows about the machine.  Each fact is learned at
+;;;; Facts: what lfetch knows about the machine.  Each fact is learned at
 ;;;; most once per run, lazily; one that fails is NIL and its herald line is
 ;;;; left out.  Redefine any of them from init.lisp with DEFINE-FACT.
-(in-package #:lithfetch)
+(in-package #:lfetch)
 
 (defvar *facts* (make-hash-table) "Fact name -> function of no arguments.")
 (defvar *fact-cache* (make-hash-table))

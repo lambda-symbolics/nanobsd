@@ -1,5 +1,5 @@
 ;;;; Running: options, the user's init.lisp, layout.
-(in-package #:lithfetch)
+(in-package #:lfetch)
 
 (defvar *init-file* nil "Overrides the init file path (--init FILE).")
 (defvar *max-width* 100 "The herald never grows wider than this.")
@@ -7,8 +7,8 @@
 (defun init-path ()
   (or *init-file*
       (let ((xdg (env "XDG_CONFIG_HOME")) (home (env "HOME")))
-        (cond (xdg (format nil "~A/lithfetch/init.lisp" xdg))
-              (home (format nil "~A/.config/lithfetch/init.lisp" home))))))
+        (cond (xdg (format nil "~A/lfetch/init.lisp" xdg))
+              (home (format nil "~A/.config/lfetch/init.lisp" home))))))
 
 (defun load-init ()
   "LOAD the user's init file into this package, raw: it may redefine anything.
@@ -18,12 +18,12 @@ An error in it is reported and the run goes on with whatever it did define."
       (handler-case
           ;; Interpreted, without compiler chatter: an init file is a handful
           ;; of forms, and redefining things is the point of it.
-          (let ((*package* (find-package '#:lithfetch))
+          (let ((*package* (find-package '#:lfetch))
                 (sb-ext:*evaluator-mode* :interpret))
             (handler-bind ((warning #'muffle-warning))
               (load path)))
         (error (e)
-          (format *error-output* "~&lithfetch: ~A: ~A~%" path e))))))
+          (format *error-output* "~&lfetch: ~A: ~A~%" path e))))))
 
 (defun pad-to (spans width)
   (append spans (list (make-string (max 0 (- width (line-width spans))) :initial-element #\Space))))
@@ -53,41 +53,47 @@ An error in it is reported and the run goes on with whatever it did define."
 
 (defun facts-sexp ()
   "Every fact but the raw ones, as one property list."
-  (cons 'lithfetch
+  (cons 'lfetch
         (loop for name in (sort (loop for k being the hash-keys of *facts* collect k) #'string<)
               unless (member name '(:sysctl :dmesg :envstat))
                 append (list name (fact name)))))
 
 (defun usage ()
-  (format t "usage: lithfetch [--sexp] [--no-init] [--init FILE] [--no-logo] [--no-status]
+  (format t "usage: lfetch [--sexp] [--no-init] [--init FILE] [--no-logo] [--no-status]
 
-  --sexp       print what lithfetch knows as a Lisp property list
-  --no-init    do not load ~~/.config/lithfetch/init.lisp
+  --sexp       print what lfetch knows as a Lisp property list
+  --no-init    do not load ~~/.config/lfetch/init.lisp
   --init FILE  load FILE instead
   --no-logo    leave the λ out
   --no-status  leave the status line out
 
-init.lisp is LOADed into the LITHFETCH package after the defaults, so it can
+init.lisp is LOADed into the LFETCH package after the defaults, so it can
 change anything: DEFINE-FACT, DEFINE-ENTRY, *HERALD*, *PALETTE*, *LOGO*.~%"))
 
 (defun main ()
+  ;; A reader that goes away early (lfetch | head) ends the run quietly,
+  ;; as for any other Unix tool; :abort skips the flush that would fail again.
+  (handler-case (run)
+    (sb-int:broken-pipe () (sb-ext:exit :code 0 :abort t))))
+
+(defun run ()
   (clrhash *fact-cache*)
   (setf *start-rapl* (rapl-now))
   (let ((args (rest sb-ext:*posix-argv*)) (init t) (sexp nil))
     (loop while args
           do (let ((a (pop args)))
-               (cond ((member a '("-h" "--help") :test #'string=) (usage) (return-from main))
+               (cond ((member a '("-h" "--help") :test #'string=) (usage) (return-from run))
                      ((string= a "--sexp") (setf sexp t))
                      ((string= a "--no-init") (setf init nil))
                      ((string= a "--init") (setf *init-file* (pop args)))
                      ((string= a "--no-logo") (setf *logo* nil))
                      ((string= a "--no-status") (setf *status* nil))
-                     (t (format *error-output* "lithfetch: unknown option ~A~%" a)
+                     (t (format *error-output* "lfetch: unknown option ~A~%" a)
                         (usage) (sb-ext:exit :code 2)))))
     (when init (load-init))
     (if sexp
         (let ((*print-case* :downcase) (*print-pretty* t) (*print-right-margin* 80)
-              (*package* (find-package '#:lithfetch)))
+              (*package* (find-package '#:lfetch)))
           (prin1 (facts-sexp)) (terpri))
         (draw))
     (finish-output)))

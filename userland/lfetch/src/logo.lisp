@@ -1,6 +1,6 @@
 ;;;; The LispBSD λ (the one from our pfetch), a row of styles per row.
 ;;;; Swap it from init.lisp: (setf *logo* '((:logo-1 . "...") ...)).
-(in-package #:lithfetch)
+(in-package #:lfetch)
 
 (defparameter *lambda-rows*
   '("  ⠠⠟⢧⡀"

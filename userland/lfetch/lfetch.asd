@@ -1,5 +1,5 @@
-;;; lithfetch --- a Lisp machine herald for the LispBSD X1 Nano.  -*- Mode: Lisp -*-
-(asdf:defsystem #:lithfetch
+;;; lfetch --- a Lisp machine herald for the LispBSD X1 Nano.  -*- Mode: Lisp -*-
+(asdf:defsystem #:lfetch
   :description "System information for the LispBSD X1 Nano, as a Lisp machine herald."
   :version "0.1.0"
   :license "ISC"

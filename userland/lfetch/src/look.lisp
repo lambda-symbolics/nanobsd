@@ -3,7 +3,7 @@
 ;;;; A line of output is a list of spans; a span is a string (plain) or
 ;;;; (ROLE . STRING), drawn with the style ROLE has in *PALETTE*.  Repaint from
 ;;;; init.lisp with (setf (style :label) (c:make-style ...)).
-(in-package #:lithfetch)
+(in-package #:lfetch)
 
 (defun indexed (index fallback &rest attributes)
   (apply #'c:make-style :foreground (c:indexed-color index :fallback fallback) attributes))

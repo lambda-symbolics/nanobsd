@@ -1,22 +1,22 @@
-lithfetch: system information for the LispBSD X1 Nano, printed the way a Lisp
+lfetch: system information for the LispBSD X1 Nano, printed the way a Lisp
 machine printed its herald at boot: system and boot file, machine, the
 software loaded, one line per fact, and a status line at the bottom.  The λ
 is the LispBSD logo from our pfetch.
 
-  lithfetch            the herald
-  lithfetch --sexp     everything it knows, as a Lisp property list
-  lithfetch --help
+  lfetch            the herald
+  lfetch --sexp     everything it knows, as a Lisp property list
+  lfetch --help
 
-It is meant to be changed.  ~/.config/lithfetch/init.lisp is LOADed raw into
-the LITHFETCH package after the defaults (interpreted, warnings muffled, an
+It is meant to be changed.  ~/.config/lfetch/init.lisp is LOADed raw into
+the LFETCH package after the defaults (interpreted, warnings muffled, an
 error is reported and the run goes on), so it can redefine anything:
 DEFINE-FACT, DEFINE-ENTRY, *HERALD* (the order), *PALETTE* (roles to
 cl-colorist styles), *LOGO*, *STATUS*, or any function.  See
-init.lisp.example; try a file with lithfetch --init FILE.
+init.lisp.example; try a file with lfetch --init FILE.
 
 Source: src/facts.lisp (what it learns: sysctl, envstat, ifconfig, vmstat,
 df, mixerctl, dmesg.boot, and the running Mahogany through mahoganyctl),
 src/herald.lisp (the lines), src/look.lisp (palette, bars), src/logo.lisp.
 Only dependency: cl-colorist (lambda-symbolics), from cclsh's sources.
-Build on the laptop as root: ./build.sh -> /usr/local/bin/lithfetch (an SBCL
-executable, ~80 ms per run).  Sources live in /usr/local/lib/lithfetch.
+Build on the laptop as root: ./build.sh -> /usr/local/bin/lfetch (an SBCL
+executable, ~80 ms per run).  Sources live in /usr/local/lib/lfetch.

@@ -1,5 +1,5 @@
 ;;;; Talking to NetBSD: commands with a deadline, sysctls, small parsers.
-(in-package #:lithfetch)
+(in-package #:lfetch)
 
 (defvar *command-timeout* 1.5
   "Seconds a probe command may run before it is killed and its fact is NIL.")

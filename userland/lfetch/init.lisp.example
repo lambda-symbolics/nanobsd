@@ -1,9 +1,9 @@
-;;;; ~/.config/lithfetch/init.lisp
+;;;; ~/.config/lfetch/init.lisp
 ;;;;
-;;;; LOADed raw into the LITHFETCH package after the defaults, so anything
+;;;; LOADed raw into the LFETCH package after the defaults, so anything
 ;;;; can change: facts, entries, their order, the palette, the logo, even the
 ;;;; functions that draw them.  An error here is reported and the rest of the
-;;;; run goes on.  Try a change with: lithfetch --init this-file.lisp
+;;;; run goes on.  Try a change with: lfetch --init this-file.lisp
 
 ;;; A new fact and a line that shows it.
 (define-fact :load

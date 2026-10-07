@@ -6,7 +6,7 @@
 ;;;; out).  *HERALD* is the order; add, drop or redefine entries from init.lisp:
 ;;;;   (define-entry :weather "weather" (list (sh "/usr/local/bin/wttr")))
 ;;;;   (setf *herald* (remove :audio *herald*))
-(in-package #:lithfetch)
+(in-package #:lfetch)
 
 (defvar *entries* (make-hash-table) "Entry name -> (label . function).")
 
