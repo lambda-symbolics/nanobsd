@@ -1,0 +1,26 @@
+--- Makefile.orig-lispbsd	2026-10-07 22:55:11.652613918 +0200
++++ Makefile	2026-10-07 22:58:26.580460671 +0200
+@@ -23,8 +23,8 @@
+ MESON_ARGS+=	-Ddvdnav=enabled
+ MESON_ARGS+=	-Dlibmpv=true
+ 
+-# Support Wayland via SDL2, wayland support in mpv is too fast-moving.
+-MESON_ARGS+=	-Dwayland=disabled
++# LISPBSD: native Wayland (Mahogany has no SDL2 path worth using)
++MESON_ARGS+=	-Dwayland=enabled
+ 
+ USE_TOOLS+=	perl pkg-config
+ 
+@@ -88,7 +88,11 @@
+ .include "../../multimedia/libdvdnav/buildlink3.mk"
+ BUILDLINK_API_DEPENDS.libplacebo+=	libplacebo>=6.338.2
+ .include "../../multimedia/libplacebo/buildlink3.mk"
+-.include "../../multimedia/ffmpeg7/buildlink3.mk"
++.include "../../multimedia/ffmpeg8/buildlink3.mk"
++.include "../../devel/wayland/buildlink3.mk"
++.include "../../devel/wayland-protocols/buildlink3.mk"
++.include "../../x11/libxkbcommon/buildlink3.mk"
++.include "../../devel/input-headers/buildlink3.mk"
+ .include "../../graphics/hicolor-icon-theme/buildlink3.mk"
+ .include "../../sysutils/desktop-file-utils/desktopdb.mk"
+ .include "../../mk/jpeg.buildlink3.mk"
