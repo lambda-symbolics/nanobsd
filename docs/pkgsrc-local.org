@@ -14,3 +14,5 @@ Never run pkgin or pkg_add while a build runs.  Before and after, compare
 | mpv-0.41.0         | 2026-10-07 | =userland/mpv/build.sh= (local Makefile change) |
 | bsdfetch-1.1.2     | 2026-10-07 | plain =make package-install=, no dependencies  |
 | adwaita-icon-theme | 2026-10-07 | installed and removed again (cursor test)      |
+| screenfetch-3.9.9  | 2026-10-07 | plain build; bash, curl, scrot already there   |
+| rsftch-0.7.7       | 2026-10-07 | plain build with the installed rust 1.96       |

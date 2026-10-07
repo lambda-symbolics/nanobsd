@@ -1,0 +1,4 @@
+[Icon Theme]
+Name=Adwaita
+Comment=Cursor-only alias for the emergency theme (GTK asks for Adwaita and its setting cannot be changed without D-Bus). Remove if adwaita-icon-theme is ever installed.
+Inherits=emergency

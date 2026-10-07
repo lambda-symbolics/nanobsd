@@ -1,0 +1,15 @@
+The "emergency" cursor theme: the cursors compiled into libwayland-cursor
+(what Mahogany draws when no theme is installed), unchanged, padded into
+24x24 Xcursor images.  Installed in ~mag/.icons (dotfiles/.icons): the theme,
+plus "default" (what Mahogany/wlroots loads) and "Adwaita" (what GTK asks
+for; its setting cannot change without D-Bus) both inheriting it.  Remove
+~/.icons/Adwaita if adwaita-icon-theme is ever installed.
+
+GTK 4 cursors were 2-3x bigger: GTK 4.22 ignores cursor themes on Wayland,
+draws its own 32 px images and scales them by cursor-size/32 the wrong way
+round (gdkseat-wayland.c: destination = 32 / (24/32) = 42 px).  It only does
+that without cursor-shape-v1; GNOME and niri have the protocol.  The fix is
+in Mahogany (988c155: heart supports cursor-shape-v1, the compositor draws
+the named cursor from this theme).
+
+Regenerate: python3 mkcursors.py wayland-1.25.0/cursor/cursor-data.h OUT
