@@ -62,9 +62,13 @@ quarter of them.
 
 Done 2026-10-08 evening (kernels 141/142, see =mahogany.org=): the full 30 Hz
 configuration moves cdclk one step (192 -> 172.8 MHz) and saves 2.3 W package
-on battery for a still screen, but the saving is entirely the watermarks and
-line time, which kernel 142 applies inside the seamless fastset
-(=lispbsd_seamless_rr=3=, now the sysctl.conf default), no modeset, no blink.
+on battery for a still screen by the package RAPL counter, but the battery's
+own charge counter sees only about 0.5 W, and the package counter turned out
+to carry a ~2 W offset tonight (panel-off package 2.57 W against 0.84 W on
+09-26).  The watermark/line time part is applied inside the seamless fastset
+by kernel 142 (=lispbsd_seamless_rr=3=, sysctl.conf default), no modeset, no
+blink; cdclk itself is worth nothing.  Next: why the package RAPL reading
+moved since the review.
 
 * 3. Browser
 =ui.prefersReducedMotion=1= is in =user.js= (only pages that honour the

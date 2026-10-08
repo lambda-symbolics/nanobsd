@@ -637,3 +637,34 @@ state tonight with the same PC8 65 %, which wants an explanation; whether
 reading mode should also run on AC now that it is worth 2 W; the AC run.  Knob 2 (full
 configuration, one second blink per switch) stays available for experiments
 but has no use.
+
+** Battery ground truth: 0.5 W, and the package counter is lying tonight
+
+The runs above used the package RAPL counter (=machdep.cidle.rapl=, MSR
+0x611).  =rr30-ab6.sh= adds the battery's own charge counter per window
+(=envstat acpibat0= charge, 1 mWh steps, so ±0.24 W over 150 s) and ends with
+a panel-off window:
+
+| state (battery, still screen, 150 s)   | package RAPL | battery (Wh delta) | EC rate |
+|----------------------------------------+--------------+--------------------+---------|
+| A 60 Hz mode, idleness DRRS            | 4.25 W       | 4.08 W             | 3.63 W  |
+| E seamless 30 Hz, slow watermarks (3)  | 2.15 W       | 4.08 W             | 3.54 W  |
+| A                                      | 3.88 W       | 4.80 W             | 3.65 W  |
+| E                                      | 2.22 W       | 4.32 W             | 3.54 W  |
+| A                                      | 3.36 W       | 5.04 W             | 3.67 W  |
+| E                                      | 1.83 W       | 4.08 W             | 3.64 W  |
+| panel off                              | 2.57 W       | 2.62 W             | 2.25 W  |
+
+At the battery the slow watermarks are worth about 0.5 W (A mean 4.64 W, E
+mean 4.16 W; the EC's instantaneous rate agrees in direction, 0.08 W), not
+the 2.3 W the package counter shows.  The counter cannot be right: with the
+panel off it reports 2.57 W for a package that sits in PC10 48 % of the time,
+as much as the whole machine draws from the battery, where the same state
+read 0.84 W on 2026-09-26 (kernel 129, battery 2.95 W) and 0.25-0.31 W on
+2026-10-06.  So since the power review the package RAPL reading has acquired
+an offset of about two watts that the slow-watermark state happens to remove,
+and every package-only number from this evening (the codec D3 test included)
+inherits that doubt.  Finding what moved the RAPL model (the RPS governor,
+kernel 136-139, is the obvious suspect: it changed what the GT requests while
+parked) is the next item.  Knob 3 stays: it is a plain fastset, costs
+nothing, and the 0.5 W at the battery is consistent in direction.
