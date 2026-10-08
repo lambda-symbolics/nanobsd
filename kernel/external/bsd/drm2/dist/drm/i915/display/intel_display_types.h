@@ -946,6 +946,13 @@ struct intel_crtc_state {
 	 * there is nothing slower to drop to.
 	 */
 	bool lispbsd_full_downclock;
+	/*
+	 * seamless_slow_wm (lispbsd_seamless_rr=3): a seamless state whose
+	 * plane watermarks and line time are sized for the pixel clock in
+	 * use instead of the fast mode's; only cdclk stays sized for the
+	 * fast mode, so the switch is still a fastset.
+	 */
+	bool seamless_slow_wm;
 
 	bool has_psr;
 	bool has_psr2;

@@ -97,7 +97,8 @@ i915_param_named_unsafe(lispbsd_seamless_rr, int, 0600,
 	"Switch eDP between the panel's fixed and downclock (DRRS) modes "
 	"without a modeset by rewriting the link M/N values "
 	"(0=off, 1=on [default], 2=configure the whole pipe for the downclock "
-	"mode: cdclk and watermarks follow it, every switch is a modeset)");
+	"mode: cdclk and watermarks follow it, every switch is a modeset, "
+	"3=as 1 with the watermarks and line time sized for the mode in use)");
 
 i915_param_named_unsafe(lispbsd_idle_drrs, int, 0600,
 	"Let idleness DRRS drop the eDP panel to its downclock refresh a "

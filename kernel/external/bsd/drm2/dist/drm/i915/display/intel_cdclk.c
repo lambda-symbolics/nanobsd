@@ -1907,10 +1907,23 @@ intel_set_cdclk_post_plane_update(struct drm_i915_private *dev_priv,
 		intel_set_cdclk(dev_priv, new_state, pipe);
 }
 
+/*
+ * LISPBSD: the pixel rate cdclk is sized for. A seamless refresh state
+ * keeps it at the fast mode's clock whatever the mode in use, so a switch
+ * never needs a cdclk change, and with it a modeset.
+ */
+static int lispbsd_cdclk_pixel_rate(const struct intel_crtc_state *crtc_state)
+{
+	if (crtc_state->seamless_m_n &&
+	    crtc_state->seamless_pixel_clock > crtc_state->pixel_rate)
+		return crtc_state->seamless_pixel_clock;
+	return crtc_state->pixel_rate;
+}
+
 static int intel_pixel_rate_to_cdclk(const struct intel_crtc_state *crtc_state)
 {
 	struct drm_i915_private *dev_priv = to_i915(crtc_state->uapi.crtc->dev);
-	int pixel_rate = crtc_state->pixel_rate;
+	int pixel_rate = lispbsd_cdclk_pixel_rate(crtc_state);
 
 	if (INTEL_GEN(dev_priv) >= 10 || IS_GEMINILAKE(dev_priv))
 		return DIV_ROUND_UP(pixel_rate, 2);
@@ -2019,7 +2032,7 @@ int intel_crtc_compute_min_cdclk(const struct intel_crtc_state *crtc_state)
 	 * rather a Hack, than final solution.
 	 */
 	if (IS_TIGERLAKE(dev_priv))
-		min_cdclk = max(min_cdclk, (int)crtc_state->pixel_rate);
+		min_cdclk = max(min_cdclk, lispbsd_cdclk_pixel_rate(crtc_state));
 
 	if (min_cdclk > dev_priv->max_cdclk_freq) {
 		DRM_DEBUG_KMS("required cdclk (%d kHz) exceeds max (%d kHz)\n",

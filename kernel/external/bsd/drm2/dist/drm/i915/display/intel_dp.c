@@ -2536,7 +2536,8 @@ intel_dp_compute_config(struct intel_encoder *encoder,
 	    dev_priv->drrs.type == SEAMLESS_DRRS_SUPPORT &&
 	    INTEL_GEN(dev_priv) >= 8 && !IS_CHERRYVIEW(dev_priv) &&
 	    !pipe_config->has_pch_encoder &&
-	    i915_modparams.lispbsd_seamless_rr == 1) {
+	    (i915_modparams.lispbsd_seamless_rr == 1 ||
+	     i915_modparams.lispbsd_seamless_rr == 3)) {
 		const struct drm_display_mode *fixed =
 			intel_connector->panel.fixed_mode;
 		const struct drm_display_mode *down =
@@ -2544,6 +2545,8 @@ intel_dp_compute_config(struct intel_encoder *encoder,
 
 		pipe_config->seamless_m_n = true;
 		pipe_config->seamless_pixel_clock = fixed->clock;
+		pipe_config->seamless_slow_wm =
+			i915_modparams.lispbsd_seamless_rr == 3;
 
 		if (lispbsd_wants_downclock(intel_connector,
 					    pipe_config->hw.mode.clock)) {

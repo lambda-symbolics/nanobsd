@@ -7832,10 +7832,12 @@ static u32 ilk_pipe_pixel_rate(const struct intel_crtc_state *pipe_config)
 	pixel_rate = pipe_config->hw.adjusted_mode.crtc_clock;
 
 	/*
-	 * LISPBSD: seamless refresh switching keeps watermarks and cdclk
-	 * sized for the fast mode, so a switch changes neither.
+	 * LISPBSD: seamless refresh switching keeps the watermarks sized
+	 * for the fast mode, so a switch changes nothing but M/N; with
+	 * seamless_slow_wm they follow the clock in use (cdclk is sized
+	 * for the fast mode separately, in intel_crtc_compute_min_cdclk).
 	 */
-	if (pipe_config->seamless_m_n &&
+	if (pipe_config->seamless_m_n && !pipe_config->seamless_slow_wm &&
 	    pipe_config->seamless_pixel_clock > pixel_rate)
 		pixel_rate = pipe_config->seamless_pixel_clock;
 
@@ -14862,6 +14864,18 @@ static void intel_pipe_fastset(const struct intel_crtc_state *old_crtc_state,
 		spin_lock_irqsave(&dev_priv->drm.vblank_time_lock, irqflags);
 		intel_crtc_update_active_timings(new_crtc_state);
 		spin_unlock_irqrestore(&dev_priv->drm.vblank_time_lock, irqflags);
+
+		/*
+		 * Watermarks sized for the clock in use: the plane update
+		 * of this commit rewrites the plane watermarks; the pipe's
+		 * line time, which SKL+ writes only when the pipe comes up,
+		 * latches here with the new M/N.
+		 */
+		if (INTEL_GEN(dev_priv) >= 9 &&
+		    (old_crtc_state->seamless_slow_wm ||
+		     new_crtc_state->seamless_slow_wm))
+			I915_WRITE(PIPE_WM_LINETIME(crtc->pipe),
+				   new_crtc_state->wm.skl.optimal.linetime);
 	}
 }
 
