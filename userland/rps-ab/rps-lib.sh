@@ -42,5 +42,14 @@ meas() {	# label
 	r=$(echo "$g0 $g1 $el" | awk '{d=$2-$1; if (d<0) d+=4294967296; printf "%.0f%%", 100*d*1.28e-6/$3}')
 	echo "  $(date +%T) [$1] ${el}s $w $pc rc6=$r $act $ev fps=$fps drops=$((d1 - d0)) cur=$(sysctl -n hw.i915rps.cur_mhz)" | tee -a $OUT
 }
-mpvstart() { su mag -c "sh $R/mpvrun.sh $1" > /dev/null 2>&1 & sleep 8; }
-mpvstop() { printf '{ "command": ["quit"] }\n' | nc -U -w 2 $R/sock > /dev/null 2>&1; sleep 3; pkill -x mpv; sleep 2; }
+mpvstart() { su mag -c "sh $R/mpvrun.sh $1" > /dev/null 2>&1 & sleep 8; pgrep -u mag -x mpv > $R/mpv.pid; }
+# SIGTERM did not stop a fullscreen test mpv whose window had been hidden
+# (two instances survived a whole run on 10-08): quit over IPC, then TERM,
+# then KILL the recorded pids, and verify.
+mpvstop() {
+	printf '{ "command": ["quit"] }\n' | nc -U -w 2 $R/sock > /dev/null 2>&1; sleep 3
+	for p in $(cat $R/mpv.pid 2>/dev/null); do kill -TERM $p 2>/dev/null; done; sleep 2
+	for p in $(cat $R/mpv.pid 2>/dev/null); do kill -KILL $p 2>/dev/null; done; sleep 1
+	pgrep -u mag -x mpv > /dev/null && echo "WARNING: an mpv survived mpvstop" | tee -a $OUT
+	rm -f $R/mpv.pid
+}
