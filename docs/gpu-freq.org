@@ -1,0 +1,78 @@
+#+TITLE: GPU frequency scaling (RPS) on the X1 Nano
+#+DATE: 2026-10-08
+
+* The finding
+Astra's review suggested checking whether Tiger Lake GPU frequency scaling
+(RPS) is enabled at all: NetBSD's =i915_pci.c= still has
+=.has_rps = false, /* XXX disabled for debugging */= for =tgl_info=.
+
+It is not that simple.  In this Linux 5.6 snapshot =HAS_RPS()= only gates
+debugfs and our guard in =intel_rps_mark_interactive=; =intel_rps_enable=
+runs unconditionally from =intel_gt_resume=.  Read from the live kernel
+(=gdb target kvm /dev/mem=, =((struct drm_i915_private *)lispbsd_i915_sc->sc_drm_dev)->gt.rps=)
+on kernel 134 after 3h50 of use:
+
+| field          | value | meaning                                   |
+|----------------+-------+-------------------------------------------|
+| enabled        | true  | RPS is on                                 |
+| rp0/rp1/rpe/rpn | 66/24/18/6 | 1100 / 400 / 300 / 100 MHz (16.67 MHz units) |
+| cur_freq       | 66    | 1100 MHz requested whenever awake         |
+| last_freq      | 6     | 100 MHz written at park                   |
+| boosts         | 19    | client wait-boosts since boot             |
+| pm_events      | 0     | interrupts disabled (parked)              |
+
+So the GPU ran at RP0 whenever it was awake.  Mechanism: =intel_rps_park=
+writes RPn but keeps =cur_freq=; =intel_rps_unpark= restores
+=max(cur_freq, efficient_freq)=; the only thing that ever raises =cur_freq=
+is a client wait-boost (to =boost_freq= = RP0) and the only thing that lowers
+it is a PM interrupt (DOWN_THRESHOLD after 32 ms below 60 % busy, or
+DOWN_TIMEOUT after 1 s).  A compositor or a video player wakes the GT for a
+few ms per frame (120 parks/s playing 1440p60), so no evaluation interval
+ever completes: with kernel 135's counters, =irq_raw= stayed 0 through
+every test.  After the first boost, 1100 MHz forever.
+
+The compositor itself is not "hammering" the GPU: a still desktop is 100 %
+RC6 (=rc6test=, =rps-ab desktop-*=).  The cost is the clock level during the
+wakes, so it scales with GPU-awake time: video, animation, scrolling.
+
+* Kernel 135/136: knobs and counters (=hw.i915rps=)
+act_mhz (0 while parked), cur_mhz, rp0/rp1/rpe/rpn_mhz, max_mhz (hard cap,
+also caps boost), min_mhz, boost_mhz, idle_mhz, unpark_start
+(0 stock, 1 RPe, 2 RPn), stats (irq_raw, irq, boost, up, timeout, down,
+unknown, park, unpark, set, tick + state).  =machdep.cidle.rapl= gained
+=pp1=, the graphics RAPL plane (MSR 0x641), so GPU watts are measured
+directly.  The node cannot be CTLFLAG_PERMANENT (i915 attaches after the
+sysctl root is sealed; kernel 135 lost the node to EPERM, 136 fixed it).
+
+* Measurement 1 (kernel 136, =userland/rps-ab=, rep 1, AC, EPP 240)
+Fullscreen mpv, 1440p60 VP9, zero-copy VA-API, 60 s each:
+
+| policy         | pkg W | GPU W | RC6  | fps  | drops | act MHz samples |
+|----------------+-------+-------+------+------+-------+-----------------|
+| stock (1100)   |  4.21 |  1.54 | 39 % | 59.2 |     0 | 1100 when awake |
+| unpark at RPe (300) | 3.71 | 1.06 |  2 % | 60.1 |     0 | 300             |
+| unpark at RPn (100) | 3.30 | 0.74 |  0 % | 34.9 |     0 | 100: cannot keep up |
+| cap 400        |  3.57 |  0.99 | 20 % | 59.4 |     0 | 400             |
+| cap 300        |  3.76 |  1.06 |  3 % | 59.2 |     0 | 300             |
+
+Half a watt of GPU power for the same frames at 300-400 MHz; 100 MHz is
+too slow for 1440p60.  The stock rows of reps 2-3 were invalid: "stock" is
+path-dependent (nothing raises =cur_freq= but a boost), the harness now
+forces 1100 first.  Idle desktop package power on AC was 3.7-4.2 W in both
+policies, far above the 0.9 W measured on battery on 10-06; not
+investigated here (AC-side effect, not a GPU one: GPU 0.02 W).
+
+* Kernel 137: the busyness timer (Linux 5.8 =rps_timer=)
+Linux solved exactly this in 5.8 (c4e8ba739034): instead of PM interrupts,
+a timer samples each engine's busy time while unparked (1 ms doubling to
+20 ms; here jiffies at HZ=100, so 10 ms steps), weighs the busiest engines
+and queues an up step above =power.up_threshold= or a down step below
+=power.down_threshold= of the unparked time; park lowers =cur_freq= a
+step (doubling across consecutive parks) so the next unpark restarts lower.
+The 5.6 port already has the engine busy-time accounting (=intel_engine_get_busy_time=,
+enabled per engine with =intel_enable_engine_stats=, execlists engines set
+=I915_ENGINE_SUPPORTS_STATS=).  Backported as NetBSD-only code in
+=intel_rps.c= behind =hw.i915rps.timer= (default 1) and
+=hw.i915rps.park_down= (default 1); =timer=0= is the old interrupt path.
+
+Results: see measurement 2 below.
