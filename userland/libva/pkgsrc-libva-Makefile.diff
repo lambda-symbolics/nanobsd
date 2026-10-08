@@ -1,0 +1,10 @@
+--- Makefile.orig-lispbsd
++++ Makefile
+@@
+-# Might be useful to have this but I'll leave it to
+-# someone else to enable. -tnn
+-CONFIGURE_ARGS+=	--disable-wayland
++# LISPBSD: the Wayland backend (vaGetDisplayWl) lets a VA-API client in a
++# Wayland window get a VA display without X11, which mpv needs for zero-copy
++# hwdec=vaapi.  libva finds the GPU through wl_drm or linux-dmabuf feedback.
++CONFIGURE_ARGS+=	--enable-wayland

@@ -20,8 +20,10 @@
 # hangs mpv (docs/mpv-sndio.org).
 # Pulled in on 2026-10-07, nothing replaced: libdvdread, libdvdnav,
 # libplacebo, vulkan-headers, py313-glad2, lua52, sndio and Python build tools.
-# ~/.config/mpv/mpv.conf (dotfiles/) sets hwdec=vaapi-copy: this libva has no
-# Wayland backend, so zero-copy vaapi cannot get a VA display in a Wayland window.
+# libva must be built with its Wayland backend first (userland/libva/build.sh):
+# meson then finds libva-wayland and hwdec=vaapi (zero-copy, mpv.conf in
+# dotfiles/) can open a VA display in the Wayland window.  REPLACE=1 rebuilds
+# over an installed mpv (make replace) instead of package-install.
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 cd /usr/pkgsrc/multimedia/mpv
@@ -29,4 +31,9 @@ cd /usr/pkgsrc/multimedia/mpv
 grep -q 'PKG_OPTIONS.mpv' /etc/mk.conf ||
     printf 'PKG_OPTIONS.mpv=\t-bluray -sixel -javascript -sdl2 -vdpau sndio\n' >> /etc/mk.conf
 make clean
-make package-install USE_BUILTIN.MesaLib=no
+if [ -n "$REPLACE" ]; then
+	make replace USE_BUILTIN.MesaLib=no
+else
+	make package-install USE_BUILTIN.MesaLib=no
+fi
+make clean
