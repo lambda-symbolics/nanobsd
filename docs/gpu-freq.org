@@ -75,4 +75,12 @@ enabled per engine with =intel_enable_engine_stats=, execlists engines set
 =intel_rps.c= behind =hw.i915rps.timer= (default 1) and
 =hw.i915rps.park_down= (default 1); =timer=0= is the old interrupt path.
 
+Kernel 137 panicked ("cpu0: softints stuck for 16 seconds", trace in
+=lispbsd_rps_timer_fn= via callout_softclock) the moment the harness
+switched the timer on under video: =msecs_to_jiffies()= is =mstohz()=,
+which is 0 for anything under 10 ms at HZ=100, and NetBSD's =mod_timer=
+schedules a callout 0 ticks away, which the same softclock pass runs
+again at once, forever.  Kernel 138 re-arms for at least one tick (the
+1/2/4/8 ms rungs of Linux's ladder are all one 10 ms tick here).
+
 Results: see measurement 2 below.
