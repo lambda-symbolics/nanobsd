@@ -13,6 +13,7 @@ __KERNEL_RCSID(0, "$NetBSD: intel_rps.c,v 1.5 2021/12/19 12:32:15 riastradh Exp 
 #include "intel_gt.h"
 #include "intel_gt_irq.h"
 #include "intel_gt_pm_irq.h"
+#include "intel_engine.h"
 #include "intel_rps.h"
 #include "intel_sideband.h"
 /* #include "../../../platform/x86/intel_ips.h" */
@@ -32,6 +33,12 @@ static DEFINE_SPINLOCK(mchdev_lock);
 /* LISPBSD: see intel_rps.h; read and set through hw.i915rps. */
 struct lispbsd_rps_stats lispbsd_rps_stats;
 int lispbsd_rps_unpark_start = 0;
+int lispbsd_rps_timer = 1;
+int lispbsd_rps_park_down = 1;
+
+#define LISPBSD_BUSY_MAX_EI	20u	/* ms */
+#define LISPBSD_TIMER_EVENTS	(GEN6_PM_RP_UP_THRESHOLD | GEN6_PM_RP_DOWN_THRESHOLD)
+
 #endif
 
 static struct intel_gt *rps_to_gt(struct intel_rps *rps)
@@ -761,6 +768,12 @@ void intel_rps_unpark(struct intel_rps *rps)
 	rps->last_adj = 0;
 	mutex_unlock(&rps->lock);
 
+#ifdef __NetBSD__
+	if (lispbsd_rps_timer && lispbsd_has_busy_stats(rps)) {
+		rps->pm_iir = 0;
+		lispbsd_rps_start_timer(rps);
+	} else
+#endif
 	if (INTEL_GEN(rps_to_i915(rps)) >= 6)
 		rps_enable_interrupts(rps);
 
@@ -776,6 +789,11 @@ void intel_rps_park(struct intel_rps *rps)
 		return;
 
 	LISPBSD_RPS_COUNT(park);
+#ifdef __NetBSD__
+	if (rps->lispbsd_timer_on)
+		lispbsd_rps_stop_timer(rps);
+	else
+#endif
 	if (INTEL_GEN(i915) >= 6)
 		rps_disable_interrupts(rps);
 
@@ -799,6 +817,25 @@ void intel_rps_park(struct intel_rps *rps)
 	intel_uncore_forcewake_get(rps_to_uncore(rps), FORCEWAKE_MEDIA);
 	rps_set(rps, rps->idle_freq, false);
 	intel_uncore_forcewake_put(rps_to_uncore(rps), FORCEWAKE_MEDIA);
+
+#ifdef __NetBSD__
+	/*
+	 * Linux 5.8 intel_rps_park: the next unpark restarts from cur_freq,
+	 * so treat the park as a down-clock event, doubling while parks
+	 * follow each other without an up step in between; the busyness
+	 * timer raises it again if the work needs it.
+	 */
+	if (lispbsd_rps_park_down) {
+		int adj = rps->last_adj;
+
+		if (adj < 0)
+			adj *= 2;
+		else
+			adj = -2;
+		rps->last_adj = adj;
+		rps->cur_freq = max_t(int, rps->cur_freq + adj, rps->min_freq);
+	}
+#endif
 }
 
 void intel_rps_boost(struct i915_request *rq)
@@ -1228,6 +1265,19 @@ void intel_rps_enable(struct intel_rps *rps)
 	if (!rps->enabled)
 		return;
 
+#ifdef __NetBSD__
+	/* Busy-time accounting for the timer (refcounted, never dropped). */
+	if (lispbsd_has_busy_stats(rps)) {
+		struct intel_engine_cs *engine;
+		enum intel_engine_id id;
+
+		for_each_engine(engine, rps_to_gt(rps), id) {
+			if (engine->stats.enabled == 0)
+				intel_enable_engine_stats(engine);
+		}
+	}
+#endif
+
 	WARN_ON(rps->max_freq < rps->min_freq);
 	WARN_ON(rps->idle_freq > rps->max_freq);
 
@@ -1479,6 +1529,128 @@ static u32 vlv_wa_c0_ei(struct intel_rps *rps, u32 pm_iir)
 	return events;
 }
 
+#ifdef __NetBSD__
+static bool
+lispbsd_has_busy_stats(struct intel_rps *rps)
+{
+	struct intel_engine_cs *engine;
+	enum intel_engine_id id;
+
+	for_each_engine(engine, rps_to_gt(rps), id) {
+		if (!intel_engine_supports_stats(engine))
+			return false;
+		if ((unsigned)id >= ARRAY_SIZE(rps->lispbsd_busy))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Linux 5.8 rps_timer (c4e8ba739034, "drm/i915/gt: Switch to manual
+ * evaluation of RPS"): sample each engine's busy time since the last
+ * evaluation, weigh the busiest engines, and queue an up or down step
+ * for rps_work when the busiest is above power.up_threshold or below
+ * power.down_threshold of the elapsed unparked time.  The elapsed time
+ * only counts while unparked (pm_timestamp is folded at start and stop),
+ * so short wakes accumulate into one evaluation.  A jiffies timer: with
+ * HZ=100 the shortest interval is one 10 ms tick.
+ */
+static void
+lispbsd_rps_timer_fn(struct timer_list *t)
+{
+	struct intel_rps *rps = from_timer(rps, t, lispbsd_timer);
+	struct intel_gt *gt = rps_to_gt(rps);
+	struct intel_engine_cs *engine;
+	ktime_t dt, last, timestamp;
+	enum intel_engine_id id;
+	s64 max_busy[3] = {};
+	unsigned long flags;
+
+	timestamp = ktime_get();
+	for_each_engine(engine, gt, id) {
+		s64 busy;
+		int i;
+
+		dt = intel_engine_get_busy_time(engine);
+		last = rps->lispbsd_busy[id];
+		rps->lispbsd_busy[id] = dt;
+
+		busy = ktime_to_ns(ktime_sub(dt, last));
+		for (i = 0; i < ARRAY_SIZE(max_busy); i++) {
+			if (busy > max_busy[i]) {
+				s64 tmp = max_busy[i];
+				max_busy[i] = busy;
+				busy = tmp;
+			}
+		}
+	}
+	last = rps->lispbsd_pm_timestamp;
+	rps->lispbsd_pm_timestamp = timestamp;
+
+	if (rps->active && rps->lispbsd_timer_on) {
+		s64 busy, dtns;
+		int i;
+
+		dtns = ktime_to_ns(ktime_sub(timestamp, last));
+		LISPBSD_RPS_COUNT(tick);
+
+		/* The busiest engine counts in full, the next ones by half
+		 * and a quarter: a decode -> post-process -> render chain is
+		 * one GPU-bound task spread over engines. */
+		busy = max_busy[0];
+		for (i = 1; i < ARRAY_SIZE(max_busy); i++) {
+			if (!max_busy[i])
+				break;
+			busy += max_busy[i] >> i;
+		}
+
+		if (dtns > 0 && 100 * busy > rps->power.up_threshold * dtns &&
+		    rps->cur_freq < rps->max_freq_softlimit) {
+			spin_lock_irqsave(&gt->irq_lock, flags);
+			rps->pm_iir |= GEN6_PM_RP_UP_THRESHOLD;
+			spin_unlock_irqrestore(&gt->irq_lock, flags);
+			rps->lispbsd_pm_interval = 1;
+			schedule_work(&rps->work);
+		} else if (dtns > 0 &&
+		    100 * busy < rps->power.down_threshold * dtns &&
+		    rps->cur_freq > rps->min_freq_softlimit) {
+			spin_lock_irqsave(&gt->irq_lock, flags);
+			rps->pm_iir |= GEN6_PM_RP_DOWN_THRESHOLD;
+			spin_unlock_irqrestore(&gt->irq_lock, flags);
+			rps->lispbsd_pm_interval = 1;
+			schedule_work(&rps->work);
+		} else {
+			rps->last_adj = 0;
+		}
+
+		mod_timer(&rps->lispbsd_timer,
+		    jiffies + msecs_to_jiffies(rps->lispbsd_pm_interval));
+		rps->lispbsd_pm_interval =
+		    min(rps->lispbsd_pm_interval * 2, LISPBSD_BUSY_MAX_EI);
+	}
+}
+
+static void
+lispbsd_rps_start_timer(struct intel_rps *rps)
+{
+	rps->lispbsd_pm_timestamp =
+	    ktime_sub(ktime_get(), rps->lispbsd_pm_timestamp);
+	rps->lispbsd_pm_interval = 1;
+	rps->lispbsd_timer_on = true;
+	mod_timer(&rps->lispbsd_timer, jiffies + 1);
+}
+
+static void
+lispbsd_rps_stop_timer(struct intel_rps *rps)
+{
+	rps->lispbsd_timer_on = false;
+	del_timer_sync(&rps->lispbsd_timer);
+	rps->lispbsd_pm_timestamp =
+	    ktime_sub(ktime_get(), rps->lispbsd_pm_timestamp);
+	cancel_work_sync(&rps->work);
+}
+#endif
+
 static void rps_work(struct work_struct *work)
 {
 	struct intel_rps *rps = container_of(work, typeof(*rps), work);
@@ -1493,10 +1665,23 @@ static void rps_work(struct work_struct *work)
 	spin_unlock_irq(&gt->irq_lock);
 
 	/* Make sure we didn't queue anything we're not going to process. */
+#ifdef __NetBSD__
+	if ((pm_iir & (rps->pm_events |
+	    (rps->lispbsd_timer_on ? LISPBSD_TIMER_EVENTS : 0))) == 0 &&
+	    !client_boost)
+		goto out;
+#else
 	if ((pm_iir & rps->pm_events) == 0 && !client_boost)
 		goto out;
+#endif
 
 	mutex_lock(&rps->lock);
+#ifdef __NetBSD__
+	if (!rps->active) {	/* parked since the timer queued us */
+		mutex_unlock(&rps->lock);
+		goto out;
+	}
+#endif
 
 	pm_iir |= vlv_wa_c0_ei(rps, pm_iir);
 
@@ -1571,6 +1756,10 @@ static void rps_work(struct work_struct *work)
 	mutex_unlock(&rps->lock);
 
 out:
+#ifdef __NetBSD__
+	if (rps->lispbsd_timer_on)	/* no PM interrupts to unmask */
+		return;
+#endif
 	spin_lock_irq(&gt->irq_lock);
 	gen6_gt_pm_unmask_irq(gt, rps->pm_events);
 	spin_unlock_irq(&gt->irq_lock);
@@ -1656,6 +1845,9 @@ void intel_rps_init_early(struct intel_rps *rps)
 	mutex_init(&rps->power.mutex);
 
 	INIT_WORK(&rps->work, rps_work);
+#ifdef __NetBSD__
+	timer_setup(&rps->lispbsd_timer, lispbsd_rps_timer_fn, 0);
+#endif
 
 	atomic_set(&rps->num_waiters, 0);
 }

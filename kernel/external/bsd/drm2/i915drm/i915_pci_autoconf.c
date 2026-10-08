@@ -266,8 +266,8 @@ i915drmkms_sysctl_rps_stats(SYSCTLFN_ARGS)
 	rps = &to_i915(sc->sc_drm_dev)->gt.rps;
 	snprintf(buf, sizeof(buf),
 	    "irq_raw=%llu irq=%llu boost=%llu up=%llu timeout=%llu down=%llu"
-	    " unknown=%llu park=%llu unpark=%llu set=%llu"
-	    " enabled=%d active=%d pm_events=0x%x power=%d"
+	    " unknown=%llu park=%llu unpark=%llu set=%llu tick=%llu"
+	    " enabled=%d active=%d timer_on=%d pm_events=0x%x power=%d"
 	    " last_adj=%d waiters=%d boosts=%d",
 	    (unsigned long long)lispbsd_rps_stats.irq_raw,
 	    (unsigned long long)lispbsd_rps_stats.irq,
@@ -279,7 +279,9 @@ i915drmkms_sysctl_rps_stats(SYSCTLFN_ARGS)
 	    (unsigned long long)lispbsd_rps_stats.park,
 	    (unsigned long long)lispbsd_rps_stats.unpark,
 	    (unsigned long long)lispbsd_rps_stats.set,
-	    rps->enabled, rps->active, READ_ONCE(rps->pm_events),
+	    (unsigned long long)lispbsd_rps_stats.tick,
+	    rps->enabled, rps->active, rps->lispbsd_timer_on,
+	    READ_ONCE(rps->pm_events),
 	    rps->power.mode, rps->last_adj, atomic_read(&rps->num_waiters),
 	    atomic_read(&rps->boosts));
 	node.sysctl_data = buf;
@@ -324,6 +326,14 @@ i915drmkms_sysctl_rps_init(void)
 	    CTLFLAG_READWRITE, CTLTYPE_INT, "unpark_start",
 	    SYSCTL_DESCR("frequency at unpark: 0 max(last, RPe) [stock], 1 RPe, 2 RPn"),
 	    NULL, 0, &lispbsd_rps_unpark_start, 0, CTL_CREATE, CTL_EOL);
+	(void)sysctl_createv(NULL, 0, &rnode, NULL,
+	    CTLFLAG_READWRITE, CTLTYPE_INT, "timer",
+	    SYSCTL_DESCR("1: busyness timer drives the frequency while unparked (Linux 5.8 rps_timer), 0: PM interrupts"),
+	    NULL, 0, &lispbsd_rps_timer, 0, CTL_CREATE, CTL_EOL);
+	(void)sysctl_createv(NULL, 0, &rnode, NULL,
+	    CTLFLAG_READWRITE, CTLTYPE_INT, "park_down",
+	    SYSCTL_DESCR("1: every park lowers the frequency the next unpark starts from"),
+	    NULL, 0, &lispbsd_rps_park_down, 0, CTL_CREATE, CTL_EOL);
 	(void)sysctl_createv(NULL, 0, &rnode, NULL,
 	    CTLFLAG_READONLY, CTLTYPE_STRING, "stats",
 	    SYSCTL_DESCR("RPS event counters and state"),

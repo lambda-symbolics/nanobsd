@@ -12,6 +12,7 @@
 #include <linux/atomic.h>
 #include <linux/ktime.h>
 #include <linux/mutex.h>
+#include <linux/timer.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
@@ -73,6 +74,19 @@ struct intel_rps {
 	u16 gpll_ref_freq;	/* vlv/chv GPLL reference frequency */
 
 	int last_adj;
+
+#ifdef __NetBSD__
+	/*
+	 * LISPBSD: busyness timer, the Linux 5.8 rps_timer, since the PM
+	 * interrupts never complete an evaluation interval on a GT that
+	 * parks between frames (see intel_rps.c).
+	 */
+	struct timer_list lispbsd_timer;
+	ktime_t lispbsd_pm_timestamp;	/* accumulated unparked time */
+	u32 lispbsd_pm_interval;	/* ms, 1 .. LISPBSD_BUSY_MAX_EI */
+	bool lispbsd_timer_on;		/* started at unpark, stopped at park */
+	ktime_t lispbsd_busy[16];	/* last busy time per engine id */
+#endif
 
 	struct {
 		struct mutex mutex;

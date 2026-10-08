@@ -60,10 +60,15 @@ struct lispbsd_rps_stats {
 	u64 park;
 	u64 unpark;
 	u64 set;	/* intel_rps_set calls */
+	u64 tick;	/* busyness timer evaluations while active */
 };
 extern struct lispbsd_rps_stats lispbsd_rps_stats;
 /* 0: stock, max(cur_freq, RPe); 1: start every unpark at RPe; 2: at RPn */
 extern int lispbsd_rps_unpark_start;
+/* 1: busyness timer instead of the PM interrupts (Linux 5.8 rps_timer) */
+extern int lispbsd_rps_timer;
+/* 1: lower cur_freq a step on every park (Linux 5.8 intel_rps_park) */
+extern int lispbsd_rps_park_down;
 #define LISPBSD_RPS_COUNT(f)	((void)lispbsd_rps_stats.f++)
 #else
 #define LISPBSD_RPS_COUNT(f)	((void)0)
