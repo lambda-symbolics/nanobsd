@@ -83,4 +83,52 @@ schedules a callout 0 ticks away, which the same softclock pass runs
 again at once, forever.  Kernel 138 re-arms for at least one tick (the
 1/2/4/8 ms rungs of Linux's ladder are all one 10 ms tick here).
 
-Results: see measurement 2 below.
+* Measurement 2 (kernel 139, rps-ab, 3 interleaved reps, AC, EPP 240)
+The one-tick fix was built twice, so the installed kernel is #139
+(=/netbsd.i915.rpm.139=, nanobsd "kernel 138" commit).  Fullscreen mpv,
+1440p60 VP9 zero-copy, 60 s per cell.  GPU watts are the RAPL graphics
+plane; package watts drifted upward over the run (4.2 -> 5.1 W for stock)
+so only within-rep package differences mean anything.
+
+| policy                 | GPU W (3 reps)     | pkg W vs stock, same rep | fps       | drops | settles at |
+|------------------------+--------------------+--------------------------+-----------+-------+------------|
+| stock (1100 fixed)     | 1.57 / 1.51 / 1.39 | 0                        | 60.2      | 0     | 1100       |
+| timer + park_down      | 0.95 / 1.00 / 1.00 | -0.72 / -0.95 / -1.12    | 59.2-60.2 | 0     | 283-300    |
+| timer, no park_down    | 1.49 / 1.41 / 1.29 | -0.17 / +0.06 / -0.14    | 59.2      | 0     | 1100       |
+| unpark at RPe, no timer | 1.06 / 1.10 / 1.11 | -0.48 / -0.73 / -1.02   | 60.1      | 0     | 300        |
+| cap 400 + timer        | 0.98 / 0.98 / 1.00 | -0.60 / -0.85 / -1.14    | 59.3      | 0     | 283-300    |
+
+The governor finds the 300 MHz floor on its own (3500 up steps and a few
+hundred down steps per minute, 3600-3900 timer evaluations, equilibrium
+with the park step) and gets the same ~0.5 W GPU saving as a hard cap, with
+no frame loss.  Without the park step the up steps win and it sits at 1100
+like stock: both halves of the Linux change are needed.  The old interrupt
+path produced zero events in every cell (=irq=0=).
+
+Under load it does scale up: vaapi-copy (the GPU copies every frame back)
+ran at 417-450 MHz with samples up to 1050 MHz, 16-20 wait-boosts per
+minute, and that path costs 2.1-3.1 W of GPU against 1.0 W zero-copy:
+the libva Wayland change (=mpv-zero-copy.org=) is worth 1.5-2 W of GPU and
+2-3 W of package on video by itself.
+
+* Firefox animation
+rps-ff.sh, the fftest =anim.html= page in the Wayland Firefox (WebRender
+on iris), panel at 60 Hz, 2 interleaved reps of 45 s:
+
+| policy | GPU W       | pkg W       | fps  | drops | settles at |
+|--------+-------------+-------------+------+-------+------------|
+| stock  | 0.53 / 0.52 | 4.35 / 4.33 | 60.2 | 0     | 1100       |
+| timer  | 0.46 / 0.45 | 4.01 / 3.99 | 60.3 | 0     | 300        |
+
+A page animating at 60 fps needs little GPU, so the governor keeps it at
+300 MHz for 0.07 W of GPU and about 0.34 W of package (the lower clock also
+lets the package idle more between frames), with 11-18 wait-boosts per
+minute showing the boost path still fires when a client blocks.  No frame
+loss in either workload; a GPU-bound client still gets RP0 through the up
+steps and boosts (the vaapi-copy rows above).
+
+* State
+Kernel 139 defaults: =hw.i915rps.timer=1=, =park_down=1=, =unpark_start=0=,
+no caps.  =timer=0= restores the kernel 134 behaviour for an A/B.  Open:
+the idle desktop package power on AC (3.4-4.4 W here vs 0.9 W on battery
+on 10-06) is not a GPU effect (0.02 W) and was not chased.
