@@ -4200,7 +4200,7 @@ hdafg_set_port(void *opaque, mixer_ctrl_t *mc)
 	struct hdafg_softc *sc = ad->ad_sc;
 	struct hdaudio_mixer *mx;
 	struct hdaudio_control *ctl;
-	int i, divisor;
+	int i, left, right;
 
 	if (mc->dev < 0 || mc->dev >= sc->sc_nmixers)
 		return EINVAL;
@@ -4232,10 +4232,23 @@ hdafg_set_port(void *opaque, mixer_ctrl_t *mc)
 
 	switch (mx->mx_di.type) {
 	case AUDIO_MIXER_VALUE:
-		divisor = 255 / ctl->ctl_step;
-		hdafg_control_amp_set(ctl, HDAUDIO_AMP_MUTE_NONE,
-		  mc->un.value.level[AUDIO_MIXER_LEVEL_LEFT] / divisor,
-		  mc->un.value.level[AUDIO_MIXER_LEVEL_RIGHT] / divisor);
+		/*
+		 * LISPBSD: scale 0..255 onto 0..ctl_step exactly.  The old
+		 * "level / (255 / ctl_step)" truncated the divisor: with the
+		 * ALC287's 88-step DAC amplifiers it was 2, so every level
+		 * above 174 programmed an index past the amplifier's last
+		 * step and the DAC ran above 0 dB, clipping loud passages
+		 * (the "crunch" at master 190).
+		 */
+		left = (mc->un.value.level[AUDIO_MIXER_LEVEL_LEFT] *
+		    ctl->ctl_step + 127) / 255;
+		right = (mc->un.value.level[AUDIO_MIXER_LEVEL_RIGHT] *
+		    ctl->ctl_step + 127) / 255;
+		if (left > ctl->ctl_step)
+			left = ctl->ctl_step;
+		if (right > ctl->ctl_step)
+			right = ctl->ctl_step;
+		hdafg_control_amp_set(ctl, HDAUDIO_AMP_MUTE_NONE, left, right);
 		break;
 	case AUDIO_MIXER_ENUM:
 		hdafg_control_amp_set(ctl,
@@ -4257,7 +4270,7 @@ hdafg_get_port(void *opaque, mixer_ctrl_t *mc)
 	struct hdaudio_mixer *mx;
 	struct hdaudio_control *ctl;
 	u_int mask = 0;
-	int i, factor;
+	int i;
 
 	if (mc->dev < 0 || mc->dev >= sc->sc_nmixers)
 		return EINVAL;
@@ -4289,9 +4302,11 @@ hdafg_get_port(void *opaque, mixer_ctrl_t *mc)
 
 	switch (mx->mx_di.type) {
 	case AUDIO_MIXER_VALUE:
-		factor = 255 / ctl->ctl_step;
-		mc->un.value.level[AUDIO_MIXER_LEVEL_LEFT] = ctl->ctl_left * factor;
-		mc->un.value.level[AUDIO_MIXER_LEVEL_RIGHT] = ctl->ctl_right * factor;
+		/* LISPBSD: inverse of the exact scaling in hdafg_set_port. */
+		mc->un.value.level[AUDIO_MIXER_LEVEL_LEFT] =
+		    (ctl->ctl_left * 255 + ctl->ctl_step / 2) / ctl->ctl_step;
+		mc->un.value.level[AUDIO_MIXER_LEVEL_RIGHT] =
+		    (ctl->ctl_right * 255 + ctl->ctl_step / 2) / ctl->ctl_step;
 		break;
 	case AUDIO_MIXER_ENUM:
 		mc->un.ord = (ctl->ctl_muted || ctl->ctl_forcemute) ? 1 : 0;
