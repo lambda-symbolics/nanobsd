@@ -668,3 +668,24 @@ inherits that doubt.  Finding what moved the RAPL model (the RPS governor,
 kernel 136-139, is the obvious suspect: it changed what the GT requests while
 parked) is the next item.  Knob 3 stays: it is a plain fastset, costs
 nothing, and the 0.5 W at the battery is consistent in direction.
+
+** Mahogany: a still screen now selects 30 Hz itself (mahogany 6fac471)
+
+With the kernel sizing the watermarks only for an explicitly selected mode,
+=refresh.lisp= no longer leaves still screens to the kernel's DRRS: an
+output drawing fewer than =*refresh-busy-rate*= (10) frames a second for
+=*refresh-still-seconds*= (2, NIL turns it off) gets the 30 Hz mode, on
+battery or AC, inhibitor or not (nothing that draws is slowed).  Any key,
+button, wheel or pointer motion ends it at once through the activity
+callback, the first animation ends it at the next poll (the idle poll stays
+at 5 s, so an animation starting without input may run at 30 Hz for up to
+5 s), and 30 fps content and reading mode behave as before.  A blinking
+cursor (2 fps) or the bar's minute repaint count as still, which the kernel's
+DRRS never managed: its one idle second was reset by every blink.
+
+Verified in the restarted session (22:14): still screen selected 30 Hz 6 s
+after start with line time 0xc4 and the slow watermarks; activity
+(=refresh-note-activity=) returned 60 Hz, fast watermarks, within a second;
+30 Hz again 6 s later.  Installed by rebuild and session restart (the
+defstruct gained slots, so no hot-load); the previous binaries are
+=/usr/local/bin/mahogany.pre-still= and =/usr/local/lib/libheart.so.pre-still=.
