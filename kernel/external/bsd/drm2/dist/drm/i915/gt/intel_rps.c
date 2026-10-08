@@ -1626,8 +1626,11 @@ lispbsd_rps_timer_fn(struct timer_list *t)
 			rps->last_adj = 0;
 		}
 
-		mod_timer(&rps->lispbsd_timer,
-		    jiffies + msecs_to_jiffies(rps->lispbsd_pm_interval));
+		/* At least one tick: msecs_to_jiffies() of a few ms is 0 at
+		 * HZ=100, and a timer re-armed for "now" re-runs in the same
+		 * callout pass forever ("softints stuck" panic, kernel 137). */
+		mod_timer(&rps->lispbsd_timer, jiffies +
+		    max_t(unsigned long, msecs_to_jiffies(rps->lispbsd_pm_interval), 1));
 		rps->lispbsd_pm_interval =
 		    min(rps->lispbsd_pm_interval * 2, LISPBSD_BUSY_MAX_EI);
 	}
