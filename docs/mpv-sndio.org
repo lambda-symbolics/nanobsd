@@ -1,0 +1,72 @@
+#+TITLE: mpv hangs on seek, pause and track switch: libsndio on NetBSD audio(4)
+#+DATE: 2026-10-08
+
+Report: mpv (pkgsrc 0.41.0, native Wayland, sndio output; userland/mpv)
+plays fine untouched, but a seek, a subtitle or audio track switch leaves
+it so stuck that only =kill -9= ends it.
+
+* Reproduction without the user's screen or speakers
+A silent black clip (=ffmpeg8 -f lavfi -i anullsrc ... -f lavfi -i color=black=),
+=mpv --no-config --vo=null --ao=sndio --input-ipc-server=...=, commands over
+the socket, =time-pos= polled before and after each.  Scripts in
+=/var/tmp/mpvtest= on the laptop (run.sh, run2.sh, run3.sh).
+
+Stock libsndio: after =seek 40= the position never moves again.  gdb:
+#+begin_example
+Thread 3 "ao":   poll <- sio_psleep <- sio_write <- audio_write <- ao_thread
+Thread 27 main:  pthread mutex_lock_slow <- ao_get_delay
+#+end_example
+mpv calls the output's write with its buffer lock held ("called locked" in
+audio/out/buffer.c), so a write that never returns takes the core, the
+keyboard and =q= with it.
+
+* Cause 1: flush does not discard (the hang)
+The pkgsrc package builds libsndio's OSS backend (sio_oss.c) over
+ossaudio(3).  =sio_flush()= is =SNDCTL_DSP_SETTRIGGER 0=, which FreeBSD's OSS
+implements as abort-and-discard, but NetBSD's libossaudio turns into
+=AUDIO_SETINFO play.pause=1=: the queued samples (up to 250 ms, mpv's
+buffer) stay in the kernel.  =sio_start()= then zeroes libsndio's own fill
+count and keeps the device paused until the client has filled =bufsz=.
+mpv writes, the kernel ring fills early because of the stale data, the
+blocking write sleeps in =poll(POLLOUT)= on a paused device, and the start
+condition is never evaluated again.
+
+Fix: on NetBSD, =SNDCTL_DSP_HALT_OUTPUT= (libossaudio: =AUDIO_FLUSH=, which
+clears the track) before the trigger-off.
+
+* Cause 2: the start condition (no sound after unpause)
+With the flush fixed, seeks and track switches worked, but after pause +
+unpause the clock stood still (not blocked: quit worked).  ktrace of the
+audio fd across an unpause, =AUDIO_GETBUFINFO= decoded:
+
+| event                   | play.seek (bytes) | play.samples |
+|-------------------------+-------------------+--------------|
+| after write 41728 bytes |             34048 |         7680 |
+| after write 13440 bytes |             47488 |         7680 |
+| then                    | only polls, no AUDIO_SETINFO |   |
+
+audio(4) converts up to NBLKOUT (4) blocks from the user ring into the
+track's output ring as soon as they are written, pause or not, and both
+=play.seek= and =play.samples= move with that (=samples= counts converted
+blocks, not played ones; there is no played counter visible to userland).
+libsndio takes the drop in =seek= as 1920 frames played, lowers its fill
+count, mpv lowers its delay estimate by the same amount and writes more,
+but mpv sizes writes in whole 480-frame blocks of the reported space, so
+the fill ends 128 frames short of =bufsz= and =sio_oss_pollfd()= (start
+only when =wused == bufsz=) never starts the device.  The first start
+after open escapes this because mpv writes the whole buffer in one go.
+
+Fix: on NetBSD, start when the buffer is within one block of full.
+
+Not fixed: the same pre-conversion means libsndio's clock runs four
+blocks (40 ms) ahead of the hardware in steady state, so mpv's audio delay
+estimate is ~40 ms low.  =--audio-delay= if it is ever noticed.
+
+* Change
+=userland/sndio/patch-lispbsd-libsndio_sio__oss.c= (pkgsrc
+audio/sndio/patches, checksum via =make makepatchsum=), rebuilt with
+=make replace= (userland/sndio/build.sh); mpv untouched.
+
+Verified headless after the rebuild: seek, pause, unpause (twice, 6 s
+wait), audio track 1<->2, subtitle track on/off, absolute and relative
+seeks, quit: all advance, exit 0.

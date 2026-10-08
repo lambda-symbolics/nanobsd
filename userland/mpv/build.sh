@@ -15,7 +15,9 @@
 # with the base one every GPU output fails and auto-probing then hits an
 # assertion in mpv's X11 fallback.
 # Options (/etc/mk.conf): no Blu-ray/sixel/JavaScript/SDL2/VDPAU, sndio for
-# audio (libsndio talks to /dev/audio itself, no daemon).
+# audio (libsndio talks to /dev/audio itself, no daemon).  libsndio needs the
+# LISPBSD patch from userland/sndio, or every seek, pause and track switch
+# hangs mpv (docs/mpv-sndio.org).
 # Pulled in on 2026-10-07, nothing replaced: libdvdread, libdvdnav,
 # libplacebo, vulkan-headers, py313-glad2, lua52, sndio and Python build tools.
 # ~/.config/mpv/mpv.conf (dotfiles/) sets hwdec=vaapi-copy: this libva has no
