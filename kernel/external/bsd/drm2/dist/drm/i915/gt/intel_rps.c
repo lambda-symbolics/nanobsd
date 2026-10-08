@@ -39,6 +39,9 @@ int lispbsd_rps_park_down = 1;
 #define LISPBSD_BUSY_MAX_EI	20u	/* ms */
 #define LISPBSD_TIMER_EVENTS	(GEN6_PM_RP_UP_THRESHOLD | GEN6_PM_RP_DOWN_THRESHOLD)
 
+static bool lispbsd_has_busy_stats(struct intel_rps *);
+static void lispbsd_rps_start_timer(struct intel_rps *);
+static void lispbsd_rps_stop_timer(struct intel_rps *);
 #endif
 
 static struct intel_gt *rps_to_gt(struct intel_rps *rps)
