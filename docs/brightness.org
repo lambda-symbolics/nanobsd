@@ -1,0 +1,113 @@
+#+TITLE: Brightness and refresh switching: the flashes
+#+DATE: 2026-10-08
+
+Reported: the panel briefly shows a "default" brightness during transitions
+(idle dim and undim, resume from s2idle, plugging or pulling the charger),
+and the switch to 30 Hz sometimes shows a black frame.  Linux does neither.
+Measured on the machine with =blprobe= (below), then fixed.  The 2026-09-27
+source-only analysis (branch =brightness=, never deployed) was right about
+the resume flash and about the brightness keys, wrong about where the
+unblank level comes from.
+
+* The probe
+
+=/var/tmp/blprobe/blprobe SECONDS [INTERVAL_US]= reads the PCH backlight PWM
+(BXT_BLC_PWM_CTL/FREQ/DUTY at BAR0 + 0xC8250..58), pipe A's link M (0x55555
+= 60 Hz, 0x2adb3 = 30 Hz) and PP_STATUS through =/dev/mem=, and prints a
+timestamped line whenever any of them changes.  Duty / freq is the level:
+8898 / 19393 = 46 %.  Source in =userland/blprobe.c=.
+
+* What the hardware showed (kernel 133, before the changes)
+
+| transition                          | PWM sequence                               |
+|-------------------------------------+--------------------------------------------|
+| idle dim 46 -> 15, undim            | 15 then 46, nothing in between             |
+| =brightness 46= at 46               | no change at all                           |
+| =brightness 30=, =46=               | one step each                              |
+| powerd key action -10, +10          | 36, then 46: one step each                 |
+| blank at 46, unblank                | off; on at 46 directly                     |
+| dim 15, blank, unblank              | off; *on at 15, 46 after 17 ms*            |
+| dim, blank, restore while off, unblank | the same: the restore while off is ignored |
+| level 0 (as s2idle did), blank, unblank | off; *on at 100 %*, until the restore    |
+
+So in the dim-blank-unblank case the panel lights at the dim level and jumps
+a frame later, and anything that leaves i915's level at the panel minimum
+lights it at full brightness (=__intel_panel_enable_backlight=: a level at or
+below the minimum becomes the maximum).  =s0ix suspend= set the level to 0
+before every freeze: that is the full-brightness flash at every resume.
+
+Why a level set while the panel is off was ignored: the firmware's =_BCM=
+(SSDT IgfxSsdt) is =AINT(1, level)= (an opregion ASLE request) plus
+=BRTL = level=; i915's =intel_panel_set_backlight_acpi= returns before
+storing anything when the connector has no CRTC, which is the case while
+the output is off.  The sysfs path on Linux stores the level regardless,
+which is why a Linux desktop restoring brightness while the panel is off
+works.
+
+The charger: =acadapter= runs =brightness restore ac|bat=, which is one
+=_BCM= per output with the remembered level.  Nothing else writes the level
+on an AC change: NetBSD's acpivga sets =_DOS(5)= (bit 2 set: the firmware
+must not control brightness on AC/DC changes; same as Linux on Windows 8+
+firmware), and the DSDT's AC query does not touch =BRTL= or =AINT=.  The
+visible change on plug or unplug is the AC and battery levels themselves
+being different (=/home/mag/.brightness.{ac,bat}=), which is by design.
+What could still show as a flash there is a stale remembered level: the old
+script saved every key step from the level the panel *showed*, so a step
+while dimmed (15 + 10) or while the firmware's =BRTL= read 1 after a resume
+became the preference.  =/var/log/messages= has "AC disconnected: brightness
+1" twice on 10-08.
+
+The brightness keys: a real key press is handled three times.  thinkpad(4)
+asks the BIOS to step through the CMOS interface, the firmware's =BRTN=
+notifies the output device (0x86/0x87) and acpiout steps by 5 on its own,
+and the powerd action runs =brightness +10=.  The probe run only exercised
+the powerd path (one step of 10, nothing else), so whether the other two
+land is unverified; kernel 134 has switches and counters for both (below).
+
+* The 30 Hz black frame
+
+Mahogany's explicit switch (=hrt_output_set_refresh=, heart) committed an
+output state carrying only the new mode.  wlroots 0.19's
+=output_ensure_buffer= attaches an empty, black buffer to any commit that
+changes the mode and has none ("Attaching empty buffer to output for
+modeset"), so the switch scanned out one black frame before the next
+rendered one.  The kernel side (seamless M/N fastset, kernel 127) was fine:
+no modeset, the frame counter never restarts.  Fixed in heart: the switch
+commit now carries the scene rendered through =wlr_scene_output_build_state=.
+
+The kernel's own idleness DRRS (30 Hz one second after the last flip)
+writes the four M/N registers from a work item without vblank evasion, as
+Linux 5.6 did.  Not seen to glitch; if a flicker remains with the heart fix,
+=sysctl -w hw.drm2.i915_modparams.lispbsd_idle_drrs=0= turns it off to tell.
+
+* Changes (all deployed 2026-10-08, kernel 134)
+
+- =userland/s0ix=: no zeroing before the freeze (one sysctl call for both
+  outputs).
+- =userland/brightness=: the remembered level is the truth; steps start
+  from it, never from what the panel shows; =dim N= / =undim= for the idle
+  timer; a lock.
+- =etc/powerd/actions/brightness-{up,down}=: step, then =mahoganyctl
+  '(idle-poke)'= so the ACPI keys count as activity and undim.
+- Mahogany =lisp/idle.lisp= (fb57839): dim and undim through the script;
+  blanking puts the remembered level back while the panel is off, which
+  kernel 134 makes stick; a restore after unblank as the safety net;
+  =idle-poke=.
+- Kernel 134: =intel_panel.c= stores an ACPI level with no CRTC;
+  =hw.acpi.acpiout{15,16}.hotkeys= (0: the firmware's 0x86/0x87 no longer
+  step the level; evcnt "brightness notify"), =hw.acpi.thinkpad0.bios_brightness=
+  (0: no BIOS CMOS step; evcnt "brightness hotkey"),
+  =hw.drm2.i915_modparams.lispbsd_idle_drrs=.  All default to the old
+  behaviour.
+- heart (mahogany de36294): the refresh switch commits the rendered scene.
+
+* Still to check with someone at the keyboard
+
+1. =brightness-probe=, press brightness up twice: a change with the powerd
+   actions held off means a kernel or firmware owner; =vmstat -e | grep
+   brightness= says which.  Then set the matching switch to 0 in
+   =/etc/sysctl.conf=.
+2. Lid shut and open on battery: no flash on open.
+3. Plug and pull the charger: the two remembered levels, nothing else.
+4. Reading mode (an animating page, 15 s without input on battery): no
+   black frame at the switch either way.
