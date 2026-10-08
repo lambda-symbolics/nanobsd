@@ -1,16 +1,31 @@
 #!/bin/sh
-# brightness [N|+N|-N|restore [ac|bat]] - panel backlight via ACPI.
+# brightness [N|+N|-N|restore [ac|bat]|dim N|undim] - panel backlight via ACPI.
 #
 # AC and battery levels are remembered separately: the panel wants to be much
 # brighter plugged in than it does on the train, and one shared setting means
 # every AC transition throws away whichever one you had just chosen.
 #
+# The remembered level is the truth and the panel follows it.  Steps start
+# from the remembered level, not from what the panel shows: the panel can be
+# dimmed by the idle timer, or left at the minimum by the firmware after
+# s2idle (its display-off _DSM), and a step from there used to be saved as
+# the new preference.
+#
+# dim N and undim belong to the compositor's idle timer.  dim lowers the
+# panel to N without touching the remembered level and marks it dimmed;
+# undim, a step or a new level put the remembered level back.  A restore
+# (AC transition, lid) while dimmed leaves the panel dimmed, and the next
+# undim applies the level of the supply in use by then.
+#
 # The state files are NOT under $HOME.  The keybindings run as mag, but the
-# powerd(8) AC hook runs as root, and both have to read and write the same
-# two files, so the location is fixed here instead.
+# powerd(8) hooks run as root, and both have to read and write the same
+# files, so the location is fixed here instead.
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
 N15=hw.acpi.acpiout15.brightness; N16=hw.acpi.acpiout16.brightness
 STATE_DIR=${BRIGHTNESS_STATE_DIR:-/home/mag}
+RUN_DIR=${BRIGHTNESS_RUN_DIR:-/var/run/user/1000}
+DIMMED=$RUN_DIR/brightness.dimmed
+LOCK=$RUN_DIR/brightness.lock
 DEFAULT_AC=100
 DEFAULT_BAT=50
 
@@ -40,8 +55,23 @@ read_state() {
 }
 
 apply() {
-	$SUDO /sbin/sysctl -w "$N15=$1" >/dev/null 2>&1
-	$SUDO /sbin/sysctl -w "$N16=$1" >/dev/null 2>&1
+	$SUDO /sbin/sysctl -w "$N15=$1" "$N16=$1" >/dev/null 2>&1
+}
+
+# The compositor, powerd and the keys can all run this at once; one at a
+# time, and a lock left by a killed run expires after about two seconds.
+lock() {
+	[ -d "$RUN_DIR" ] || return 0
+	_n=0
+	until mkdir "$LOCK" 2>/dev/null; do
+		_n=$((_n + 1))
+		if [ $_n -ge 20 ]; then
+			rmdir "$LOCK" 2>/dev/null
+			_n=0
+		fi
+		sleep 0.1
+	done
+	trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 }
 
 cur=$(sysctl -n "$N15" 2>/dev/null); [ -z "$cur" ] && cur=100
@@ -53,19 +83,42 @@ restore)
 	# Reapply the level remembered for this supply.  Deliberately does not
 	# save: restoring is not the user choosing a level, and saving here
 	# would let a default overwrite a real preference.
+	lock
 	src=${2:-$(ac_state)}
 	new=$(read_state "$src")
+	[ -e "$DIMMED" ] || apply "$new"
+	echo "$new"; exit 0 ;;
+dim)
+	lock
+	want=${2:-15}
+	new=$(read_state "$(ac_state)")
+	if [ "$new" -gt "$want" ]; then
+		echo "$want" > "$DIMMED" 2>/dev/null
+		apply "$want"
+	fi
+	exit 0 ;;
+undim)
+	lock
+	rm -f "$DIMMED"
+	new=$(read_state "$(ac_state)")
 	apply "$new"
 	echo "$new"; exit 0 ;;
-+[0-9]*) new=$((cur + ${1#+})) ;;
--[0-9]*) new=$((cur - ${1#-})) ;;
-[0-9]*)  new=$1 ;;
++[0-9]*|-[0-9]*|[0-9]*)
+	lock
+	src=$(ac_state)
+	base=$(read_state "$src")
+	case "$1" in
+	+*) new=$((base + ${1#+})) ;;
+	-*) new=$((base - ${1#-})) ;;
+	*)  new=$1 ;;
+	esac ;;
 *)
-	echo "usage: brightness [N|+N|-N|restore [ac|bat]]" >&2; exit 1 ;;
+	echo "usage: brightness [N|+N|-N|restore [ac|bat]|dim N|undim]" >&2; exit 1 ;;
 esac
 
 [ "$new" -lt 1 ] && new=1
 [ "$new" -gt 100 ] && new=100
+rm -f "$DIMMED"
 apply "$new"
-echo "$new" > "$(state_file "$(ac_state)")" 2>/dev/null
+echo "$new" > "$(state_file "$src")" 2>/dev/null
 echo "$new"

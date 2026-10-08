@@ -54,6 +54,7 @@ struct drm_printer;
 	param(int, enable_fbc, -1) \
 	param(int, enable_psr, -1) \
 	param(int, lispbsd_seamless_rr, 1) \
+	param(int, lispbsd_idle_drrs, 1) \
 	param(int, disable_power_well, -1) \
 	param(int, enable_ips, 1) \
 	param(int, invert_brightness, 0) \

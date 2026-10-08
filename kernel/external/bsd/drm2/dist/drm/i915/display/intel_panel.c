@@ -711,13 +711,7 @@ void intel_panel_set_backlight_acpi(const struct drm_connector_state *conn_state
 	struct intel_panel *panel = &connector->panel;
 	u32 hw_level;
 
-	/*
-	 * Lack of crtc may occur during driver init because
-	 * connection_mutex isn't held across the entire backlight
-	 * setup + modeset readout, and the BIOS can issue the
-	 * requests at any time.
-	 */
-	if (!panel->backlight.present || !conn_state->crtc)
+	if (!panel->backlight.present)
 		return;
 
 	mutex_lock(&dev_priv->backlight_lock);
@@ -726,6 +720,25 @@ void intel_panel_set_backlight_acpi(const struct drm_connector_state *conn_state
 
 	hw_level = clamp_user_to_hw(connector, user_level, user_max);
 	panel->backlight.level = hw_level;
+
+	/*
+	 * Lack of crtc may occur during driver init because
+	 * connection_mutex isn't held across the entire backlight
+	 * setup + modeset readout, and the BIOS can issue the
+	 * requests at any time.
+	 *
+	 * LISPBSD: the level is still remembered above.  The panel is lit
+	 * with the remembered level when its pipe comes back
+	 * (__intel_panel_enable_backlight), so a level set while the panel is
+	 * off (the compositor putting the user's level back after dimming,
+	 * acpiout re-applying its level at resume) is the one it comes on
+	 * with, instead of the last level set while it was on.  Linux drops
+	 * such a request entirely.
+	 */
+	if (!conn_state->crtc) {
+		mutex_unlock(&dev_priv->backlight_lock);
+		return;
+	}
 
 #ifndef __NetBSD__		/* XXX backlight */
 	if (panel->backlight.device)

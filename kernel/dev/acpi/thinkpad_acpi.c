@@ -31,6 +31,7 @@ __KERNEL_RCSID(0, "$NetBSD: thinkpad_acpi.c,v 1.57 2024/04/27 14:50:18 christos 
 
 #include <sys/param.h>
 #include <sys/device.h>
+#include <sys/evcnt.h>
 #include <sys/module.h>
 #include <sys/sdt.h>
 #include <sys/systm.h>
@@ -103,6 +104,15 @@ typedef struct thinkpad_softc {
 
 	struct sysmon_pswitch	sc_smpsw[TP_PSW_LAST];
 	bool			sc_smpsw_valid;
+
+	/*
+	 * LISPBSD: whether the brightness hotkeys also ask the BIOS to step
+	 * the level through the CMOS interface.  With i915's opregion that
+	 * step can land, and userland already steps the level on the PSWITCH
+	 * event, so 0 keeps one owner.  The keys are counted either way.
+	 */
+	int			sc_bios_brightness;
+	struct evcnt		sc_ev_brightness;
 
 	struct sysmon_envsys	*sc_sme;
 	envsys_data_t		sc_sensor[THINKPAD_NSENSORS];
@@ -207,6 +217,7 @@ static void	thinkpad_cmos(thinkpad_softc_t *, uint8_t);
 
 static void	thinkpad_battery_probe_support(device_t);
 static void	thinkpad_battery_sysctl_setup(device_t);
+static void	thinkpad_brightness_sysctl_setup(device_t);
 
 CFATTACH_DECL3_NEW(thinkpad, sizeof(thinkpad_softc_t),
     thinkpad_match, thinkpad_attach, thinkpad_detach, NULL, NULL, NULL,
@@ -261,6 +272,9 @@ thinkpad_attach(device_t parent, device_t self, void *opaque)
 
 	sc->sc_dev = self;
 	sc->sc_log = NULL;
+	sc->sc_bios_brightness = 1;
+	evcnt_attach_dynamic(&sc->sc_ev_brightness, EVCNT_TYPE_MISC, NULL,
+	    device_xname(self), "brightness hotkey");
 	sc->sc_powhdl = NULL;
 	sc->sc_cmoshdl = NULL;
 	sc->sc_node = aa->aa_node;
@@ -422,6 +436,7 @@ thinkpad_attach(device_t parent, device_t self, void *opaque)
 		}
 		thinkpad_battery_sysctl_setup(self);
 	}
+	thinkpad_brightness_sysctl_setup(self);
 
 fail:
 	if (!pmf_device_register(self, NULL, thinkpad_resume))
@@ -450,6 +465,7 @@ thinkpad_detach(device_t self, int flags)
 
 	if (sc->sc_log != NULL)
 		sysctl_teardown(&sc->sc_log);
+	evcnt_detach(&sc->sc_ev_brightness);
 
 	pmf_device_deregister(self);
 
@@ -512,7 +528,9 @@ thinkpad_get_hotkeys(void *opaque)
 
 		switch (event) {
 		case THINKPAD_NOTIFY_BrightnessUp:
-			thinkpad_brightness_up(self);
+			sc->sc_ev_brightness.ev_count++;
+			if (sc->sc_bios_brightness)
+				thinkpad_brightness_up(self);
 #ifndef THINKPAD_NORMAL_HOTKEYS
 			if (sc->sc_smpsw_valid == false)
 				break;
@@ -521,7 +539,9 @@ thinkpad_get_hotkeys(void *opaque)
 #endif
 			break;
 		case THINKPAD_NOTIFY_BrightnessDown:
-			thinkpad_brightness_down(self);
+			sc->sc_ev_brightness.ev_count++;
+			if (sc->sc_bios_brightness)
+				thinkpad_brightness_down(self);
 #ifndef THINKPAD_NORMAL_HOTKEYS
 			if (sc->sc_smpsw_valid == false)
 				break;
@@ -1285,6 +1305,33 @@ thinkpad_battery_sysctl_setup(device_t self)
 
 fail:
 	aprint_error_dev(self, "unable to add sysctl nodes (%d)\n", err);
+}
+
+static void
+thinkpad_brightness_sysctl_setup(device_t self)
+{
+	thinkpad_softc_t *sc = device_private(self);
+	const struct sysctlnode *rnode;
+	int err;
+
+	err = sysctl_createv(&sc->sc_log, 0, NULL, &rnode,
+	    0, CTLTYPE_NODE, "acpi", NULL,
+	    NULL, 0, NULL, 0, CTL_HW, CTL_CREATE, CTL_EOL);
+	if (err == 0)
+		err = sysctl_createv(&sc->sc_log, 0, &rnode, &rnode,
+		    0, CTLTYPE_NODE, device_xname(self),
+		    SYSCTL_DESCR("ThinkPad ACPI controls"),
+		    NULL, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+	if (err == 0)
+		err = sysctl_createv(&sc->sc_log, 0, &rnode, NULL,
+		    CTLFLAG_READWRITE, CTLTYPE_INT, "bios_brightness",
+		    SYSCTL_DESCR("Brightness hotkeys also step the level "
+			"through the BIOS (0: userland owns it)"),
+		    NULL, 0, &sc->sc_bios_brightness, 0,
+		    CTL_CREATE, CTL_EOL);
+	if (err)
+		aprint_error_dev(self,
+		    "unable to add the brightness sysctl (%d)\n", err);
 }
 
 static bool

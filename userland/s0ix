@@ -17,8 +17,8 @@ restore_brightness()
 {
 	b=$(cat "$BR" 2>/dev/null)
 	case "$b" in ''|*[!0-9]*) return ;; esac
-	sysctl -w hw.acpi.acpiout15.brightness="$b" >/dev/null 2>&1
-	sysctl -w hw.acpi.acpiout16.brightness="$b" >/dev/null 2>&1
+	sysctl -w hw.acpi.acpiout15.brightness="$b" \
+	    hw.acpi.acpiout16.brightness="$b" >/dev/null 2>&1
 }
 case "$1" in
 suspend)
@@ -27,9 +27,12 @@ suspend)
 	TICKLESS=$(sysctl -n machdep.cidle.tickless) || exit 1
 	# The low-power hold needs tickless idle; restore the awake policy on exit.
 	sysctl -w machdep.cidle.tickless=1 >/dev/null || exit 1
+	# The firmware's display-off _DSM drops the backlight to its minimum
+	# and the display-on one does not bring it back, so remember the level.
+	# Do not zero it here: i915 turns the panel off for the freeze anyway,
+	# and it lights a panel whose level is at the minimum at full brightness
+	# (__intel_panel_enable_backlight), which flashed at every resume.
 	sysctl -n hw.acpi.acpiout15.brightness > "$BR" || exit 1
-	sysctl -w hw.acpi.acpiout15.brightness=0 >/dev/null 2>&1
-	sysctl -w hw.acpi.acpiout16.brightness=0 >/dev/null 2>&1
 	# Whole-machine power over the suspension, from the battery gauge.
 	c0=$(charge); a0=$(onac); t0=$(date +%s)
 	if ! sysctl -w hw.acpi.sleep.freeze=1 >/dev/null; then
