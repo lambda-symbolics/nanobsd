@@ -2386,6 +2386,19 @@ static bool intel_dp_port_has_audio(struct drm_i915_private *dev_priv,
 	return true;
 }
 
+/*
+ * LISPBSD: did userspace ask for the panel's downclock mode? The two modes
+ * share every timing but the pixel clock, so the nearer clock decides.
+ */
+static bool
+lispbsd_wants_downclock(const struct intel_connector *connector, int want)
+{
+	const struct drm_display_mode *fixed = connector->panel.fixed_mode;
+	const struct drm_display_mode *down = connector->panel.downclock_mode;
+
+	return abs(want - down->clock) < abs(want - fixed->clock);
+}
+
 int
 intel_dp_compute_config(struct intel_encoder *encoder,
 			struct intel_crtc_state *pipe_config,
@@ -2427,8 +2440,23 @@ intel_dp_compute_config(struct intel_encoder *encoder,
 		pipe_config->has_audio = intel_conn_state->force_audio == HDMI_AUDIO_ON;
 
 	if (intel_dp_is_edp(intel_dp) && intel_connector->panel.fixed_mode) {
-		intel_fixed_panel_mode(intel_connector->panel.fixed_mode,
-				       adjusted_mode);
+		const struct drm_display_mode *panel_mode =
+			intel_connector->panel.fixed_mode;
+
+		/*
+		 * LISPBSD: lispbsd_seamless_rr=2 configures the whole pipe
+		 * for the downclock mode when userspace picks it: the pixel
+		 * rate, and with it cdclk and the watermarks, are those of
+		 * the slow mode. Every switch is then a full modeset.
+		 */
+		if (i915_modparams.lispbsd_seamless_rr == 2 &&
+		    intel_connector->panel.downclock_mode &&
+		    lispbsd_wants_downclock(intel_connector,
+					    pipe_config->hw.mode.clock)) {
+			panel_mode = intel_connector->panel.downclock_mode;
+			pipe_config->lispbsd_full_downclock = true;
+		}
+		intel_fixed_panel_mode(panel_mode, adjusted_mode);
 
 		if (INTEL_GEN(dev_priv) >= 9) {
 			ret = skl_update_scaler_crtc(pipe_config);
@@ -2476,8 +2504,10 @@ intel_dp_compute_config(struct intel_encoder *encoder,
 			       &pipe_config->dp_m_n,
 			       constant_n, pipe_config->fec_enable);
 
+	/* LISPBSD: a pipe configured for the slow mode has nothing to drop to */
 	if (intel_connector->panel.downclock_mode != NULL &&
-		dev_priv->drrs.type == SEAMLESS_DRRS_SUPPORT) {
+		dev_priv->drrs.type == SEAMLESS_DRRS_SUPPORT &&
+		!pipe_config->lispbsd_full_downclock) {
 			pipe_config->has_drrs = true;
 			intel_link_compute_m_n(output_bpp,
 					       pipe_config->lane_count,
@@ -2506,21 +2536,17 @@ intel_dp_compute_config(struct intel_encoder *encoder,
 	    dev_priv->drrs.type == SEAMLESS_DRRS_SUPPORT &&
 	    INTEL_GEN(dev_priv) >= 8 && !IS_CHERRYVIEW(dev_priv) &&
 	    !pipe_config->has_pch_encoder &&
-	    i915_modparams.lispbsd_seamless_rr) {
+	    i915_modparams.lispbsd_seamless_rr == 1) {
 		const struct drm_display_mode *fixed =
 			intel_connector->panel.fixed_mode;
 		const struct drm_display_mode *down =
 			intel_connector->panel.downclock_mode;
-		int want = pipe_config->hw.mode.clock;
-		int dfixed = want > fixed->clock ? want - fixed->clock :
-		    fixed->clock - want;
-		int ddown = want > down->clock ? want - down->clock :
-		    down->clock - want;
 
 		pipe_config->seamless_m_n = true;
 		pipe_config->seamless_pixel_clock = fixed->clock;
 
-		if (ddown < dfixed) {
+		if (lispbsd_wants_downclock(intel_connector,
+					    pipe_config->hw.mode.clock)) {
 			intel_link_compute_m_n(output_bpp,
 					       pipe_config->lane_count,
 					       down->clock,

@@ -939,6 +939,13 @@ struct intel_crtc_state {
 	bool seamless_m_n;
 	bool update_m_n;
 	int seamless_pixel_clock;
+	/*
+	 * lispbsd_full_downclock: the pipe is configured for the downclock
+	 * mode outright (lispbsd_seamless_rr=2): pixel rate, cdclk and
+	 * watermarks follow the slow clock, and idleness DRRS is off since
+	 * there is nothing slower to drop to.
+	 */
+	bool lispbsd_full_downclock;
 
 	bool has_psr;
 	bool has_psr2;
