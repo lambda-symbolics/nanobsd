@@ -306,8 +306,10 @@ i915drmkms_sysctl_rps_init(void)
 	const struct sysctlnode *rnode = NULL;
 	int i;
 
+	/* Not CTLFLAG_PERMANENT: the drm attach runs after the sysctl root
+	 * is sealed, and sysctl_create refuses permanent nodes by then. */
 	if (sysctl_createv(NULL, 0, NULL, &rnode,
-	    CTLFLAG_PERMANENT, CTLTYPE_NODE, "i915rps",
+	    0, CTLTYPE_NODE, "i915rps",
 	    SYSCTL_DESCR("LISPBSD GPU frequency scaling (RPS) state and limits"),
 	    NULL, 0, NULL, 0, CTL_HW, CTL_CREATE, CTL_EOL) != 0)
 		return;
