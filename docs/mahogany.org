@@ -527,3 +527,74 @@ pkgsrc =wayland/wlroots= (kikadf, 0.20.2nb1) patches; sway issue #6921 and
 wlroots MR !5378 for the state of BSD input backends; Mahogany issues #84
 (Xwayland), #393 (idle-notify), #378 (lid), #139/#140 (brightness/volume);
 =www/firefox/mozilla-common.mk= for the gtk3 wayland dependency.
+
+* The sustained low-clock 30 Hz configuration (kernels 141/142, 2026-10-08)
+
+Astra's remaining display item: instead of the seamless switch, which keeps
+cdclk and the watermarks sized for the 60 Hz mode, configure the pipe for the
+30 Hz mode outright and see whether the clock configuration changes at all.
+
+** What the pipe runs at today
+
+Read with =/var/tmp/memread= on the live registers (=CDCLK_CTL= 0x46000,
+=DE_PLL_ENABLE= 0x46070, =PLANE_WM= 0x70240.., =WM_LINETIME= 0x45270):
+
+| state                         | cdclk     | VCO       | plane WM level 7         | line time |
+|-------------------------------+-----------+-----------+--------------------------+-----------|
+| panel on, 60 Hz mode          | 192 MHz   | 384 MHz   | enabled, 181 blocks/10 l | 0x62      |
+| panel off                     | 172.8 MHz | 345.6 MHz | (power well off)         | -         |
+| panel on, full 30 Hz (knob 2) | 172.8 MHz | 345.6 MHz | enabled, 91 blocks/5 l   | 0xc4      |
+
+172.8 MHz is the lowest entry of the Tiger Lake cdclk table, so the slow
+configuration moves cdclk by exactly one step.  At 60 Hz the driver cannot go
+lower because of Linux's TGL rule =min_cdclk >= pixel_rate= (180 MHz -> 192);
+the firmware boots the panel at 172.8 MHz, which the driver inherits until the
+first modeset (a lid blank and unblank is one), after which 192 MHz sticks.
+All eight watermark levels are enabled either way; the 30 Hz configuration
+only shrinks the block counts.  SAGV is never touched on gen 12 in this driver
+(=intel_has_sagv= has the upstream "HACK" returning false), so it is not a
+variable here.
+
+** Kernel 141: =lispbsd_seamless_rr=2=
+
+=hw.drm2.i915_modparams.lispbsd_seamless_rr=2= makes =intel_dp_compute_config=
+take the downclock mode as the panel mode when userspace asks for it (nearer
+pixel clock), so pixel rate, cdclk and watermarks all follow 90.4 MHz and
+idleness DRRS is off in that state (nothing slower to drop to).  Every switch
+is then a full modeset.  1 keeps the kernel 127 seamless path, 0 the old
+no-op.
+
+** Measured (AC, still screen, Mahogany, clients suspended)
+
+=userland/rr30/rr30-ab3.sh= cycles four states, 30 s each, four rounds, with
+every state reached by a real mode change (wlroots drops a mode set equal to
+the current one, which silently voided an earlier run).  Package RAPL:
+
+| state                              | cdclk | round 1 | round 2 | round 3 | round 4 |
+|------------------------------------+-------+---------+---------+---------+---------|
+| A 60 Hz mode, idleness DRRS 30 Hz  | 192   | 4.80 W  | 4.94 W  | 5.83 W  | 4.67 W  |
+| B explicit seamless 30 Hz (knob 1) | 192   | 4.09 W  | 6.02 W  | 3.75 W  | 5.38 W  |
+| C full 30 Hz configuration (knob 2)| 172.8 | 1.72 W  | 3.18 W  | 2.36 W  | 3.12 W  |
+| D full 60 Hz (knob 2, 60 selected) | 192   | 5.10 W  | 4.90 W  | 4.69 W  | 4.63 W  |
+
+An earlier run (kernel 141, =rr30-ab.sh=) gave the same picture: 5.17/4.19/
+4.38 W against 2.42/2.07 W.  The AC package noise is about ±0.6 W; the full
+30 Hz state sits 2.3 W below every 192 MHz state in all eight pairs, with a
+distinct C-state signature (PC2 24 % instead of 30 %, PC3 1 % instead of 4 %,
+PC6 8 % instead of 0 %, PC8 unchanged at 65 %).  The panel shows 30 frames a
+second in every state, GPU power 0.02 W and RC6 100 % throughout.  No
+underrun or state-mismatch message in the kernel log.
+
+So the clock configuration does change, by one cdclk step, and the package
+draws 2.3 W less on AC with the pipe configured for 30 Hz.  Whether cdclk or
+the watermarks and line time carry the saving is the subject of kernel 142.
+
+** The cost of a full switch
+
+Traced at 30 ms with =PP_STATUS=, =PP_CONTROL=, the backlight PWM and
+=PIPECONF= across a knob 2 switch in each direction: the modeset disables the
+DDI port, which runs the eDP power sequence: backlight PWM off, panel power
+down (about 0.7 s), pipe off, then power up and backlight on.  About a second
+of black with the backlight off, each way.  The whole =hrt_output_set_refresh=
+call takes 1 s.  That is fine for a manual mode but not for reading mode,
+whose exit on the first key press would blink the panel for a second.
