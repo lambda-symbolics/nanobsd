@@ -1,0 +1,47 @@
+#+TITLE: mpv zero-copy VA-API under Mahogany
+#+DATE: 2026-10-08
+
+* Before
+=hwdec=vaapi-copy=: the GPU decodes, every frame is copied back to system
+memory and uploaded again for presentation.  1440p60 VP9 cost about 26 % of
+one core in mpv (measured 2026-10-07).  The reason was libva: pkgsrc builds
+=multimedia/libva= with =--disable-wayland= ("I'll leave it to someone else
+to enable"), so mpv had no way to get a VA display inside a Wayland window.
+
+mpv 0.41 (=video/out/hwdec/hwdec_vaapi.c=) tries three native display
+constructors in order: X11 (=vaGetDisplay= on the X display, never present
+under Wayland), Wayland (=vaGetDisplayWl=, only compiled when meson finds
+=libva-wayland=) and DRM (=vaGetDisplayDRM= on the =render_fd= of a
+=drm_params_v2= resource that only the DRM/KMS EGL context provides).  So
+under Wayland the Wayland backend is the only path.
+
+* Change
+- =userland/libva/build.sh=: =--enable-wayland= instead of
+  =--disable-wayland=, =devel/wayland= buildlinked (wayland-client and
+  wayland-scanner; the wl_drm and linux-dmabuf protocol XML are bundled),
+  PLIST gains =va_wayland.h=, =va_backend_wayland.h=, =libva-wayland.la=
+  and the =.pc=.  =make replace= took libva 2.23.0 to 2.24.1 (same ABI;
+  MesaLib, ffmpeg8 and mpv depend on it, nothing else rebuilt).
+- =userland/mpv/build.sh= with =REPLACE=1=: meson reports
+  "Run-time dependency libva-wayland found: YES 1.24.0" and mpv links
+  =libva-wayland.so.2=.
+- =dotfiles/.config/mpv/mpv.conf=: =hwdec=vaapi=.
+
+* Verified (kernel 136, Mahogany, 1440p60 VP9, =--vo=gpu-next --fs=)
+#+begin_example
+[vo/gpu-next/vaapi] Using EGL dmabuf interop via GL_EXT_EGL_image_storage
+[vo/gpu-next/vaapi] Trying to open a x11 VA display...
+[vo/gpu-next/vaapi] Trying to open a wayland VA display...
+[vo/gpu-next/vaapi/vaapi] libva: VA-API version 1.24.0
+Using hardware decoding (vaapi).
+[vd] Decoder format: 2560x1440 [0:1] vaapi[nv12]
+#+end_example
+=hwdec-current= is =vaapi=; mpv used about 8 % of a core (26 % with
+vaapi-copy).  The compositor advertises linux-dmabuf v4 with feedback and
+wl_drm (heart creates it), and the Xe planes take the NV12 dmabuf through
+the GLES2 renderer; direct scanout of the video plane is not attempted
+(Mahogany is a wlr_scene compositor, scanout only for a fullscreen surface,
+and the formats would have to be checked first).
+
+Power and frame drops for vaapi vs vaapi-copy are in =gpu-freq.org=
+(the rps-ab run measures both under the stock GPU frequency policy).
