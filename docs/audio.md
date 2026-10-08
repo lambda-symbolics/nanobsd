@@ -115,3 +115,18 @@ audio(4) remembers the last pause flag for `/dev/sound`, so a test
 `audioplay` started while mpv is paused begins paused and hangs in
 `audiowr`; use `-d /dev/audio`.  And a Firefox content process writes
 digital silence at 35 % of a core while a stale media tab exists.
+
+## 2026-10-08 evening: codec power-down is not a lever (AC)
+
+hdafg never leaves D0 at runtime (D0 on attach and resume only); the ALC287
+reports D0-D3 and D3cold supported.  Setting the AFG to D3 by raw verb
+(`hdaverb 0 1 0x705 3`, widgets follow, readback 0x233) with nothing holding
+/dev/audio and alternating five 30 s D0/D3 windows on AC gave package 2.0-3.4 W
+in both states; the paired differences were -0.31, -0.55, +0.54, -0.51 and
++0.66 W, i.e. noise.  pc10 was reached with the codec in D0, so neither the
+codec nor the hdaudio controller in D0 blocks package C-states here.  The
+codec's own draw is off-package and does not show in RAPL; if it matters at
+all it is a battery-discharge A/B, tens of mW at most.  Firefox's silent
+35 %-CPU content process (stale media tab, seen 10-08 afternoon) died with
+the reboot and was not reproducible on demand; Firefox has the sndio and
+sun cubeb backends built in, backend pref unset.
