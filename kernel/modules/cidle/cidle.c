@@ -109,6 +109,7 @@ static uint8_t		cidle_cf[256] __aligned(16);
  */
 #define MSR_RAPL_POWER_UNIT	0x606
 #define MSR_PKG_ENERGY_STATUS	0x611
+#define MSR_PP1_ENERGY_STATUS	0x641	/* graphics (GT) plane */
 
 static void
 cidle_xc_resid(void *arg1, void *arg2)
@@ -145,14 +146,15 @@ cidle_sysctl_rapl(SYSCTLFN_ARGS)
 {
 	struct sysctlnode node = *rnode;
 	uint64_t units;
-	uint32_t raw, esu;
+	uint32_t raw, esu, pp1;
 
 	units = rdmsr(MSR_RAPL_POWER_UNIT);
 	esu = (uint32_t)((units >> 8) & 0x1f);
 	raw = (uint32_t)rdmsr(MSR_PKG_ENERGY_STATUS);
+	pp1 = (uint32_t)rdmsr(MSR_PP1_ENERGY_STATUS);
 	snprintf(cidle_rapl, sizeof(cidle_rapl),
-	    "raw=%u esu=%u uj_per_unit=%u", raw, esu,
-	    (esu < 31) ? (1000000u >> esu) : 0);
+	    "raw=%u esu=%u uj_per_unit=%u pp1=%u", raw, esu,
+	    (esu < 31) ? (1000000u >> esu) : 0, pp1);
 	node.sysctl_data = cidle_rapl;
 	return sysctl_lookup(SYSCTLFN_CALL(&node));
 }
@@ -436,7 +438,7 @@ cidle_sysctl_setup(void)
 	    CTL_CREATE, CTL_EOL);
 	sysctl_createv(&cidle_sysctl_log, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING, "rapl",
-	    SYSCTL_DESCR("RAPL package energy counter and unit exponent"),
+	    SYSCTL_DESCR("RAPL package (raw) and graphics (pp1) energy counters, unit exponent"),
 	    cidle_sysctl_rapl, 0, NULL, sizeof(cidle_rapl),
 	    CTL_CREATE, CTL_EOL);
 	sysctl_createv(&cidle_sysctl_log, 0, &node, NULL,

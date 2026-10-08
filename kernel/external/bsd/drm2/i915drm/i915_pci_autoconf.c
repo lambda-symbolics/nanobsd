@@ -48,6 +48,7 @@ __KERNEL_RCSID(0, "$NetBSD: i915_pci_autoconf.c,v 1.14 2022/10/15 15:20:06 riast
 
 #include "i915_drv.h"
 #include "i915_pci.h"
+#include "gt/intel_rps.h"
 
 struct drm_device;
 
@@ -167,6 +168,164 @@ i915drmkms_sysctl_pmstate(SYSCTLFN_ARGS)
 	node.sysctl_data = buf;
 	node.sysctl_size = strlen(buf) + 1;
 	return sysctl_lookup(SYSCTLFN_CALL(&node));
+}
+
+/*
+ * LISPBSD: GPU frequency scaling (RPS) state and limits, hw.i915rps.*.
+ * Frequencies are MHz.  max_mhz also caps boost_mhz, so it is a hard cap
+ * (rps_work ignores the soft limit for a wait-boost); min_mhz and boost_mhz
+ * are the usual soft limits.  Reading act_mhz does not wake the GPU: it is
+ * 0 while the GT is parked.
+ */
+enum {
+	RPS_ACT, RPS_CUR, RPS_RP0, RPS_RP1, RPS_RPE, RPS_RPN,
+	RPS_MAX, RPS_MIN, RPS_BOOST, RPS_IDLE, RPS_NSEL
+};
+static int lispbsd_rps_sel[RPS_NSEL] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+
+static int
+i915drmkms_sysctl_rps_mhz(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	struct i915drmkms_softc *sc = lispbsd_i915_sc;
+	struct intel_rps *rps;
+	int sel = *(const int *)rnode->sysctl_data;
+	int val, error, opcode;
+
+	if (sc == NULL || sc->sc_drm_dev == NULL)
+		return ENXIO;
+	rps = &to_i915(sc->sc_drm_dev)->gt.rps;
+	switch (sel) {
+	case RPS_ACT:	val = intel_rps_read_actual_frequency(rps); break;
+	case RPS_CUR:	val = intel_gpu_freq(rps, READ_ONCE(rps->cur_freq)); break;
+	case RPS_RP0:	val = intel_gpu_freq(rps, rps->rp0_freq); break;
+	case RPS_RP1:	val = intel_gpu_freq(rps, rps->rp1_freq); break;
+	case RPS_RPE:	val = intel_gpu_freq(rps, rps->efficient_freq); break;
+	case RPS_RPN:	val = intel_gpu_freq(rps, rps->min_freq); break;
+	case RPS_MAX:	val = intel_gpu_freq(rps, rps->max_freq_softlimit); break;
+	case RPS_MIN:	val = intel_gpu_freq(rps, rps->min_freq_softlimit); break;
+	case RPS_BOOST:	val = intel_gpu_freq(rps, rps->boost_freq); break;
+	case RPS_IDLE:	val = intel_gpu_freq(rps, rps->idle_freq); break;
+	default:	return EINVAL;
+	}
+	node.sysctl_data = &val;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error || newp == NULL)
+		return error;
+	if (sel != RPS_MAX && sel != RPS_MIN && sel != RPS_BOOST)
+		return EPERM;
+	if (!rps->enabled)
+		return ENXIO;
+
+	opcode = intel_freq_opcode(rps, val);
+	if (opcode < rps->min_freq || opcode > rps->max_freq)
+		return EINVAL;
+	mutex_lock(&rps->lock);
+	switch (sel) {
+	case RPS_MAX:
+		if (opcode < rps->min_freq_softlimit) {
+			error = EINVAL;
+			break;
+		}
+		rps->max_freq_softlimit = opcode;
+		if (rps->boost_freq > opcode)
+			rps->boost_freq = opcode;
+		break;
+	case RPS_MIN:
+		if (opcode > rps->max_freq_softlimit) {
+			error = EINVAL;
+			break;
+		}
+		rps->min_freq_softlimit = opcode;
+		break;
+	case RPS_BOOST:
+		rps->boost_freq = opcode;
+		break;
+	}
+	if (error == 0 && sel != RPS_BOOST) {
+		/* Re-clamp the request and the interrupt limits, as sysfs does. */
+		val = clamp_t(int, rps->cur_freq, rps->min_freq_softlimit,
+		    rps->max_freq_softlimit);
+		if (intel_rps_set(rps, val))
+			error = EIO;
+	}
+	mutex_unlock(&rps->lock);
+	return error;
+}
+
+static int
+i915drmkms_sysctl_rps_stats(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	struct i915drmkms_softc *sc = lispbsd_i915_sc;
+	struct intel_rps *rps;
+	char buf[320];
+
+	if (sc == NULL || sc->sc_drm_dev == NULL)
+		return ENXIO;
+	rps = &to_i915(sc->sc_drm_dev)->gt.rps;
+	snprintf(buf, sizeof(buf),
+	    "irq_raw=%llu irq=%llu boost=%llu up=%llu timeout=%llu down=%llu"
+	    " unknown=%llu park=%llu unpark=%llu set=%llu"
+	    " enabled=%d active=%d pm_events=0x%x power=%d"
+	    " last_adj=%d waiters=%d boosts=%d",
+	    (unsigned long long)lispbsd_rps_stats.irq_raw,
+	    (unsigned long long)lispbsd_rps_stats.irq,
+	    (unsigned long long)lispbsd_rps_stats.boost,
+	    (unsigned long long)lispbsd_rps_stats.up,
+	    (unsigned long long)lispbsd_rps_stats.timeout,
+	    (unsigned long long)lispbsd_rps_stats.down,
+	    (unsigned long long)lispbsd_rps_stats.unknown,
+	    (unsigned long long)lispbsd_rps_stats.park,
+	    (unsigned long long)lispbsd_rps_stats.unpark,
+	    (unsigned long long)lispbsd_rps_stats.set,
+	    rps->enabled, rps->active, READ_ONCE(rps->pm_events),
+	    rps->power.mode, rps->last_adj, atomic_read(&rps->num_waiters),
+	    atomic_read(&rps->boosts));
+	node.sysctl_data = buf;
+	node.sysctl_size = strlen(buf) + 1;
+	return sysctl_lookup(SYSCTLFN_CALL(&node));
+}
+
+static void
+i915drmkms_sysctl_rps_init(void)
+{
+	static const char *const names[RPS_NSEL] = {
+		"act_mhz", "cur_mhz", "rp0_mhz", "rp1_mhz", "rpe_mhz", "rpn_mhz",
+		"max_mhz", "min_mhz", "boost_mhz", "idle_mhz"
+	};
+	static const char *const descs[RPS_NSEL] = {
+		"actual GT frequency (0 while parked)",
+		"frequency the driver currently requests when awake",
+		"RP0, hardware maximum", "RP1, guaranteed", "RPe, efficient",
+		"RPn, hardware minimum",
+		"software maximum, also caps boost_mhz (hard cap)",
+		"software minimum", "frequency for a client wait-boost",
+		"frequency requested when parked"
+	};
+	const struct sysctlnode *rnode = NULL;
+	int i;
+
+	if (sysctl_createv(NULL, 0, NULL, &rnode,
+	    CTLFLAG_PERMANENT, CTLTYPE_NODE, "i915rps",
+	    SYSCTL_DESCR("LISPBSD GPU frequency scaling (RPS) state and limits"),
+	    NULL, 0, NULL, 0, CTL_HW, CTL_CREATE, CTL_EOL) != 0)
+		return;
+	for (i = 0; i < RPS_NSEL; i++)
+		(void)sysctl_createv(NULL, 0, &rnode, NULL,
+		    (i == RPS_MAX || i == RPS_MIN || i == RPS_BOOST) ?
+		    CTLFLAG_READWRITE : CTLFLAG_READONLY,
+		    CTLTYPE_INT, names[i], SYSCTL_DESCR(descs[i]),
+		    i915drmkms_sysctl_rps_mhz, 0, &lispbsd_rps_sel[i], 0,
+		    CTL_CREATE, CTL_EOL);
+	(void)sysctl_createv(NULL, 0, &rnode, NULL,
+	    CTLFLAG_READWRITE, CTLTYPE_INT, "unpark_start",
+	    SYSCTL_DESCR("frequency at unpark: 0 max(last, RPe) [stock], 1 RPe, 2 RPn"),
+	    NULL, 0, &lispbsd_rps_unpark_start, 0, CTL_CREATE, CTL_EOL);
+	(void)sysctl_createv(NULL, 0, &rnode, NULL,
+	    CTLFLAG_READONLY, CTLTYPE_STRING, "stats",
+	    SYSCTL_DESCR("RPS event counters and state"),
+	    i915drmkms_sysctl_rps_stats, 0, NULL, 0, CTL_CREATE, CTL_EOL);
 }
 
 CFATTACH_DECL_NEW(i915drmkms, sizeof(struct i915drmkms_softc),
@@ -313,6 +472,7 @@ i915drmkms_attach_real(device_t self)
 	    SYSCTL_DESCR("i915 software wakeref snapshot without waking the GPU"),
 	    i915drmkms_sysctl_pmstate, 0, NULL, 0,
 	    CTL_HW, CTL_CREATE, CTL_EOL);
+	i915drmkms_sysctl_rps_init();
 
 	/*
 	 * Now that the drm driver is attached, we can safely suspend

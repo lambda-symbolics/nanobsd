@@ -41,4 +41,32 @@ void gen11_rps_irq_handler(struct intel_rps *rps, u32 pm_iir);
 
 extern spinlock_t mchdev_lock;
 
+#ifdef __NetBSD__
+/*
+ * LISPBSD: event counters for the RPS path and the unpark start policy,
+ * exposed through hw.i915rps (i915_pci_autoconf.c).  The GT parks between
+ * frames on a desktop, so the interrupt-driven scaling rarely gets an
+ * evaluation interval and the frequency it restores on unpark is what the
+ * GPU actually runs at.
+ */
+struct lispbsd_rps_stats {
+	u64 irq_raw;	/* gen11_rps_irq_handler calls */
+	u64 irq;	/* ... with an event we listen for (work scheduled) */
+	u64 boost;	/* rps_work: client wait-boost to boost_freq */
+	u64 up;		/* rps_work: UP_THRESHOLD */
+	u64 timeout;	/* rps_work: DOWN_TIMEOUT (idle for a second) */
+	u64 down;	/* rps_work: DOWN_THRESHOLD */
+	u64 unknown;	/* rps_work: no event bit we understand */
+	u64 park;
+	u64 unpark;
+	u64 set;	/* intel_rps_set calls */
+};
+extern struct lispbsd_rps_stats lispbsd_rps_stats;
+/* 0: stock, max(cur_freq, RPe); 1: start every unpark at RPe; 2: at RPn */
+extern int lispbsd_rps_unpark_start;
+#define LISPBSD_RPS_COUNT(f)	((void)lispbsd_rps_stats.f++)
+#else
+#define LISPBSD_RPS_COUNT(f)	((void)0)
+#endif
+
 #endif /* INTEL_RPS_H */

@@ -28,6 +28,12 @@ spinlock_t mchdev_lock;
 static DEFINE_SPINLOCK(mchdev_lock);
 #endif
 
+#ifdef __NetBSD__
+/* LISPBSD: see intel_rps.h; read and set through hw.i915rps. */
+struct lispbsd_rps_stats lispbsd_rps_stats;
+int lispbsd_rps_unpark_start = 0;
+#endif
+
 static struct intel_gt *rps_to_gt(struct intel_rps *rps)
 {
 	return container_of(rps, struct intel_gt, rps);
@@ -733,7 +739,23 @@ void intel_rps_unpark(struct intel_rps *rps)
 	 */
 	mutex_lock(&rps->lock);
 	rps->active = true;
+#ifdef __NetBSD__
+	/*
+	 * LISPBSD: cur_freq is never lowered on park, and a GT that wakes
+	 * for a few ms per frame never completes a 32 ms down-evaluation
+	 * interval, so after the first wait-boost every unpark restored RP0
+	 * and the GPU ran at its maximum clock for all desktop work.
+	 */
+	LISPBSD_RPS_COUNT(unpark);
+	if (lispbsd_rps_unpark_start == 2)
+		freq = rps->min_freq_softlimit;
+	else if (lispbsd_rps_unpark_start == 1)
+		freq = rps->efficient_freq;
+	else
+		freq = max(rps->cur_freq, rps->efficient_freq);
+#else
 	freq = max(rps->cur_freq, rps->efficient_freq),
+#endif
 	freq = clamp(freq, rps->min_freq_softlimit, rps->max_freq_softlimit);
 	intel_rps_set(rps, freq);
 	rps->last_adj = 0;
@@ -753,6 +775,7 @@ void intel_rps_park(struct intel_rps *rps)
 	if (!rps->enabled)
 		return;
 
+	LISPBSD_RPS_COUNT(park);
 	if (INTEL_GEN(i915) >= 6)
 		rps_disable_interrupts(rps);
 
@@ -809,6 +832,7 @@ int intel_rps_set(struct intel_rps *rps, u8 val)
 	GEM_BUG_ON(val > rps->max_freq);
 	GEM_BUG_ON(val < rps->min_freq);
 
+	LISPBSD_RPS_COUNT(set);
 	if (rps->active) {
 		err = rps_set(rps, val, true);
 		if (err)
@@ -1483,9 +1507,11 @@ static void rps_work(struct work_struct *work)
 	if (client_boost)
 		max = rps->max_freq;
 	if (client_boost && new_freq < rps->boost_freq) {
+		LISPBSD_RPS_COUNT(boost);
 		new_freq = rps->boost_freq;
 		adj = 0;
 	} else if (pm_iir & GEN6_PM_RP_UP_THRESHOLD) {
+		LISPBSD_RPS_COUNT(up);
 		if (adj > 0)
 			adj *= 2;
 		else /* CHV needs even encode values */
@@ -1494,14 +1520,17 @@ static void rps_work(struct work_struct *work)
 		if (new_freq >= rps->max_freq_softlimit)
 			adj = 0;
 	} else if (client_boost) {
+		LISPBSD_RPS_COUNT(boost);
 		adj = 0;
 	} else if (pm_iir & GEN6_PM_RP_DOWN_TIMEOUT) {
+		LISPBSD_RPS_COUNT(timeout);
 		if (rps->cur_freq > rps->efficient_freq)
 			new_freq = rps->efficient_freq;
 		else if (rps->cur_freq > rps->min_freq_softlimit)
 			new_freq = rps->min_freq_softlimit;
 		adj = 0;
 	} else if (pm_iir & GEN6_PM_RP_DOWN_THRESHOLD) {
+		LISPBSD_RPS_COUNT(down);
 		if (adj < 0)
 			adj *= 2;
 		else /* CHV needs even encode values */
@@ -1510,6 +1539,7 @@ static void rps_work(struct work_struct *work)
 		if (new_freq <= rps->min_freq_softlimit)
 			adj = 0;
 	} else { /* unknown event */
+		LISPBSD_RPS_COUNT(unknown);
 		adj = 0;
 	}
 
@@ -1553,8 +1583,10 @@ void gen11_rps_irq_handler(struct intel_rps *rps, u32 pm_iir)
 
 	lockdep_assert_held(&gt->irq_lock);
 
+	LISPBSD_RPS_COUNT(irq_raw);
 	if (unlikely(!events))
 		return;
+	LISPBSD_RPS_COUNT(irq);
 
 	gen6_gt_pm_mask_irq(gt, events);
 
