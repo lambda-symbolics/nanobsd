@@ -564,7 +564,7 @@ idleness DRRS is off in that state (nothing slower to drop to).  Every switch
 is then a full modeset.  1 keeps the kernel 127 seamless path, 0 the old
 no-op.
 
-** Measured (AC, still screen, Mahogany, clients suspended)
+** Measured (battery, still screen, Mahogany, clients suspended)
 
 =userland/rr30/rr30-ab3.sh= cycles four states, 30 s each, four rounds, with
 every state reached by a real mode change (wlroots drops a mode set equal to
@@ -578,7 +578,7 @@ the current one, which silently voided an earlier run).  Package RAPL:
 | D full 60 Hz (knob 2, 60 selected) | 192   | 5.10 W  | 4.90 W  | 4.69 W  | 4.63 W  |
 
 An earlier run (kernel 141, =rr30-ab.sh=) gave the same picture: 5.17/4.19/
-4.38 W against 2.42/2.07 W.  The AC package noise is about ±0.6 W; the full
+4.38 W against 2.42/2.07 W.  The package noise is about ±0.6 W; the full
 30 Hz state sits 2.3 W below every 192 MHz state in all eight pairs, with a
 distinct C-state signature (PC2 24 % instead of 30 %, PC3 1 % instead of 4 %,
 PC6 8 % instead of 0 %, PC8 unchanged at 65 %).  The panel shows 30 frames a
@@ -586,7 +586,9 @@ second in every state, GPU power 0.02 W and RC6 100 % throughout.  No
 underrun or state-mismatch message in the kernel log.
 
 So the clock configuration does change, by one cdclk step, and the package
-draws 2.3 W less on AC with the pipe configured for 30 Hz.  Whether cdclk or
+draws 2.3 W less on battery with the pipe configured for 30 Hz.  (These runs
+were first written up as AC runs; the charger was in fact unplugged all
+evening, =envstat acpiacad0 connected FALSE=, battery discharging.)  Whether cdclk or
 the watermarks and line time carry the saving is the subject of kernel 142.
 
 ** The cost of a full switch
@@ -609,7 +611,7 @@ cdclk stays sized for 60 Hz (=lispbsd_cdclk_pixel_rate= in
 rewritten by the plane update of the same commit (=skl_wm_add_affected_planes=
 adds the planes); =WM_LINETIME=, which SKL+ only writes when a pipe comes up,
 is written next to the M/N update inside vblank evasion.  Same run shape as
-above (=rr30-ab4.sh=, AC, still screen, four rounds of 30 s):
+above (=rr30-ab4.sh=, battery, still screen, four rounds of 30 s):
 
 | state                                   | cdclk | round 1 | round 2 | round 3 | round 4 |
 |-----------------------------------------+-------+---------+---------+---------+---------|
@@ -629,9 +631,9 @@ only a mode explicitly selected by the compositor does.
 Default now: =lispbsd_seamless_rr=3= in =/etc/sysctl.conf= (kernel default
 still 1).  With it, Mahogany's reading mode (battery, 15 s without input) and
 its 30 fps content selection size the watermarks for 30 Hz automatically,
-without any change to =refresh.lisp=.  Open: the same run on battery (unplug
-and run =sh /var/tmp/rr30/rr30-ab4.sh=; AC package idle is 3-5 W here against
-0.9 W on battery, so the saving may be smaller there), and whether reading
-mode should also run on AC now that it is worth 2 W.  Knob 2 (full
+without any change to =refresh.lisp=.  Open: the same still screen measured
+0.90 W package on 2026-10-06 (power review table) against 3-5 W in the 60 Hz
+state tonight with the same PC8 65 %, which wants an explanation; whether
+reading mode should also run on AC now that it is worth 2 W; the AC run.  Knob 2 (full
 configuration, one second blink per switch) stays available for experiments
 but has no use.
