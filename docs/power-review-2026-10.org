@@ -60,8 +60,12 @@ client holds an idle inhibitor (video).  An idle Firefox costs ~nothing;
 the extra watts of a busy page are its animation, and this takes about a
 quarter of them.
 
-Not done: the sustained low-clock 30 Hz configuration (watermarks and CDCLK
-sized for 30 Hz).  Speculative, needs a modeset per switch; later.
+Done 2026-10-08 evening (kernels 141/142, see =mahogany.org=): the full 30 Hz
+configuration moves cdclk one step (192 -> 172.8 MHz) and saves 2.3 W package
+on AC for a still screen, but the saving is entirely the watermarks and line
+time, which kernel 142 applies inside the seamless fastset
+(=lispbsd_seamless_rr=3=, now the sysctl.conf default), no modeset, no blink.
+Battery run still to do.
 
 * 3. Browser
 =ui.prefersReducedMotion=1= is in =user.js= (only pages that honour the

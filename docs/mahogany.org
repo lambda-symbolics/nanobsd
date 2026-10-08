@@ -598,3 +598,40 @@ down (about 0.7 s), pipe off, then power up and backlight on.  About a second
 of black with the backlight off, each way.  The whole =hrt_output_set_refresh=
 call takes 1 s.  That is fine for a manual mode but not for reading mode,
 whose exit on the first key press would blink the panel for a second.
+
+** Kernel 142: the saving is the watermarks, not cdclk (=lispbsd_seamless_rr=3=)
+
+Knob value 3 keeps the kernel 127 seamless fastset but computes the plane
+watermarks and the pipe line time for the pixel clock in use (=pixel_rate=
+no longer bumped to the fast mode's clock in =ilk_pipe_pixel_rate=); only
+cdclk stays sized for 60 Hz (=lispbsd_cdclk_pixel_rate= in
+=intel_cdclk.c=), so no modeset is needed.  The plane watermarks are
+rewritten by the plane update of the same commit (=skl_wm_add_affected_planes=
+adds the planes); =WM_LINETIME=, which SKL+ only writes when a pipe comes up,
+is written next to the M/N update inside vblank evasion.  Same run shape as
+above (=rr30-ab4.sh=, AC, still screen, four rounds of 30 s):
+
+| state                                   | cdclk | round 1 | round 2 | round 3 | round 4 |
+|-----------------------------------------+-------+---------+---------+---------+---------|
+| A 60 Hz mode, idleness DRRS 30 Hz       | 192   | 3.35 W  | 5.28 W  | 2.96 W  | 4.99 W  |
+| E seamless 30 Hz, slow watermarks (3)   | 192   | 2.39 W  | 1.72 W  | 1.66 W  | 2.75 W  |
+| C full 30 Hz configuration (2)          | 172.8 | 2.31 W  | 2.24 W  | 1.76 W  | 1.94 W  |
+
+E and C are the same within noise, with the same C-state signature (PC2 24 %,
+PC6 8 %), and the frame counter runs on through every E switch (no modeset,
+no panel power cycle).  So the one cdclk step is worth nothing; what the
+package spends 2.3 W on in the fast configuration is the display engine's
+memory fetch pattern set by the watermarks and line time (10 lines/181 blocks
+at level 7 against 5/91), which keeps the uncore out of the deeper package
+states.  The kernel's own idleness DRRS, a bare M/N write, does not get this;
+only a mode explicitly selected by the compositor does.
+
+Default now: =lispbsd_seamless_rr=3= in =/etc/sysctl.conf= (kernel default
+still 1).  With it, Mahogany's reading mode (battery, 15 s without input) and
+its 30 fps content selection size the watermarks for 30 Hz automatically,
+without any change to =refresh.lisp=.  Open: the same run on battery (unplug
+and run =sh /var/tmp/rr30/rr30-ab4.sh=; AC package idle is 3-5 W here against
+0.9 W on battery, so the saving may be smaller there), and whether reading
+mode should also run on AC now that it is worth 2 W.  Knob 2 (full
+configuration, one second blink per switch) stays available for experiments
+but has no use.
