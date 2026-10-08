@@ -82,3 +82,36 @@ the three ring blocks. `ringcap SECONDS` captures the played PCM to
 `ring.raw`. `hdactl` dumps CORB/RIRB state. `tone.raw` is 3 s of 440 Hz for
 `audioplay -f -e slinear_le -P 16 -s 48000 -c 2`. `fakekey KEYCODE` injects a
 key via XTEST. All register access is read-only.
+
+## 2026-10-08: the "crunch" was the mixer level mapping (kernel 140)
+
+Symptom since September: hiss/crunch that scales with loudness, starts
+"randomly" during use, then every player crunches (Firefox on 10-07, mpv
+with a local E-AC-3 episode on 10-08), persists across player restarts,
+never from a fresh boot.  The 10-07 work had shown the digital path to be
+faithful (DMA ring == client samples, no gaps, no clipping) and the codec
+registers identical to a clean dump.
+
+Today's capture of the DMA ring during the crunch (`/var/tmp/ringcap`,
+analysed on the workstation) again showed clean program audio: no
+full-scale samples, no zero runs, no discontinuities, same spectrum and
+crest factor as the ffmpeg decode of the track.  The only register
+difference from the clean September dump was the two DAC output
+amplifiers (nid 0x02/0x03): index 0x5f, where the amplifier capability
+(0x25757) says 88 steps, so the last valid index is 0x57 (0 dB).
+
+`hdafg_set_port` computed `divisor = 255 / ctl_step` in integer
+arithmetic: 255/87 = 2, so the amplifier index was `level / 2` and every
+master level above 174 ran past the last step; the Realtek DAC treats
+that as gain above 0 dB and clips loud passages.  The mixer read back
+`index * 2`, so `mixerctl` showed a plausible 190 all along.  "Random
+start under load" was the moment the volume keys took the master from
+under 174 to over it; it persisted because the level stayed.
+
+Kernel 140 maps 0..255 onto 0..ctl_step exactly (rounded, clamped) and
+inverts it in `hdafg_get_port`.  Until the reboot, keep `outputs.master`
+and `outputs.master2` at 174 or below.  Also found on the way:
+audio(4) remembers the last pause flag for `/dev/sound`, so a test
+`audioplay` started while mpv is paused begins paused and hangs in
+`audiowr`; use `-d /dev/audio`.  And a Firefox content process writes
+digital silence at 35 % of a core while a stale media tab exists.
