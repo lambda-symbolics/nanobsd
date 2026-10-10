@@ -701,3 +701,31 @@ global (wlr_server_decoration_manager, default SERVER) next to the xdg
 one.  Takes effect at the next Mahogany start; the Lisp side and the
 struct layout are unchanged, so only /usr/local/lib/libheart.so was
 reinstalled.
+
+** Mouse "dropping out" = still-screen 30 Hz flapping -- 2026-10-10
+
+With the MX Master on the Type-C hub the cursor felt as if the mouse were
+disconnecting and reconnecting every moment.  Not USB: dmesg has two real
+unplugs in the whole evening, the kernel's idle counter never reset while
+the laptop was untouched, the receiver's HID++ interfaces were silent, the
+libopeninput key-release fallback never fired, lpsched pack/coalesce are
+off.  The Mahogany log has the cause: during mouse use the panel was
+modeset 30 <-> 60 Hz about twice a minute, and at 03:42:37 it went 30 Hz
+and back 50 ms later.  The still-screen rule (6fac471) counted only keys,
+buttons and wheel as input; pointer motion over a static screen draws no
+frames, so after 2 s the screen counted as still, the panel went 30 Hz,
+the next motion fired the one-shot activity callback, the poll modeset it
+back (20-60 ms with the cursor held), and two seconds later again.
+"Atomic commit failed: Device busy" lines cluster around the switches.
+
+Mahogany c4863d8: heart records the monotonic time of the last input of
+any kind (hrt_ms_since_activity, fed from hrt_idle_notify_activity, so
+motion included); refresh.lisp's seconds-since-input takes the more recent
+of its own and heart's, the still rule also requires no input for the
+whole period, and *refresh-still-seconds* is 10 rather than 2.  Installed
+(libheart.so + mahogany), effective at the next session start; in the
+running session *refresh-still-seconds* was set to NIL via mahoganyctl so
+the A/B can be done before restarting.  Open: whether the EBUSY commit
+failures also appear at a steady 60 Hz (they did between 04:04 and 04:24
+with no modeset), which would be a kernel-side pending-commit issue of the
+knob-3 fastset rather than this.
