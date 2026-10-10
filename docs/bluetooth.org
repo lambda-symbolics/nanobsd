@@ -1,0 +1,38 @@
+#+TITLE: Bluetooth on the X1 Nano (Intel AX201, ubt)
+
+* Kernel 147: Intel firmware loader in ubt(4) -- 2026-10-11
+
+The AX201 (USB 8087:0026, "HrP", hw variant 0x13) powers up in a
+bootloader that only speaks Intel vendor commands; HCI Reset answers
+status 0x01 (unknown command) and =btconfig ubt0 up= timed out, so the
+laptop never had working Bluetooth.  Linux's btintel downloads the
+operational firmware in its setup hook; NetBSD's ubt had nothing.
+
+=kernel/dev/usb/ubt.c= (LISPBSD block, ~600 lines) does the download on
+the first =btconfig ubt0 up=, when the root file system holds the image:
+- =/libdata/firmware/ubt/ibt-19-0-4.sfi= and =.ddc= (linux-firmware
+  =intel/ibt-19-0-4.*=, the ddc is a symlink to =ibt-0040-0041.ddc=;
+  copies in =userland/ubt-firmware=).
+- Flow (btintel_bootloader_setup, legacy RSA path): Intel_Read_Version
+  (0xfc05 with param 0xff), Intel_Read_Boot_Params (0xfc0d, limited_cce
+  must be 0), parse the image (128 CSS + 256 key + 256 signature, then
+  HCI commands in 4-byte-aligned groups; Intel_Write_Boot_Params 0xfc0e
+  carries the boot address), Intel_Secure_Send (0xfc09: header type 0,
+  key 3, signature 2, data 1, fragments of 252), wait for vendor event
+  0xff/0x06, Intel_Reset (0xfc01 soft, boot_param) and wait for 0xff/0x02,
+  DDC entries via 0xfc8b, version again (plain form), event mask 0xfc52.
+- Three transport quirks, all from btusb: in bootloader mode 0xfc09 goes
+  down the BULK OUT endpoint and the bootloader answers on BULK IN; 0xfc01
+  is never acknowledged; and the endpoints must not be closed and
+  reopened between the download and the HCI init (kernel 146 did, and
+  the HCI Reset after boot got no answer: data toggles).  So the loader
+  runs on ubt_enable's own pipes with =sc_intel_loading= diverting
+  ubt_recv_event/ubt_recv_acl_complete packets into its queue.
+- Result: "firmware loaded in 2568 ms", "firmware booted in 8 ms",
+  =bthub0 at ubt0 local-bdaddr 20:c1:9b:e1:c9:c6=, HCI version 11.
+
+Gotchas: rc.local's =usb off= suspends both xHCI controllers at boot;
+anything USB then blocks in the kernel (D state, wchan xhcicmdq) and a
+reboot with such a process wedges.  =usb on= first; bluetooth/webcam =on=
+do it.  Kernels 144 (control-pipe secure send), 145 (bulk out), 146
+(bulk in listener, own pipes) were the steps.
