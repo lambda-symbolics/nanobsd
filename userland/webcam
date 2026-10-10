@@ -8,6 +8,9 @@ present(){ drvctl -l "$HUB" 2>/dev/null | grep -q uvideo0; }
 case "${1:-status}" in
   off)    $SUDO drvctl -d uvideo1 2>/dev/null; $SUDO drvctl -d uvideo0 2>/dev/null
           present && echo "webcam: still on (detach failed)" || echo "webcam: OFF" ;;
+  on)     # The xHCI controllers are suspended by `usb off` (rc.local at boot);
+          # a rescan then blocks in the kernel and a later reboot wedges.
+          [ "$(/usr/local/bin/usb status)" = "usb: off" ] && /usr/local/bin/usb on
   on)     $SUDO drvctl -r "$HUB" 2>/dev/null; sleep 1
           present && echo "webcam: ON" || echo "webcam: on (re-attach pending; retry or replug)" ;;
   status) present && echo "webcam: ON" || echo "webcam: OFF" ;;
