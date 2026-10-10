@@ -44,6 +44,11 @@
   (load custom-file nil t))
 
 (column-number-mode 1)
+;; Line numbers in every code, text and config buffer, as Doom does on the
+;; workstation; SPC t l toggles them per buffer.
+(setq display-line-numbers-type t)
+(dolist (hook '(prog-mode-hook text-mode-hook conf-mode-hook))
+  (add-hook hook #'display-line-numbers-mode))
 (global-auto-revert-mode 1)
 (recentf-mode 1)
 (savehist-mode 1)
@@ -199,6 +204,9 @@
         (goto-char (point-max))
         (insert rc)
         (sly-mrepl-return)))))
+
+;; The workstation's custom Common Lisp font-lock rules.
+(load (locate-user-emacs-file "cl-highlight.el") nil t)
 
 (global-set-key (kbd "C-j") #'sp-forward-barf-sexp)
 (global-set-key (kbd "C-k") #'sp-forward-slurp-sexp)
