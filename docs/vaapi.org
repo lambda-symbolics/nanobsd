@@ -39,3 +39,34 @@ RDD process means hardware decoding.  =/usr/pkg/lib/firefox/vaapitest -d
 =MOZ_LOG=PlatformDecoderModule:5,FFmpegVideo:5,Dmabuf:5=.
 
 Not yet tested: AV1 content, the X11 session.
+
+* Kernel 143: virtual-engine tree collisions (panics 10-05 and 10-10)
+
+Two "panic: trap" dumps (/var/crash/netbsd.14, 10-05 13:53, and
+netbsd.17, 10-10 12:46) have the same chain:
+=contexts_free_all -> __free_engines -> virtual_context_destroy
+(intel_lrc.c:4737) -> rb_erase_cached -> rb_tree_remove_node=, a write
+through a NULL parent in =rb_tree_prune_node= (rb.c:515).  Read with
+=gdb -batch -ex 'target kvm netbsd.17.core' -ex bt compile/GENERIC/netbsd.gdb=;
+the node (=p *(struct ve_node *)=) had =inserted = true=, =prio 3=,
+=order 6= and all links zero, and the sibling's tree was empty.
+
+Cause: the NetBSD port keys the per-engine virtual tree by (prio, order)
+with =order= counted per virtual engine ("XXX kludge to get insertion
+order").  Two virtual engines (two video decoders, Firefox and mpv or two
+Firefox streams) at the same priority produce the same keys; the second
+=rb_tree_insert_node= returns the first engine's node, the only check is a
+KASSERT (GENERIC has no DIAGNOSTIC), the node is flagged inserted anyway,
+and when that context is freed the erase of a node that is not in a tree
+faults.  Kernel 143 (cb3832f): the counter is per sibling engine
+(=execlists.virtual_order=, under =active.lock=), the compare puts the
+highest priority leftmost as Linux does (rb_first = highest), =first= is
+=RB_TREE_MIN(tree) == node=, and a collision, now impossible, is logged
+and the node left out instead of flagged.
+
+Crash dumps: savecore(8) writes them to =/var/crash= as =netbsd.N.core.gz=
+plus the kernel =netbsd.N.gz= (=bounds= holds the next N, =minfree= the KB
+of free space below which it refuses), and nothing ever removes them;
+5.8 GB were there on 10-10 (netbsd.2 to netbsd.7 from September also
+uncompressed).  The panic line and time are in /var/log/messages as
+"savecore: reboot after panic".
