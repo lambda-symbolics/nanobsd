@@ -689,3 +689,15 @@ after start with line time 0xc4 and the slow watermarks; activity
 30 Hz again 6 s later.  Installed by rebuild and session restart (the
 defstruct gained slots, so no hot-load); the previous binaries are
 =/usr/local/bin/mahogany.pre-still= and =/usr/local/lib/libheart.so.pre-still=.
+
+** GTK3 title bars (pgtk Emacs) -- 2026-10-10
+
+pgtk Emacs drew a GTK client-side title bar under Mahogany even though
+every window is tiled and the heart lib answers xdg-decoration requests
+with "server side".  GTK3 never binds zxdg_decoration_manager_v1; it only
+drops its header bar when the older KDE org_kde_kwin_server_decoration
+global exists and defaults to server mode.  Mahogany 342c9f7 creates that
+global (wlr_server_decoration_manager, default SERVER) next to the xdg
+one.  Takes effect at the next Mahogany start; the Lisp side and the
+struct layout are unchanged, so only /usr/local/lib/libheart.so was
+reinstalled.
