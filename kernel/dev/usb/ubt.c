@@ -88,6 +88,8 @@ __KERNEL_RCSID(0, "$NetBSD: ubt.c,v 1.67 2024/07/05 04:31:52 rin Exp $");
 #include <dev/usb/usbdi_util.h>
 #include <dev/usb/usbdevs.h>
 #include <dev/firmload.h>
+#include <sys/mutex.h>
+#include <sys/condvar.h>
 #include <sys/time.h>
 
 #include <netbt/bluetooth.h>
@@ -1059,45 +1061,133 @@ struct ubt_intel_boot_params {
 #define UBT_INTEL_MAX_FW		(4 * 1024 * 1024)
 #define UBT_INTEL_MAX_DDC		4096
 
+#define UBT_INTEL_NEVQ		16
+
+struct ubt_intel_ev {
+	uint32_t		 len;
+	uint8_t			 data[UBT_BUFSIZ_EVENT];
+};
+
+/*
+ * While the bootloader runs, events may arrive on the interrupt endpoint
+ * or on the bulk-in endpoint (the answers to bulk-sent commands do), so
+ * both are kept listening, as btusb does, and feed one queue.
+ */
 struct ubt_intel {
 	struct ubt_softc	*sc;
-	struct usbd_pipe	*pipe;		/* interrupt endpoint, events */
-	struct usbd_xfer	*xfer;
-	uint8_t			*evt;		/* UBT_BUFSIZ_EVENT */
-	struct usbd_pipe	*bpipe;		/* bulk out: secure send goes here */
-	struct usbd_xfer	*bxfer;
+	kmutex_t		 lock;
+	kcondvar_t		 cv;
+	struct ubt_intel_ev	 evq[UBT_INTEL_NEVQ];
+	unsigned		 evq_head;	/* next to read */
+	unsigned		 evq_count;
+	struct usbd_pipe	*ipipe;		/* interrupt in, events */
+	uint8_t			*ibuf;
+	struct usbd_pipe	*rpipe;		/* bulk in, events too */
+	struct usbd_xfer	*rxfer;
+	uint8_t			*rbuf;
+	struct usbd_pipe	*wpipe;		/* bulk out: secure send */
+	struct usbd_xfer	*wxfer;
 	uint8_t			*cmd;		/* 3 + 255, the bulk xfer's buffer */
+	uint8_t			 evt[UBT_BUFSIZ_EVENT];	/* last event read */
 	int			 ssr_seen;	/* vendor 0x06: download result */
 	uint8_t			 ssr_result;
 	int			 boot_seen;	/* vendor 0x02: firmware booted */
 };
 
-static int
-ubt_intel_ms_since(const struct timeval *start)
+static void
+ubt_intel_enqueue(struct ubt_intel *ui, const uint8_t *buf, uint32_t len)
 {
-	struct timeval now, d;
+	struct ubt_intel_ev *ev;
 
-	getmicrouptime(&now);
-	timersub(&now, start, &d);
-	return d.tv_sec * 1000 + d.tv_usec / 1000;
+	if (len < 2 || len > UBT_BUFSIZ_EVENT)
+		return;
+	mutex_enter(&ui->lock);
+	if (ui->evq_count < UBT_INTEL_NEVQ) {
+		ev = &ui->evq[(ui->evq_head + ui->evq_count) % UBT_INTEL_NEVQ];
+		memcpy(ev->data, buf, len);
+		ev->len = len;
+		ui->evq_count++;
+		cv_broadcast(&ui->cv);
+	}
+	mutex_exit(&ui->lock);
+}
+
+static void
+ubt_intel_intr_cb(struct usbd_xfer *xfer, void *priv, usbd_status status)
+{
+	struct ubt_intel *ui = priv;
+	uint32_t len;
+	void *buf;
+
+	if (status != USBD_NORMAL_COMPLETION)
+		return;
+	usbd_get_xfer_status(xfer, NULL, &buf, &len, NULL);
+	ubt_intel_enqueue(ui, buf, len);
+}
+
+static void ubt_intel_bulk_cb(struct usbd_xfer *, void *, usbd_status);
+
+static void
+ubt_intel_bulk_start(struct ubt_intel *ui)
+{
+
+	usbd_setup_xfer(ui->rxfer, ui, ui->rbuf, UBT_BUFSIZ_ACL,
+	    USBD_SHORT_XFER_OK, USBD_NO_TIMEOUT, ubt_intel_bulk_cb);
+	(void)usbd_transfer(ui->rxfer);
+}
+
+static void
+ubt_intel_bulk_cb(struct usbd_xfer *xfer, void *priv, usbd_status status)
+{
+	struct ubt_intel *ui = priv;
+	uint32_t len;
+	void *buf;
+
+	if (status == USBD_CANCELLED || ui->sc->sc_dying)
+		return;
+	if (status != USBD_NORMAL_COMPLETION) {
+		if (status == USBD_STALLED)
+			usbd_clear_endpoint_stall_async(ui->rpipe);
+		ubt_intel_bulk_start(ui);
+		return;
+	}
+	usbd_get_xfer_status(xfer, NULL, &buf, &len, NULL);
+	ubt_intel_enqueue(ui, buf, len);
+	ubt_intel_bulk_start(ui);
 }
 
 /*
- * Read one event; note the bootloader's vendor events on the way.
+ * Take the next event from the queue into ui->evt; note the bootloader's
+ * vendor events on the way.
  */
 static int
 ubt_intel_read_event(struct ubt_intel *ui, int timeout_ms, uint32_t *lenp)
 {
-	uint32_t len = UBT_BUFSIZ_EVENT;
-	usbd_status err;
+	struct ubt_intel_ev *ev;
+	uint32_t len;
 
 	if (ui->sc->sc_dying)
 		return EIO;
-	err = usbd_intr_transfer(ui->xfer, ui->pipe, USBD_SHORT_XFER_OK,
-	    timeout_ms, ui->evt, &len);
-	if (err != USBD_NORMAL_COMPLETION)
-		return err == USBD_TIMEOUT ? ETIMEDOUT : EIO;
-	if (len < 2 || len < 2u + ui->evt[1])
+	mutex_enter(&ui->lock);
+	while (ui->evq_count == 0) {
+		if (cv_timedwait(&ui->cv, &ui->lock,
+		    MAX(1, mstohz(timeout_ms))) == EWOULDBLOCK) {
+			mutex_exit(&ui->lock);
+			return ETIMEDOUT;
+		}
+		if (ui->sc->sc_dying) {
+			mutex_exit(&ui->lock);
+			return EIO;
+		}
+	}
+	ev = &ui->evq[ui->evq_head];
+	len = ev->len;
+	memcpy(ui->evt, ev->data, len);
+	ui->evq_head = (ui->evq_head + 1) % UBT_INTEL_NEVQ;
+	ui->evq_count--;
+	mutex_exit(&ui->lock);
+
+	if (len < 2u + ui->evt[1])
 		return EIO;
 	if (ui->evt[0] == 0xff && ui->evt[1] >= 1) {
 		switch (ui->evt[2]) {
@@ -1114,6 +1204,16 @@ ubt_intel_read_event(struct ubt_intel *ui, int timeout_ms, uint32_t *lenp)
 	}
 	*lenp = len;
 	return 0;
+}
+
+static int
+ubt_intel_ms_since(const struct timeval *start)
+{
+	struct timeval now, d;
+
+	getmicrouptime(&now);
+	timersub(&now, start, &d);
+	return d.tv_sec * 1000 + d.tv_usec / 1000;
 }
 
 /*
@@ -1145,7 +1245,7 @@ ubt_intel_cmd(struct ubt_intel *ui, uint16_t opcode, const void *params,
 
 	if (opcode == UBT_INTEL_CMD_SECURE_SEND) {
 		len = 3 + plen;
-		err = usbd_bulk_transfer(ui->bxfer, ui->bpipe, 0, 2000,
+		err = usbd_bulk_transfer(ui->wxfer, ui->wpipe, 0, 2000,
 		    ui->cmd, &len);
 	} else {
 		memset(&req, 0, sizeof(req));
@@ -1268,7 +1368,7 @@ ubt_intel_read_version(struct ubt_intel *ui, struct ubt_intel_version *ver)
 static int
 ubt_intel_fwload(struct ubt_softc *sc)
 {
-	struct ubt_intel ui;
+	struct ubt_intel *ui;
 	struct ubt_intel_version ver;
 	struct ubt_intel_boot_params bp;
 	struct timeval start;
@@ -1280,40 +1380,53 @@ ubt_intel_fwload(struct ubt_softc *sc)
 	usbd_status err;
 	int error;
 
-	memset(&ui, 0, sizeof(ui));
-	ui.sc = sc;
-	err = usbd_open_pipe(sc->sc_iface0, sc->sc_evt_addr,
-	    USBD_EXCLUSIVE_USE, &ui.pipe);
+	ui = kmem_zalloc(sizeof(*ui), KM_SLEEP);
+	ui->sc = sc;
+	mutex_init(&ui->lock, MUTEX_DEFAULT, IPL_USB);
+	cv_init(&ui->cv, "ubtintel");
+
+	/* Bulk out, the command buffer. */
+	err = usbd_open_pipe(sc->sc_iface0, sc->sc_aclwr_addr,
+	    USBD_EXCLUSIVE_USE, &ui->wpipe);
+	if (err != USBD_NORMAL_COMPLETION) {
+		aprint_error_dev(sc->sc_dev, "Intel firmware: bulk out: %s\n",
+		    usbd_errstr(err));
+		error = EIO;
+		goto fail1;
+	}
+	error = usbd_create_xfer(ui->wpipe, 3 + 255, 0, 0, &ui->wxfer);
+	if (error)
+		goto fail2;
+	ui->cmd = usbd_get_buffer(ui->wxfer);
+
+	/* Bulk in, listening. */
+	err = usbd_open_pipe(sc->sc_iface0, sc->sc_aclrd_addr,
+	    USBD_EXCLUSIVE_USE, &ui->rpipe);
+	if (err != USBD_NORMAL_COMPLETION) {
+		aprint_error_dev(sc->sc_dev, "Intel firmware: bulk in: %s\n",
+		    usbd_errstr(err));
+		error = EIO;
+		goto fail3;
+	}
+	error = usbd_create_xfer(ui->rpipe, UBT_BUFSIZ_ACL, 0, 0, &ui->rxfer);
+	if (error)
+		goto fail4;
+	ui->rbuf = usbd_get_buffer(ui->rxfer);
+	ubt_intel_bulk_start(ui);
+
+	/* Interrupt in, listening. */
+	ui->ibuf = kmem_alloc(UBT_BUFSIZ_EVENT, KM_SLEEP);
+	err = usbd_open_pipe_intr(sc->sc_iface0, sc->sc_evt_addr,
+	    USBD_SHORT_XFER_OK, &ui->ipipe, ui, ui->ibuf, UBT_BUFSIZ_EVENT,
+	    ubt_intel_intr_cb, USBD_DEFAULT_INTERVAL);
 	if (err != USBD_NORMAL_COMPLETION) {
 		aprint_error_dev(sc->sc_dev, "Intel firmware: event pipe: %s\n",
 		    usbd_errstr(err));
-		return EIO;
+		error = EIO;
+		goto fail5;
 	}
-	error = usbd_create_xfer(ui.pipe, UBT_BUFSIZ_EVENT, 0, 0, &ui.xfer);
-	if (error) {
-		usbd_close_pipe(ui.pipe);
-		return error;
-	}
-	ui.evt = usbd_get_buffer(ui.xfer);
-	err = usbd_open_pipe(sc->sc_iface0, sc->sc_aclwr_addr,
-	    USBD_EXCLUSIVE_USE, &ui.bpipe);
-	if (err != USBD_NORMAL_COMPLETION) {
-		aprint_error_dev(sc->sc_dev, "Intel firmware: bulk pipe: %s\n",
-		    usbd_errstr(err));
-		usbd_destroy_xfer(ui.xfer);
-		usbd_close_pipe(ui.pipe);
-		return EIO;
-	}
-	error = usbd_create_xfer(ui.bpipe, 3 + 255, 0, 0, &ui.bxfer);
-	if (error) {
-		usbd_close_pipe(ui.bpipe);
-		usbd_destroy_xfer(ui.xfer);
-		usbd_close_pipe(ui.pipe);
-		return error;
-	}
-	ui.cmd = usbd_get_buffer(ui.bxfer);
 
-	error = ubt_intel_read_version(&ui, &ver);
+	error = ubt_intel_read_version(ui, &ver);
 	if (error)
 		goto out;
 	aprint_normal_dev(sc->sc_dev,
@@ -1347,7 +1460,7 @@ ubt_intel_fwload(struct ubt_softc *sc)
 	}
 
 	rl = sizeof(bp);
-	error = ubt_intel_cmd(&ui, UBT_INTEL_CMD_READ_BOOT_PARAMS, NULL, 0, &bp,
+	error = ubt_intel_cmd(ui, UBT_INTEL_CMD_READ_BOOT_PARAMS, NULL, 0, &bp,
 	    &rl, 2000);
 	if (error == 0 && (rl != sizeof(bp) || bp.status != 0))
 		error = EIO;
@@ -1428,9 +1541,9 @@ ubt_intel_fwload(struct ubt_softc *sc)
 	getmicrouptime(&start);
 
 	/* CSS header, public key and signature open the download. */
-	if ((error = ubt_intel_secure_send(&ui, 0x00, fw, 128)) != 0 ||
-	    (error = ubt_intel_secure_send(&ui, 0x03, fw + 128, 256)) != 0 ||
-	    (error = ubt_intel_secure_send(&ui, 0x02, fw + 388, 256)) != 0) {
+	if ((error = ubt_intel_secure_send(ui, 0x00, fw, 128)) != 0 ||
+	    (error = ubt_intel_secure_send(ui, 0x03, fw + 128, 256)) != 0 ||
+	    (error = ubt_intel_secure_send(ui, 0x02, fw + 388, 256)) != 0) {
 		aprint_error_dev(sc->sc_dev, "firmware header rejected (%d)\n",
 		    error);
 		goto reset;
@@ -1445,7 +1558,7 @@ ubt_intel_fwload(struct ubt_softc *sc)
 	while (off + frag < fwsize) {
 		frag += 3 + fw[off + frag + 2];
 		if ((frag % 4) == 0) {
-			error = ubt_intel_secure_send(&ui, 0x01, fw + off, frag);
+			error = ubt_intel_secure_send(ui, 0x01, fw + off, frag);
 			if (error) {
 				aprint_error_dev(sc->sc_dev,
 				    "firmware data rejected at %zu (%d)\n", off,
@@ -1463,10 +1576,10 @@ ubt_intel_fwload(struct ubt_softc *sc)
 		goto reset;
 	}
 
-	error = ubt_intel_wait(&ui, &ui.ssr_seen, 5000);
-	if (error == 0 && ui.ssr_result != 0) {
+	error = ubt_intel_wait(ui, &ui->ssr_seen, 5000);
+	if (error == 0 && ui->ssr_result != 0) {
 		aprint_error_dev(sc->sc_dev, "firmware download failed (%#x)\n",
-		    ui.ssr_result);
+		    ui->ssr_result);
 		error = EIO;
 	} else if (error)
 		aprint_error_dev(sc->sc_dev,
@@ -1490,13 +1603,13 @@ ubt_intel_fwload(struct ubt_softc *sc)
 	reset[5] = (boot_param >> 8) & 0xff;
 	reset[6] = (boot_param >> 16) & 0xff;
 	reset[7] = (boot_param >> 24) & 0xff;
-	error = ubt_intel_cmd(&ui, UBT_INTEL_CMD_RESET, reset, sizeof(reset),
+	error = ubt_intel_cmd(ui, UBT_INTEL_CMD_RESET, reset, sizeof(reset),
 	    NULL, NULL, 0);
 	if (error) {
 		aprint_error_dev(sc->sc_dev, "Intel reset: %d\n", error);
 		goto out;
 	}
-	error = ubt_intel_wait(&ui, &ui.boot_seen, 3000);
+	error = ubt_intel_wait(ui, &ui->boot_seen, 3000);
 	if (error) {
 		aprint_error_dev(sc->sc_dev, "firmware did not boot (%d)\n",
 		    error);
@@ -1517,7 +1630,7 @@ ubt_intel_fwload(struct ubt_softc *sc)
 					if (off + 1 + ddc[off] > dsz)
 						break;
 					rl = 1;
-					if (ubt_intel_cmd(&ui,
+					if (ubt_intel_cmd(ui,
 					    UBT_INTEL_CMD_WRITE_DDC, &ddc[off],
 					    1 + ddc[off], &status, &rl,
 					    2000) != 0) {
@@ -1535,7 +1648,7 @@ ubt_intel_fwload(struct ubt_softc *sc)
 		aprint_normal_dev(sc->sc_dev, "no %s, running without DDC\n",
 		    name);
 
-	if (ubt_intel_read_version(&ui, &ver) == 0)
+	if (ubt_intel_read_version(ui, &ver) == 0)
 		aprint_normal_dev(sc->sc_dev,
 		    "Intel firmware revision %u.%u build %u week %u %u\n",
 		    ver.fw_revision >> 4, ver.fw_revision & 0x0f,
@@ -1546,7 +1659,7 @@ ubt_intel_fwload(struct ubt_softc *sc)
 		static const uint8_t mask[8] =
 		    { 0x87, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 		rl = 1;
-		(void)ubt_intel_cmd(&ui, UBT_INTEL_CMD_EVENT_MASK, mask,
+		(void)ubt_intel_cmd(ui, UBT_INTEL_CMD_EVENT_MASK, mask,
 		    sizeof(mask), &status, &rl, 2000);
 	}
 	error = 0;
@@ -1568,16 +1681,28 @@ reset:
 	reset[2] = 0x01;
 	reset[3] = 0x00;
 	reset[4] = reset[5] = reset[6] = reset[7] = 0;
-	(void)ubt_intel_cmd(&ui, UBT_INTEL_CMD_RESET, reset, sizeof(reset),
+	(void)ubt_intel_cmd(ui, UBT_INTEL_CMD_RESET, reset, sizeof(reset),
 	    NULL, NULL, 0);
 
 out:
 	if (fw != NULL)
 		firmware_free(fw, fwsize);
-	usbd_destroy_xfer(ui.bxfer);
-	usbd_close_pipe(ui.bpipe);
-	usbd_destroy_xfer(ui.xfer);
-	usbd_close_pipe(ui.pipe);
+	usbd_abort_pipe(ui->ipipe);
+	usbd_close_pipe(ui->ipipe);
+fail5:
+	kmem_free(ui->ibuf, UBT_BUFSIZ_EVENT);
+	usbd_abort_pipe(ui->rpipe);
+	usbd_destroy_xfer(ui->rxfer);
+fail4:
+	usbd_close_pipe(ui->rpipe);
+fail3:
+	usbd_destroy_xfer(ui->wxfer);
+fail2:
+	usbd_close_pipe(ui->wpipe);
+fail1:
+	cv_destroy(&ui->cv);
+	mutex_destroy(&ui->lock);
+	kmem_free(ui, sizeof(*ui));
 	return error;
 }
 
