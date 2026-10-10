@@ -87,6 +87,8 @@ __KERNEL_RCSID(0, "$NetBSD: ubt.c,v 1.67 2024/07/05 04:31:52 rin Exp $");
 #include <dev/usb/usbdi.h>
 #include <dev/usb/usbdi_util.h>
 #include <dev/usb/usbdevs.h>
+#include <dev/firmload.h>
+#include <sys/time.h>
 
 #include <netbt/bluetooth.h>
 #include <netbt/hci.h>
@@ -148,6 +150,9 @@ SYSCTL_SETUP(sysctl_hw_ubt_debug_setup, "sysctl hw.ubt_debug setup")
 
 /* Transmit timeouts */
 #define UBT_CMD_TIMEOUT		USBD_DEFAULT_TIMEOUT
+
+/* LISPBSD: Intel controllers get their firmware loaded at enable */
+#define UBT_INTEL_VENDOR	0x8087
 #define UBT_ACL_TIMEOUT		USBD_DEFAULT_TIMEOUT
 
 /*
@@ -234,6 +239,10 @@ struct ubt_softc {
 
 	/* Successfully attached */
 	int			 sc_ok;
+
+	/* LISPBSD: Intel controllers need their firmware loaded (ubt_intel_fwload) */
+	int			 sc_intel;
+	int			 sc_intel_fwdone;
 };
 
 /*******************************************************************************
@@ -491,6 +500,7 @@ ubt_attach(device_t parent, device_t self, void *aux)
 
 	sc->sc_dev = self;
 	sc->sc_udev = uaa->uaa_device;
+	sc->sc_intel = (uaa->uaa_vendor == UBT_INTEL_VENDOR);
 
 	MBUFQ_INIT(&sc->sc_cmd_queue);
 	MBUFQ_INIT(&sc->sc_aclwr_queue);
@@ -980,6 +990,566 @@ ubt_abortdealloc(struct ubt_softc *sc)
  * Bluetooth Unit/USB callbacks
  *
  */
+
+/*******************************************************************************
+ *
+ * LISPBSD: Intel firmware download
+ *
+ * Intel CNVi controllers (JfP, ThP, HrP, CcP: hardware variants 0x11 to
+ * 0x14, e.g. the AX201 as USB 8087:0026) power up in a bootloader that
+ * only takes the vendor commands needed to load the operational firmware;
+ * HCI Reset answers "unknown command" and the netbt init never completes.
+ * Linux's btintel does the download from its setup hook.  Here it happens
+ * on the first enable, when the root file system is there to hold the
+ * image: /libdata/firmware/ubt/ibt-<hw_variant>-<hw_revision>-<fw_revision>.sfi
+ * and .ddc, the files linux-firmware ships under intel/.
+ *
+ * The exchange is synchronous and uses nothing of the netbt stack:
+ * commands go down the control pipe exactly as ubt_xmit_cmd sends them,
+ * events are read one at a time from the interrupt endpoint.  The
+ * bootloader acknowledges every fragment with a Command Complete (the
+ * boot parameters say so, limited_cce == 0) and reports the result of the
+ * whole download, and later the boot into the new firmware, in vendor
+ * events 0xff/0x06 and 0xff/0x02.
+ */
+
+struct ubt_intel_version {
+	uint8_t		status;
+	uint8_t		hw_platform;	/* 0x37 */
+	uint8_t		hw_variant;
+	uint8_t		hw_revision;
+	uint8_t		fw_variant;	/* 0x06 bootloader, 0x23 firmware */
+	uint8_t		fw_revision;
+	uint8_t		fw_build_num;
+	uint8_t		fw_build_ww;
+	uint8_t		fw_build_yy;
+	uint8_t		fw_patch_num;
+} __packed;
+
+struct ubt_intel_boot_params {
+	uint8_t		status;
+	uint8_t		otp_format;
+	uint8_t		otp_content;
+	uint8_t		otp_patch;
+	uint8_t		dev_revid[2];
+	uint8_t		secure_boot;
+	uint8_t		key_from_hdr;
+	uint8_t		key_type;
+	uint8_t		otp_lock;
+	uint8_t		api_lock;
+	uint8_t		debug_lock;
+	uint8_t		otp_bdaddr[6];
+	uint8_t		min_fw_build_nn;
+	uint8_t		min_fw_build_cw;
+	uint8_t		min_fw_build_yy;
+	uint8_t		limited_cce;
+	uint8_t		unlocked_state;
+} __packed;
+
+#define UBT_INTEL_CMD_READ_VERSION	0xfc05
+#define UBT_INTEL_CMD_READ_BOOT_PARAMS	0xfc0d
+#define UBT_INTEL_CMD_WRITE_BOOT_PARAMS	0xfc0e	/* inside the firmware image */
+#define UBT_INTEL_CMD_SECURE_SEND	0xfc09
+#define UBT_INTEL_CMD_RESET		0xfc01
+#define UBT_INTEL_CMD_WRITE_DDC		0xfc8b
+#define UBT_INTEL_CMD_EVENT_MASK	0xfc52
+
+#define UBT_INTEL_RSA_HEADER_LEN	644	/* 128 CSS + 256 key + 256 signature */
+#define UBT_INTEL_FRAGMENT		252
+#define UBT_INTEL_MAX_FW		(4 * 1024 * 1024)
+#define UBT_INTEL_MAX_DDC		4096
+
+struct ubt_intel {
+	struct ubt_softc	*sc;
+	struct usbd_pipe	*pipe;		/* interrupt endpoint, events */
+	struct usbd_xfer	*xfer;
+	uint8_t			*evt;		/* UBT_BUFSIZ_EVENT */
+	uint8_t			 cmd[3 + 255];
+	int			 ssr_seen;	/* vendor 0x06: download result */
+	uint8_t			 ssr_result;
+	int			 boot_seen;	/* vendor 0x02: firmware booted */
+};
+
+static int
+ubt_intel_ms_since(const struct timeval *start)
+{
+	struct timeval now, d;
+
+	getmicrouptime(&now);
+	timersub(&now, start, &d);
+	return d.tv_sec * 1000 + d.tv_usec / 1000;
+}
+
+/*
+ * Read one event; note the bootloader's vendor events on the way.
+ */
+static int
+ubt_intel_read_event(struct ubt_intel *ui, int timeout_ms, uint32_t *lenp)
+{
+	uint32_t len = UBT_BUFSIZ_EVENT;
+	usbd_status err;
+
+	if (ui->sc->sc_dying)
+		return EIO;
+	err = usbd_intr_transfer(ui->xfer, ui->pipe, USBD_SHORT_XFER_OK,
+	    timeout_ms, ui->evt, &len);
+	if (err != USBD_NORMAL_COMPLETION)
+		return err == USBD_TIMEOUT ? ETIMEDOUT : EIO;
+	if (len < 2 || len < 2u + ui->evt[1])
+		return EIO;
+	if (ui->evt[0] == 0xff && ui->evt[1] >= 1) {
+		switch (ui->evt[2]) {
+		case 0x02:
+			ui->boot_seen = 1;
+			break;
+		case 0x06:
+			if (ui->evt[1] >= 5) {
+				ui->ssr_seen = 1;
+				ui->ssr_result = ui->evt[3];
+			}
+			break;
+		}
+	}
+	*lenp = len;
+	return 0;
+}
+
+/*
+ * Send one HCI command and wait for its Command Complete.  The return
+ * parameters (status first) are copied to rsp, *rsplen in/out.  A Command
+ * Status with an error ends the wait; anything else is dropped (vendor
+ * events having been noted by ubt_intel_read_event).
+ */
+static int
+ubt_intel_cmd(struct ubt_intel *ui, uint16_t opcode, const void *params,
+    uint8_t plen, void *rsp, size_t *rsplen, int timeout_ms)
+{
+	usb_device_request_t req;
+	struct timeval start;
+	usbd_status err;
+	uint32_t len;
+	size_t n;
+	int error, left;
+
+	ui->cmd[0] = opcode & 0xff;
+	ui->cmd[1] = opcode >> 8;
+	ui->cmd[2] = plen;
+	if (plen > 0)
+		memcpy(&ui->cmd[3], params, plen);
+
+	memset(&req, 0, sizeof(req));
+	req.bmRequestType = UT_WRITE_CLASS_DEVICE;
+	USETW(req.wLength, 3 + plen);
+	err = usbd_do_request(ui->sc->sc_udev, &req, ui->cmd);
+	if (err != USBD_NORMAL_COMPLETION) {
+		aprint_error_dev(ui->sc->sc_dev,
+		    "Intel command %#x: %s\n", opcode, usbd_errstr(err));
+		return EIO;
+	}
+
+	getmicrouptime(&start);
+	for (;;) {
+		left = timeout_ms - ubt_intel_ms_since(&start);
+		if (left <= 0)
+			return ETIMEDOUT;
+		error = ubt_intel_read_event(ui, left, &len);
+		if (error)
+			return error;
+		/* Command Complete: ncmd, opcode, return parameters */
+		if (ui->evt[0] == 0x0e && len >= 5 &&
+		    (ui->evt[3] | (ui->evt[4] << 8)) == opcode) {
+			n = len - 5;
+			if (rsp != NULL) {
+				if (n > *rsplen)
+					n = *rsplen;
+				memcpy(rsp, &ui->evt[5], n);
+				*rsplen = n;
+			}
+			return 0;
+		}
+		/* Command Status: status, ncmd, opcode */
+		if (ui->evt[0] == 0x0f && len >= 6 &&
+		    (ui->evt[4] | (ui->evt[5] << 8)) == opcode &&
+		    ui->evt[2] != 0) {
+			aprint_error_dev(ui->sc->sc_dev,
+			    "Intel command %#x: status %#x\n", opcode,
+			    ui->evt[2]);
+			return EIO;
+		}
+	}
+}
+
+static int
+ubt_intel_wait(struct ubt_intel *ui, int *flag, int timeout_ms)
+{
+	struct timeval start;
+	uint32_t len;
+	int left, error;
+
+	getmicrouptime(&start);
+	while (!*flag) {
+		left = timeout_ms - ubt_intel_ms_since(&start);
+		if (left <= 0)
+			return ETIMEDOUT;
+		error = ubt_intel_read_event(ui, left, &len);
+		if (error)
+			return error;
+	}
+	return 0;
+}
+
+/*
+ * Intel_Secure_Send: fragment type, then up to 252 bytes of the image.
+ */
+static int
+ubt_intel_secure_send(struct ubt_intel *ui, uint8_t type,
+    const uint8_t *data, size_t len)
+{
+	uint8_t params[1 + UBT_INTEL_FRAGMENT], status;
+	size_t n, rl;
+	int error;
+
+	while (len > 0) {
+		n = MIN(len, UBT_INTEL_FRAGMENT);
+		params[0] = type;
+		memcpy(&params[1], data, n);
+		rl = 1;
+		status = 0xff;
+		error = ubt_intel_cmd(ui, UBT_INTEL_CMD_SECURE_SEND, params,
+		    n + 1, &status, &rl, 2000);
+		if (error)
+			return error;
+		if (rl < 1 || status != 0) {
+			aprint_error_dev(ui->sc->sc_dev,
+			    "Intel secure send type %#x: status %#x\n", type,
+			    status);
+			return EIO;
+		}
+		data += n;
+		len -= n;
+	}
+	return 0;
+}
+
+static int
+ubt_intel_read_version(struct ubt_intel *ui, struct ubt_intel_version *ver)
+{
+	uint8_t param = 0xff;	/* understood by old and new bootloaders */
+	size_t rl = sizeof(*ver);
+	int error;
+
+	error = ubt_intel_cmd(ui, UBT_INTEL_CMD_READ_VERSION, &param, 1, ver,
+	    &rl, 2000);
+	if (error)
+		return error;
+	if (rl != sizeof(*ver) || ver->status != 0 || ver->hw_platform != 0x37) {
+		aprint_error_dev(ui->sc->sc_dev,
+		    "unexpected Intel version reply (%zu bytes, status %#x, "
+		    "platform %#x)\n", rl, ver->status, ver->hw_platform);
+		return EIO;
+	}
+	return 0;
+}
+
+static int
+ubt_intel_fwload(struct ubt_softc *sc)
+{
+	struct ubt_intel ui;
+	struct ubt_intel_version ver;
+	struct ubt_intel_boot_params bp;
+	struct timeval start;
+	firmware_handle_t fwh;
+	char name[32];
+	uint8_t *fw = NULL, *ddc, status, reset[8];
+	size_t fwsize = 0, dsz, rl, off, frag;
+	uint32_t boot_param = 0;
+	usbd_status err;
+	int error;
+
+	memset(&ui, 0, sizeof(ui));
+	ui.sc = sc;
+	err = usbd_open_pipe(sc->sc_iface0, sc->sc_evt_addr,
+	    USBD_EXCLUSIVE_USE, &ui.pipe);
+	if (err != USBD_NORMAL_COMPLETION) {
+		aprint_error_dev(sc->sc_dev, "Intel firmware: event pipe: %s\n",
+		    usbd_errstr(err));
+		return EIO;
+	}
+	error = usbd_create_xfer(ui.pipe, UBT_BUFSIZ_EVENT, 0, 0, &ui.xfer);
+	if (error) {
+		usbd_close_pipe(ui.pipe);
+		return error;
+	}
+	ui.evt = usbd_get_buffer(ui.xfer);
+
+	error = ubt_intel_read_version(&ui, &ver);
+	if (error)
+		goto out;
+	aprint_normal_dev(sc->sc_dev,
+	    "Intel hw variant %#x rev %u, %s revision %u.%u build %u week %u %u\n",
+	    ver.hw_variant, ver.hw_revision,
+	    ver.fw_variant == 0x06 ? "bootloader" :
+	    ver.fw_variant == 0x23 ? "firmware" : "unknown image",
+	    ver.fw_revision >> 4, ver.fw_revision & 0x0f, ver.fw_build_num,
+	    ver.fw_build_ww, 2000 + ver.fw_build_yy);
+	if (ver.fw_variant == 0x23) {
+		/* Operational firmware is running (warm restart). */
+		error = 0;
+		goto out;
+	}
+	if (ver.fw_variant != 0x06) {
+		error = ENXIO;
+		goto out;
+	}
+	switch (ver.hw_variant) {
+	case 0x11:	/* JfP */
+	case 0x12:	/* ThP */
+	case 0x13:	/* HrP */
+	case 0x14:	/* CcP */
+		break;
+	default:
+		aprint_error_dev(sc->sc_dev,
+		    "no firmware loader for Intel hw variant %#x\n",
+		    ver.hw_variant);
+		error = ENXIO;
+		goto out;
+	}
+
+	rl = sizeof(bp);
+	error = ubt_intel_cmd(&ui, UBT_INTEL_CMD_READ_BOOT_PARAMS, NULL, 0, &bp,
+	    &rl, 2000);
+	if (error == 0 && (rl != sizeof(bp) || bp.status != 0))
+		error = EIO;
+	if (error) {
+		aprint_error_dev(sc->sc_dev, "Intel boot parameters: %d\n",
+		    error);
+		goto out;
+	}
+	if (bp.limited_cce != 0) {
+		aprint_error_dev(sc->sc_dev,
+		    "Intel bootloader does not acknowledge fragments (%u)\n",
+		    bp.limited_cce);
+		error = ENXIO;
+		goto out;
+	}
+	aprint_normal_dev(sc->sc_dev,
+	    "Intel device revision %u, secure boot %s, otp bdaddr %s\n",
+	    bp.dev_revid[0] | (bp.dev_revid[1] << 8),
+	    bp.secure_boot ? "on" : "off",
+	    (bp.otp_bdaddr[0] | bp.otp_bdaddr[1] | bp.otp_bdaddr[2] |
+	     bp.otp_bdaddr[3] | bp.otp_bdaddr[4] | bp.otp_bdaddr[5]) ?
+	    "set" : "none");
+
+	snprintf(name, sizeof(name), "ibt-%u-%u-%u.sfi", ver.hw_variant,
+	    ver.hw_revision, ver.fw_revision);
+	error = firmware_open("ubt", name, &fwh);
+	if (error) {
+		aprint_error_dev(sc->sc_dev,
+		    "firmware %s not found (%d); install it in "
+		    "/libdata/firmware/ubt\n", name, error);
+		goto out;
+	}
+	fwsize = firmware_get_size(fwh);
+	if (fwsize < UBT_INTEL_RSA_HEADER_LEN + 4 || fwsize > UBT_INTEL_MAX_FW) {
+		aprint_error_dev(sc->sc_dev, "firmware %s: bad size %zu\n",
+		    name, fwsize);
+		firmware_close(fwh);
+		error = EINVAL;
+		fwsize = 0;
+		goto out;
+	}
+	fw = firmware_malloc(fwsize);
+	error = firmware_read(fwh, 0, fw, fwsize);
+	firmware_close(fwh);
+	if (error) {
+		aprint_error_dev(sc->sc_dev, "firmware %s: read error %d\n",
+		    name, error);
+		goto out;
+	}
+
+	/*
+	 * Walk the command stream behind the signature block once: every
+	 * command must lie inside the file, and Intel_Write_Boot_Params in
+	 * it carries the address the firmware is booted from.
+	 */
+	off = UBT_INTEL_RSA_HEADER_LEN;
+	while (off < fwsize) {
+		uint16_t op;
+		uint8_t plen;
+
+		if (off + 3 > fwsize)
+			goto badfw;
+		op = fw[off] | (fw[off + 1] << 8);
+		plen = fw[off + 2];
+		if (off + 3 + plen > fwsize)
+			goto badfw;
+		if (op == UBT_INTEL_CMD_WRITE_BOOT_PARAMS && plen >= 7) {
+			boot_param = fw[off + 3] | (fw[off + 4] << 8) |
+			    (fw[off + 5] << 16) | ((uint32_t)fw[off + 6] << 24);
+			aprint_normal_dev(sc->sc_dev,
+			    "firmware %s: build %u week %u %u, boot address %#x\n",
+			    name, fw[off + 7], fw[off + 8], 2000 + fw[off + 9],
+			    boot_param);
+		}
+		off += 3 + plen;
+	}
+
+	getmicrouptime(&start);
+
+	/* CSS header, public key and signature open the download. */
+	if ((error = ubt_intel_secure_send(&ui, 0x00, fw, 128)) != 0 ||
+	    (error = ubt_intel_secure_send(&ui, 0x03, fw + 128, 256)) != 0 ||
+	    (error = ubt_intel_secure_send(&ui, 0x02, fw + 388, 256)) != 0) {
+		aprint_error_dev(sc->sc_dev, "firmware header rejected (%d)\n",
+		    error);
+		goto reset;
+	}
+
+	/*
+	 * Then the commands, in groups whose length is a multiple of four
+	 * as the file lays them out (Intel_NOPs pad them).
+	 */
+	off = UBT_INTEL_RSA_HEADER_LEN;
+	frag = 0;
+	while (off + frag < fwsize) {
+		frag += 3 + fw[off + frag + 2];
+		if ((frag % 4) == 0) {
+			error = ubt_intel_secure_send(&ui, 0x01, fw + off, frag);
+			if (error) {
+				aprint_error_dev(sc->sc_dev,
+				    "firmware data rejected at %zu (%d)\n", off,
+				    error);
+				goto reset;
+			}
+			off += frag;
+			frag = 0;
+		}
+	}
+	if (frag != 0) {
+		aprint_error_dev(sc->sc_dev,
+		    "firmware %s: %zu unaligned trailing bytes\n", name, frag);
+		error = EINVAL;
+		goto reset;
+	}
+
+	error = ubt_intel_wait(&ui, &ui.ssr_seen, 5000);
+	if (error == 0 && ui.ssr_result != 0) {
+		aprint_error_dev(sc->sc_dev, "firmware download failed (%#x)\n",
+		    ui.ssr_result);
+		error = EIO;
+	} else if (error)
+		aprint_error_dev(sc->sc_dev,
+		    "no firmware download result (%d)\n", error);
+	if (error)
+		goto reset;
+	aprint_normal_dev(sc->sc_dev, "firmware loaded in %d ms\n",
+	    ubt_intel_ms_since(&start));
+
+	/*
+	 * Intel_Reset: soft reset, patches enabled, no DDC reload, boot from
+	 * the address found above.  The bootloader may or may not answer; the
+	 * firmware announces itself with the boot-up vendor event.
+	 */
+	getmicrouptime(&start);
+	reset[0] = 0x00;
+	reset[1] = 0x01;
+	reset[2] = 0x00;
+	reset[3] = 0x01;
+	reset[4] = boot_param & 0xff;
+	reset[5] = (boot_param >> 8) & 0xff;
+	reset[6] = (boot_param >> 16) & 0xff;
+	reset[7] = (boot_param >> 24) & 0xff;
+	rl = 1;
+	error = ubt_intel_cmd(&ui, UBT_INTEL_CMD_RESET, reset, sizeof(reset),
+	    &status, &rl, 2000);
+	if (error != 0 && error != ETIMEDOUT) {
+		aprint_error_dev(sc->sc_dev, "Intel reset: %d\n", error);
+		goto out;
+	}
+	error = ubt_intel_wait(&ui, &ui.boot_seen, 3000);
+	if (error) {
+		aprint_error_dev(sc->sc_dev, "firmware did not boot (%d)\n",
+		    error);
+		goto reset;
+	}
+	aprint_normal_dev(sc->sc_dev, "firmware booted in %d ms\n",
+	    ubt_intel_ms_since(&start));
+
+	/* Device configuration parameters; the firmware runs without them. */
+	snprintf(name, sizeof(name), "ibt-%u-%u-%u.ddc", ver.hw_variant,
+	    ver.hw_revision, ver.fw_revision);
+	if (firmware_open("ubt", name, &fwh) == 0) {
+		dsz = firmware_get_size(fwh);
+		if (dsz > 0 && dsz <= UBT_INTEL_MAX_DDC) {
+			ddc = firmware_malloc(dsz);
+			if (firmware_read(fwh, 0, ddc, dsz) == 0) {
+				for (off = 0; off < dsz; off += 1 + ddc[off]) {
+					if (off + 1 + ddc[off] > dsz)
+						break;
+					rl = 1;
+					if (ubt_intel_cmd(&ui,
+					    UBT_INTEL_CMD_WRITE_DDC, &ddc[off],
+					    1 + ddc[off], &status, &rl,
+					    2000) != 0) {
+						aprint_error_dev(sc->sc_dev,
+						    "DDC entry at %zu rejected\n",
+						    off);
+						break;
+					}
+				}
+			}
+			firmware_free(ddc, dsz);
+		}
+		firmware_close(fwh);
+	} else
+		aprint_normal_dev(sc->sc_dev, "no %s, running without DDC\n",
+		    name);
+
+	if (ubt_intel_read_version(&ui, &ver) == 0)
+		aprint_normal_dev(sc->sc_dev,
+		    "Intel firmware revision %u.%u build %u week %u %u\n",
+		    ver.fw_revision >> 4, ver.fw_revision & 0x0f,
+		    ver.fw_build_num, ver.fw_build_ww, 2000 + ver.fw_build_yy);
+
+	/* Intel vendor events useful in operation; harmless if refused. */
+	{
+		static const uint8_t mask[8] =
+		    { 0x87, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+		rl = 1;
+		(void)ubt_intel_cmd(&ui, UBT_INTEL_CMD_EVENT_MASK, mask,
+		    sizeof(mask), &status, &rl, 2000);
+	}
+	error = 0;
+	goto out;
+
+badfw:
+	aprint_error_dev(sc->sc_dev,
+	    "firmware %s: malformed command stream at %zu\n", name, off);
+	error = EINVAL;
+	goto out;
+
+reset:
+	/*
+	 * Linux's recovery: a hard reset makes the controller re-enumerate
+	 * with a clean bootloader; this device goes away and comes back.
+	 */
+	reset[0] = 0x01;
+	reset[1] = 0x01;
+	reset[2] = 0x01;
+	reset[3] = 0x00;
+	reset[4] = reset[5] = reset[6] = reset[7] = 0;
+	rl = 1;
+	(void)ubt_intel_cmd(&ui, UBT_INTEL_CMD_RESET, reset, sizeof(reset),
+	    &status, &rl, 1000);
+
+out:
+	if (fw != NULL)
+		firmware_free(fw, fwsize);
+	usbd_destroy_xfer(ui.xfer);
+	usbd_close_pipe(ui.pipe);
+	return error;
+}
+
 static int
 ubt_enable(device_t self)
 {
@@ -991,6 +1561,22 @@ ubt_enable(device_t self)
 
 	if (sc->sc_enabled)
 		return 0;
+
+	/*
+	 * LISPBSD: an Intel controller still in its bootloader gets the
+	 * firmware now, before the pipes and the HCI Reset that follows.
+	 * Sleeping here is fine: bt_lock is an adaptive mutex.
+	 */
+	if (sc->sc_intel && !sc->sc_intel_fwdone) {
+		error = ubt_intel_fwload(sc);
+		if (error == 0)
+			sc->sc_intel_fwdone = 1;
+		else
+			aprint_error_dev(sc->sc_dev,
+			    "Intel firmware setup failed (%d)\n", error);
+		if (sc->sc_dying)
+			return EIO;
+	}
 
 	s = splusb();
 
