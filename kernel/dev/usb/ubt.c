@@ -1331,7 +1331,7 @@ ubt_intel_read_version(struct ubt_intel *ui, struct ubt_intel_version *ver,
 }
 
 static int
-ubt_intel_fwload(struct ubt_softc *sc)
+ubt_intel_fwload(struct ubt_softc *sc, int *booted)
 {
 	struct ubt_intel *ui;
 	struct ubt_intel_version ver;
@@ -1557,6 +1557,7 @@ ubt_intel_fwload(struct ubt_softc *sc)
 	}
 	aprint_normal_dev(sc->sc_dev, "firmware booted in %d ms\n",
 	    ubt_intel_ms_since(&start));
+	*booted = 1;
 
 	/* Device configuration parameters; the firmware runs without them. */
 	snprintf(name, sizeof(name), "ibt-%u-%u-%u.ddc", ver.hw_variant,
@@ -1636,19 +1637,88 @@ out:
 	return error;
 }
 
+/*
+ * LISPBSD: reset the device's endpoint data toggles.  The pipes opened
+ * afterwards start at DATA0 on the host (xhci configures the endpoint
+ * afresh), the device's toggles only on a halt clear; after a down/up, or
+ * once the Intel firmware has rebooted the chip, they are out of step and
+ * the first event is silently dropped, so the HCI Reset never answers.
+ */
+static void
+ubt_clear_halts(struct ubt_softc *sc)
+{
+
+	(void)usbd_clear_endpoint_feature(sc->sc_udev, sc->sc_evt_addr,
+	    UF_ENDPOINT_HALT);
+	(void)usbd_clear_endpoint_feature(sc->sc_udev, sc->sc_aclrd_addr,
+	    UF_ENDPOINT_HALT);
+	(void)usbd_clear_endpoint_feature(sc->sc_udev, sc->sc_aclwr_addr,
+	    UF_ENDPOINT_HALT);
+}
+
+static int ubt_open_pipes(struct ubt_softc *);
+
 static int
 ubt_enable(device_t self)
 {
 	struct ubt_softc *sc = device_private(self);
-	usbd_status err;
-	int s, i, error;
+	int s, error, booted;
 
 	DPRINTFN(1, "sc=%p\n", sc);
 
 	if (sc->sc_enabled)
 		return 0;
 
+	ubt_clear_halts(sc);
 	s = splusb();
+	error = ubt_open_pipes(sc);
+	if (error) {
+		ubt_abortdealloc(sc);
+		splx(s);
+		return error;
+	}
+	sc->sc_enabled = 1;
+	splx(s);
+
+	/*
+	 * LISPBSD: an Intel controller still in its bootloader gets the
+	 * firmware now, on the pipes just opened, before the HCI Reset
+	 * that follows.  Sleeping here is fine: bt_lock is adaptive.  Once
+	 * the chip has rebooted into the firmware, its endpoints start
+	 * over, so the pipes are set up again from scratch.
+	 */
+	if (sc->sc_intel && !sc->sc_intel_fwdone) {
+		booted = 0;
+		error = ubt_intel_fwload(sc, &booted);
+		if (error == 0)
+			sc->sc_intel_fwdone = 1;
+		else
+			aprint_error_dev(sc->sc_dev,
+			    "Intel firmware setup failed (%d)\n", error);
+		if (booted) {
+			s = splusb();
+			ubt_abortdealloc(sc);
+			splx(s);
+			ubt_clear_halts(sc);
+			s = splusb();
+			error = ubt_open_pipes(sc);
+			if (error) {
+				ubt_abortdealloc(sc);
+				sc->sc_enabled = 0;
+				splx(s);
+				return error;
+			}
+			splx(s);
+		}
+	}
+	return 0;
+}
+
+static int
+ubt_open_pipes(struct ubt_softc *sc)
+{
+	usbd_status err;
+	int i, error;
 
 	/* Events */
 	sc->sc_evt_buf = kmem_alloc(UBT_BUFSIZ_EVENT, KM_SLEEP);
@@ -1754,27 +1824,9 @@ ubt_enable(device_t self)
 		sc->sc_scowr_busy = 0;
 	}
 
-	sc->sc_enabled = 1;
-	splx(s);
-
-	/*
-	 * LISPBSD: an Intel controller still in its bootloader gets the
-	 * firmware now, on the pipes just opened, before the HCI Reset
-	 * that follows.  Sleeping here is fine: bt_lock is adaptive.
-	 */
-	if (sc->sc_intel && !sc->sc_intel_fwdone) {
-		error = ubt_intel_fwload(sc);
-		if (error == 0)
-			sc->sc_intel_fwdone = 1;
-		else
-			aprint_error_dev(sc->sc_dev,
-			    "Intel firmware setup failed (%d)\n", error);
-	}
 	return 0;
 
 bad:
-	ubt_abortdealloc(sc);
-	splx(s);
 	return error;
 }
 
