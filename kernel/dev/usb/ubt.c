@@ -177,6 +177,8 @@ struct ubt_isoc_xfer {
 	int			 busy;
 };
 
+struct ubt_intel;
+
 struct ubt_softc {
 	device_t		 sc_dev;
 	struct usbd_device	*sc_udev;
@@ -245,7 +247,11 @@ struct ubt_softc {
 	/* LISPBSD: Intel controllers need their firmware loaded (ubt_intel_fwload) */
 	int			 sc_intel;
 	int			 sc_intel_fwdone;
+	int			 sc_intel_loading;	/* events go to the loader */
+	struct ubt_intel	*sc_intel_ui;
 };
+
+static void ubt_intel_enqueue(struct ubt_intel *, const uint8_t *, uint32_t);
 
 /*******************************************************************************
  *
@@ -1069,9 +1075,12 @@ struct ubt_intel_ev {
 };
 
 /*
- * While the bootloader runs, events may arrive on the interrupt endpoint
- * or on the bulk-in endpoint (the answers to bulk-sent commands do), so
- * both are kept listening, as btusb does, and feed one queue.
+ * The loader uses the pipes ubt_enable opened: while sc_intel_loading is
+ * set, ubt_recv_event and ubt_recv_acl_complete hand their packets here
+ * instead of to netbt, since the bootloader answers commands sent down
+ * the bulk endpoint on the bulk-in endpoint.  Nothing is closed and
+ * reopened around the download, as in btusb; the endpoints keep their
+ * state into the HCI init that follows.
  */
 struct ubt_intel {
 	struct ubt_softc	*sc;
@@ -1080,13 +1089,7 @@ struct ubt_intel {
 	struct ubt_intel_ev	 evq[UBT_INTEL_NEVQ];
 	unsigned		 evq_head;	/* next to read */
 	unsigned		 evq_count;
-	struct usbd_pipe	*ipipe;		/* interrupt in, events */
-	uint8_t			*ibuf;
-	struct usbd_pipe	*rpipe;		/* bulk in, events too */
-	struct usbd_xfer	*rxfer;
-	uint8_t			*rbuf;
-	struct usbd_pipe	*wpipe;		/* bulk out: secure send */
-	struct usbd_xfer	*wxfer;
+	struct usbd_xfer	*wxfer;		/* on the bulk-out pipe */
 	uint8_t			*cmd;		/* 3 + 255, the bulk xfer's buffer */
 	uint8_t			 evt[UBT_BUFSIZ_EVENT];	/* last event read */
 	int			 ssr_seen;	/* vendor 0x06: download result */
@@ -1099,7 +1102,7 @@ ubt_intel_enqueue(struct ubt_intel *ui, const uint8_t *buf, uint32_t len)
 {
 	struct ubt_intel_ev *ev;
 
-	if (len < 2 || len > UBT_BUFSIZ_EVENT)
+	if (ui == NULL || len < 2 || len > UBT_BUFSIZ_EVENT)
 		return;
 	mutex_enter(&ui->lock);
 	if (ui->evq_count < UBT_INTEL_NEVQ) {
@@ -1110,50 +1113,6 @@ ubt_intel_enqueue(struct ubt_intel *ui, const uint8_t *buf, uint32_t len)
 		cv_broadcast(&ui->cv);
 	}
 	mutex_exit(&ui->lock);
-}
-
-static void
-ubt_intel_intr_cb(struct usbd_xfer *xfer, void *priv, usbd_status status)
-{
-	struct ubt_intel *ui = priv;
-	uint32_t len;
-	void *buf;
-
-	if (status != USBD_NORMAL_COMPLETION)
-		return;
-	usbd_get_xfer_status(xfer, NULL, &buf, &len, NULL);
-	ubt_intel_enqueue(ui, buf, len);
-}
-
-static void ubt_intel_bulk_cb(struct usbd_xfer *, void *, usbd_status);
-
-static void
-ubt_intel_bulk_start(struct ubt_intel *ui)
-{
-
-	usbd_setup_xfer(ui->rxfer, ui, ui->rbuf, UBT_BUFSIZ_ACL,
-	    USBD_SHORT_XFER_OK, USBD_NO_TIMEOUT, ubt_intel_bulk_cb);
-	(void)usbd_transfer(ui->rxfer);
-}
-
-static void
-ubt_intel_bulk_cb(struct usbd_xfer *xfer, void *priv, usbd_status status)
-{
-	struct ubt_intel *ui = priv;
-	uint32_t len;
-	void *buf;
-
-	if (status == USBD_CANCELLED || ui->sc->sc_dying)
-		return;
-	if (status != USBD_NORMAL_COMPLETION) {
-		if (status == USBD_STALLED)
-			usbd_clear_endpoint_stall_async(ui->rpipe);
-		ubt_intel_bulk_start(ui);
-		return;
-	}
-	usbd_get_xfer_status(xfer, NULL, &buf, &len, NULL);
-	ubt_intel_enqueue(ui, buf, len);
-	ubt_intel_bulk_start(ui);
 }
 
 /*
@@ -1245,8 +1204,8 @@ ubt_intel_cmd(struct ubt_intel *ui, uint16_t opcode, const void *params,
 
 	if (opcode == UBT_INTEL_CMD_SECURE_SEND) {
 		len = 3 + plen;
-		err = usbd_bulk_transfer(ui->wxfer, ui->wpipe, 0, 2000,
-		    ui->cmd, &len);
+		err = usbd_bulk_transfer(ui->wxfer, ui->sc->sc_aclwr_pipe, 0,
+		    2000, ui->cmd, &len);
 	} else {
 		memset(&req, 0, sizeof(req));
 		req.bmRequestType = UT_WRITE_CLASS_DEVICE;
@@ -1345,15 +1304,21 @@ ubt_intel_secure_send(struct ubt_intel *ui, uint8_t type,
 	return 0;
 }
 
+/*
+ * Intel_Read_Version.  With the 0xff parameter every bootloader answers
+ * in the legacy layout; operational firmware answers that form with TLVs
+ * (platform byte not 0x37), so the plain form is used once it runs.
+ */
 static int
-ubt_intel_read_version(struct ubt_intel *ui, struct ubt_intel_version *ver)
+ubt_intel_read_version(struct ubt_intel *ui, struct ubt_intel_version *ver,
+    int with_param)
 {
-	uint8_t param = 0xff;	/* understood by old and new bootloaders */
+	uint8_t param = 0xff;
 	size_t rl = sizeof(*ver);
 	int error;
 
-	error = ubt_intel_cmd(ui, UBT_INTEL_CMD_READ_VERSION, &param, 1, ver,
-	    &rl, 2000);
+	error = ubt_intel_cmd(ui, UBT_INTEL_CMD_READ_VERSION, &param,
+	    with_param ? 1 : 0, ver, &rl, 2000);
 	if (error)
 		return error;
 	if (rl != sizeof(*ver) || ver->status != 0 || ver->hw_platform != 0x37) {
@@ -1377,58 +1342,33 @@ ubt_intel_fwload(struct ubt_softc *sc)
 	uint8_t *fw = NULL, *ddc, status, reset[8];
 	size_t fwsize = 0, dsz, rl, off, frag;
 	uint32_t boot_param = 0;
-	usbd_status err;
 	int error;
 
 	ui = kmem_zalloc(sizeof(*ui), KM_SLEEP);
 	ui->sc = sc;
 	mutex_init(&ui->lock, MUTEX_DEFAULT, IPL_USB);
 	cv_init(&ui->cv, "ubtintel");
-
-	/* Bulk out, the command buffer. */
-	err = usbd_open_pipe(sc->sc_iface0, sc->sc_aclwr_addr,
-	    USBD_EXCLUSIVE_USE, &ui->wpipe);
-	if (err != USBD_NORMAL_COMPLETION) {
-		aprint_error_dev(sc->sc_dev, "Intel firmware: bulk out: %s\n",
-		    usbd_errstr(err));
-		error = EIO;
-		goto fail1;
+	error = usbd_create_xfer(sc->sc_aclwr_pipe, 3 + 255, 0, 0, &ui->wxfer);
+	if (error) {
+		cv_destroy(&ui->cv);
+		mutex_destroy(&ui->lock);
+		kmem_free(ui, sizeof(*ui));
+		return error;
 	}
-	error = usbd_create_xfer(ui->wpipe, 3 + 255, 0, 0, &ui->wxfer);
-	if (error)
-		goto fail2;
 	ui->cmd = usbd_get_buffer(ui->wxfer);
+	sc->sc_intel_ui = ui;
+	sc->sc_intel_loading = 1;
 
-	/* Bulk in, listening. */
-	err = usbd_open_pipe(sc->sc_iface0, sc->sc_aclrd_addr,
-	    USBD_EXCLUSIVE_USE, &ui->rpipe);
-	if (err != USBD_NORMAL_COMPLETION) {
-		aprint_error_dev(sc->sc_dev, "Intel firmware: bulk in: %s\n",
-		    usbd_errstr(err));
-		error = EIO;
-		goto fail3;
-	}
-	error = usbd_create_xfer(ui->rpipe, UBT_BUFSIZ_ACL, 0, 0, &ui->rxfer);
-	if (error)
-		goto fail4;
-	ui->rbuf = usbd_get_buffer(ui->rxfer);
-	ubt_intel_bulk_start(ui);
-
-	/* Interrupt in, listening. */
-	ui->ibuf = kmem_alloc(UBT_BUFSIZ_EVENT, KM_SLEEP);
-	err = usbd_open_pipe_intr(sc->sc_iface0, sc->sc_evt_addr,
-	    USBD_SHORT_XFER_OK, &ui->ipipe, ui, ui->ibuf, UBT_BUFSIZ_EVENT,
-	    ubt_intel_intr_cb, USBD_DEFAULT_INTERVAL);
-	if (err != USBD_NORMAL_COMPLETION) {
-		aprint_error_dev(sc->sc_dev, "Intel firmware: event pipe: %s\n",
-		    usbd_errstr(err));
-		error = EIO;
-		goto fail5;
-	}
-
-	error = ubt_intel_read_version(ui, &ver);
-	if (error)
+	error = ubt_intel_read_version(ui, &ver, 1);
+	if (error) {
+		if (ver.status == 0 && ver.hw_platform != 0x37) {
+			/* A TLV answer: operational firmware is running. */
+			aprint_normal_dev(sc->sc_dev,
+			    "Intel firmware already running\n");
+			error = 0;
+		}
 		goto out;
+	}
 	aprint_normal_dev(sc->sc_dev,
 	    "Intel hw variant %#x rev %u, %s revision %u.%u build %u week %u %u\n",
 	    ver.hw_variant, ver.hw_revision,
@@ -1648,7 +1588,7 @@ ubt_intel_fwload(struct ubt_softc *sc)
 		aprint_normal_dev(sc->sc_dev, "no %s, running without DDC\n",
 		    name);
 
-	if (ubt_intel_read_version(ui, &ver) == 0)
+	if (ubt_intel_read_version(ui, &ver, 0) == 0)
 		aprint_normal_dev(sc->sc_dev,
 		    "Intel firmware revision %u.%u build %u week %u %u\n",
 		    ver.fw_revision >> 4, ver.fw_revision & 0x0f,
@@ -1687,19 +1627,9 @@ reset:
 out:
 	if (fw != NULL)
 		firmware_free(fw, fwsize);
-	usbd_abort_pipe(ui->ipipe);
-	usbd_close_pipe(ui->ipipe);
-fail5:
-	kmem_free(ui->ibuf, UBT_BUFSIZ_EVENT);
-	usbd_abort_pipe(ui->rpipe);
-	usbd_destroy_xfer(ui->rxfer);
-fail4:
-	usbd_close_pipe(ui->rpipe);
-fail3:
+	sc->sc_intel_loading = 0;
+	sc->sc_intel_ui = NULL;
 	usbd_destroy_xfer(ui->wxfer);
-fail2:
-	usbd_close_pipe(ui->wpipe);
-fail1:
 	cv_destroy(&ui->cv);
 	mutex_destroy(&ui->lock);
 	kmem_free(ui, sizeof(*ui));
@@ -1717,22 +1647,6 @@ ubt_enable(device_t self)
 
 	if (sc->sc_enabled)
 		return 0;
-
-	/*
-	 * LISPBSD: an Intel controller still in its bootloader gets the
-	 * firmware now, before the pipes and the HCI Reset that follows.
-	 * Sleeping here is fine: bt_lock is an adaptive mutex.
-	 */
-	if (sc->sc_intel && !sc->sc_intel_fwdone) {
-		error = ubt_intel_fwload(sc);
-		if (error == 0)
-			sc->sc_intel_fwdone = 1;
-		else
-			aprint_error_dev(sc->sc_dev,
-			    "Intel firmware setup failed (%d)\n", error);
-		if (sc->sc_dying)
-			return EIO;
-	}
 
 	s = splusb();
 
@@ -1842,6 +1756,20 @@ ubt_enable(device_t self)
 
 	sc->sc_enabled = 1;
 	splx(s);
+
+	/*
+	 * LISPBSD: an Intel controller still in its bootloader gets the
+	 * firmware now, on the pipes just opened, before the HCI Reset
+	 * that follows.  Sleeping here is fine: bt_lock is adaptive.
+	 */
+	if (sc->sc_intel && !sc->sc_intel_fwdone) {
+		error = ubt_intel_fwload(sc);
+		if (error == 0)
+			sc->sc_intel_fwdone = 1;
+		else
+			aprint_error_dev(sc->sc_dev,
+			    "Intel firmware setup failed (%d)\n", error);
+	}
 	return 0;
 
 bad:
@@ -2292,6 +2220,11 @@ ubt_recv_event(struct usbd_xfer *xfer, void * h, usbd_status status)
 
 	usbd_get_xfer_status(xfer, NULL, &buf, &count, NULL);
 
+	if (sc->sc_intel_loading) {
+		ubt_intel_enqueue(sc->sc_intel_ui, buf, count);
+		return;
+	}
+
 	if (count < sizeof(hci_event_hdr_t) - 1) {
 		DPRINTF("dumped undersized event (count = %d)\n", count);
 		sc->sc_stats.err_rx++;
@@ -2383,7 +2316,10 @@ ubt_recv_acl_complete(struct usbd_xfer *xfer,
 	} else {
 		usbd_get_xfer_status(xfer, NULL, &buf, &count, NULL);
 
-		if (count < sizeof(hci_acldata_hdr_t) - 1) {
+		if (sc->sc_intel_loading) {
+			/* The bootloader answers on this endpoint too. */
+			ubt_intel_enqueue(sc->sc_intel_ui, buf, count);
+		} else if (count < sizeof(hci_acldata_hdr_t) - 1) {
 			DPRINTF("dumped undersized packet (%d)\n", count);
 			sc->sc_stats.err_rx++;
 		} else {
