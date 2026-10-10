@@ -209,10 +209,9 @@ struct virtual_engine {
 	struct ve_node {
 		struct rb_node rb;
 		int prio;
-		uint64_t order;
+		uint64_t order;	/* LISPBSD: the sibling's insertion counter */
 		bool inserted;
 	} nodes[I915_NUM_ENGINES];
-	uint64_t order;
 
 	/*
 	 * Keep track of bonded pairs -- restrictions upon on our selection
@@ -238,9 +237,19 @@ compare_ve_nodes(void *cookie, const void *va, const void *vb)
 	const struct ve_node *na = va;
 	const struct ve_node *nb = vb;
 
-	if (na->prio < nb->prio)
-		return -1;
+	/*
+	 * LISPBSD: as in Linux, the highest priority is the leftmost node
+	 * (rb_first), equal priorities in insertion order.  The order comes
+	 * from the sibling engine's counter, so nodes of different virtual
+	 * engines never compare equal: with a per-virtual-engine counter two
+	 * engines at the same priority produced equal keys, the second
+	 * rb_tree_insert_node returned the first engine's node, the second
+	 * was flagged inserted without being in the tree, and its later
+	 * erase wrote through a NULL parent (panics of 10-05 and 10-10).
+	 */
 	if (na->prio > nb->prio)
+		return -1;
+	if (na->prio < nb->prio)
 		return +1;
 	if (na->order < nb->order)
 		return -1;
@@ -255,9 +264,9 @@ compare_ve_node_key(void *cookie, const void *vn, const void *vk)
 	const struct ve_node *n = vn;
 	const int *k = vk;
 
-	if (n->prio < *k)
-		return -1;
 	if (n->prio > *k)
+		return -1;
+	if (n->prio < *k)
 		return +1;
 	return 0;
 }
@@ -4913,17 +4922,23 @@ static void virtual_submission_tasklet(unsigned long data)
 #ifdef __NetBSD__
 		__USE(parent);
 		__USE(rb);
-		struct ve_node *collision __diagused;
-		/* XXX kludge to get insertion order */
-		node->order = ve->order++;
+		struct ve_node *collision;
+		/* Insertion order among equal priorities, per sibling. */
+		node->order = sibling->execlists.virtual_order++;
 		collision = rb_tree_insert_node(
 			&sibling->execlists.virtual.rb_root.rbr_tree,
 			node);
 		KASSERT(collision == node);
+		if (__predict_false(collision != node)) {
+			/* Not in the tree: leave it so, never erase it. */
+			printf("i915: %s: virtual engine node collision\n",
+			    sibling->name);
+			spin_unlock(&sibling->active.lock);
+			continue;
+		}
 		node->inserted = true;
-		first = rb_tree_find_node_geq(
-			&sibling->execlists.virtual.rb_root.rbr_tree,
-			&node->prio) == node;
+		first = RB_TREE_MIN(
+			&sibling->execlists.virtual.rb_root.rbr_tree) == node;
 #else
 		rb = NULL;
 		first = true;

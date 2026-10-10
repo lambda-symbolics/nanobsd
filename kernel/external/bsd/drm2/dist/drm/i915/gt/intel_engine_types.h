@@ -170,6 +170,11 @@ struct intel_engine_execlists {
 	bus_space_handle_t bsh;
 	bus_size_t submit_reg;
 	bus_size_t ctrl_reg;
+	/*
+	 * LISPBSD: insertion counter for the virtual-engine tree, under
+	 * active.lock; keeps the tree's keys unique across virtual engines.
+	 */
+	uint64_t virtual_order;
 #else
 	/**
 	 * @submit_reg: gen-specific execlist submission register
