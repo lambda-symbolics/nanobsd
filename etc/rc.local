@@ -29,8 +29,11 @@ ifconfig iwx0 powersave
 # camera off by default (privacy); use `webcam on` to enable
 /usr/local/bin/webcam off >/dev/null 2>&1
 
-# bluetooth off by default (A2DP is available through bta2dpd(8) + pad(4) when wanted); `bluetooth on` to enable
-/usr/local/bin/bluetooth off >/dev/null 2>&1
+# bluetooth stays attached: the PerL Pro headphones use bta2dpd(8) + pad(4),
+# and a `bluetooth on` re-attach after the boot-time detach left the Intel
+# chip unresponsive (stuck USB transfer, 2026-10-10).  `bluetooth off` by hand
+# if the radio is unwanted for a long battery stretch.
+#/usr/local/bin/bluetooth off >/dev/null 2>&1
 
 # Disable unused USB data controllers; run `usb on` when needed.
 /usr/local/bin/usb off >/dev/null 2>&1
