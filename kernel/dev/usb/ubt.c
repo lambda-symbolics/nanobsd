@@ -1064,7 +1064,9 @@ struct ubt_intel {
 	struct usbd_pipe	*pipe;		/* interrupt endpoint, events */
 	struct usbd_xfer	*xfer;
 	uint8_t			*evt;		/* UBT_BUFSIZ_EVENT */
-	uint8_t			 cmd[3 + 255];
+	struct usbd_pipe	*bpipe;		/* bulk out: secure send goes here */
+	struct usbd_xfer	*bxfer;
+	uint8_t			*cmd;		/* 3 + 255, the bulk xfer's buffer */
 	int			 ssr_seen;	/* vendor 0x06: download result */
 	uint8_t			 ssr_result;
 	int			 boot_seen;	/* vendor 0x02: firmware booted */
@@ -1119,6 +1121,10 @@ ubt_intel_read_event(struct ubt_intel *ui, int timeout_ms, uint32_t *lenp)
  * parameters (status first) are copied to rsp, *rsplen in/out.  A Command
  * Status with an error ends the wait; anything else is dropped (vendor
  * events having been noted by ubt_intel_read_event).
+ *
+ * Two bootloader quirks, as in Linux's btusb: Intel_Secure_Send goes down
+ * the bulk endpoint rather than the control pipe, and Intel_Reset never
+ * answers (timeout_ms 0: send and return).
  */
 static int
 ubt_intel_cmd(struct ubt_intel *ui, uint16_t opcode, const void *params,
@@ -1137,15 +1143,23 @@ ubt_intel_cmd(struct ubt_intel *ui, uint16_t opcode, const void *params,
 	if (plen > 0)
 		memcpy(&ui->cmd[3], params, plen);
 
-	memset(&req, 0, sizeof(req));
-	req.bmRequestType = UT_WRITE_CLASS_DEVICE;
-	USETW(req.wLength, 3 + plen);
-	err = usbd_do_request(ui->sc->sc_udev, &req, ui->cmd);
+	if (opcode == UBT_INTEL_CMD_SECURE_SEND) {
+		len = 3 + plen;
+		err = usbd_bulk_transfer(ui->bxfer, ui->bpipe, 0, 2000,
+		    ui->cmd, &len);
+	} else {
+		memset(&req, 0, sizeof(req));
+		req.bmRequestType = UT_WRITE_CLASS_DEVICE;
+		USETW(req.wLength, 3 + plen);
+		err = usbd_do_request(ui->sc->sc_udev, &req, ui->cmd);
+	}
 	if (err != USBD_NORMAL_COMPLETION) {
 		aprint_error_dev(ui->sc->sc_dev,
 		    "Intel command %#x: %s\n", opcode, usbd_errstr(err));
 		return EIO;
 	}
+	if (timeout_ms == 0)
+		return 0;
 
 	getmicrouptime(&start);
 	for (;;) {
@@ -1281,6 +1295,23 @@ ubt_intel_fwload(struct ubt_softc *sc)
 		return error;
 	}
 	ui.evt = usbd_get_buffer(ui.xfer);
+	err = usbd_open_pipe(sc->sc_iface0, sc->sc_aclwr_addr,
+	    USBD_EXCLUSIVE_USE, &ui.bpipe);
+	if (err != USBD_NORMAL_COMPLETION) {
+		aprint_error_dev(sc->sc_dev, "Intel firmware: bulk pipe: %s\n",
+		    usbd_errstr(err));
+		usbd_destroy_xfer(ui.xfer);
+		usbd_close_pipe(ui.pipe);
+		return EIO;
+	}
+	error = usbd_create_xfer(ui.bpipe, 3 + 255, 0, 0, &ui.bxfer);
+	if (error) {
+		usbd_close_pipe(ui.bpipe);
+		usbd_destroy_xfer(ui.xfer);
+		usbd_close_pipe(ui.pipe);
+		return error;
+	}
+	ui.cmd = usbd_get_buffer(ui.bxfer);
 
 	error = ubt_intel_read_version(&ui, &ver);
 	if (error)
@@ -1447,7 +1478,7 @@ ubt_intel_fwload(struct ubt_softc *sc)
 
 	/*
 	 * Intel_Reset: soft reset, patches enabled, no DDC reload, boot from
-	 * the address found above.  The bootloader may or may not answer; the
+	 * the address found above.  The bootloader does not answer; the
 	 * firmware announces itself with the boot-up vendor event.
 	 */
 	getmicrouptime(&start);
@@ -1459,10 +1490,9 @@ ubt_intel_fwload(struct ubt_softc *sc)
 	reset[5] = (boot_param >> 8) & 0xff;
 	reset[6] = (boot_param >> 16) & 0xff;
 	reset[7] = (boot_param >> 24) & 0xff;
-	rl = 1;
 	error = ubt_intel_cmd(&ui, UBT_INTEL_CMD_RESET, reset, sizeof(reset),
-	    &status, &rl, 2000);
-	if (error != 0 && error != ETIMEDOUT) {
+	    NULL, NULL, 0);
+	if (error) {
 		aprint_error_dev(sc->sc_dev, "Intel reset: %d\n", error);
 		goto out;
 	}
@@ -1538,13 +1568,14 @@ reset:
 	reset[2] = 0x01;
 	reset[3] = 0x00;
 	reset[4] = reset[5] = reset[6] = reset[7] = 0;
-	rl = 1;
 	(void)ubt_intel_cmd(&ui, UBT_INTEL_CMD_RESET, reset, sizeof(reset),
-	    &status, &rl, 1000);
+	    NULL, NULL, 0);
 
 out:
 	if (fw != NULL)
 		firmware_free(fw, fwsize);
+	usbd_destroy_xfer(ui.bxfer);
+	usbd_close_pipe(ui.bpipe);
 	usbd_destroy_xfer(ui.xfer);
 	usbd_close_pipe(ui.pipe);
 	return error;
