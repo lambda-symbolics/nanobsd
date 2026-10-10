@@ -729,5 +729,7 @@ forcing jit-lock to refontify the rest of a large defun or ASDF form."
 
 (setq outline-minor-mode-cycle t)
 
+(luk/cl-apply-highlight-palette)
+
 (provide 'cl-highlight)
 ;;; cl-highlight.el ends here
