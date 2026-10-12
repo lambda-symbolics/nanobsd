@@ -1063,6 +1063,26 @@ hci_cmd_read_local_features(struct hci_unit *unit, struct mbuf *m)
 	DPRINTFN(1, "%s: sco_mask %4.4x\n",
 		device_xname(unit->hci_dev), unit->hci_sco_mask);
 
+	/*
+	 * LISPBSD: Secure Simple Pairing.  When the controller supports it,
+	 * switch it on and unmask its events (the spec's default event mask
+	 * ends at 0x2d), so bthcid can answer the IO capability and user
+	 * confirmation requests; otherwise a remote made since 2007 only
+	 * ever sees legacy PIN pairing, which it refuses.  The mask is the
+	 * one Linux sets on every controller.
+	 */
+	if (rp.features[6] & HCI_LMP_SIMPLE_PAIRING) {
+		static const uint8_t mask[HCI_EVENT_MASK_SIZE] =
+		    { 0xff, 0xff, 0xfb, 0xff, 0x07, 0xf8, 0xbf, 0x3d };
+		hci_set_event_mask_cp em;
+		uint8_t mode = 1;
+
+		memcpy(em.event_mask, mask, sizeof(em.event_mask));
+		hci_send_cmd(unit, HCI_CMD_SET_EVENT_MASK, &em, sizeof(em));
+		hci_send_cmd(unit, HCI_CMD_WRITE_SIMPLE_PAIRING_MODE, &mode,
+		    sizeof(mode));
+	}
+
 	/* extended feature masks */
 	if (rp.features[7] & HCI_LMP_EXTENDED_FEATURES) {
 		hci_read_local_extended_features_cp cp;
