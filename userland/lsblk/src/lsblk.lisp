@@ -250,7 +250,7 @@ through doas in one go (the doas rule on this laptop needs no password)."
       (when (and (disk-unsafe d) (plusp (disk-unsafe d))) (push (format nil "~D unsafe shutdowns" (disk-unsafe d)) bits))
       (when (and (disk-media-errors d) (plusp (disk-media-errors d)))
         (push (paint :bad (format nil "~D media errors" (disk-media-errors d))) bits))
-      (format nil "  ~A ~A" (paint :tree "│") (paint :dim (format nil "~{~A~^  ~}" (reverse bits)))))))
+      (format nil "  ~A" (paint :dim (format nil "~{~A~^  ~}" (reverse bits)))))))
 
 (defun print-disk (d)
   (format t "~A ~A  ~A ~A ~A~%"
@@ -260,7 +260,6 @@ through doas in one go (the doas rule on this laptop needs no password)."
                      ((starts-with "cd" (disk-name d)) "cd") (t "disk")) 5)
           (pad "" 8)
           (paint :model (or (disk-model d) "")))
-  (let ((health (health-line d))) (when health (write-line health)))
   (let ((parts (disk-parts d)))
     (if (null parts)
         (format t "  ~A~%" (paint :tree "└─(no partitions)"))
@@ -276,7 +275,8 @@ through doas in one go (the doas rule on this laptop needs no password)."
                          (pad "part" 5)
                          (pad (paint :fs type) 8)
                          (paint :label label)
-                         (fs-info dev))))))
+                         (fs-info dev)))))
+  (let ((health (health-line d))) (when health (write-line health))))
 
 ;;; Main
 
@@ -297,7 +297,8 @@ through doas in one go (the doas rule on this laptop needs no password)."
         (read-mounts)
         (format t "~A~%" (paint :header (format nil "~A ~A  ~A ~A ~A" (pad "NAME" 10) (pad "SIZE" 12 t)
                                                 (pad "TYPE" 5) (pad "FS" 8) "LABEL / MOUNT")))
-        (dolist (name (or args (disk-names)))
-          (print-disk (read-disk name)))
+        (loop for (name . more) on (or args (disk-names))
+              do (print-disk (read-disk name))
+                 (when more (terpri)))
         (finish-output))
     (sb-int:broken-pipe () (sb-ext:exit :code 0 :abort t))))
