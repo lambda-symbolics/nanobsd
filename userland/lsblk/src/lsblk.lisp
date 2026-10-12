@@ -16,8 +16,9 @@
 (defun sh (program &rest args)
   "Standard output of PROGRAM ARGS as a string, or NIL."
   (handler-case
-      (with-output-to-string (out)
-        (sb-ext:run-program program args :search t :input nil :output out :error nil))
+      (let ((text (with-output-to-string (out)
+                    (sb-ext:run-program program args :search t :input nil :output out :error nil))))
+        (and (plusp (length text)) text))
     (error () nil)))
 
 (defun lines (text)
@@ -96,11 +97,30 @@
 
 (defun last-word (s) (car (last (words s))))
 
+(defun nvme-queries (n)
+  "The three nvmectl outputs for controller N: identify, namespace, SMART.
+nvmectl opens the controller read-write, so an unprivileged run gets them
+through doas in one go (the doas rule on this laptop needs no password)."
+  (let ((id (sh "nvmectl" "identify" n)))
+    (if id
+        (list id (sh "nvmectl" "identify" (format nil "~Ans1" n)) (sh "nvmectl" "logpage" "-p" "2" n))
+        (let* ((script (format nil "nvmectl identify ~A; echo @@; nvmectl identify ~Ans1; echo @@; nvmectl logpage -p 2 ~A" n n n))
+               (text (and (zerop (sb-unix:unix-getuid)) nil))
+               (text (or text (and (not (zerop (sb-unix:unix-getuid))) (sh "doas" "sh" "-c" script)))))
+          (when text
+            (loop with parts = (list "" "" "")
+                  with i = 0
+                  for line in (split text #\Newline)
+                  do (if (string= line "@@") (incf i)
+                         (when (< i 3) (setf (nth i parts) (format nil "~A~A~%" (nth i parts) line))))
+                  finally (return parts)))))))
+
 (defun nvme-facts (d)
   (let* ((n (nvme-of (disk-name d)))
-         (id (lines (sh "nvmectl" "identify" n)))
-         (ns (lines (sh "nvmectl" "identify" (format nil "~Ans1" n))))
-         (smart (lines (sh "nvmectl" "logpage" "-p" "2" n))))
+         (q (nvme-queries n))
+         (id (lines (first q)))
+         (ns (lines (second q)))
+         (smart (lines (third q))))
     (when id
       (setf (disk-model d) (substitute #\Space #\_ (field id "Model Number:" #'identity))
             (disk-serial d) (field id "Serial Number:")
