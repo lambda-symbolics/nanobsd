@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# PROVIDE: bootsplash_done
+# REQUIRE: LOGIN
+
+# LispBSD: rc is done, take the splash down so the console login appears.
+
+$_rc_subr_loaded . /etc/rc.subr
+
+name="bootsplash_done"
+rcvar="bootsplash"
+start_cmd="bootsplash_done_start"
+stop_cmd=":"
+
+bootsplash_done_start()
+{
+	if [ -f /var/run/bootsplash.pid ]; then
+		kill -TERM "$(cat /var/run/bootsplash.pid)" 2>/dev/null
+	fi
+}
+
+load_rc_config $name
+run_rc_command "$1"

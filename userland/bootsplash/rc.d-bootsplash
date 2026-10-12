@@ -1,0 +1,29 @@
+#!/bin/sh
+#
+# PROVIDE: bootsplash
+# REQUIRE: wscons
+# BEFORE:  NETWORKING
+
+# LispBSD: the lambda on the console while rc runs, on a quiet boot
+# (boot -q, which also makes rc silent).  bootsplash_always=YES in rc.conf
+# shows it on every boot.  rc.d/bootsplash_done ends it after LOGIN.
+
+$_rc_subr_loaded . /etc/rc.subr
+
+name="bootsplash"
+rcvar=$name
+command="/usr/local/sbin/bootsplash"
+pidfile="/var/run/bootsplash.pid"
+start_precmd="bootsplash_precmd"
+
+bootsplash_precmd()
+{
+	howto=$(/sbin/sysctl -n kern.boothowto 2>/dev/null || echo 0)
+	if [ $((howto & 0x10000)) -eq 0 ] && ! checkyesno bootsplash_always; then
+		return 1
+	fi
+	return 0
+}
+
+load_rc_config $name
+run_rc_command "$1"
