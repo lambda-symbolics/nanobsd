@@ -479,6 +479,15 @@ enable_ssp(int sock, const char *device)
 		    device);
 	else
 		syslog(LOG_DEBUG, "Simple pairing enabled on %s", device);
+	/*
+	 * Secure Connections host support (P-256 pairing, BT 4.1): peers in
+	 * "secure connections only" mode refuse to authenticate without it.
+	 * Not in hci.h; opcode 0x0c7a.  Refused by older controllers, which
+	 * is harmless.
+	 */
+	if (send_hci_cmd(sock, &sa, 0x0c7a, sizeof(mode), &mode) < 0)
+		syslog(LOG_ERR, "Could not enable secure connections on %s: %m",
+		    device);
 }
 
 /* Send HCI Command Packet to socket */

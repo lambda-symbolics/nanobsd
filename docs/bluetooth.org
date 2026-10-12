@@ -36,3 +36,45 @@ anything USB then blocks in the kernel (D state, wchan xhcicmdq) and a
 reboot with such a process wedges.  =usb on= first; bluetooth/webcam =on=
 do it.  Kernels 144 (control-pipe secure send), 145 (bulk out), 146
 (bulk in listener, own pipes) were the steps.
+
+* Pairing a modern headset: Secure Simple Pairing -- 2026-10-12
+
+With the firmware running (kernel 149/150) the Denon PerL Pro
+(8c:a9:6f:1e:89:66) refused legacy PIN pairing; the pieces that made it
+pair, in the order they were found with the HCI sniffer
+(=userland/hcisniff.c=, =/usr/local/bin/hcisniff ubt0=, root; prints every
+command, event and ACL packet with direction):
+- netbt never enabled SSP nor set an event mask, so the controller hid
+  events 0x31-0x36 and the remote only saw legacy pairing.  Kernel 149:
+  after Read_Local_Features, Set_Event_Mask (Linux's mask) and
+  Write_Simple_Pairing_Mode(1); kernel 150 adds
+  Write_Secure_Connections_Host_Support(1) (0x0c7a, not in hci.h) once
+  page 2 says the controller supports it.
+- bthcid (=userland/bthcid=, built to =/usr/local/sbin/bthcid=, base one
+  untouched) answers IO_Capability_Request with NoInputNoOutput, general
+  bonding, no MITM; auto-accepts User_Confirmation_Request ("just works");
+  rejects passkey requests; logs Simple_Pairing_Complete; and when started
+  with =-d ubt0= sends the SSP, SC and event mask commands itself (the
+  kernel does it at init anyway from 149).  hci.h's
+  HCI_CMD_IO_CAPABILITY_REP is wrong (0x042a is Reject SCO); 0x042b.
+- The remote never initiates authentication; it answers the AVDTP L2CAP
+  connect with "pending / authorization pending" and drops the link two
+  seconds later with "authentication failure" if the host has not
+  authenticated.  So the host must ask: =bta2dpd -m encrypt= sets the
+  L2CAP link mode, hci_acl_setmode sends Authentication_Requested, and
+  the whole SSP exchange follows (Link_Key_Request, negative reply,
+  IO capability, user confirmation, Simple_Pairing_Complete,
+  Link_Key_Notification, Set_Connection_Encryption).
+- Stale state: a timed-out L2CAP connect leaves the remote holding our
+  source CID; the next attempt on the same HCI link gets result 7
+  "source CID already allocated".  =btconfig ubt0 down; up= clears it.
+- The headphones must be in pairing mode for the first bond; after that
+  the link key in =/var/db/bthcid.keys= is enough.
+
+=userland/bt-headphones on|off|status=: usb on, ubt0 up (firmware), the
+local bthcid and sdpd, =bta2dpd -D -n -m encrypt -d ubt0 -a ADDR
+/dev/pad0=, and =audiocfg default= to the pad (audio2) so players reach
+the headphones; off puts the built-in codec back.  First real stream
+2026-10-12 22:3x: an audiobook chapter over SBC, heard on the PerL Pro.
+Not done: microphone (HFP/SCO is phone quality anyway), volume via AVRCP,
+latency tuning (=-M mtu=, =-B bitpool=).

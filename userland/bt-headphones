@@ -1,0 +1,42 @@
+#!/bin/sh
+# bt-headphones on|off|status [bdaddr] - A2DP to Bluetooth headphones via
+# bta2dpd(8) reading pad(4).  on: resumes USB (rc.local suspends the xHCI
+# controllers), brings ubt0 up (the Intel firmware loads on the first up),
+# starts the SSP-capable bthcid from /usr/local/sbin and sdpd, connects the
+# stream daemon with an authenticated and encrypted link, and makes the pad
+# the default audio device so every player ends up in the headphones.
+# First pairing: put the headphones into pairing mode before "on"; the link
+# key then lives in /var/db/bthcid.keys and later connections need nothing.
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/bin:/usr/local/sbin:/usr/pkg/bin; export PATH
+ADDR=${2:-8c:a9:6f:1e:89:66}	# Denon PerL Pro
+DEV=ubt0
+SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="doas"
+pad_index(){ audiocfg list 2>/dev/null | awk '/@ pad0/ { sub(":", "", $1); print $1; exit }'; }
+builtin_index(){ audiocfg list 2>/dev/null | awk '/hdafg0/ { sub(":", "", $1); print $1; exit }'; }
+case "${1:-status}" in
+  on)
+	$SUDO usb on >/dev/null 2>&1
+	$SUDO btconfig $DEV up 2>&1 | grep -v "^$"
+	btconfig $DEV | grep -q UP || { echo "bt-headphones: $DEV did not come up (firmware? dmesg)"; exit 1; }
+	pgrep -x bthcid >/dev/null || $SUDO /usr/local/sbin/bthcid -d $DEV
+	pgrep -x sdpd >/dev/null || $SUDO sdpd
+	sleep 1
+	if ! pgrep -f "bta2dpd.*$ADDR" >/dev/null; then
+		$SUDO bta2dpd -D -n -m encrypt -d $DEV -a "$ADDR" /dev/pad0 || exit 1
+	fi
+	sleep 2
+	P=$(pad_index)
+	[ -n "$P" ] && $SUDO audiocfg default "$P" && echo "bt-headphones: ON, audio${P} (pad) is the default device"
+	;;
+  off)
+	B=$(builtin_index); [ -n "$B" ] && $SUDO audiocfg default "$B"
+	$SUDO pkill -f "bta2dpd.*$ADDR"
+	echo "bt-headphones: OFF, built-in audio is the default device"
+	;;
+  status)
+	btconfig $DEV 2>/dev/null | head -1
+	pgrep -f "bta2dpd.*$ADDR" >/dev/null && echo "stream: connected to $ADDR" || echo "stream: off"
+	audiocfg default 2>/dev/null | head -1
+	;;
+  *) echo "usage: bt-headphones [on|off|status] [bdaddr]" >&2; exit 1 ;;
+esac

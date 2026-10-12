@@ -1124,6 +1124,17 @@ hci_cmd_read_local_extended_features(struct hci_unit *unit, struct mbuf *m)
 	switch (rp.page) {
 	case 2:
 		memcpy(unit->hci_feat2, rp.features, HCI_FEATURES_SIZE);
+		/*
+		 * LISPBSD: Secure Connections (P-256 pairing) host support
+		 * when the controller has it (page 2, byte 1, bit 0); peers
+		 * in "secure connections only" mode refuse to pair without.
+		 * Write_Secure_Connections_Host_Support, 0x0c7a.
+		 */
+		if (rp.features[1] & 0x01) {
+			uint8_t sc = 1;
+
+			hci_send_cmd(unit, 0x0c7a, &sc, sizeof(sc));
+		}
 		break;
 		
 	case 1:
