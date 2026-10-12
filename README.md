@@ -44,7 +44,8 @@ paths.
 - `docs/` — running notes, including `lpsched-design.org` (design, review,
   repairs and measurements), `rpm-s0ix-findings.org`, `vaapi.org`,
   `stuck-keys.org`, `braiins-wifi.org`, `emacs.org`, `video-power.org`,
-  `reboot-wedge.org`, `epp-load.org` and `power-review-2026-10.org`.
+  `reboot-wedge.org`, `epp-load.org`, `power-review-2026-10.org` and
+  `power-audit-2026-10-13.org` (what is left, by layer).
 - `userland/lsblk` — `lsblk`/`lsblock`; `userland/pcsample` — package C-state
   samples after charger/lid events (`/var/log/pcstate.log`).
 

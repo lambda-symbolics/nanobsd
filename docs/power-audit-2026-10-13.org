@@ -1,0 +1,201 @@
+#+TITLE: Power-efficiency audit, 2026-10-13: where the next joules are
+#+DATE: 2026-10-13
+
+Pure reading, no changes on the machine.  The question is efficiency, not
+saving: the same experience for less energy.  The laptop was running the
+Firefox rebuild (6 jobs, charger in) the whole time, so every rate below
+is a count since boot or a 10 s sample under load; the idle census has to
+be repeated on battery with the panel off (commands at the end).
+
+What is already done is in =power-levers.org=, =power-review-2026-10.org=,
+=epp-load.org=, =gpu-freq.org=, =lpsched-design.org=, =rpm-s0ix-findings.org=.
+This file ranks what is left, by layer, with the evidence found today.
+
+* Summary, ranked
+
+| # | layer    | item                                                      | size guess   | effort |
+|---+----------+-----------------------------------------------------------+--------------+--------|
+| 1 | kernel   | network protocol timers fire 5+2 Hz forever, doing nothing | wake-ups     | small  |
+| 2 | kernel   | six 1 Hz timers (syncer, rt, if, ipsec key, nd6, hda jack)  | wake-ups     | small  |
+| 3 | driver   | audio codec never leaves D0; jack polled every second      | 0.1-0.3 W?   | medium |
+| 4 | policy   | USB2 devices stay powered after bt/webcam use              | up to ~0.5 W | small  |
+| 5 | software | postfix pickup (60 s), atrun (10 min), syslog fsync/line   | wake-ups, SSD | small  |
+| 6 | kernel   | NVMe: 8 I/O queues, one per CPU; coalescing off            | energy/GB    | small  |
+| 7 | gefs+    | Lazymax fixed at 300 s; now vfs.gefs.lazymax               | SSD wake-ups | done   |
+| 8 | kernel   | IPSEC/NETATALK/NFSSERVER etc. compiled in (only IPSEC ticks)| 1 wake-up/s  | trivial|
+
+Not levers (checked today): PCI D-states of driverless IPs (idle_d3 exists,
+measured as nothing), ASPM/L1.2/LTR on the NVMe link (all on), FBC
+(superseded by render compression), DC5/DC6 (panel has no PSR), WiFi
+(beacon filter + 100 ms powersave on), the tick (cidle is tickless),
+userland at idle (Mahogany 0.2 wake-ups/s, lpschedd 0.2/s).
+
+* 1. Kernel: the periodic callouts
+
+=crash -N /netbsd.i915.rpm.149 -M /dev/mem= with =show callout= lists what
+is armed.  Besides sleep timeouts, these reschedule themselves forever:
+
+| callout            | period | does at idle                                   |
+|--------------------+--------+------------------------------------------------|
+| pffasttimo         | 200 ms | ip/arp/frag6: =if (drainwanted)=; igmp: flag    |
+| pfslowtimo         | 500 ms | ip_reass_slowtimo, igmp rti walk, ipflow and   |
+|                    |        | ip6flow each enqueue a workqueue item (2 more  |
+|                    |        | thread wake-ups per 500 ms)                     |
+| rt_timer_timer     | 1 s    | route timer queue, empty                        |
+| if_slowtimo_intr   | 1 s    | the interface watchdog (one interface)          |
+| key_timehandler    | 1 s    | IPsec SA/SP expiry, none exist (=options IPSEC=)|
+| nd6_timer          | 1 s    | ND cache walk (=nd6_prune= 1)                   |
+| syncer (kpause hz) | 1 s    | =sched_sync= walks the slot even when empty      |
+| hdafg jack thread  | 1 s    | CORB pin-sense command + RIRB interrupt         |
+| vmem_rehash        | 10 s   |                                                 |
+| sme_events_check   | 30 s   | x7: acpibat, acpiacad, coretemp x4, thinkpad    |
+| acpitz_tick        | 30 s   |                                                 |
+| cache_update_stats | 300 s  |                                                 |
+
+That is about 7 + 4 + 6 = 17 kernel wake-ups per second with nothing to do,
+which caps the idle gap at 200 ms.  =rpm-s0ix-findings.org= U7/U8/U10/U18
+already showed that the gap length sets the package depth (the PC10
+blocker "is callouts"), and the s2idle work went around it with the
+freezer; while awake these timers are the floor.  Each wake-up is cheap on
+its own (microjoules), so the gain is in PC8/PC10 share, not in the
+wake-ups themselves: measure before deciding.
+
+The fixes are the obvious on-demand ones, all small and upstreamable:
+- =pffasttimo=: every hook is "if (x_drainwanted)" or "if (igmp_timers_on)";
+  arm the callout from the places that set those flags, let it stop when
+  nothing is wanted.
+- =pfslowtimo=: ipflow/ip6flow only need the timer while the flow table is
+  non-empty; ip_reass only while a fragment queue exists; igmp only while an
+  IGMPv1 router is being aged.
+- =rt_timer_timer=: schedule for the nearest expiry, or not at all when the
+  queue is empty.
+- =key_timehandler=: =options IPSEC= out of LISPBSD (WireGuard does not use
+  it), or on-demand like the others.
+- =sched_sync=: sleep without timeout when every slot is empty and no mount
+  is dirty; =vfs_vnode= already knows when it adds to the worklist.
+- =nd6_timer=: nearest-expiry scheduling (Linux and FreeBSD do this).
+- hdafg: see 3.
+
+* 2. Interrupts and IPIs
+
+=vmstat -i= since boot (2 h 58, of which ~30 min idle on battery, the rest
+the build): nvme 1.5 M over 8 vectors, hdaudio 270 k (the A2DP session),
+iwx 90 k (8/s average), xhci1 10 k, i915 13 k, TLB shootdown 5.8 M (build),
+"ioapic0 pin 27 unknown" 12.5 k (the LPSS I2C controller behind the
+touchpad, it is only unnamed), ihidev0 2.7 k, cpu0 timer 43/s average
+(tickless idle works: 100/s under load).  =vmstat -e=: "softint ser/0"
+31/s and "cpu0 AST IPI" 16/s are the build's ptys; check both at idle.
+Event counters to delta at idle: xcall IPI per CPU, AST IPI, softint
+ser/clk/bio, "wapbl ... journal write total".
+
+* 3. Audio: codec in D0 for the machine's life
+
+=hdafg.c= powers every widget to D0 at attach and at resume and never sets
+D3; the jack-sense thread polls =GET_PIN_SENSE= every =hz= (that is the
+1 hdaudio interrupt per second with nothing open; =fstat= shows no audio
+descriptors).  Linux's =power_save= puts the codec and the controller in
+D3 after a second of silence and uses unsolicited responses for jack
+detect; =hdafg= already has =fg_unsol= and =HDAUDIO_UNSOLTAG_EVENT_HP=, so
+polling is only needed on codecs without unsol support.  The user asked
+to leave the codec alone until the hiss work (=power-review-2026-10.org=
+4); it stays the one driver lever with a known effect elsewhere.
+
+* 4. USB: three USB2 devices powered
+
+=usbdevs=: fingerprint reader (06cb:00bd, full speed), camera
+(04f2:b6ea, high speed, 500 mA configuration), Intel Bluetooth
+(8087:0026) on xhci1; the USB-C xHCI (xhci0) has nothing attached.  They
+are on because =bt-headphones on= runs =usb on= and nothing turns the
+controllers off again.  =rpm-s0ix-findings.org= U24: "USB2 devices block
+USB2PLL", and =usb off= was part of reaching PC10.  NetBSD's xhci has no
+selective suspend (only the root-hub =UHF_PORT_SUSPEND= path).  Two ways:
+- policy: =bt-headphones off= / =webcam off= run =usb off= when nothing
+  else is open (the D-state hangs came from =usb off= under an open
+  device, so check =fstat= first);
+- kernel: port U3 for idle ugen/uvideo/ubt with resume on open, which
+  keeps the devices usable without the scripts.
+
+* 5. PCI: every function is in D0
+
+=pcictl dump= for all 22 functions: power state D0 everywhere, PME
+disabled; the NVMe root port (0:6:0) and the drive have ASPM L1 entry
+enabled, L1.1/L1.2 and PCI-PM L1.1/L1.2 on, LTR on, L1.2 threshold
+107 ms; the two Thunderbolt root ports show link width x0 (nothing
+behind them) and L1 enabled.  The driverless functions (ISH, HECI,
+GNA, DTT, crash log, SPI, shared SRAM, Thunderbolt DMA 0/1) have no
+driver to put them in D3; the kernel's =hw.acpi.sleep.idle_d3= does it
+through their ACPI power resources and was measured as no change for the
+blanked idle (=power-levers.org= 8: only Thunderbolt DMA 1 actually
+moves).  Nothing to gain here that the review has not already tried.
+
+* 6. NVMe
+
+Five power states: PS0 6.3 W, PS1 2.4 W, PS2 1.9 W, PS3 50 mW (1 ms
+enter/exit), PS4 4 mW (1 ms / 9 ms).  APST is on (kernel 131) and the
+drive sits in PS4 98 % when quiet.  What is left is the active side:
+=nvme_pci_mq= gives one I/O queue per CPU (8 MSI-X vectors, one per
+core), so completions wake whichever core issued the I/O; interrupt
+coalescing (feature 8) is never set.  For energy per GB on battery an A/B
+of =ioq=1= (vmstat -i shows how the vectors are used) is the test; the
+build is the wrong workload for it.
+
+* 7. Software and settings
+
+- postfix runs (master, qmgr, pickup): pickup wakes every 60 s to scan an
+  always-empty maildrop.  Only cron's daily/weekly mail needs a mailer;
+  =postfix=NO= and =MAILTO= to a file removes a daemon and a minute wake-up.
+- cron: =*/10 atrun= with no at jobs ever (=/var/at/jobs= empty): drop.
+  =*/15 pcsample= is the PC-state logger (one 60 s sample of 1 Hz
+  sysctl reads per 15 minutes), keep while the AC question is open.
+  =ntpdate= hourly is fine.
+- syslogd fsyncs after every kernel line (=syslog.conf(5)=); =messages= got
+  106 kernel lines in the 23:00 hour and 62 in the next.  A =-= before
+  =/var/log/messages= on the =kern.*= line keeps the journal flush per line
+  away; the lines themselves come from our drivers (worth a look at what
+  prints at idle).
+- dhcpcd: four privsep processes, 1.5 wake-ups/s between them under the
+  build (RA/NA traffic on the Zyxel network).  Fine unless idle shows the
+  same.
+- inetd runs with an empty =inetd.conf=; dbus and seatd are needed.
+- =vfs.sync= 30/30/15/10 s and =kern.threadpool.idle_ms= 30 s are fine.
+- CPU: =cstcfg=0x74008008=: package limit C10 (unlocked), C1 auto-demotion
+  and undemotion on, package demotion/undemotion on.  Core residency is
+  all C7 (c3=c6=0).  An A/B with C1 auto-demotion off (bit 26) is a
+  reversible MSR write for a later idle session; Linux leaves it as BIOS
+  set, so expect little.
+- The PC-state log on battery (12th 23:31 to 13th 00:31, panel on):
+  PC8 38-58 %, PC3 1-4 %, 1.0-2.0 W package.  No sticky PC3 on battery.
+  The AC half of the question answers itself once the build ends and the
+  machine idles on the charger: the =cron= lines with =ac=TRUE= in
+  =/var/log/pcstate.log=.
+
+* 8. gefs+
+
+The write path already does the lazy thing (queued blocks are written only
+at commits, a clean tree commits nothing).  Two items from GEFSPLUS.org 4:
+- =Lazymax= (how long atime and deferred frees may wait alone) was a
+  compile-time 300 s; it is now =vfs.gefs.lazymax= (seconds, default 300),
+  so the battery policy can set it with =vfs.gefs.interval=.  It bounds
+  what a crash leaks, nothing else.
+- the deadlist-merging cost after truncating old data under a snapshot
+  (~2300 block writes per commit) is still the item that matters for a
+  gefs root on battery; it needs a format-compatible rewrite of
+  =reclaimblocks= and is not polish.
+
+* The idle census, to run on battery with the panel off
+
+#+begin_src sh
+K=/$(sysctl -n machdep.booted_kernel)
+printf 'show callout\n' | crash -N $K -M /dev/mem          # armed timers
+vmstat -i > /tmp/i1; vmstat -e > /tmp/e1; sleep 60
+vmstat -i > /tmp/i2; vmstat -e > /tmp/e2                   # delta = rate
+ps -axo pid,nvcsw,nivcsw,comm > /tmp/p1; sleep 60
+ps -axo pid,nvcsw,nivcsw,comm > /tmp/p2                    # userland wake-ups
+sysctl machdep.cidle.residency machdep.cidle.tlstats       # package share
+#+end_src
+
+Then one change at a time, each with the Wh-delta method of
+=epp-load.org= (battery counter, not package RAPL, which carries an
+offset): timers on demand (1, 2), =usb off= after bt/webcam (4), postfix
+and atrun off (5), syslog =-= (5), NVMe single queue under an I/O workload
+(6).
