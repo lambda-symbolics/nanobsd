@@ -277,3 +277,21 @@ events); it would need a kernel patch.
   and wedges accel. NOT a reset or interrupt problem (both fine).
 - State: native KMS display + battery both work (entry 4 / /netbsd.i915 GENERIC #9).
   Accel remains blocked on TGL execlists context/LRC/PPGTT submission (deep, uncertain).
+
+* Boot screen (2026-10-13)
+
+The first boot.cfg entry boots the kernel with =-q=: the kernel prints
+only errors on the console and /etc/defaults/rc.conf derives
+=rc_silent=YES= from =kern.boothowto= (AB_QUIET, 0x10000), so rc prints
+nothing (=rc_silent_cmd=":"= in rc.conf).  =rc.d/bootsplash= (right after
+wscons in rcorder) starts =/usr/local/sbin/bootsplash=, which switches the
+console screen to dumb-framebuffer mode, paints the lfetch lambda scaled to
+a third of the panel height in the six greens, and waits;
+=rc.d/bootsplash_done= (after LOGIN, last in rcorder) sends it SIGTERM, it
+restores text mode and clears the screen, and the autologin getty takes
+over.  The second menu entry boots without =-q= for the full log; the
+precmd of rc.d/bootsplash only starts it on a quiet boot unless
+=bootsplash_always=YES=.  Sources: =userland/bootsplash= (bootsplash.c,
+logo.h made by mkbitmap.py from lfetch's logo.lisp, fbdump.c to read the
+framebuffer back for a remote check, the two rc.d scripts).  The green
+kernel text is =msg.kernel.fg=green= in wscons; it is simply not shown now.
