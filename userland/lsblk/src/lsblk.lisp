@@ -141,7 +141,9 @@ through doas in one go (the doas rule on this laptop needs no password)."
             (setf (disk-written d) (subseq w (1+ (position #\( w)) (position #\) w)))))))))
 
 (defun dmesg-model (d)
-  (let ((line (find-if (lambda (l) (search (format nil "] ~A: <" (disk-name d)) l)) (lines (sh "dmesg")))))
+  ;; "sd0 at scsibus0 target 0 lun 0: <USB, SanDisk 3.2Gen1, 1.00> disk removable"
+  (let ((line (find-if (lambda (l) (and (search (format nil "] ~A at " (disk-name d)) l) (position #\< l) (position #\> l)))
+                       (reverse (lines (sh "dmesg"))))))
     (when line
       (let ((open (position #\< line)) (close (position #\> line)))
         (when (and open close)
