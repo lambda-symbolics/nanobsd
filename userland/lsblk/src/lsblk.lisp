@@ -281,7 +281,7 @@ through doas in one go (the doas rule on this laptop needs no password)."
 ;;; Main
 
 (defun disk-names ()
-  (remove-if (lambda (n) (starts-with "dk" n)) (words (or (sh "sysctl" "-n" "hw.disknames") ""))))
+  (remove-if (lambda (n) (starts-with "dk" n)) (words (or (first (lines (sh "sysctl" "-n" "hw.disknames"))) ""))))
 
 (defun tty-p () (ignore-errors (plusp (sb-unix:unix-isatty 1))))
 
