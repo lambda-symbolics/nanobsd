@@ -268,7 +268,7 @@ through doas in one go (the doas rule on this laptop needs no password)."
 
 (defun print-disk (d)
   (format t "~A ~A  ~A ~A ~A~%"
-          (pad (paint :disk (disk-name d)) 10)
+          (pad (paint :disk (disk-name d)) 12)
           (pad (paint :disk-size (hum (disk-bytes d))) 12 t)
           (pad (cond ((starts-with "ld" (disk-name d)) "nvme") ((starts-with "sd" (disk-name d)) "usb")
                      ((starts-with "cd" (disk-name d)) "cd") (t "disk")) 5)
@@ -309,7 +309,7 @@ through doas in one go (the doas rule on this laptop needs no password)."
                          ((string= a "-c") (setf *color* t))
                          (t (format *error-output* "usage: lsblk [-p|-c] [disk ...]~%") (sb-ext:exit :code 2)))))
         (read-mounts)
-        (format t "~A~%" (paint :header (format nil "~A ~A  ~A ~A ~A" (pad "NAME" 10) (pad "SIZE" 12 t)
+        (format t "~A~%" (paint :header (format nil "~A ~A  ~A ~A ~A" (pad "NAME" 12) (pad "SIZE" 12 t)
                                                 (pad "TYPE" 5) (pad "FS" 8) "LABEL / MOUNT")))
         (loop for (name . more) on (or args (disk-names))
               do (print-disk (read-disk name))
