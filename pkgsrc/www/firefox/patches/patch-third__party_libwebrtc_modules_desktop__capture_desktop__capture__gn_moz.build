@@ -1,0 +1,33 @@
+$NetBSD$
+
+LispBSD: build the wlr-screencopy screen capturer on NetBSD with Wayland.
+
+--- third_party/libwebrtc/modules/desktop_capture/desktop_capture_gn/moz.build.orig
++++ third_party/libwebrtc/modules/desktop_capture/desktop_capture_gn/moz.build
+@@ -123,6 +123,26 @@
+         "/third_party/libwebrtc/modules/desktop_capture/window_capturer_linux.cc"
+     ]
+ 
++if CONFIG["OS_TARGET"] == "NetBSD" and CONFIG["MOZ_WAYLAND"]:
++
++    # LispBSD: wlr-screencopy screen capture for wlroots compositors.
++    DEFINES["WEBRTC_USE_WLR_SCREENCOPY"] = True
++
++    CFLAGS += CONFIG["MOZ_WAYLAND_CFLAGS"]
++    CXXFLAGS += CONFIG["MOZ_WAYLAND_CFLAGS"]
++
++    OS_LIBS += [
++        "wayland-client"
++    ]
++
++    SOURCES += [
++        "/third_party/libwebrtc/modules/desktop_capture/linux/wayland_wlr/wlr-screencopy-unstable-v1-protocol.c"
++    ]
++
++    UNIFIED_SOURCES += [
++        "/third_party/libwebrtc/modules/desktop_capture/linux/wayland_wlr/screen_capturer_wlr.cc"
++    ]
++
+ if CONFIG["OS_TARGET"] == "OpenBSD":
+ 
+     DEFINES["USE_GLIB"] = "1"
