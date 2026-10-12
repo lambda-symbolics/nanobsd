@@ -237,20 +237,23 @@ through doas in one go (the doas rule on this laptop needs no password)."
                        "")))
           (t ""))))
 
-(defun health-line (d)
+(defun health-lines (d)
+  "Two dimmed lines: identity (serial, firmware, sectors, temperature), then wear and history."
   (when (disk-serial d)
-    (let ((bits (list (format nil "fw ~A" (disk-firmware d)) (format nil "serial ~A" (disk-serial d)))))
-      (when (disk-sector d) (push (format nil "~D B sectors" (disk-sector d)) bits))
+    (let ((identity (list (format nil "serial ~A" (disk-serial d)) (format nil "fw ~A" (disk-firmware d))))
+          (history '()))
+      (when (disk-sector d) (setf identity (append identity (list (format nil "~D B sectors" (disk-sector d))))))
       (when (disk-temp d)
-        (push (paint (cond ((>= (disk-temp d) 60) :bad) ((>= (disk-temp d) 50) :warn) (t :dim))
-                     (format nil "~D °C" (disk-temp d))) bits))
-      (when (disk-wear d) (push (format nil "wear ~D %" (disk-wear d)) bits))
-      (when (disk-hours d) (push (format nil "~D h on" (disk-hours d)) bits))
-      (when (disk-written d) (push (format nil "~A written" (disk-written d)) bits))
-      (when (and (disk-unsafe d) (plusp (disk-unsafe d))) (push (format nil "~D unsafe shutdowns" (disk-unsafe d)) bits))
+        (setf identity (append identity (list (paint (cond ((>= (disk-temp d) 60) :bad) ((>= (disk-temp d) 50) :warn) (t :dim))
+                                                     (format nil "~D °C" (disk-temp d)))))))
+      (when (disk-wear d) (push (format nil "wear ~D %" (disk-wear d)) history))
+      (when (disk-hours d) (push (format nil "~D h on" (disk-hours d)) history))
+      (when (disk-written d) (push (format nil "~A written" (disk-written d)) history))
+      (when (and (disk-unsafe d) (plusp (disk-unsafe d))) (push (format nil "~D unsafe shutdowns" (disk-unsafe d)) history))
       (when (and (disk-media-errors d) (plusp (disk-media-errors d)))
-        (push (paint :bad (format nil "~D media errors" (disk-media-errors d))) bits))
-      (format nil "  ~A" (paint :dim (format nil "~{~A~^  ~}" (reverse bits)))))))
+        (push (paint :bad (format nil "~D media errors" (disk-media-errors d))) history))
+      (remove nil (list (format nil "  ~A" (paint :dim (format nil "~{~A~^  ~}" identity)))
+                        (and history (format nil "  ~A" (paint :dim (format nil "~{~A~^  ~}" (reverse history))))))))))
 
 (defun print-disk (d)
   (format t "~A ~A  ~A ~A ~A~%"
@@ -276,7 +279,7 @@ through doas in one go (the doas rule on this laptop needs no password)."
                          (pad (paint :fs type) 8)
                          (paint :label label)
                          (fs-info dev)))))
-  (let ((health (health-line d))) (when health (write-line health))))
+  (dolist (line (health-lines d)) (write-line line)))
 
 ;;; Main
 
