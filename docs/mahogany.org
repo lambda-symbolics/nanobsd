@@ -736,3 +736,27 @@ the A/B can be done before restarting.  Open: whether the EBUSY commit
 failures also appear at a steady 60 Hz (they did between 04:04 and 04:24
 with no modeset), which would be a kernel-side pending-commit issue of the
 knob-3 fastset rather than this.
+
+** Alacritty flicker in fullscreen (autolith) -- 2026-10-13, open
+
+Checked: Alacritty 0.17 (pkgsrc) renders on the GPU: EGL 1.5, OpenGL 4.6
+Core, Mesa 21.3.9 (base X11R7 libEGL) loading =/usr/pkg/lib/dri/iris_dri.so=
+(=EGL_LOG_LEVEL=debug=); 4.6 is iris, llvmpipe stops at 4.5.  So it is not
+software rendering.  Mahogany builds its scene state with default options,
+so a fullscreen surface gets wlroots direct scanout: the client's buffers
+go to the display plane without composition.  Two things only happen in
+that mode and match "flickers only in fullscreen":
+- a page flip the kernel refuses ("Atomic commit failed: Device busy",
+  2679 in the log over all sessions, bursts at steady 60 Hz on 10-10 with
+  the mouse in use, none in a 30 s unattended fullscreen scroll test) drops
+  the client's frame while the client is told it was shown; with
+  Alacritty's damage-only redraws that alternates old and new content;
+- the 30/60 Hz refresh switches commit a composited frame (modeset =
+  scanout ineligible) between scanned-out ones.
+Not testable remotely (screencopy renders the scene, not the CRTC).  A/B
+for the next session at the laptop: =/etc/mahogany.env= with
+=export WLR_SCENE_DISABLE_DIRECT_SCANOUT=1= (startmh sources it), and
+live =mahoganyctl '(setf mahogany::*refresh-enabled* nil)'= to stop the
+refresh switching; =alacritty -o debug.highlight_damage=true= shows what it
+redraws.  If scanout off cures it, the kernel's flip completion (EBUSY)
+under knob 3 is the next suspect.
