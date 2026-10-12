@@ -12,9 +12,9 @@
     "     ⢭⣦⣀ ⠘⣿⡄"
     "     ⠈⢿⡝⢷⣄⠘⣿⡄"
     "      ⠈⢿⡄⠙⣷⣜⣿⡄"
-    "       ⠘⣷⡀⠈⠻⣿⢿⡄"
+    "       ⠘⣷⡀⠈⠻⣿⣿⡄"
     "⠓⢦⣄⡀    ⢸⡇  ⠙⢯⠳⡀"
-    "  ⠈⠙⠳⢶⣤⣤⡾⠃     ⣠"))
+    "  ⠈⠙⠳⢶⣤⣤⡾⠃   ⠈ ⣠"))
 
 (defun shaded (rows)
   "ROWS as logo lines, shaded top to bottom through :LOGO-1 .. :LOGO-6."
