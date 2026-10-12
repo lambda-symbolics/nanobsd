@@ -252,8 +252,19 @@ through doas in one go (the doas rule on this laptop needs no password)."
       (when (and (disk-unsafe d) (plusp (disk-unsafe d))) (push (format nil "~D unsafe shutdowns" (disk-unsafe d)) history))
       (when (and (disk-media-errors d) (plusp (disk-media-errors d)))
         (push (paint :bad (format nil "~D media errors" (disk-media-errors d))) history))
-      (remove nil (list (format nil "  ~A" (paint :dim (format nil "~{~A~^  ~}" identity)))
-                        (and history (format nil "  ~A" (paint :dim (format nil "~{~A~^  ~}" (reverse history))))))))))
+      (aligned (remove nil (list identity (and history (reverse history))))))))
+
+(defun aligned (rows)
+  "ROWS of cells as dimmed lines, each column padded to its widest cell."
+  (let* ((columns (reduce #'max rows :key #'length))
+         (widths (loop for i below columns
+                       collect (reduce #'max rows :key (lambda (row) (if (< i (length row)) (c:visible-length (nth i row)) 0))))))
+    (loop for row in rows
+          collect (format nil "  ~A"
+                          (paint :dim (string-right-trim " "
+                                                         (format nil "~{~A~^  ~}"
+                                                                 (loop for cell in row for w in widths
+                                                                       collect (pad cell w)))))))))
 
 (defun print-disk (d)
   (format t "~A ~A  ~A ~A ~A~%"
