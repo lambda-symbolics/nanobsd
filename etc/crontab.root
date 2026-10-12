@@ -1,3 +1,4 @@
+# 2026-10-13: cron is off (rc.conf cron=NO); kept for the record. pcsample still runs from the powerd acadapter/lid_switch hooks.
 #
 SHELL=/bin/sh
 PATH=/bin:/sbin:/usr/bin:/usr/sbin

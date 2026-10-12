@@ -199,3 +199,15 @@ Then one change at a time, each with the Wh-delta method of
 offset): timers on demand (1, 2), =usb off= after bt/webcam (4), postfix
 and atrun off (5), syslog =-= (5), NVMe single queue under an I/O workload
 (6).
+
+* Done 2026-10-13 evening
+
+- =cron=NO= and =postfix=NO= in rc.conf, both stopped.  Postfix was the
+  stock MTA with no listener and no mailbox; the crontab had newsyslog,
+  daily/weekly (mailed into nothing), hourly ntpdate (the boot-time
+  =ntpdate=YES= stays), atrun and the pcsample baseline.  Consequences:
+  logs are no longer rotated hourly and the PC-state log gets only the
+  charger and lid samples from the powerd hooks, not the 15 min baseline.
+- The fingerprint reader is a Synaptics 06cb:00bd on xhci1; NetBSD has no
+  driver for it, it attaches as ugen and is powered whenever the USB
+  controllers are.
