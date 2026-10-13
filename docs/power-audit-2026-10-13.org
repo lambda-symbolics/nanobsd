@@ -250,3 +250,22 @@ PC3 on AC" state from =power-levers.org= 8, now caught in the act (on
 battery the same idle shows 93-96 % PC10).  The energy effect of the
 deferrable timers therefore has to be read on battery; the PC3-on-charger
 cause is the bigger item and is being tested next (=idle_d3=).
+
+* Kernel 153: audio runtime power management, verified (2026-10-13 22:51)
+
+=hw.hdaudio.power_save= (default 10 s).  On the booted kernel, read with
+=pcictl pci0 dump -d 31 -f 3=: the controller is in D3hot from boot
+(nothing open), goes to D0 for a write to /dev/audio, is back in D3hot
+12 s after the close, wakes for a mixer write and sleeps again, and stays
+in D3hot for mixer reads (hdafg answers those from software state, which
+is what the status bar polls every minute).  No codec errors in dmesg.
+The codecs are put in D3 widget by widget before the controller; the
+Intel display codec on the GPU power well is left alone.  What is still
+to measure on battery: the energy difference (controller + codec + the
+1 Hz jack poll gone) and whether the first sound after idle carries a
+pop or the old hiss.  Both the s2idle path and this one share
+hdafg_suspend_hw/hdafg_resume_hw.
+
+Fresh boot of 153 on the charger, panel on: PC8 67 %, PC3 0.7 %; the
+55 % PC3 seen at 22:28 on 152 (panel off, charger) was gone by 22:35
+without any sysctl change.  Intermittent; watched further below.
