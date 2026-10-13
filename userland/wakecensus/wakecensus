@@ -1,0 +1,29 @@
+#!/bin/sh
+# wakecensus [SECONDS] [LABEL]: what wakes the machine while it idles.
+# Armed self-rescheduling callouts (crash(8) on /dev/mem), then over SECONDS:
+# interrupt and kernel event-counter rates, per-process context switches,
+# package C-state residency shares and the battery's Wh delta.
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin:/usr/local/sbin:/usr/local/bin
+n=${1:-60}; label=${2:-idle}
+K=/$(sysctl -n machdep.booted_kernel)
+T=/tmp/wakecensus.$$; mkdir -p $T
+echo "== wakecensus $label: $n s, $(date), kernel $(sysctl -n machdep.booted_kernel), ac=$(envstat -d acpiacad0 | awk '/connected/{print $2}')"
+echo "-- armed periodic callouts (function: count)"
+printf 'show callout\n' | crash -N $K -M /dev/mem 2>/dev/null | awk 'NF==4 && $4!="sleepq_timeout" && $1 ~ /^[0-9]+$/ {print $4}' | sort | uniq -c | sort -rn | awk '{printf "  %s: %s\n", $2, $1}'
+snap() {
+	vmstat -i | awk 'NF>=3 && $NF ~ /^[0-9]+$/ {n=$(NF-1); $(NF-1)=""; $NF=""; sub(/ +$/,""); print $0 "|" n}' > $T/i$1
+	vmstat -e | awk 'NF>=4 && $NF ~ /^[a-z]+$/ && $(NF-1) ~ /^[0-9]+$/ && $(NF-2) ~ /^[0-9]+$/ {n=$(NF-2); $(NF-2)=""; $(NF-1)=""; $NF=""; sub(/ +$/,""); print $0 "|" n}' > $T/e$1
+	ps -axo pid,nvcsw,nivcsw,comm > $T/p$1
+	sysctl -n machdep.cidle.residency > $T/r$1
+	envstat -d acpibat0 | awk '/charge:/{print $2}' > $T/c$1
+}
+snap 1; sleep "$n"; snap 2
+delta() { awk -F'|' -v n="$n" 'NR==FNR{a[$1]=$2; next} ($1 in a){d=$2-a[$1]; if(d>0) printf "%8.2f/s  %s\n", d/n, $1}' "$1" "$2" | sort -rn; }
+echo "-- interrupts/s"; delta $T/i1 $T/i2 | head -12
+echo "-- kernel event counters/s"; delta $T/e1 $T/e2 | grep -vE "^ *[0-9.]+/s  (msi|msix|ioapic)" | head -20
+echo "-- process wake-ups/s (context switches)"
+awk 'NR==FNR{a[$1]=$2+$3; next} ($1 in a){d=$2+$3-a[$1]; if(d>0) printf "%8.2f/s  %s (%s)\n", d/'"$n"', $4, $1}' $T/p1 $T/p2 | sort -rn | head -12
+echo "-- package residency over the sample"
+cat $T/r1 $T/r2 | tr ' \t' '\n' | awk -F= '/^tsc=/{if(t==""){t=$2}else{tsc=$2-t}} /^(c7|pc2|pc3|pc6|pc7|pc8|pc9|pc10)=/{if(!($1 in a)){a[$1]=$2}else{v[$1]=$2-a[$1]}} END{for(k in v) printf "  %s %.1f %%\n", k, 100*v[k]/tsc}' | sort
+awk -v n="$n" 'NR==1{a=$1} NR==2{b=$1; if(a!="" && b!="") printf "-- battery: %.3f -> %.3f Wh = %.2f W\n", a, b, (a-b)*3600/n}' $T/c1 $T/c2
+rm -rf $T

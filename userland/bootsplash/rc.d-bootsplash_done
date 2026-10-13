@@ -14,9 +14,13 @@ stop_cmd=":"
 
 bootsplash_done_start()
 {
+	# bootsplash starts before clearcritlocal, which empties /var/run and
+	# takes its pid file with it; find it by name.
 	if [ -f /var/run/bootsplash.pid ]; then
 		kill -TERM "$(cat /var/run/bootsplash.pid)" 2>/dev/null
 	fi
+	pkill -TERM -f /usr/local/sbin/bootsplash 2>/dev/null
+	return 0
 }
 
 load_rc_config $name

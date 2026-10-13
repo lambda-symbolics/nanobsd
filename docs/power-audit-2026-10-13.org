@@ -211,3 +211,24 @@ and atrun off (5), syslog =-= (5), NVMe single queue under an I/O workload
 - The fingerprint reader is a Synaptics 06cb:00bd on xhci1; NetBSD has no
   driver for it, it attaches as ugen and is powered whenever the USB
   controllers are.
+
+* Done 2026-10-13 night, measured idle (userland/wakecensus)
+
+- =bootsplash= survived every boot since it moved before clearcritlocal
+  (which empties /var/run, pid file included) and kept spinning at 10 Hz
+  under Mahogany; rc.d/bootsplash_done now also kills it by name.
+- dhcpcd: the home Zyxel sends an RA every 10 s with router lifetime 0 and
+  a link-local RDNSS only.  dhcpcd added and expired it every time and ran
+  the hooks twice per RA: dhcpcd-run-hooks, resolvconf -a/-d, the libc
+  updater (mkdir, rm, cmp, sed, sysctl -q x2, service nscd), a resolv.conf
+  rewrite with identical content, a syslog line.  Measured with dtrace:
+  12 forks/s and 0.6 execs/s at idle, 53 journal writes per 30 s, and the
+  TLB shootdown IPIs that each exec costs.  Fixed in dhcpcd.conf: =nodhcp6=,
+  =nohook ntp.conf, hostname=, and =noipv6rs= in an =ssid Zyxel_7B79_5G=
+  block (no IPv6 exists there).  After: 2 execs per 20 s (the wg keepalive
+  ping), 4 journal writes per 30 s, resolv.conf untouched.  dhcpcd itself
+  deserves an upstream look: an RA that changes nothing should not run
+  the script at all.
+- Idle on battery, panel on at brightness 51, kernel 151: 3.6 W at the
+  battery; cpu0 timer 15.6/s, other CPUs 1-4/s; Mahogany 0.27 wake-ups/s,
+  lpschedd 0.2/s.
