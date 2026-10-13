@@ -7,7 +7,8 @@
  * unless -f.  Pid in /var/run/bootsplash.pid.
  *
  * Build: cc -O2 -o bootsplash bootsplash.c (logo.h is generated from
- * lfetch's logo.lisp by mkbitmap.py).  LispBSD, 2026-10-13.
+ * lfetch's logo.lisp by mkbitmap.py; mkpng.py renders the same picture
+ * as the PNG the boot loader hands the kernel splash).  LispBSD, 2026-10-13.
  */
 #include <sys/types.h>
 #include <sys/ioctl.h>
@@ -202,6 +203,15 @@ main(int argc, char **argv)
 	munmap(fb, size);
 	mode = WSDISPLAYIO_MODE_EMUL;
 	ioctl(fd, WSDISPLAYIO_SMODE, &mode);
+	/*
+	 * A kernel built with options SPLASHSCREEN (and a splash image from
+	 * boot.cfg) keeps console drawing off since genfb attached; turn it
+	 * back on.  ENODEV without that option.
+	 */
+	{
+		int off = 0;
+		(void)ioctl(fd, WSDISPLAYIO_SSPLASH, &off);
+	}
 	/* the text screen comes back with the old lines; start it clean */
 	(void)write(fd, "\033[H\033[2J", 7);
 	close(fd);
