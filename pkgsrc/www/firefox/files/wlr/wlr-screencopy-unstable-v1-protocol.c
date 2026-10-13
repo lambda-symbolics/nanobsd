@@ -39,9 +39,11 @@
 #define WL_PRIVATE
 #endif
 
+#pragma GCC visibility push(default)
 extern const struct wl_interface wl_buffer_interface;
 extern const struct wl_interface wl_output_interface;
 extern const struct wl_interface zwlr_screencopy_frame_v1_interface;
+#pragma GCC visibility pop
 
 static const struct wl_interface *wlr_screencopy_unstable_v1_types[] = {
 	NULL,

@@ -6,7 +6,7 @@ $NetBSD$
 
 --- third_party/libwebrtc/modules/desktop_capture/desktop_capture_gn/moz.build.orig
 +++ third_party/libwebrtc/modules/desktop_capture/desktop_capture_gn/moz.build
-@@ -123,6 +123,26 @@
+@@ -123,6 +123,24 @@
          "/third_party/libwebrtc/modules/desktop_capture/window_capturer_linux.cc"
      ]
  
@@ -18,10 +18,8 @@ $NetBSD$
 +    CFLAGS += CONFIG["MOZ_WAYLAND_CFLAGS"]
 +    CXXFLAGS += CONFIG["MOZ_WAYLAND_CFLAGS"]
 +
-+    OS_LIBS += [
-+        "wayland-client"
-+    ]
-+
++    # The wl_* calls resolve in libmozwayland, Firefox's dlopen shim, as
++    # for widget/gtk; no -lwayland-client here.
 +    SOURCES += [
 +        "/third_party/libwebrtc/modules/desktop_capture/linux/wayland_wlr/wlr-screencopy-unstable-v1-protocol.c"
 +    ]
@@ -33,7 +31,7 @@ $NetBSD$
  if CONFIG["OS_TARGET"] == "OpenBSD":
  
      DEFINES["USE_GLIB"] = "1"
-@@ -408,7 +428,7 @@
+@@ -408,7 +426,7 @@
  
      DEFINES["_HAS_ITERATOR_DEBUGGING"] = "0"
  
@@ -42,7 +40,7 @@ $NetBSD$
  
      DEFINES["WEBRTC_USE_PIPEWIRE"] = True
      DEFINES["_GNU_SOURCE"] = True
-@@ -458,7 +478,7 @@
+@@ -458,7 +476,7 @@
          "/third_party/libwebrtc/modules/desktop_capture/linux/x11/x_window_property.cc"
      ]
  
@@ -51,7 +49,7 @@ $NetBSD$
  
      CXXFLAGS += [
          "-msse2"
-@@ -486,7 +506,7 @@
+@@ -486,7 +504,7 @@
          "/third_party/libwebrtc/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc"
      ]
  
@@ -60,7 +58,7 @@ $NetBSD$
  
      DEFINES["WEBRTC_USE_PIPEWIRE"] = True
      DEFINES["_GNU_SOURCE"] = True
-@@ -643,6 +663,10 @@
+@@ -643,6 +661,10 @@
  if CONFIG["TARGET_CPU"] == "x86_64" and CONFIG["MOZ_X11"] == "1" and (CONFIG["OS_TARGET"] == "Linux" or CONFIG["OS_TARGET"] == "NetBSD" or CONFIG["OS_TARGET"] == "OpenBSD" or CONFIG["OS_TARGET"] == "FreeBSD"):
  
      DEFINES["WEBRTC_USE_X11"] = True
