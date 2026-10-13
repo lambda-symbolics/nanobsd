@@ -1,6 +1,8 @@
 $NetBSD$
 
-LispBSD: build the wlr-screencopy screen capturer on NetBSD with Wayland.
+* Disable Wayland desktop capture for non-Linux platforms (pkgsrc).
+  Fix segfault under X11.
+* LispBSD: build the wlr-screencopy screen capturer on NetBSD with Wayland.
 
 --- third_party/libwebrtc/modules/desktop_capture/desktop_capture_gn/moz.build.orig
 +++ third_party/libwebrtc/modules/desktop_capture/desktop_capture_gn/moz.build
@@ -31,3 +33,41 @@ LispBSD: build the wlr-screencopy screen capturer on NetBSD with Wayland.
  if CONFIG["OS_TARGET"] == "OpenBSD":
  
      DEFINES["USE_GLIB"] = "1"
+@@ -408,7 +428,7 @@
+ 
+     DEFINES["_HAS_ITERATOR_DEBUGGING"] = "0"
+ 
+-if CONFIG["TARGET_CPU"] == "aarch64" and (CONFIG["OS_TARGET"] == "Linux" or CONFIG["OS_TARGET"] == "NetBSD" or CONFIG["OS_TARGET"] == "OpenBSD" or CONFIG["OS_TARGET"] == "FreeBSD"):
++if CONFIG["TARGET_CPU"] == "aarch64" and CONFIG["OS_TARGET"] == "Linux":
+ 
+     DEFINES["WEBRTC_USE_PIPEWIRE"] = True
+     DEFINES["_GNU_SOURCE"] = True
+@@ -458,7 +478,7 @@
+         "/third_party/libwebrtc/modules/desktop_capture/linux/x11/x_window_property.cc"
+     ]
+ 
+-if CONFIG["TARGET_CPU"] == "x86" and (CONFIG["OS_TARGET"] == "Linux" or CONFIG["OS_TARGET"] == "NetBSD" or CONFIG["OS_TARGET"] == "OpenBSD" or CONFIG["OS_TARGET"] == "FreeBSD"):
++if CONFIG["TARGET_CPU"] == "x86" and CONFIG["OS_TARGET"] == "Linux":
+ 
+     CXXFLAGS += [
+         "-msse2"
+@@ -486,7 +506,7 @@
+         "/third_party/libwebrtc/modules/desktop_capture/linux/wayland/shared_screencast_stream.cc"
+     ]
+ 
+-if CONFIG["TARGET_CPU"] == "x86_64" and (CONFIG["OS_TARGET"] == "Linux" or CONFIG["OS_TARGET"] == "NetBSD" or CONFIG["OS_TARGET"] == "OpenBSD" or CONFIG["OS_TARGET"] == "FreeBSD"):
++if CONFIG["TARGET_CPU"] == "x86_64" and CONFIG["OS_TARGET"] == "Linux":
+ 
+     DEFINES["WEBRTC_USE_PIPEWIRE"] = True
+     DEFINES["_GNU_SOURCE"] = True
+@@ -643,6 +663,10 @@
+ if CONFIG["TARGET_CPU"] == "x86_64" and CONFIG["MOZ_X11"] == "1" and (CONFIG["OS_TARGET"] == "Linux" or CONFIG["OS_TARGET"] == "NetBSD" or CONFIG["OS_TARGET"] == "OpenBSD" or CONFIG["OS_TARGET"] == "FreeBSD"):
+ 
+     DEFINES["WEBRTC_USE_X11"] = True
++
++    CXXFLAGS += [
++        "-msse2"
++    ]
+ 
+     OS_LIBS += [
+         "X11",
