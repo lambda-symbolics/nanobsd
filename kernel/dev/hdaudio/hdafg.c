@@ -396,7 +396,16 @@ static int	hdafg_trigger_input(void *, void *, void *, int,
 				      const audio_params_t *);
 static void	hdafg_get_locks(void *, kmutex_t **, kmutex_t **);
 
+static int	hdafg_open(void *, int);
+static void	hdafg_close(void *);
+static void	hdafg_rt_suspend(device_t);
+static void	hdafg_rt_resume(device_t);
+static void	hdafg_suspend_hw(struct hdafg_softc *);
+static void	hdafg_resume_hw(struct hdafg_softc *);
+
 static const struct audio_hw_if hdafg_hw_if = {
+	.open			= hdafg_open,
+	.close			= hdafg_close,
 	.query_format		= hdafg_query_format,
 	.set_format		= hdafg_set_format,
 	.round_blocksize	= hdafg_round_blocksize,
@@ -3813,6 +3822,8 @@ hdafg_attach(device_t parent, device_t self, void *opaque)
 	sc->sc_nid = nid;
 	sc->sc_fg = (struct hdaudio_function_group *)(vaddr_t)fgptr;
 	sc->sc_fg->fg_unsol = hdafg_unsol;
+	sc->sc_fg->fg_rt_suspend = hdafg_rt_suspend;
+	sc->sc_fg->fg_rt_resume = hdafg_rt_resume;
 	sc->sc_codec = sc->sc_fg->fg_codec;
 	KASSERT(sc->sc_codec != NULL);
 	sc->sc_host = sc->sc_codec->co_host;
@@ -3966,19 +3977,79 @@ hdafg_childdet(device_t self, device_t child)
 		sc->sc_audiodev.ad_audiodev = NULL;
 }
 
+/*
+ * LispBSD: the function group goes down (jack poll paused, every widget
+ * and the group itself in D3) for both the system suspend and the runtime
+ * idle suspend; hdafg_resume_hw is the inverse.
+ */
+static void
+hdafg_suspend_hw(struct hdafg_softc *sc)
+{
+	int nid;
+
+	if (sc->sc_jack_polling) {
+		mutex_enter(&sc->sc_jack_lock);
+		if (!sc->sc_jack_suspended)
+			sc->sc_jack_suspended = true;
+		mutex_exit(&sc->sc_jack_lock);
+	}
+	for (nid = sc->sc_startnode; nid < sc->sc_endnode; nid++)
+		hdaudio_command(sc->sc_codec, nid,
+		    CORB_SET_POWER_STATE, COP_POWER_STATE_D3);
+	hdaudio_command(sc->sc_codec, sc->sc_nid,
+	    CORB_SET_POWER_STATE, COP_POWER_STATE_D3);
+}
+
 static bool
 hdafg_suspend(device_t self, const pmf_qual_t *qual)
 {
 	struct hdafg_softc *sc = device_private(self);
 
-	if (sc->sc_jack_polling) {
-		mutex_enter(&sc->sc_jack_lock);
-		KASSERT(!sc->sc_jack_suspended);
-		sc->sc_jack_suspended = true;
-		mutex_exit(&sc->sc_jack_lock);
-	}
-
+	/* Already down for idleness: the controller is in D3hot. */
+	if (sc->sc_host->sc_rt_suspended)
+		return true;
+	hdafg_suspend_hw(sc);
 	return true;
+}
+
+/*
+ * The Intel display codec lives on the GPU's power well: its verbs time
+ * out whenever the display is down, so the runtime path leaves it alone
+ * (the controller's D3hot idles the link anyway).
+ */
+static void
+hdafg_rt_suspend(device_t self)
+{
+	struct hdafg_softc *sc = device_private(self);
+
+	if (sc->sc_vendor != 0x8086)
+		hdafg_suspend_hw(sc);
+}
+
+static void
+hdafg_rt_resume(device_t self)
+{
+	struct hdafg_softc *sc = device_private(self);
+
+	if (sc->sc_vendor != 0x8086)
+		hdafg_resume_hw(sc);
+}
+
+static int
+hdafg_open(void *opaque, int flags)
+{
+	struct hdaudio_audiodev *ad = opaque;
+
+	hdaudio_rt_use(ad->ad_sc->sc_host);
+	return 0;
+}
+
+static void
+hdafg_close(void *opaque)
+{
+	struct hdaudio_audiodev *ad = opaque;
+
+	hdaudio_rt_release(ad->ad_sc->sc_host);
 }
 
 /*
@@ -4002,13 +4073,12 @@ hdafg_realtek_kick(struct hdafg_softc *sc)
 		hdaudio_command(sc->sc_codec, 0x20, CORB_GET_PROCESSING_COEFFICIENT, 0);
 	}
 	hdaudio_command(sc->sc_codec, 0x20, CORB_SET_COEFFICIENT_INDEX, 0);
-	hda_print(sc, "resume: vendor coefficient interface walked\n");
+	hda_debug(sc, "resume: vendor coefficient interface walked\n");
 }
 
-static bool
-hdafg_resume(device_t self, const pmf_qual_t *qual)
+static void
+hdafg_resume_hw(struct hdafg_softc *sc)
 {
-	struct hdafg_softc *sc = device_private(self);
 	struct hdaudio_widget *w;
 	int nid;
 
@@ -4034,13 +4104,17 @@ hdafg_resume(device_t self, const pmf_qual_t *qual)
 
 	if (sc->sc_jack_polling) {
 		mutex_enter(&sc->sc_jack_lock);
-		KASSERT(sc->sc_jack_suspended);
 		sc->sc_jack_suspended = false;
 		sc->sc_jack_last = ~0U;	/* reapply after resume */
 		cv_broadcast(&sc->sc_jack_cv);
 		mutex_exit(&sc->sc_jack_lock);
 	}
+}
 
+static bool
+hdafg_resume(device_t self, const pmf_qual_t *qual)
+{
+	hdafg_resume_hw(device_private(self));
 	return true;
 }
 
@@ -4208,6 +4282,7 @@ hdafg_set_port(void *opaque, mixer_ctrl_t *mc)
 
 	if (mc->dev < 0 || mc->dev >= sc->sc_nmixers)
 		return EINVAL;
+	hdaudio_rt_touch(sc->sc_host);	/* LispBSD: amp writes need the codec */
 	mx = &sc->sc_mixers[mc->dev];
 	ctl = mx->mx_ctl;
 	if (ctl == NULL) {

@@ -59,6 +59,7 @@ struct hdaudio_pci_softc {
 	void			*sc_ih;
 	pcireg_t		sc_id;
 	pci_intr_handle_t	*sc_pihp;
+	struct pci_conf_state	sc_pciconf;	/* LispBSD: across runtime D3hot */
 };
 
 #define	HDAUDIO_PCI_IS_INTEL(sc)	\
@@ -79,6 +80,8 @@ static void	hdaudio_pci_enable_clock_gating(struct hdaudio_pci_softc *);
 /* power management */
 static bool	hdaudio_pci_suspend(device_t, const pmf_qual_t *);
 static bool	hdaudio_pci_resume(device_t, const pmf_qual_t *);
+static bool	hdaudio_pci_rt_suspend(struct hdaudio_softc *);
+static bool	hdaudio_pci_rt_resume(struct hdaudio_softc *);
 
 CFATTACH_DECL2_NEW(
     hdaudio_pci,
@@ -185,6 +188,8 @@ hdaudio_pci_attach(device_t parent, device_t self, void *opaque)
 	hdaudio_pci_init(sc);
 
 	/* Attach bus-independent HD audio layer */
+	sc->sc_hdaudio.sc_rt_suspend = hdaudio_pci_rt_suspend;
+	sc->sc_hdaudio.sc_rt_resume = hdaudio_pci_rt_resume;
 	if (hdaudio_attach(self, &sc->sc_hdaudio)) {
 		pci_intr_disestablish(sc->sc_pc, sc->sc_ih);
 		pci_intr_release(sc->sc_pc, sc->sc_pihp, 1);
@@ -340,6 +345,9 @@ hdaudio_pci_suspend(device_t self, const pmf_qual_t *qual)
 {
 	struct hdaudio_pci_softc *sc = device_private(self);
 
+	/* LispBSD: already down for idleness; the bus will set D3 again. */
+	if (sc->sc_hdaudio.sc_rt_suspended)
+		return true;
 	/* Children are quiescent; allow clock removal before PCI enters D3. */
 	hdaudio_pci_enable_clock_gating(sc);
 	return true;
@@ -349,9 +357,39 @@ static bool
 hdaudio_pci_resume(device_t self, const pmf_qual_t *qual)
 {
 	struct hdaudio_pci_softc *sc = device_private(self);
+	bool ok;
 
 	hdaudio_pci_init(sc);
-	return hdaudio_resume(&sc->sc_hdaudio);
+	ok = hdaudio_resume(&sc->sc_hdaudio);
+	hdaudio_rt_pmf_resumed(&sc->sc_hdaudio);
+	return ok;
+}
+
+/*
+ * LispBSD runtime power management for the controller: what the pmf
+ * suspend/resume pair and the PCI bus do, without marking the device
+ * inactive (the audio layer keeps serving it).
+ */
+static bool
+hdaudio_pci_rt_suspend(struct hdaudio_softc *hsc)
+{
+	struct hdaudio_pci_softc *sc = (struct hdaudio_pci_softc *)hsc;
+
+	hdaudio_pci_enable_clock_gating(sc);
+	pci_conf_capture(sc->sc_pc, sc->sc_tag, &sc->sc_pciconf);
+	return pci_set_powerstate(sc->sc_pc, sc->sc_tag,
+	    PCI_PMCSR_STATE_D3) == 0;
+}
+
+static bool
+hdaudio_pci_rt_resume(struct hdaudio_softc *hsc)
+{
+	struct hdaudio_pci_softc *sc = (struct hdaudio_pci_softc *)hsc;
+
+	(void)pci_set_powerstate(sc->sc_pc, sc->sc_tag, PCI_PMCSR_STATE_D0);
+	pci_conf_restore(sc->sc_pc, sc->sc_tag, &sc->sc_pciconf);
+	hdaudio_pci_init(sc);
+	return hdaudio_resume(hsc);
 }
 
 MODULE(MODULE_CLASS_DRIVER, hdaudio_pci, "pci,hdaudio,audio");

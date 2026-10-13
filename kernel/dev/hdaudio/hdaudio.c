@@ -39,6 +39,10 @@ __KERNEL_RCSID(0, "$NetBSD: hdaudio.c,v 1.18 2022/04/07 19:33:37 andvar Exp $");
 #include <sys/conf.h>
 #include <sys/bus.h>
 #include <sys/kmem.h>
+#include <sys/callout.h>
+#include <sys/workqueue.h>
+#include <sys/sysctl.h>
+#include <sys/atomic.h>
 #include <sys/module.h>
 
 #include "hdaudiovar.h"
@@ -791,6 +795,182 @@ hdaudio_stream_tag(struct hdaudio_stream *st)
 	return ret;
 }
 
+/*
+ * LispBSD runtime power management.
+ *
+ * hw.hdaudio.power_save seconds after the last audio device closes (and
+ * at boot), every codec function group is put in D3 and the controller
+ * in D3hot (the bus driver's sc_rt_suspend).  The first open or mixer
+ * write brings everything back through the same path s2idle resume uses.
+ * The idle timer is a deferrable callout: it does not wake an idle CPU.
+ * 0 turns it off (an already suspended controller wakes at the next use).
+ */
+int hdaudio_power_save = 10;
+
+static void
+hdaudio_rt_arm(struct hdaudio_softc *sc)
+{
+	KASSERT(mutex_owned(&sc->sc_rt_lock));
+	if (hdaudio_power_save > 0 && !sc->sc_rt_suspended)
+		callout_schedule(&sc->sc_rt_callout, hz * hdaudio_power_save);
+}
+
+static void
+hdaudio_rt_suspend_locked(struct hdaudio_softc *sc)
+{
+	struct hdaudio_function_group *fg;
+	int i, j;
+
+	KASSERT(mutex_owned(&sc->sc_rt_lock));
+	KASSERT(!sc->sc_rt_suspended);
+	for (i = 0; i < HDAUDIO_MAX_CODECS; i++) {
+		if (!sc->sc_codec[i].co_valid)
+			continue;
+		for (j = 0; j < sc->sc_codec[i].co_nfg; j++) {
+			fg = &sc->sc_codec[i].co_fg[j];
+			if (fg->fg_device != NULL && fg->fg_rt_suspend != NULL)
+				(*fg->fg_rt_suspend)(fg->fg_device);
+		}
+	}
+	if (sc->sc_rt_suspend != NULL && !(*sc->sc_rt_suspend)(sc))
+		aprint_error_dev(sc->sc_dev, "runtime suspend of the controller failed\n");
+	sc->sc_rt_suspended = true;
+	sc->sc_rt_suspends++;
+	aprint_debug_dev(sc->sc_dev, "runtime suspended\n");
+}
+
+static void
+hdaudio_rt_resume_locked(struct hdaudio_softc *sc)
+{
+	struct hdaudio_function_group *fg;
+	int i, j;
+
+	KASSERT(mutex_owned(&sc->sc_rt_lock));
+	KASSERT(sc->sc_rt_suspended);
+	sc->sc_rt_suspended = false;	/* the interrupt handler may run again */
+	if (sc->sc_rt_resume != NULL && !(*sc->sc_rt_resume)(sc))
+		aprint_error_dev(sc->sc_dev, "runtime resume of the controller failed\n");
+	for (i = 0; i < HDAUDIO_MAX_CODECS; i++) {
+		if (!sc->sc_codec[i].co_valid)
+			continue;
+		for (j = 0; j < sc->sc_codec[i].co_nfg; j++) {
+			fg = &sc->sc_codec[i].co_fg[j];
+			if (fg->fg_device != NULL && fg->fg_rt_resume != NULL)
+				(*fg->fg_rt_resume)(fg->fg_device);
+		}
+	}
+	sc->sc_rt_resumes++;
+	aprint_debug_dev(sc->sc_dev, "runtime resumed\n");
+}
+
+static void
+hdaudio_rt_work(struct work *wk, void *arg)
+{
+	struct hdaudio_softc *sc = arg;
+
+	mutex_enter(&sc->sc_rt_lock);
+	sc->sc_rt_queued = 0;
+	if (sc->sc_rt_users == 0 && !sc->sc_rt_suspended &&
+	    hdaudio_power_save > 0)
+		hdaudio_rt_suspend_locked(sc);
+	mutex_exit(&sc->sc_rt_lock);
+}
+
+static void
+hdaudio_rt_timeout(void *arg)
+{
+	struct hdaudio_softc *sc = arg;
+
+	/* softint: hand the sleeping work to the thread */
+	if (sc->sc_rt_wq != NULL && atomic_swap_uint(&sc->sc_rt_queued, 1) == 0)
+		workqueue_enqueue(sc->sc_rt_wq, &sc->sc_rt_work, NULL);
+}
+
+static void
+hdaudio_rt_init(struct hdaudio_softc *sc)
+{
+	mutex_init(&sc->sc_rt_lock, MUTEX_DEFAULT, IPL_NONE);
+	callout_init(&sc->sc_rt_callout, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
+	callout_setfunc(&sc->sc_rt_callout, hdaudio_rt_timeout, sc);
+	if (workqueue_create(&sc->sc_rt_wq, "hdaudiopm", hdaudio_rt_work, sc,
+	    PRI_NONE, IPL_NONE, WQ_MPSAFE) != 0) {
+		aprint_error_dev(sc->sc_dev, "no workqueue, runtime power management off\n");
+		sc->sc_rt_wq = NULL;
+	}
+}
+
+static void
+hdaudio_rt_fini(struct hdaudio_softc *sc)
+{
+	callout_halt(&sc->sc_rt_callout, NULL);
+	callout_destroy(&sc->sc_rt_callout);
+	if (sc->sc_rt_wq != NULL)
+		workqueue_destroy(sc->sc_rt_wq);
+	mutex_destroy(&sc->sc_rt_lock);
+}
+
+/* An audio device opened: keep (or make) the hardware awake. */
+void
+hdaudio_rt_use(struct hdaudio_softc *sc)
+{
+	mutex_enter(&sc->sc_rt_lock);
+	sc->sc_rt_users++;
+	callout_stop(&sc->sc_rt_callout);
+	if (sc->sc_rt_suspended)
+		hdaudio_rt_resume_locked(sc);
+	mutex_exit(&sc->sc_rt_lock);
+}
+
+/* An audio device closed: start the idle clock when it was the last. */
+void
+hdaudio_rt_release(struct hdaudio_softc *sc)
+{
+	mutex_enter(&sc->sc_rt_lock);
+	if (sc->sc_rt_users > 0)
+		sc->sc_rt_users--;
+	if (sc->sc_rt_users == 0 && sc->sc_rt_wq != NULL)
+		hdaudio_rt_arm(sc);
+	mutex_exit(&sc->sc_rt_lock);
+}
+
+/* A one-off hardware access (mixer write): wake, and restart the clock. */
+void
+hdaudio_rt_touch(struct hdaudio_softc *sc)
+{
+	mutex_enter(&sc->sc_rt_lock);
+	if (sc->sc_rt_suspended)
+		hdaudio_rt_resume_locked(sc);
+	if (sc->sc_rt_users == 0 && sc->sc_rt_wq != NULL)
+		hdaudio_rt_arm(sc);
+	mutex_exit(&sc->sc_rt_lock);
+}
+
+/* The system (pmf) resume path brought the hardware up regardless. */
+void
+hdaudio_rt_pmf_resumed(struct hdaudio_softc *sc)
+{
+	mutex_enter(&sc->sc_rt_lock);
+	sc->sc_rt_suspended = false;
+	if (sc->sc_rt_users == 0 && sc->sc_rt_wq != NULL)
+		hdaudio_rt_arm(sc);
+	mutex_exit(&sc->sc_rt_lock);
+}
+
+SYSCTL_SETUP(sysctl_hw_hdaudio_setup, "hw.hdaudio")
+{
+	const struct sysctlnode *node = NULL;
+
+	sysctl_createv(clog, 0, NULL, &node, CTLFLAG_PERMANENT, CTLTYPE_NODE,
+	    "hdaudio", SYSCTL_DESCR("HD audio"), NULL, 0, NULL, 0,
+	    CTL_HW, CTL_CREATE, CTL_EOL);
+	if (node == NULL)
+		return;
+	sysctl_createv(clog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "power_save",
+	    SYSCTL_DESCR("Seconds without an open audio device before the codecs and controller power down (0: never)"),
+	    NULL, 0, &hdaudio_power_save, 0, CTL_CREATE, CTL_EOL);
+}
+
 int
 hdaudio_attach(device_t dev, struct hdaudio_softc *sc)
 {
@@ -801,6 +981,7 @@ hdaudio_attach(device_t dev, struct hdaudio_softc *sc)
 	sc->sc_dev = dev;
 	mutex_init(&sc->sc_corb_mtx, MUTEX_DEFAULT, IPL_AUDIO);
 	mutex_init(&sc->sc_stream_mtx, MUTEX_DEFAULT, IPL_AUDIO);
+	hdaudio_rt_init(sc);
 
 	/*
 	 * Put the controller into a known state by entering and leaving
@@ -885,6 +1066,9 @@ hdaudio_attach(device_t dev, struct hdaudio_softc *sc)
 	 */
 	hdaudio_intr_enable(sc);
 
+	/* Nothing is open yet: start the idle clock. */
+	hdaudio_rt_release(sc);
+
 fail:
 	if (err)
 		hda_error(sc, "device driver failed to attach\n");
@@ -905,6 +1089,7 @@ hdaudio_detach(struct hdaudio_softc *sc, int flags)
 		return error;
 	}
 
+	hdaudio_rt_fini(sc);
 	mutex_destroy(&sc->sc_corb_mtx);
 	mutex_destroy(&sc->sc_stream_mtx);
 
@@ -930,7 +1115,7 @@ hdaudio_resume(struct hdaudio_softc *sc)
 	gctl = hda_read4(sc, HDAUDIO_MMIO_GCTL);
 	if (hda_read2(sc, HDAUDIO_MMIO_GCAP) != 0xffff &&
 	    (gctl & HDAUDIO_GCTL_CRST) != 0) {
-		aprint_normal_dev(sc->sc_dev,
+		aprint_debug_dev(sc->sc_dev,
 		    "resume: controller state kept (GCTL=0x%x), link not reset\n",
 		    gctl);
 		(void)hdaudio_rirb_stop(sc);
@@ -944,7 +1129,7 @@ hdaudio_resume(struct hdaudio_softc *sc)
 	}
 
 	hda_delay(HDAUDIO_CODEC_DELAY);
-	aprint_normal_dev(sc->sc_dev, "resume codec presence=0x%x\n",
+	aprint_debug_dev(sc->sc_dev, "resume codec presence=0x%x\n",
 	    hda_read2(sc, HDAUDIO_MMIO_STATESTS));
 
 	/*
@@ -1017,6 +1202,8 @@ hdaudio_intr(struct hdaudio_softc *sc)
 	int streamid = 0;
 	uint8_t rirbsts;
 
+	if (__predict_false(sc->sc_rt_suspended))
+		return 0;	/* LispBSD: controller in D3hot, registers read 1s */
 	intsts = hda_read4(sc, HDAUDIO_MMIO_INTSTS);
 	if (!(intsts & HDAUDIO_INTSTS_GIS))
 		return 0;

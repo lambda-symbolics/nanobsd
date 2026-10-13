@@ -232,3 +232,21 @@ and atrun off (5), syslog =-= (5), NVMe single queue under an I/O workload
 - Idle on battery, panel on at brightness 51, kernel 151: 3.6 W at the
   battery; cpu0 timer 15.6/s, other CPUs 1-4/s; Mahogany 0.27 wake-ups/s,
   lpschedd 0.2/s.
+
+* Kernel 152: deferrable callouts, measured (2026-10-13 22:28, charger in, panel off)
+
+=kern.callout_deferrable= 1 vs 0, interleaved, 60 s each, =ab-callout.sh=:
+
+| knob | cpu0 timer irq/s | softint clk/0 /s | all interrupts/s | PC10 | PC3 |
+|------+------------------+------------------+------------------+------+-----|
+|    1 | 5.9-6.0          | 6.8-7.0          | 16-18            | 37-42 % | 55-58 % |
+|    0 | 14.9-15.4        | 13.1             | 25-27            | 46 % | 51 % |
+
+The mechanism works: cpu0's timer wake-ups drop by 9/s (the 5 Hz and 2 Hz
+protocol timers, the 1 Hz ones), =kern.callout_deferred= climbs by ~2500/s.
+Package residency did not move, because on the charger the package sits in
+PC3 more than half the time whatever the timers do: this is the "sticky
+PC3 on AC" state from =power-levers.org= 8, now caught in the act (on
+battery the same idle shows 93-96 % PC10).  The energy effect of the
+deferrable timers therefore has to be read on battery; the PC3-on-charger
+cause is the bigger item and is being tested next (=idle_d3=).

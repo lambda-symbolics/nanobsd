@@ -33,6 +33,8 @@
 #define _HDAUDIOVAR_H
 
 #include <dev/audio/audio_if.h>
+#include <sys/callout.h>
+#include <sys/workqueue.h>
 
 #ifdef _KERNEL_OPT
 #include "opt_hdaudio.h"
@@ -75,6 +77,9 @@ struct hdaudio_function_group {
 	uint16_t			fg_product;
 
 	int				(*fg_unsol)(device_t, uint8_t);
+	/* LispBSD runtime power management: codec function group down/up */
+	void				(*fg_rt_suspend)(device_t);
+	void				(*fg_rt_resume)(device_t);
 };
 
 struct hdaudio_codec {
@@ -160,7 +165,29 @@ struct hdaudio_softc {
 	struct hdaudio_stream	sc_stream[HDAUDIO_MAX_STREAMS];
 	uint32_t		sc_stream_mask;
 	kmutex_t		sc_stream_mtx;
+
+	/*
+	 * LispBSD runtime power management: with no audio device open for
+	 * hw.hdaudio.power_save seconds the codecs go to D3 and the
+	 * controller to D3hot; the next open or mixer write brings them back.
+	 */
+	kmutex_t		sc_rt_lock;
+	int			sc_rt_users;		/* open audio devices */
+	bool			sc_rt_suspended;
+	u_int			sc_rt_queued;		/* work enqueued (atomic) */
+	callout_t		sc_rt_callout;
+	struct workqueue	*sc_rt_wq;
+	struct work		sc_rt_work;
+	bool			(*sc_rt_suspend)(struct hdaudio_softc *);	/* bus driver */
+	bool			(*sc_rt_resume)(struct hdaudio_softc *);
+	uint64_t		sc_rt_suspends, sc_rt_resumes;
 };
+
+extern int hdaudio_power_save;
+void	hdaudio_rt_use(struct hdaudio_softc *);
+void	hdaudio_rt_release(struct hdaudio_softc *);
+void	hdaudio_rt_touch(struct hdaudio_softc *);
+void	hdaudio_rt_pmf_resumed(struct hdaudio_softc *);
 
 int	hdaudio_attach(device_t, struct hdaudio_softc *);
 int	hdaudio_detach(struct hdaudio_softc *, int);
