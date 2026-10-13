@@ -295,3 +295,24 @@ precmd of rc.d/bootsplash only starts it on a quiet boot unless
 logo.h made by mkbitmap.py from lfetch's logo.lisp, fbdump.c to read the
 framebuffer back for a remote check, the two rc.d scripts).  The green
 kernel text is =msg.kernel.fg=green= in wscons; it is simply not shown now.
+
+** Boot screen, second round (2026-10-13 evening)
+The first version showed the lambda only from rc.d/wscons on: =-q= leaves
+the kernel's short attach lines and all of rc on the console (rc_silent
+follows =-z=, AB_SILENT 0x40000, not =-q=).  Now:
+- boot.cfg default: =splash /lambda.png;boot netbsd.i915.rpm.151 -z=.
+  =-z= silences the loader, the kernel's attach lines and rc.  The loader
+  hands the PNG to the kernel as a module (x86_machdep recognises the PNG
+  magic).
+- kernel 151 = 150 + =options SPLASHSCREEN= (dev/splash + dev/stbi).
+  genfb, including intelfb through drmfb, renders the image centered at
+  attach and turns console drawing off, unless booted with -v, -s, -c, -a
+  or -d (DISABLESPLASH).  =etc/lambda.png= is the full 2160x1350 frame
+  with the lambda exactly where and how =bootsplash= paints it
+  (=userland/bootsplash/mkpng.py= from logo.h), so the handover from the
+  kernel splash to the rc one changes no pixel.
+- rc.d/bootsplash: REQUIRE root, BEFORE DISKS (9th in rcorder), accepts
+  -q or -z; bootsplash sends WSDISPLAYIO_SSPLASH 0 before clearing the
+  text screen at the end, which re-enables console drawing.
+- Still visible: the copyright banner for the moment before genfb
+  attaches, and the loader's menu itself.
