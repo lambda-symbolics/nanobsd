@@ -1,0 +1,34 @@
+#+TITLE: The OM-1 as a webcam on LispBSD: vcam(4), om1-webcam, om1
+#+DATE: 2026-10-13
+
+Ported from the workstation's om-1-webcam project (an s6 service polling
+=lsusb= every 2 s, the Rust streamer piped through ffmpeg into
+v4l2loopback).  Here nothing polls:
+
+- =kernel/dev/vcam.c= (+ =vcamio.h=, =conf/files=, =conf/majors= char 370,
+  =pseudo-device vcam= in GENERIC): a virtual camera.  A feeder opens
+  =/dev/vcam=, sets width, height and the largest frame
+  (=VCAMIOCSFORMAT=) and writes one MJPEG frame per =write(2)=; the frame
+  becomes one payload of the video(4) device attached to vcam0 (=videoN=),
+  which Firefox's V4L2 capture reads (=video_capture_v4l2.cc= is what the
+  NetBSD build uses).  With no reader streaming, writes are dropped and
+  counted, and =VCAMIOCWAIT= sleeps the feeder until a reader starts the
+  stream.  Node: =mknod /dev/vcam c 370 0= (rc.local).
+- =userland/om1-webcam/om1-webcam.c=: the streamer in C against pkgsrc
+  libusb-1.0, with the interrupt-endpoint drain thread the Rust version
+  found necessary (the OM-1 holds bulk responses until its events are
+  read), the 0x9489/0x948b vendor init, live view at 1024x768 by default
+  (=-r=).  Frames go to =/dev/vcam=.  While nobody reads the virtual
+  camera it turns the camera's live view off and sleeps in =VCAMIOCWAIT=.
+  No ffmpeg, no transcoding: MJPEG straight through (so no mirror flip;
+  Firefox mirrors its own preview anyway).
+- =om1 on|off|status=: the knob.  =on= resumes USB, arms
+  =/var/run/om1.armed= and starts the streamer if the camera is already
+  attached; the devpubd hook =03-om1= starts it when a ugen attaches
+  while armed (=om1 attach=).  =off= stops and disarms.
+- Camera side (from FINDINGS.md): USB mode Raw/Control, Movie mode with
+  FHD (not 4K/C4K/HighSpeed), C-AF, memory card in.  0x94d0 powers the
+  camera off: never sent.
+
+Untested with the camera itself (it is not here); the vcam device is
+tested with a synthetic feeder.

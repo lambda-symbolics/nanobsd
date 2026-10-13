@@ -1,0 +1,39 @@
+#!/bin/sh
+# om1 on|off|status: the OM-1 as a webcam, on demand, no polling.
+#   on     resume USB, arm the attach hook, start streaming if the camera
+#          is already connected (USB Raw/Control mode, Movie mode)
+#   off    stop streaming, disarm the hook
+#   status what is running, and what vcam(4) sees
+# When armed, the devpubd hook starts om1-webcam the moment the camera
+# attaches (as ugenN); the streamer itself keeps the camera's live view off
+# until a reader (Firefox) opens the virtual camera.
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/bin:/usr/local/bin:/usr/local/sbin
+flag=/var/run/om1.armed
+pidfile=/var/run/om1-webcam.pid
+present() { usbdevs 2>/dev/null | grep -q "33a2"; }
+start() {
+	[ -f "$pidfile" ] && kill -0 "$(cat $pidfile)" 2>/dev/null && return 0
+	present || return 1
+	/usr/local/bin/om1-webcam -v >/var/log/om1-webcam.log 2>&1 &
+	echo $! > "$pidfile"
+	echo "om1-webcam started (pid $!)"
+}
+stop() {
+	[ -f "$pidfile" ] && { kill "$(cat $pidfile)" 2>/dev/null; rm -f "$pidfile"; echo "om1-webcam stopped"; }
+}
+case "$1" in
+on)
+	/usr/local/bin/usb on >/dev/null 2>&1
+	touch "$flag"
+	start || echo "armed: the OM-1 is not connected yet; it starts on attach"
+	;;
+off)	rm -f "$flag"; stop ;;
+attach)	[ -f "$flag" ] && start ;;	# from the devpubd hook
+status)
+	[ -f "$flag" ] && echo "armed" || echo "off"
+	[ -f "$pidfile" ] && kill -0 "$(cat $pidfile)" 2>/dev/null && echo "streaming process running (pid $(cat $pidfile))"
+	present && echo "camera connected" || echo "camera not connected"
+	ls -l /dev/vcam /dev/video* 2>/dev/null | awk '{print $NF}' | tr '\n' ' '; echo
+	;;
+*)	echo "usage: om1 on|off|status"; exit 2 ;;
+esac

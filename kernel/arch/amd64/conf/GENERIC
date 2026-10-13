@@ -790,6 +790,7 @@ atapibus* at atapi?
 
 
 # ATA RAID configuration support, as found on some Promise controllers.
+pseudo-device	vcam			# LispBSD virtual camera (MJPEG from /dev/vcam)
 pseudo-device ataraid
 ld*	at ataraid? vendtype ? unit ?
 

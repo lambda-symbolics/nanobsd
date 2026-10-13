@@ -1,0 +1,13 @@
+#!/bin/sh
+# devpubd hook: when a USB device attaches and the OM-1 webcam is armed,
+# start the streamer (om1 attach checks the flag and the camera).
+event="$1"; shift
+case "$event" in
+device-attach)
+	for dev in "$@"; do
+		case "$dev" in
+		ugen*) /usr/local/bin/om1 attach >/dev/null 2>&1 & ;;
+		esac
+	done
+	;;
+esac

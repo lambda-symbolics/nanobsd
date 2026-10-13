@@ -39,6 +39,7 @@ device-major zfs       char 190 block 190  zfs
 device-major tprof     char 191		   tprof
 device-major isv       char 192		   isv
 device-major video     char 193		   video	vector=4
+device-major vcam      char 370		   vcam		# LispBSD virtual camera
 device-major dm        char 194 block 169  dm
 device-major hdaudio   char 195		   hdaudio	vector=4
 device-major uhso      char 196		   uhso
