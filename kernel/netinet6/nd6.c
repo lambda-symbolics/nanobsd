@@ -150,8 +150,8 @@ nd6_init(void)
 
 	rw_init(&nd6_lock);
 
-	callout_init(&nd6_slowtimo_ch, CALLOUT_MPSAFE);
-	callout_init(&nd6_timer_ch, CALLOUT_MPSAFE);
+	callout_init(&nd6_slowtimo_ch, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
+	callout_init(&nd6_timer_ch, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 
 	error = workqueue_create(&nd6_timer_wq, "nd6_timer",
 	    nd6_timer_work, NULL, PRI_SOFTNET, IPL_SOFTNET, WQ_MPSAFE);

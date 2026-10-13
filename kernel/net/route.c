@@ -1822,7 +1822,7 @@ rt_timer_init(void)
 	rw_init(&rt_lock);
 
 	LIST_INIT(&rttimer_queue_head);
-	callout_init(&rt_timer_ch, CALLOUT_MPSAFE);
+	callout_init(&rt_timer_ch, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 	error = workqueue_create(&rt_timer_wq, "rt_timer",
 	    rt_timer_work, NULL, PRI_USER, IPL_SOFTNET, RT_WQ_FLAGS);
 	if (error)

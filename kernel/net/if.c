@@ -795,7 +795,7 @@ if_register(ifnet_t *ifp)
 
 		isd = kmem_zalloc(sizeof(*isd), KM_SLEEP);
 		mutex_init(&isd->isd_lock, MUTEX_DEFAULT, IPL_SOFTCLOCK);
-		callout_init(&isd->isd_ch, CALLOUT_MPSAFE);
+		callout_init(&isd->isd_ch, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 		callout_setfunc(&isd->isd_ch, if_slowtimo_intr, ifp);
 		isd->isd_ifp = ifp;
 

@@ -578,7 +578,7 @@ sme_events_init(struct sysmon_envsys *sme)
 	if (error)
 		return error;
 
-	callout_init(&sme->sme_callout, CALLOUT_MPSAFE);
+	callout_init(&sme->sme_callout, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 	callout_setfunc(&sme->sme_callout, sme_events_check, sme);
 
 	mutex_enter(&sme->sme_work_mtx);

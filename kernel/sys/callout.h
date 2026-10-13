@@ -63,6 +63,11 @@ typedef struct callout {
 					   it the requested timing stands, so
 					   an unaudited timeout is never
 					   silently stretched. */
+#define	CALLOUT_DEFERRABLE	0x0800	/* LispBSD: housekeeping that may
+					   run late: the tickless idle path
+					   does not wake a CPU for it, it runs
+					   with the next wake-up (bounded by
+					   machdep.cidle.maxskip).  Opt-in. */
 #define	CALLOUT_FLAGMASK	0xff00
 
 #define CALLOUT_FMT	"\177\020\
@@ -117,6 +122,7 @@ void	callout_hardclock(void);
 void	callout_init(callout_t *, u_int);
 void	callout_destroy(callout_t *);
 void	callout_setfunc(callout_t *, void (*)(void *), void *);
+void	callout_setdeferrable(callout_t *, bool);
 void	callout_reset(callout_t *, int, void (*)(void *), void *);
 void	callout_schedule(callout_t *, int);
 bool	callout_stop(callout_t *);

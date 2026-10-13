@@ -207,7 +207,7 @@ acpitz_attach(device_t parent, device_t self, void *aux)
 	(void)acpi_power_register(sc->sc_node->ad_handle);
 	(void)acpi_register_notify(sc->sc_node, acpitz_notify_handler);
 
-	callout_init(&sc->sc_callout, CALLOUT_MPSAFE);
+	callout_init(&sc->sc_callout, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 	callout_setfunc(&sc->sc_callout, acpitz_tick, self);
 
 	acpitz_init_envsys(self);

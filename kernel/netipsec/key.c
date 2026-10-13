@@ -8288,7 +8288,7 @@ key_do_init(void)
 
 	pfkeystat_percpu = percpu_alloc(sizeof(uint64_t) * PFKEY_NSTATS);
 
-	callout_init(&key_timehandler_ch, CALLOUT_MPSAFE);
+	callout_init(&key_timehandler_ch, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 	error = workqueue_create(&key_timehandler_wq, "key_timehandler",
 	    key_timehandler_work, NULL, PRI_SOFTNET, IPL_SOFTNET, WQ_MPSAFE);
 	if (error != 0)

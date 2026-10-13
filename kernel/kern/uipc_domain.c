@@ -91,8 +91,9 @@ static void
 domain_init_timers(void)
 {
 
-	callout_init(&pffasttimo_ch, CALLOUT_MPSAFE);
-	callout_init(&pfslowtimo_ch, CALLOUT_MPSAFE);
+	/* LispBSD: both do nothing at idle; a late run costs nothing. */
+	callout_init(&pffasttimo_ch, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
+	callout_init(&pfslowtimo_ch, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 
 	callout_reset(&pffasttimo_ch, 1, pffasttimo, NULL);
 	callout_reset(&pfslowtimo_ch, 1, pfslowtimo, NULL);

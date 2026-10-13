@@ -1115,7 +1115,7 @@ nchinit(void)
 	TAILQ_INIT(&cache_lru.list[LRU_INACTIVE]);
 
 	mutex_init(&cache_stat_lock, MUTEX_DEFAULT, IPL_NONE);
-	callout_init(&cache_stat_callout, CALLOUT_MPSAFE);
+	callout_init(&cache_stat_callout, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 	callout_setfunc(&cache_stat_callout, cache_update_stats, NULL);
 	callout_schedule(&cache_stat_callout, cache_stat_interval * hz);
 

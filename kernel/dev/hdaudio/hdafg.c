@@ -73,6 +73,7 @@ __KERNEL_RCSID(0, "$NetBSD: hdafg.c,v 1.32.4.1 2025/10/28 13:33:07 martin Exp $"
 #include <sys/module.h>
 #include <sys/condvar.h>
 #include <sys/kthread.h>
+#include <sys/lwp.h>
 #include <sys/mutex.h>
 
 #include <sys/audioio.h>
@@ -3641,6 +3642,9 @@ hdafg_hp_switch_thread(void *opaque)
 	struct hdafg_softc *sc = opaque;
 
 	KASSERT(sc->sc_jack_polling);
+
+	/* LispBSD: the jack poll may wait for the next wake-up. */
+	callout_setdeferrable(&curlwp->l_timeout_ch, true);
 
 	mutex_enter(&sc->sc_jack_lock);
 	while (!sc->sc_jack_dying) {

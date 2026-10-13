@@ -845,6 +845,9 @@ sched_sync(void *arg)
 	bool synced;
 	int error;
 
+	/* LispBSD: the once-a-second pace may run late on an idle machine. */
+	callout_setdeferrable(&curlwp->l_timeout_ch, true);
+
 	for (;;) {
 		starttime = time_second;
 		SDT_PROBE1(vfs, syncer, sync, start,  starttime);

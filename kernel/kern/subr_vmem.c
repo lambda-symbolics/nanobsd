@@ -1601,7 +1601,7 @@ vmem_rehash_start(void)
 	if (error) {
 		panic("%s: workqueue_create %d\n", __func__, error);
 	}
-	callout_init(&vmem_rehash_ch, CALLOUT_MPSAFE);
+	callout_init(&vmem_rehash_ch, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 	callout_setfunc(&vmem_rehash_ch, vmem_rehash_all_kick, NULL);
 
 	vmem_rehash_interval = hz * 10;

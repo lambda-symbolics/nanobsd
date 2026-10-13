@@ -89,6 +89,7 @@ __KERNEL_RCSID(0, "$NetBSD: kern_timeout.c,v 1.79 2023/10/08 13:23:05 ad Exp $")
 #include <sys/kernel.h>
 #include <sys/callout.h>
 #include <sys/lwp.h>
+#include <sys/sysctl.h>
 #include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/sleepq.h>
@@ -894,6 +895,53 @@ callout_hardclock(void)
 
 int callout_next_ticks(void);
 
+/*
+ * LispBSD: kern.callout_deferrable.  1 (default): callouts marked
+ * CALLOUT_DEFERRABLE do not bound the tickless idle sleep; they run when
+ * the CPU wakes for something else, at most machdep.cidle.maxskip ticks
+ * late.  0: every callout counts, for A/B measurement.
+ */
+int callout_deferrable_enabled = 1;
+static uint64_t callout_deferred_skips;	/* deferrable callouts passed over */
+
+SYSCTL_SETUP(sysctl_kern_callout_setup, "kern.callout_deferrable")
+{
+	sysctl_createv(clog, 0, NULL, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "callout_deferrable",
+	    SYSCTL_DESCR("Deferrable callouts do not wake an idle CPU (1) or do (0)"),
+	    NULL, 0, &callout_deferrable_enabled, 0,
+	    CTL_KERN, CTL_CREATE, CTL_EOL);
+	sysctl_createv(clog, 0, NULL, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_QUAD,
+	    "callout_deferred",
+	    SYSCTL_DESCR("Deferrable callouts passed over by the idle path"),
+	    NULL, 0, &callout_deferred_skips, 0,
+	    CTL_KERN, CTL_CREATE, CTL_EOL);
+}
+
+/*
+ * callout_setdeferrable:
+ *
+ *	Mark (or unmark) a callout as deferrable.  For callouts owned by
+ *	threads that sleep with a timeout (the LWP's l_timeout_ch) and for
+ *	callouts initialised elsewhere.
+ */
+void
+callout_setdeferrable(callout_t *cs, bool deferrable)
+{
+	callout_impl_t *c = (callout_impl_t *)cs;
+	kmutex_t *lock;
+
+	KASSERT(c->c_magic == CALLOUT_MAGIC);
+	lock = callout_lock(c);
+	if (deferrable)
+		c->c_flags |= CALLOUT_DEFERRABLE;
+	else
+		c->c_flags &= ~CALLOUT_DEFERRABLE;
+	mutex_spin_exit(lock);
+}
+
 int
 callout_next_ticks(void)
 {
@@ -910,6 +958,11 @@ callout_next_ticks(void)
 			b = &cc->cc_wheel[i];
 			for (p = b->cq_next_l; p != b; p = p->cq_next_l) {
 				c = (callout_impl_t *)p;
+				if (callout_deferrable_enabled &&
+				    (c->c_flags & CALLOUT_DEFERRABLE) != 0) {
+					callout_deferred_skips++;
+					continue;
+				}
 				delta = (int)((unsigned)c->c_time -
 				    (unsigned)cc->cc_ticks);
 				if (delta < best)
