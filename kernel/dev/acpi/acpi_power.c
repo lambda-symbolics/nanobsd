@@ -359,7 +359,7 @@ power_integer(ACPI_HANDLE handle, const char *method, ACPI_INTEGER *value)
 	ACPI_HANDLE object;
 	ACPI_STATUS rv;
 
-	rv = AcpiGetHandle(handle, (char *)method, &object);
+	rv = AcpiGetHandle(handle, method, &object);
 	if (ACPI_FAILURE(rv))
 		return rv;
 	rv = acpi_eval_integer(handle, method, value);
@@ -404,6 +404,7 @@ power_seed(struct power_device *dev)
 	ACPI_INTEGER sta;
 	ACPI_STATUS rv;
 	int state, first, last;
+	bool cold = false;
 
 	if (dev->seeded)
 		return AE_OK;
@@ -433,11 +434,17 @@ power_seed(struct power_device *dev)
 		rv = power_sta(entry->res, &sta);
 		if (ACPI_FAILURE(rv))
 			goto out;
-		if (sta == 0)
+		if (sta == 0) {
+			/* A boot D0 record cannot override an unpowered _PR0. */
+			if (first == ACPI_STATE_D0 && last == ACPI_STATE_D0)
+				cold = true;
 			continue;
+		}
 		ref = power_reference(entry->res, dev->handle, true);
 		ref->uses |= POWER_STATE;
 	}
+	if (cold)
+		dev->state = ACPI_STATE_D3_COLD;
 	dev->seeded = true;
 	rv = AE_OK;
 out:
@@ -563,9 +570,11 @@ acpi_power_get(ACPI_HANDLE handle, int *state)
 		if (sta == 0)
 			cold = true;
 	}
-	if (cold)
+	if (cold) {
 		current = ACPI_STATE_D3_COLD;
-	else if (dev->failed)
+		/* Another consumer's _ON cannot resume this device. */
+		dev->state = current;
+	} else if (dev->failed)
 		rv = AE_ERROR;
 	else if (dev->state != ACPI_STATE_ERROR)
 		current = dev->state;

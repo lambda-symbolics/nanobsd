@@ -111,7 +111,7 @@ static struct acpi_devnode *acpi_match_node(ACPI_HANDLE h)
 { struct fake_object *o = h; return o->attached ? &o->ad : NULL; }
 static ACPI_STATUS AcpiGetName(ACPI_HANDLE h, int type, ACPI_BUFFER *b)
 { struct fake_object *o = h; (void)type; assert(b->Length >= 5); memcpy(b->Pointer, o->name, 5); return AE_OK; }
-static ACPI_STATUS AcpiGetHandle(ACPI_HANDLE h, char *name, ACPI_HANDLE *out)
+static ACPI_STATUS AcpiGetHandle(ACPI_HANDLE h, const char *name, ACPI_HANDLE *out)
 {
 	struct fake_object *o = h;
 	bool present = false;
@@ -489,11 +489,37 @@ static void overlapping_targets(void)
 	assert(acpi_power_res(common, a, false) == AE_OK && common->off_calls == 1);
 	puts("ok partially overlapping targets and first/last public consumer");
 }
+static void cold_observation(void)
+{
+	struct fake_object *r, *a, *b;
+	int state;
+	unsigned int scenario;
+
+	for (scenario = 0; scenario < 3; scenario++) {
+		reset(); r = object("RA", true, scenario == 2 ? 1 : 0);
+		a = object("A", false, 15); b = object("B", false, 15);
+		package(a, 0, r); package(b, 0, r);
+		a->psc_present = b->psc_present = false;
+		if (scenario == 2) {
+			assert(acpi_power_get(a, &state) && state == 0);
+			r->sta = 0; /* Power lost after initial ownership was recorded. */
+		}
+		if (scenario != 0)
+			assert(acpi_power_get(a, &state) && state == ACPI_STATE_D3_COLD);
+		assert(acpi_power_set(b, 0));
+		/* A sibling's _ON is not this device's _PS0. */
+		assert(acpi_power_get(a, &state) && state == ACPI_STATE_D3_COLD);
+		assert(acpi_power_set(a, 0));
+		assert(acpi_power_get(a, &state) && state == 0);
+	}
+	puts("ok initial and observed cold state survives sibling resource activation");
+}
 int main(void)
 {
 	common_resources(); shared_and_untouched(); dedicated_order();
 	acquisition_failure(); method_failures(); many_and_wake();
 	initial_state(); package_errors(); edge_cases(); overlapping_targets();
+	cold_observation();
 	reset();
 	puts("all ACPI power production-backend tests passed");
 	return 0;
