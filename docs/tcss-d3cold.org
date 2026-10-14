@@ -124,7 +124,10 @@ caveat.
   cold flag, host harness =tests/acpi-power.sh=), D3cold tables including
   the Thunderbolt root ports, idle_d3_exp knobs, both xhci fixes.
   =usb off= = TCSS cold = PC10 97 %, restore verified repeatedly.
-- Next: the Wh number for the default state (/var/tmp/cold-wh.txt),
+- Default state measured (panel off, battery, 300 s): PC10 97.0 %,
+  1.20 W by the Wh counter, 1.07 W by the discharge-rate sensor.  Same
+  kernel, plain usb off (USB_TCSS_D3=0): 1.95 W / 1.63 W.
+- Next:
   xhci_resume after power loss (so TXHC can join the s2idle table), the
   PMC latch capture Astra described for a PC10 state, lid test of s2idle
   with usb on and off.
