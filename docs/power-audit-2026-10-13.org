@@ -327,3 +327,27 @@ window (=battery-ab.sh=):
   time it shows, run =pc3-kicks.sh= at once.
 - Whole-machine floor today, panel off, Wi-Fi associated: 1.08 W.  The
   user's own reading at minimum brightness with the panel on: 2.3 W.
+
+* Kernel 156: USB runtime power management (2026-10-14 17:09)
+
+In xhci(4), port level: a device on a root hub port with no pipe open
+other than the control pipe and no transfer for =hw.usbpm.autosuspend=
+seconds (default 5) gets DEVICE_REMOTE_WAKEUP set when it supports it and
+its port written to U3; the controller stays in D0 (the PCH gates the USB
+PLLs once every port is in U3 or empty).  While the port sleeps,
+transfers are queued on the rings and their doorbells remembered; a pipe
+open (process context) resumes synchronously, a transfer or a remote
+wakeup (port status change with the link in Resume) resumes from a usb
+task, then the deferred doorbells ring.  Devices with a HID interface
+are left awake unless =hw.usbpm.hid=1=; devices behind an external hub
+are not touched (v1).  The pmf system resume clears the state.  Counters
+in =hw.usbpm.stats=.
+
+Verified after boot: =usb on= attaches the fingerprint reader, camera and
+Bluetooth; suspends=3 within the idle window; =usbdevs= wakes them
+(resumes) and they sleep again; =btconfig ubt0 up= wakes the radio and
+=down= lets it sleep; failed=0.  =battery-usb.sh= (panel off, 300 s
+windows, a b c c b a: USB on with suspend, USB on without, =usb off=)
+measures whether the sleeping devices cost anything over today's
+=usb off= baseline; if not, rc.local stops suspending the controllers at
+boot and the bluetooth/webcam scripts lose their =usb on= step.
