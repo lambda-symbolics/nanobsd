@@ -1467,7 +1467,7 @@ defpseudo nullcons
 defpseudo lockstat
 defpseudo bio:		sysmon_envsys
 
-defpseudo vcam:		videobus	# LispBSD virtual camera
+defpseudodev vcam:	videobus	# LispBSD virtual camera
 file	dev/vcam.c			vcam
 defpseudo loop:		ifnet
 defpseudo sl:		ifnet
