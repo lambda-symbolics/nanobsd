@@ -71,6 +71,23 @@ halted or destroyed in =xhci_detach=, so the freed softc stayed on the
 callout wheel.  Fixed in commit b72419f (=sc_dying=, =callout_halt=,
 =callout_destroy= before the rings are freed).  Dump: =/var/crash/netbsd.18=.
 
+* Kernel 159/160 findings (23:00-23:15)
+
+- Kernel 159 (Astra's backend b61eb1b + the D3cold tables): all seven
+  idle_d3 entries went D3cold and came back D0 cleanly, xhci0 reattached
+  by the rescan, but 0:13:0 still answered on PCI and PC10 stayed 0 %:
+  the Thunderbolt PCIe root ports TRP0/TRP2 (0:7:0, 0:7:2, ppb drivers,
+  nothing behind them) list {D3C, TBT0|TBT1} in _PR0 under TRTD, so the
+  correct backend keeps D3C on for them.  Kernel 160 adds both as D3cold
+  entries in the idle_d3 and s2idle tables (commit 0c2b722).
+- Kernel 160 panicked in the first =usb on= of the test, before any
+  cold-off: =xhci_resume= rang a doorbell at a garbage offset.  The
+  runtime PM scans (kernel 156) walk slot ids 1..sc_maxslots but the
+  slot array had sc_maxslots entries, so index 64 was the neighbour's
+  memory; its stale "pending doorbell" mask was nonzero on that boot.
+  Commit a866d5c allocates sc_maxslots + 1 entries.  Dump
+  =/var/crash/netbsd.19= (deleted after analysis).
+
 * Status
 
 - Kernel 158 (building): pmcreqs probe (acpi_lps0_probe before the PMC
