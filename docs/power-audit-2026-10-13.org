@@ -299,3 +299,31 @@ without any sysctl change.  Intermittent; watched further below.
   checked, windows stamped with idle_ms) and =pc3-kicks.sh= (net, disk,
   modeset kicks) run via =when-idle.sh= when the laptop is untouched for
   15 min on battery.
+
+* 2026-10-14 16:12, battery, panel off, untouched: the counterbalanced 2x2
+
+One round, 300 s windows, kernel 155, audio D-state read before each
+window (=battery-ab.sh=):
+
+| timers deferrable | audio PM | controller | PC10   | PC3   | battery |
+|-------------------+----------+------------+--------+-------+---------|
+| on                | on       | D3hot      | 97.6 % | 0.7 % | 1.08 W  |
+| off               | on       | D3hot      | 96.0 % | 0.6 % | 1.08 W  |
+| on                | off      | D0         | 97.8 % | 0.6 % | 2.52 W  |
+| off               | off      | D0         | 96.6 % | 0.7 % | 1.68 W  |
+
+- Audio runtime PM is worth at least 0.6 W at idle (both awake windows are
+  far above both asleep ones; the overnight 3.6-vs-1.4 W pair says the
+  same).  The hdaudio controller and codec in D0 were the single largest
+  idle consumer after the panel.
+- Deferrable callouts: no energy difference resolvable at 5 min and
+  10 mWh (±0.12 W); cpu0 timer interrupts 2.4 vs 2.7/s here.  Kept on:
+  it costs nothing and the 15 -> 6/s reduction is real, but it is not a
+  watt-class lever on this machine, as the audit guessed.
+- The sticky PC3 state was absent this boot (PC10 96-98 % in every window,
+  =pc3-kicks.sh= found nothing to kick).  It was present in every
+  measurement yesterday, on charger and on battery, through kernels
+  152-153; it is per boot or per session, trigger still unknown.  Next
+  time it shows, run =pc3-kicks.sh= at once.
+- Whole-machine floor today, panel off, Wi-Fi associated: 1.08 W.  The
+  user's own reading at minimum brightness with the panel on: 2.3 W.
