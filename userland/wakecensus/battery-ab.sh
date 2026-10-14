@@ -19,8 +19,10 @@ while [ $r -lt $R ]; do
 		sysctl -w kern.callout_deferrable=$d >/dev/null
 		if [ "$a" = 1 ]; then sysctl -w hw.hdaudio.power_save=10 >/dev/null; else sysctl -w hw.hdaudio.power_save=0 >/dev/null; fi
 		sleep 25
-		echo "-- condition deferrable=$d audio-pm=$a hda=$(hda) pipe=$(( ($(/var/tmp/memread 0x603c070000 0x008 2>/dev/null | awk '{print $NF}') >> 31) & 1 ))" >> $OUT
+		i0=$(sysctl -n machdep.lpsched.idle_ms)
+		echo "-- condition deferrable=$d audio-pm=$a hda=$(hda) pipe=$(( ($(/var/tmp/memread 0x603c070000 0x008 2>/dev/null | awk '{print $NF}') >> 31) & 1 )) idle_s=$((i0/1000))" >> $OUT
 		wakecensus $W "deferrable=$d audio-pm=$a round=$r" 2>&1 | grep -E "^== wakecensus|  pc(3|10) |Total|cpu0 timer|battery" >> $OUT
+		i1=$(sysctl -n machdep.lpsched.idle_ms); [ $((i1 - i0)) -lt $((W*1000 - 5000)) ] && echo "-- TOUCHED during this window (idle_ms $i0 -> $i1): discard" >> $OUT
 	done
 	order=$(echo $order | tr ' ' '\n' | tail -r | tr '\n' ' ')
 	r=$((r+1))
