@@ -20,11 +20,20 @@ case "${1:-status}" in
 	btconfig $DEV | grep -q UP || { echo "bt-headphones: $DEV did not come up (firmware? dmesg)"; exit 1; }
 	pgrep -x bthcid >/dev/null || $SUDO /usr/local/sbin/bthcid -d $DEV
 	pgrep -x sdpd >/dev/null || $SUDO sdpd
-	sleep 1
+	# sdpd listens a moment after it starts; bta2dpd gives up at once if it
+	# cannot open an SDP session, so wait for the socket, then retry once.
+	i=0; while [ ! -S /var/run/sdp ] && [ $i -lt 20 ]; do sleep 0.25; i=$((i+1)); done
 	if ! pgrep -f "bta2dpd.*$ADDR" >/dev/null; then
 		$SUDO bta2dpd -D -n -m encrypt -d $DEV -a "$ADDR" /dev/pad0 || exit 1
+		sleep 2
+		if ! pgrep -f "bta2dpd.*$ADDR" >/dev/null; then
+			echo "bt-headphones: first attempt ended, retrying (headphones on and in range?)"
+			sleep 2
+			$SUDO bta2dpd -D -n -m encrypt -d $DEV -a "$ADDR" /dev/pad0 || exit 1
+			sleep 2
+		fi
 	fi
-	sleep 2
+	pgrep -f "bta2dpd.*$ADDR" >/dev/null || { echo "bt-headphones: no stream to $ADDR (see /var/log/messages)"; exit 1; }
 	P=$(pad_index)
 	[ -n "$P" ] && $SUDO audiocfg default "$P" && echo "bt-headphones: ON, audio${P} (pad) is the default device"
 	;;
