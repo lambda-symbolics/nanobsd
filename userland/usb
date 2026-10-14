@@ -5,6 +5,7 @@
 # Keyboard/trackpoint are I2C-HID, not USB, so they are unaffected.
 # NetBSD has no per-device USB autosuspend, so this all-or-nothing gate is the
 # power lever; use webcam/bluetooth for granular control while usb is on.
+# "off" also powers the whole TCSS block down (see below); USB_TCSS_D3=0 to skip.
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="doas"
 CTRLS="xhci0 xhci1"
@@ -15,25 +16,28 @@ state(){ # crude: if uhub children exist, controller is up
 }
 case "${1:-status}" in
   off)  rc=0
-        # USB_TCSS_D3=1: also switch the TCSS power resource (D3C, shared
-        # by the USB-C xHCI and the Thunderbolt DMA engines) off, which
-        # lets the package reach PC10 every time instead of a PC3 split.
-        # That is D3cold: the controller comes back reset, so the driver
-        # is detached here and reattached by a pci0 rescan in "on"
-        # (nothing internal hangs off the USB-C controller).  The kernel
-        # refuses the cold-off while xhci0 is attached.
-        if [ "${USB_TCSS_D3:-0}" = 1 ] && drvctl -l pci0 2>/dev/null | grep -q xhci0; then
-          $SUDO drvctl -d xhci0 2>/dev/null || { echo "usb: xhci0 did not detach" >&2; rc=1; }
-        fi
+        # Default: also switch the TCSS power resource (D3C, shared by the
+        # USB-C xHCI, the Thunderbolt DMA engines and the Thunderbolt root
+        # ports) off = TCSS D3cold; the package then idles in PC10 (about
+        # 1.1 W) instead of a PC3/PC10 split (about 1.9 W).  The USB-C
+        # controller comes back reset, so it is suspended (ports quiesced,
+        # D3hot: without this the TCSS only reaches PC9), then detached, and
+        # reattached by a pci0 rescan in "on".  USB_TCSS_D3=0 keeps the old
+        # D3hot-only behaviour.  The kernel refuses the cold-off while xhci0
+        # is attached.
+        cold=${USB_TCSS_D3:-1}
         for c in $CTRLS; do
           drvctl -l pci0 2>/dev/null | grep -q "$c" || continue
           $SUDO drvctl -S "$c" 2>/dev/null || { echo "usb: $c did not suspend" >&2; rc=1; }
         done
+        if [ $rc -eq 0 ] && [ "$cold" = 1 ] && drvctl -l pci0 2>/dev/null | grep -q xhci0; then
+          $SUDO drvctl -d xhci0 2>/dev/null || { echo "usb: xhci0 did not detach" >&2; rc=1; }
+        fi
         # Only with every driver quiescent may the ACPI power resources of
         # the TCSS functions and the driverless platform IPs go off.
-        if [ $rc -eq 0 ] && [ "${USB_TCSS_D3:-0}" = 1 ]; then
+        if [ $rc -eq 0 ] && [ "$cold" = 1 ]; then
           $SUDO sysctl -w hw.acpi.sleep.idle_d3=1 >/dev/null 2>&1 || echo "usb: idle_d3 not set" >&2
-          echo "usb: OFF (xhci0 detached, xhci1 suspended, TCSS power resource off; charging unaffected)"
+          echo "usb: OFF (TCSS cold, PCH xhci suspended; charging unaffected)"
         elif [ $rc -eq 0 ]; then
           echo "usb: OFF (xhci suspended; charging unaffected)"
         else
