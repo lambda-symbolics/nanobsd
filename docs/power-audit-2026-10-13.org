@@ -351,3 +351,23 @@ windows, a b c c b a: USB on with suspend, USB on without, =usb off=)
 measures whether the sleeping devices cost anything over today's
 =usb off= baseline; if not, rc.local stops suspending the controllers at
 boot and the bluetooth/webcam scripts lose their =usb on= step.
+
+* The PC3 state, narrowed (2026-10-14 evening, kernel 156, battery, panel off)
+
+- An xHCI controller in D3hot (=usb off=, =drvctl -S=) is the condition:
+  with both controllers in D0 and every port in U3 (runtime suspend) the
+  package sits in PC9 97-98 % every time; with one or both controllers in
+  D3hot it is either PC10 97 % (16:12) or PC3 54 % / PC10 45 % (every
+  other measurement today).  The USB-C controller alone, with nothing
+  attached, is enough to bring the split.
+- Not the cause: a pending PME (status clear), firmware SMIs (counter
+  flat in both states), port link states (identical before and after:
+  USB3 ports RxDetect, the three internal devices U3), first versus
+  second suspension (a fresh boot's own rc.local suspension gave PC3 53 %
+  at 21:04), a CPU burst, a network burst, disk I/O, a modeset.
+- The one within-boot recovery seen (yesterday 22:28 PC3 to 22:35 clean)
+  followed a kernel build; a sustained all-core load is being tried as the
+  kick, and a 10-minute pair (controllers off vs on with sleeping ports,
+  Wh delta and the rate sensor) decides today's policy.  Runtime suspend
+  of the controllers themselves (v2) only makes sense once D3hot is
+  reliably the PC10 state.
