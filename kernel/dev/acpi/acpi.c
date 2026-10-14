@@ -272,6 +272,7 @@ static int		acpi_freeze_ltr_ignore;
 static int		acpi_freeze_storage;
 static int		acpi_freeze_keep_net;
 static int		acpi_idle_d3;
+static int		acpi_idle_d3_exp;	/* see acpi_adr_power */
 static int		sysctl_hw_acpi_idle_d3(SYSCTLFN_PROTO);
 static int		acpi_freeze_thread_started;
 static void		acpi_freeze_thread(void *);
@@ -3245,8 +3246,6 @@ struct acpi_adr_pwr {
  *      hot-plug/PME SCI on the port (config 0xd8 bits 30/31).
  *   2: do not write PMCSR D3hot before the cold-off.
  */
-static int acpi_idle_d3_exp;
-
 static void
 acpi_adr_power(struct acpi_softc *sc, const char *what,
     struct acpi_adr_pwr *table, unsigned n, int state)
