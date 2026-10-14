@@ -37,6 +37,7 @@
 #include <sys/pmf.h>
 #include <sys/pool.h>
 
+#include <sys/callout.h>
 #include <dev/usb/usbdi.h>
 #include <dev/usb/usbdivar.h>
 
@@ -80,6 +81,24 @@ struct xhci_slot {
 	struct xhci_ring *xs_xr[XHCI_MAX_DCI + 1];
 					/* transfer rings */
 	u_int xs_idx;			/* slot index */
+
+	/*
+	 * LispBSD USB runtime power management (xhci.c, xhci_rt_*): a
+	 * device on a root hub port with no open pipe for hw.usbpm.autosuspend
+	 * seconds has its port put in U3 with remote wakeup enabled; the next
+	 * pipe open, transfer or remote wake brings it back to U0.
+	 */
+	struct usbd_device *xs_dev;	/* the device in this slot */
+	u_int xs_npipes;		/* open pipes other than the control pipe */
+	int xs_lastbusy;		/* getticks() at the last transfer or pipe change */
+	u_int xs_ctlrport;		/* controller port (0: not on a root hub port) */
+	u_int xs_bus;			/* 0: USB3 root hub, 1: USB2 root hub */
+	bool xs_rt_init;
+	bool xs_suspended;		/* port in U3 by the idle policy */
+	bool xs_resuming;		/* resume in progress: doorbells deferred */
+	uint32_t xs_dbpending;		/* doorbells to ring after the resume, bit per dci */
+	int xs_rt_want;			/* 1: suspend, 2: resume (for xs_rt_task) */
+	struct usb_task xs_rt_task;
 };
 
 struct xhci_softc {
@@ -142,6 +161,10 @@ struct xhci_softc {
 	bool sc_dying;
 	bool sc_suspendresume_failed;
 	struct lwp *sc_suspender;
+
+	/* LispBSD USB runtime power management */
+	callout_t sc_rt_callout;	/* the idle scan, deferrable */
+	uint64_t sc_rt_suspends, sc_rt_resumes, sc_rt_wakes, sc_rt_failed;
 
 	void (*sc_vendor_init)(struct xhci_softc *);
 	int (*sc_vendor_port_status)(struct xhci_softc *, uint32_t, int);

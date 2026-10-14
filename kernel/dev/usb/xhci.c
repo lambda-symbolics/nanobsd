@@ -143,6 +143,10 @@ static usbd_status xhci_open(struct usbd_pipe *);
 static void xhci_close_pipe(struct usbd_pipe *);
 static int xhci_intr1(struct xhci_softc * const);
 static void xhci_softintr(void *);
+
+/* LispBSD USB runtime power management (defined before xhci_init) */
+static void xhci_rt_doorbell(struct xhci_softc *, struct xhci_slot *, u_int);
+static void xhci_rt_ring_pending(struct xhci_softc *, struct xhci_slot *);
 static void xhci_poll(struct usbd_bus *);
 static struct usbd_xfer *xhci_allocx(struct usbd_bus *, unsigned int);
 static void xhci_freex(struct usbd_bus *, struct usbd_xfer *);
@@ -1118,7 +1122,7 @@ xhci_resume(device_t self, const pmf_qual_t *qual)
 				continue;
 
 			/* Ring the doorbell.  */
-			xhci_db_write_4(sc, XHCI_DOORBELL(xs->xs_idx), dci);
+			xhci_rt_doorbell(sc, xs, dci);
 		}
 	}
 
@@ -1148,6 +1152,23 @@ out:	/*
 	sc->sc_suspendresume_failed = !ok;
 	cv_broadcast(&sc->sc_cmdbusy_cv);
 	mutex_exit(&sc->sc_lock);
+
+	/* LispBSD runtime PM: every port is in U0 again. */
+	mutex_enter(&sc->sc_intr_lock);
+	for (int si = 1; si <= sc->sc_maxslots; si++) {
+		struct xhci_slot *xs = &sc->sc_slots[si];
+		if (xs->xs_idx == 0 || !xs->xs_rt_init)
+			continue;
+		xs->xs_suspended = false;
+		xs->xs_resuming = false;
+		xs->xs_lastbusy = getticks();
+	}
+	mutex_exit(&sc->sc_intr_lock);
+	for (int si = 1; si <= sc->sc_maxslots; si++) {
+		struct xhci_slot *xs = &sc->sc_slots[si];
+		if (xs->xs_idx != 0 && xs->xs_rt_init && xs->xs_dbpending != 0)
+			xhci_rt_ring_pending(sc, xs);
+	}
 
 	mutex_exit(&sc->sc_rhlock);
 	return ok;
@@ -1400,6 +1421,391 @@ xhci_start(struct xhci_softc *sc)
 	    xhci_op_read_4(sc, XHCI_USBCMD));
 }
 
+/*
+ * LispBSD USB runtime power management.
+ *
+ * A device on a root hub port that has had no pipe open and no transfer
+ * for hw.usbpm.autosuspend seconds gets DEVICE_REMOTE_WAKEUP set (when it
+ * supports it) and its port put in U3.  While the port sleeps, transfers
+ * are queued on the rings but the doorbells are not rung; a pipe open, a
+ * transfer or a remote wakeup (a port status change with the link in
+ * Resume) brings the port back to U0 and rings the deferred doorbells.
+ * Devices with a HID interface are left alone unless hw.usbpm.hid is set,
+ * so an external keyboard never loses its first key.  Devices behind an
+ * external hub are left alone (v1).  The controller stays in D0; with
+ * every port in U3 or empty the PCH gates the USB PLLs by itself.
+ */
+int xhci_autosuspend = 5;	/* seconds; 0: off */
+int xhci_autosuspend_hid = 0;
+
+static void xhci_rt_task(void *);
+static void xhci_rt_callout(void *);
+
+static inline bool
+xhci_rt_enabled(void)
+{
+	return xhci_autosuspend > 0;
+}
+
+/* Bind a slot to its device the first time a pipe on it is opened. */
+static void
+xhci_rt_bind(struct xhci_softc *sc, struct xhci_slot *xs,
+    struct usbd_device *dev)
+{
+	if (xs->xs_rt_init)
+		return;
+	xs->xs_dev = dev;
+	xs->xs_npipes = 0;
+	xs->xs_lastbusy = getticks();
+	xs->xs_suspended = xs->xs_resuming = false;
+	xs->xs_dbpending = 0;
+	xs->xs_ctlrport = 0;
+	if (dev->ud_depth == 1 && dev->ud_powersrc != NULL) {
+		xs->xs_bus = (dev->ud_bus == &sc->sc_bus2) ? 1 : 0;
+		xs->xs_ctlrport = xhci_rhport2ctlrport(sc, xs->xs_bus,
+		    dev->ud_powersrc->up_portno);
+	}
+	usb_init_task(&xs->xs_rt_task, xhci_rt_task, xs, USB_TASKQ_MPSAFE);
+	xs->xs_rt_init = true;
+}
+
+static void
+xhci_rt_unbind(struct xhci_softc *sc, struct xhci_slot *xs)
+{
+	if (!xs->xs_rt_init)
+		return;
+	if (xs->xs_dev != NULL)
+		usb_rem_task_wait(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC,
+		    mutex_owned(&sc->sc_lock) ? &sc->sc_lock : NULL);
+	xs->xs_dev = NULL;
+	xs->xs_rt_init = false;
+	xs->xs_suspended = xs->xs_resuming = false;
+	xs->xs_dbpending = 0;
+	xs->xs_ctlrport = 0;
+}
+
+static bool
+xhci_rt_has_hid(struct usbd_device *dev)
+{
+	int i;
+
+	if (dev->ud_ifaces == NULL || dev->ud_cdesc == NULL)
+		return false;
+	for (i = 0; i < dev->ud_cdesc->bNumInterface; i++) {
+		if (dev->ud_ifaces[i].ui_idesc != NULL &&
+		    dev->ud_ifaces[i].ui_idesc->bInterfaceClass == UICLASS_HID)
+			return true;
+	}
+	return false;
+}
+
+static void
+xhci_rt_kick(struct xhci_softc *sc, struct xhci_slot *xs, int want)
+{
+	if (xs->xs_dev == NULL || !xs->xs_rt_init)
+		return;
+	xs->xs_rt_want = want;
+	usb_add_task(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC);
+}
+
+/*
+ * Ring a doorbell, or remember it when the port is asleep or waking: the
+ * TRBs are on the ring already; the resume rings it.
+ */
+static void
+xhci_rt_doorbell(struct xhci_softc *sc, struct xhci_slot *xs, u_int dci)
+{
+	bool defer, resume = false;
+
+	mutex_enter(&sc->sc_intr_lock);
+	defer = xs->xs_suspended || xs->xs_resuming;
+	if (defer) {
+		xs->xs_dbpending |= 1u << dci;
+		resume = xs->xs_suspended && !xs->xs_resuming;
+		if (resume)
+			xs->xs_resuming = true;
+	}
+	mutex_exit(&sc->sc_intr_lock);
+	if (!defer) {
+		xhci_db_write_4(sc, XHCI_DOORBELL(xs->xs_idx), dci);
+		return;
+	}
+	if (resume)
+		xhci_rt_kick(sc, xs, 2);
+}
+
+static void
+xhci_rt_ring_pending(struct xhci_softc *sc, struct xhci_slot *xs)
+{
+	uint32_t pending;
+	u_int dci;
+
+	mutex_enter(&sc->sc_intr_lock);
+	pending = xs->xs_dbpending;
+	xs->xs_dbpending = 0;
+	mutex_exit(&sc->sc_intr_lock);
+	for (dci = 1; dci <= XHCI_MAX_DCI; dci++)
+		if (pending & (1u << dci))
+			xhci_db_write_4(sc, XHCI_DOORBELL(xs->xs_idx), dci);
+}
+
+/* process context */
+static void
+xhci_rt_suspend_dev(struct xhci_softc *sc, struct xhci_slot *xs)
+{
+	struct usbd_device *dev = xs->xs_dev;
+	usb_device_request_t req;
+	bus_size_t port;
+	uint32_t v;
+	int j;
+
+	if (dev == NULL || xs->xs_ctlrport == 0 || sc->sc_dying ||
+	    sc->sc_suspender != NULL)
+		return;
+	mutex_enter(&sc->sc_intr_lock);
+	if (xs->xs_suspended || xs->xs_resuming || xs->xs_npipes != 0 ||
+	    getticks() - xs->xs_lastbusy < hz * xhci_autosuspend) {
+		mutex_exit(&sc->sc_intr_lock);
+		return;
+	}
+	mutex_exit(&sc->sc_intr_lock);
+
+	/* Remote wakeup, so an event (a Bluetooth connection) wakes it. */
+	if (dev->ud_cdesc != NULL &&
+	    (dev->ud_cdesc->bmAttributes & UC_REMOTE_WAKEUP) != 0) {
+		req.bmRequestType = UT_WRITE_DEVICE;
+		req.bRequest = UR_SET_FEATURE;
+		USETW(req.wValue, UF_DEVICE_REMOTE_WAKEUP);
+		USETW(req.wIndex, 0);
+		USETW(req.wLength, 0);
+		(void)usbd_do_request(dev, &req, NULL);
+	}
+
+	port = XHCI_PORTSC(xs->xs_ctlrport);
+	v = xhci_op_read_4(sc, port);
+	if ((v & XHCI_PS_PED) == 0 || XHCI_PS_PLS_GET(v) >= XHCI_PS_PLS_U3)
+		return;
+
+	mutex_enter(&sc->sc_intr_lock);
+	if (xs->xs_npipes != 0 || xs->xs_resuming) {
+		mutex_exit(&sc->sc_intr_lock);
+		return;
+	}
+	xs->xs_suspended = true;	/* doorbells defer from here on */
+	mutex_exit(&sc->sc_intr_lock);
+
+	v &= ~(XHCI_PS_PLS_MASK | XHCI_PS_CLEAR);
+	v |= XHCI_PS_LWS | XHCI_PS_PLS_SET(XHCI_PS_PLS_SETU3);
+	xhci_op_write_4(sc, port, v);
+	for (j = 0; j < XHCI_WAIT_PLS_U3; j++) {
+		v = xhci_op_read_4(sc, port);
+		if (XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_U3)
+			break;
+		usb_delay_ms(&sc->sc_bus, 1);
+	}
+	if (j == XHCI_WAIT_PLS_U3) {
+		aprint_debug_dev(sc->sc_dev, "port %u: U3 timeout\n",
+		    xs->xs_ctlrport);
+		sc->sc_rt_failed++;
+		/* leave it: a later resume puts it in a known state */
+	}
+	sc->sc_rt_suspends++;
+	aprint_debug_dev(sc->sc_dev, "port %u suspended\n", xs->xs_ctlrport);
+	if (xs->xs_dbpending != 0)
+		xhci_rt_kick(sc, xs, 2);
+}
+
+/* process context */
+static void
+xhci_rt_resume_dev(struct xhci_softc *sc, struct xhci_slot *xs)
+{
+	bus_size_t port = XHCI_PORTSC(xs->xs_ctlrport);
+	uint32_t v;
+	int j;
+
+	if (xs->xs_ctlrport == 0 || sc->sc_dying)
+		goto done;
+	mutex_enter(&sc->sc_intr_lock);
+	xs->xs_resuming = true;
+	mutex_exit(&sc->sc_intr_lock);
+
+	v = xhci_op_read_4(sc, port);
+	if (XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_U3 && xs->xs_bus == 1) {
+		/* USB2: drive resume signalling for T_DRSMDN, then U0. */
+		v &= ~(XHCI_PS_PLS_MASK | XHCI_PS_CLEAR);
+		v |= XHCI_PS_LWS | XHCI_PS_PLS_SET(XHCI_PS_PLS_SETRESUME);
+		xhci_op_write_4(sc, port, v);
+		usb_delay_ms(&sc->sc_bus, 20);
+		v = xhci_op_read_4(sc, port);
+	} else if (XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_RESUME) {
+		/* the device woke us: let its resume signalling finish */
+		usb_delay_ms(&sc->sc_bus, 20);
+		v = xhci_op_read_4(sc, port);
+	}
+	if (XHCI_PS_PLS_GET(v) != XHCI_PS_PLS_U0) {
+		v &= ~(XHCI_PS_PLS_MASK | XHCI_PS_CLEAR);
+		v |= XHCI_PS_LWS | XHCI_PS_PLS_SET(XHCI_PS_PLS_SETU0);
+		xhci_op_write_4(sc, port, v);
+		for (j = 0; j < XHCI_WAIT_PLS_U0; j++) {
+			v = xhci_op_read_4(sc, port);
+			if (XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_U0)
+				break;
+			usb_delay_ms(&sc->sc_bus, 1);
+		}
+		if (j == XHCI_WAIT_PLS_U0) {
+			aprint_debug_dev(sc->sc_dev, "port %u: U0 timeout\n",
+			    xs->xs_ctlrport);
+			sc->sc_rt_failed++;
+		}
+	}
+	usb_delay_ms(&sc->sc_bus, USB_RESUME_RECOVERY);
+	sc->sc_rt_resumes++;
+done:
+	mutex_enter(&sc->sc_intr_lock);
+	xs->xs_suspended = false;
+	xs->xs_resuming = false;
+	xs->xs_lastbusy = getticks();
+	mutex_exit(&sc->sc_intr_lock);
+	xhci_rt_ring_pending(sc, xs);
+}
+
+static void
+xhci_rt_task(void *arg)
+{
+	struct xhci_slot *xs = arg;
+	struct xhci_softc *sc;
+	int want;
+
+	if (xs->xs_dev == NULL)
+		return;
+	sc = XHCI_BUS2SC(xs->xs_dev->ud_bus);
+	want = xs->xs_rt_want;
+	xs->xs_rt_want = 0;
+	if (want == 2 || xs->xs_resuming)
+		xhci_rt_resume_dev(sc, xs);
+	else if (want == 1)
+		xhci_rt_suspend_dev(sc, xs);
+}
+
+/* Pipe open on a sleeping device (process context): wake it first. */
+static void
+xhci_rt_wake_for_open(struct xhci_softc *sc, struct xhci_slot *xs)
+{
+	bool need;
+
+	mutex_enter(&sc->sc_intr_lock);
+	need = xs->xs_suspended && !xs->xs_resuming;
+	if (need)
+		xs->xs_resuming = true;
+	mutex_exit(&sc->sc_intr_lock);
+	if (need)
+		xhci_rt_resume_dev(sc, xs);
+}
+
+/* softint: the idle scan */
+static void
+xhci_rt_callout(void *arg)
+{
+	struct xhci_softc *sc = arg;
+	struct xhci_slot *xs;
+	int i, idle;
+
+	if (sc->sc_dying)
+		return;
+	if (xhci_rt_enabled() && sc->sc_suspender == NULL) {
+		idle = hz * xhci_autosuspend;
+		for (i = 1; i <= sc->sc_maxslots; i++) {
+			xs = &sc->sc_slots[i];
+			if (xs->xs_idx == 0 || !xs->xs_rt_init ||
+			    xs->xs_dev == NULL || xs->xs_ctlrport == 0 ||
+			    xs->xs_suspended || xs->xs_resuming ||
+			    xs->xs_npipes != 0 ||
+			    getticks() - xs->xs_lastbusy < idle)
+				continue;
+			if (!xhci_autosuspend_hid && xhci_rt_has_hid(xs->xs_dev))
+				continue;
+			xhci_rt_kick(sc, xs, 1);
+		}
+	}
+	callout_schedule(&sc->sc_rt_callout,
+	    hz * (xhci_autosuspend > 0 ? xhci_autosuspend : 5));
+}
+
+/* A port status change: a remote wakeup of a sleeping device? */
+static void
+xhci_rt_portchange(struct xhci_softc *sc, u_int ctlrport)
+{
+	struct xhci_slot *xs;
+	uint32_t v;
+	int i;
+
+	for (i = 1; i <= sc->sc_maxslots; i++) {
+		xs = &sc->sc_slots[i];
+		if (xs->xs_idx == 0 || !xs->xs_rt_init ||
+		    xs->xs_ctlrport != ctlrport || !xs->xs_suspended ||
+		    xs->xs_resuming)
+			continue;
+		v = xhci_op_read_4(sc, XHCI_PORTSC(ctlrport));
+		if (XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_RESUME ||
+		    XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_U0) {
+			mutex_enter(&sc->sc_intr_lock);
+			xs->xs_resuming = true;
+			mutex_exit(&sc->sc_intr_lock);
+			sc->sc_rt_wakes++;
+			xhci_rt_kick(sc, xs, 2);
+		}
+		return;
+	}
+}
+
+static int
+sysctl_hw_usbpm_stats(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	char buf[128];
+	device_t dv;
+	deviter_t di;
+	uint64_t s = 0, r = 0, w = 0, f = 0;
+
+	for (dv = deviter_first(&di, DEVITER_F_LEAVES_FIRST); dv != NULL;
+	     dv = deviter_next(&di)) {
+		if (!device_is_a(dv, "xhci"))
+			continue;
+		struct xhci_softc *sc = device_private(dv);
+		s += sc->sc_rt_suspends; r += sc->sc_rt_resumes;
+		w += sc->sc_rt_wakes; f += sc->sc_rt_failed;
+	}
+	deviter_release(&di);
+	snprintf(buf, sizeof(buf), "suspends=%" PRIu64 " resumes=%" PRIu64
+	    " wakes=%" PRIu64 " failed=%" PRIu64, s, r, w, f);
+	node.sysctl_data = buf;
+	node.sysctl_size = strlen(buf) + 1;
+	return sysctl_lookup(SYSCTLFN_CALL(&node));
+}
+
+SYSCTL_SETUP(sysctl_hw_usbpm_setup, "hw.usbpm")
+{
+	const struct sysctlnode *node = NULL;
+
+	sysctl_createv(clog, 0, NULL, &node, CTLFLAG_PERMANENT, CTLTYPE_NODE,
+	    "usbpm", SYSCTL_DESCR("USB runtime power management"),
+	    NULL, 0, NULL, 0, CTL_HW, CTL_CREATE, CTL_EOL);
+	if (node == NULL)
+		return;
+	sysctl_createv(clog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "autosuspend",
+	    SYSCTL_DESCR("Seconds a root-port device may be idle before its port sleeps (0: never)"),
+	    NULL, 0, &xhci_autosuspend, 0, CTL_CREATE, CTL_EOL);
+	sysctl_createv(clog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "hid",
+	    SYSCTL_DESCR("Also sleep devices with a HID interface (keyboards, mice)"),
+	    NULL, 0, &xhci_autosuspend_hid, 0, CTL_CREATE, CTL_EOL);
+	sysctl_createv(clog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING, "stats",
+	    SYSCTL_DESCR("suspends, resumes, remote wakes, failures"),
+	    sysctl_hw_usbpm_stats, 0, NULL, 128, CTL_CREATE, CTL_EOL);
+}
+
 int
 xhci_init(struct xhci_softc *sc)
 {
@@ -1639,6 +2045,10 @@ xhci_init(struct xhci_softc *sc)
 
 	sc->sc_slots = kmem_zalloc(sizeof(*sc->sc_slots) * sc->sc_maxslots,
 	    KM_SLEEP);
+	/* LispBSD USB runtime power management: the idle scan */
+	callout_init(&sc->sc_rt_callout, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
+	callout_setfunc(&sc->sc_rt_callout, xhci_rt_callout, sc);
+	callout_schedule(&sc->sc_rt_callout, hz * 5);
 	if (sc->sc_slots == NULL) {
 		aprint_error_dev(sc->sc_dev, "slots init fail, err %d\n", err);
 		rv = ENOMEM;
@@ -2085,6 +2495,11 @@ xhci_open(struct usbd_pipe *pipe)
 	usb_init_task(&xpipe->xp_async_task, xhci_pipe_restart_async_task,
 	    pipe, USB_TASKQ_MPSAFE);
 
+	/* LispBSD runtime PM: bind the slot, wake a sleeping device. */
+	KASSERT(xs != NULL);
+	xhci_rt_bind(sc, xs, dev);
+	xhci_rt_wake_for_open(sc, xs);
+
 	switch (xfertype) {
 	case UE_CONTROL:
 		pipe->up_methods = &xhci_device_ctrl_methods;
@@ -2116,8 +2531,16 @@ xhci_open(struct usbd_pipe *pipe)
 		return err;
 	}
 
-	if (ed->bEndpointAddress != USB_CONTROL_ENDPOINT)
-		return xhci_configure_endpoint(pipe);
+	if (ed->bEndpointAddress != USB_CONTROL_ENDPOINT) {
+		err = xhci_configure_endpoint(pipe);
+		if (err == USBD_NORMAL_COMPLETION) {
+			mutex_enter(&sc->sc_intr_lock);
+			xs->xs_npipes++;
+			xs->xs_lastbusy = getticks();
+			mutex_exit(&sc->sc_intr_lock);
+		}
+		return err;
+	}
 
 	return USBD_NORMAL_COMPLETION;
 }
@@ -2159,6 +2582,14 @@ xhci_close_pipe(struct usbd_pipe *pipe)
 
 	if (pipe->up_dev->ud_depth == 0)
 		return;
+
+	if (ed->bEndpointAddress != USB_CONTROL_ENDPOINT && xs->xs_rt_init) {
+		mutex_enter(&sc->sc_intr_lock);
+		if (xs->xs_npipes > 0)
+			xs->xs_npipes--;
+		xs->xs_lastbusy = getticks();
+		mutex_exit(&sc->sc_intr_lock);
+	}
 
 	if (dci == XHCI_DCI_EP_CONTROL) {
 		DPRINTFN(4, "closing ep0", 0, 0, 0, 0);
@@ -2372,6 +2803,8 @@ xhci_rhpsc(struct xhci_softc * const sc, u_int ctlrport)
 	if (ctlrport > sc->sc_maxports)
 		return;
 
+	xhci_rt_portchange(sc, ctlrport);
+
 	const size_t bn = xhci_ctlrport2bus(sc, ctlrport);
 	const size_t rhp = xhci_ctlrport2rhport(sc, ctlrport);
 	struct usbd_xfer * const xfer = sc->sc_intrxfer[bn];
@@ -2419,6 +2852,7 @@ xhci_event_transfer(struct xhci_softc * const sc,
 	slot = XHCI_TRB_3_SLOT_GET(trb_3);
 	dci = XHCI_TRB_3_EP_GET(trb_3);
 	xs = &sc->sc_slots[slot];
+	xs->xs_lastbusy = getticks();	/* LispBSD runtime PM */
 	xr = xs->xs_xr[dci];
 
 	/* sanity check */
@@ -3544,6 +3978,8 @@ xhci_free_slot(struct xhci_softc *sc, struct xhci_slot *xs)
 	XHCIHIST_FUNC();
 	XHCIHIST_CALLARGS("slot %ju", xs->xs_idx, 0, 0, 0);
 
+	xhci_rt_unbind(sc, xs);
+
 	/* deallocate all allocated rings in the slot */
 	for (dci = XHCI_DCI_SLOT; dci <= XHCI_MAX_DCI; dci++) {
 		if (xs->xs_xr[dci] != NULL)
@@ -4528,7 +4964,7 @@ xhci_device_ctrl_start(struct usbd_xfer *xfer)
 	if (!polling)
 		mutex_exit(&tr->xr_lock);
 
-	xhci_db_write_4(sc, XHCI_DOORBELL(xs->xs_idx), dci);
+	xhci_rt_doorbell(sc, xs, dci);
 
 out:	if (xfer->ux_status == USBD_NOT_STARTED) {
 		xfer->ux_status = USBD_IN_PROGRESS;
@@ -4682,7 +5118,7 @@ xhci_device_isoc_enter(struct usbd_xfer *xfer)
 	if (!polling)
 		mutex_exit(&tr->xr_lock);
 
-	xhci_db_write_4(sc, XHCI_DOORBELL(xs->xs_idx), dci);
+	xhci_rt_doorbell(sc, xs, dci);
 	xfer->ux_status = USBD_IN_PROGRESS;
 	usbd_xfer_schedule_timeout(xfer);
 
@@ -4803,7 +5239,7 @@ xhci_device_bulk_start(struct usbd_xfer *xfer)
 	if (!polling)
 		mutex_exit(&tr->xr_lock);
 
-	xhci_db_write_4(sc, XHCI_DOORBELL(xs->xs_idx), dci);
+	xhci_rt_doorbell(sc, xs, dci);
 
 out:	if (xfer->ux_status == USBD_NOT_STARTED) {
 		xfer->ux_status = USBD_IN_PROGRESS;
@@ -4914,7 +5350,7 @@ xhci_device_intr_start(struct usbd_xfer *xfer)
 	if (!polling)
 		mutex_exit(&tr->xr_lock);
 
-	xhci_db_write_4(sc, XHCI_DOORBELL(xs->xs_idx), dci);
+	xhci_rt_doorbell(sc, xs, dci);
 
 out:	if (xfer->ux_status == USBD_NOT_STARTED) {
 		xfer->ux_status = USBD_IN_PROGRESS;
