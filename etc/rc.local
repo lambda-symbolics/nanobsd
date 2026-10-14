@@ -22,6 +22,7 @@ echo '.'
 
 # ensure DRM primary node exists for screentemp/gamma
 [ -c /dev/dri/card0 ] || ( cd /dev && sh MAKEDEV drm0 )
+[ -c /dev/vcam ] || mknod /dev/vcam c 370 0	# vcam(4), the virtual camera (om1 feeds it)
 
 # battery: WiFi power save (~1.5 W)
 ifconfig iwx0 powersave
