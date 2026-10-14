@@ -683,7 +683,7 @@ xhci_detach(struct xhci_softc *sc, int flags)
 	xhci_op_write_8(sc, XHCI_DCBAAP, 0);
 	usb_freemem(&sc->sc_dcbaa_dma);
 
-	kmem_free(sc->sc_slots, sizeof(*sc->sc_slots) * sc->sc_maxslots);
+	kmem_free(sc->sc_slots, sizeof(*sc->sc_slots) * (sc->sc_maxslots + 1));
 
 	kmem_free(sc->sc_ctlrportbus,
 	    howmany(sc->sc_maxports * sizeof(uint8_t), NBBY));
@@ -2077,8 +2077,14 @@ xhci_init(struct xhci_softc *sc)
 		usb_syncmem(dma, 0, size, BUS_DMASYNC_PREWRITE);
 	}
 
-	sc->sc_slots = kmem_zalloc(sizeof(*sc->sc_slots) * sc->sc_maxslots,
-	    KM_SLEEP);
+	/*
+	 * LispBSD: slot ids are 1..sc_maxslots and the runtime PM scans
+	 * walk that whole range, so keep sc_maxslots + 1 entries (one past
+	 * the array read a stale doorbell mask and rang a doorbell at a
+	 * garbage offset on resume, kernel 160).
+	 */
+	sc->sc_slots = kmem_zalloc(sizeof(*sc->sc_slots) *
+	    (sc->sc_maxslots + 1), KM_SLEEP);
 	/* LispBSD USB runtime power management: the idle scan */
 	callout_init(&sc->sc_rt_callout, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 	callout_setfunc(&sc->sc_rt_callout, xhci_rt_callout, sc);
@@ -2137,7 +2143,7 @@ xhci_init(struct xhci_softc *sc)
 
 	if (sc->sc_slots) {
 		kmem_free(sc->sc_slots, sizeof(*sc->sc_slots) *
-		    sc->sc_maxslots);
+		    (sc->sc_maxslots + 1));
 		sc->sc_slots = NULL;
 	}
 
