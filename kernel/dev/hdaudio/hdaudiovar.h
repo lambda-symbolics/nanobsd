@@ -35,6 +35,7 @@
 #include <dev/audio/audio_if.h>
 #include <sys/callout.h>
 #include <sys/workqueue.h>
+#include <sys/queue.h>
 
 #ifdef _KERNEL_OPT
 #include "opt_hdaudio.h"
@@ -180,13 +181,14 @@ struct hdaudio_softc {
 	struct work		sc_rt_work;
 	bool			(*sc_rt_suspend)(struct hdaudio_softc *);	/* bus driver */
 	bool			(*sc_rt_resume)(struct hdaudio_softc *);
-	uint64_t		sc_rt_suspends, sc_rt_resumes;
+	int			sc_rt_lastbusy;		/* getticks() at the last release */
+	uint64_t		sc_rt_suspends, sc_rt_resumes, sc_rt_stale;
+	SLIST_ENTRY(hdaudio_softc) sc_rt_link;		/* all controllers, for the sysctl */
 };
 
 extern int hdaudio_power_save;
-void	hdaudio_rt_use(struct hdaudio_softc *);
+int	hdaudio_rt_use(struct hdaudio_softc *);
 void	hdaudio_rt_release(struct hdaudio_softc *);
-void	hdaudio_rt_touch(struct hdaudio_softc *);
 void	hdaudio_rt_pmf_resumed(struct hdaudio_softc *);
 
 int	hdaudio_attach(device_t, struct hdaudio_softc *);

@@ -382,6 +382,7 @@ static int	hdafg_commit_settings(void *);
 static int	hdafg_halt_output(void *);
 static int	hdafg_halt_input(void *);
 static int	hdafg_set_port(void *, mixer_ctrl_t *);
+static int	hdafg_set_port_hw(void *, mixer_ctrl_t *);
 static int	hdafg_get_port(void *, mixer_ctrl_t *);
 static int	hdafg_query_devinfo(void *, mixer_devinfo_t *);
 static void *	hdafg_allocm(void *, int, size_t);
@@ -4040,8 +4041,7 @@ hdafg_open(void *opaque, int flags)
 {
 	struct hdaudio_audiodev *ad = opaque;
 
-	hdaudio_rt_use(ad->ad_sc->sc_host);
-	return 0;
+	return hdaudio_rt_use(ad->ad_sc->sc_host);
 }
 
 static void
@@ -4272,7 +4272,7 @@ hdafg_getdev(void *opaque, struct audio_device *audiodev)
 }
 
 static int
-hdafg_set_port(void *opaque, mixer_ctrl_t *mc)
+hdafg_set_port_hw(void *opaque, mixer_ctrl_t *mc)
 {
 	struct hdaudio_audiodev *ad = opaque;
 	struct hdafg_softc *sc = ad->ad_sc;
@@ -4282,7 +4282,6 @@ hdafg_set_port(void *opaque, mixer_ctrl_t *mc)
 
 	if (mc->dev < 0 || mc->dev >= sc->sc_nmixers)
 		return EINVAL;
-	hdaudio_rt_touch(sc->sc_host);	/* LispBSD: amp writes need the codec */
 	mx = &sc->sc_mixers[mc->dev];
 	ctl = mx->mx_ctl;
 	if (ctl == NULL) {
@@ -4339,6 +4338,21 @@ hdafg_set_port(void *opaque, mixer_ctrl_t *mc)
 	}
 
 	return 0;
+}
+
+/* LispBSD: amp writes need the codec awake for the whole access. */
+static int
+hdafg_set_port(void *opaque, mixer_ctrl_t *mc)
+{
+	struct hdaudio_audiodev *ad = opaque;
+	int error;
+
+	error = hdaudio_rt_use(ad->ad_sc->sc_host);
+	if (error != 0)
+		return error;
+	error = hdafg_set_port_hw(opaque, mc);
+	hdaudio_rt_release(ad->ad_sc->sc_host);
+	return error;
 }
 
 static int

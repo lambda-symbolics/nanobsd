@@ -800,18 +800,29 @@ hdaudio_stream_tag(struct hdaudio_stream *st)
  *
  * hw.hdaudio.power_save seconds after the last audio device closes (and
  * at boot), every codec function group is put in D3 and the controller
- * in D3hot (the bus driver's sc_rt_suspend).  The first open or mixer
- * write brings everything back through the same path s2idle resume uses.
- * The idle timer is a deferrable callout: it does not wake an idle CPU.
- * 0 turns it off (an already suspended controller wakes at the next use).
+ * in D3hot (the bus driver's sc_rt_suspend).  The first open brings
+ * everything back through the same path s2idle resume uses; a mixer write
+ * holds a use reference around its hardware access.  The idle timer is a
+ * deferrable callout: it does not wake an idle CPU (and so fires at most
+ * machdep.cidle.maxskip late); the worker revalidates the deadline from
+ * the last release, so a use in between restarts the interval instead of
+ * being followed by an immediate suspend.  power_save 0: never suspend,
+ * and writing 0 wakes a suspended controller; writing a delay re-arms
+ * idle controllers.
  */
 int hdaudio_power_save = 10;
+
+static kmutex_t hdaudio_rt_listlock;
+static SLIST_HEAD(, hdaudio_softc) hdaudio_rt_list =
+    SLIST_HEAD_INITIALIZER(hdaudio_rt_list);
+static bool hdaudio_rt_listinit;
 
 static void
 hdaudio_rt_arm(struct hdaudio_softc *sc)
 {
 	KASSERT(mutex_owned(&sc->sc_rt_lock));
-	if (hdaudio_power_save > 0 && !sc->sc_rt_suspended)
+	if (hdaudio_power_save > 0 && !sc->sc_rt_suspended &&
+	    sc->sc_rt_wq != NULL)
 		callout_schedule(&sc->sc_rt_callout, hz * hdaudio_power_save);
 }
 
@@ -839,7 +850,8 @@ hdaudio_rt_suspend_locked(struct hdaudio_softc *sc)
 	aprint_debug_dev(sc->sc_dev, "runtime suspended\n");
 }
 
-static void
+/* Returns true when the hardware is usable again. */
+static bool
 hdaudio_rt_resume_locked(struct hdaudio_softc *sc)
 {
 	struct hdaudio_function_group *fg;
@@ -847,9 +859,11 @@ hdaudio_rt_resume_locked(struct hdaudio_softc *sc)
 
 	KASSERT(mutex_owned(&sc->sc_rt_lock));
 	KASSERT(sc->sc_rt_suspended);
-	sc->sc_rt_suspended = false;	/* the interrupt handler may run again */
-	if (sc->sc_rt_resume != NULL && !(*sc->sc_rt_resume)(sc))
+	if (sc->sc_rt_resume != NULL && !(*sc->sc_rt_resume)(sc)) {
 		aprint_error_dev(sc->sc_dev, "runtime resume of the controller failed\n");
+		return false;	/* stays suspended; the next use retries */
+	}
+	sc->sc_rt_suspended = false;	/* the interrupt handler may run again */
 	for (i = 0; i < HDAUDIO_MAX_CODECS; i++) {
 		if (!sc->sc_codec[i].co_valid)
 			continue;
@@ -861,18 +875,28 @@ hdaudio_rt_resume_locked(struct hdaudio_softc *sc)
 	}
 	sc->sc_rt_resumes++;
 	aprint_debug_dev(sc->sc_dev, "runtime resumed\n");
+	return true;
 }
 
 static void
 hdaudio_rt_work(struct work *wk, void *arg)
 {
 	struct hdaudio_softc *sc = arg;
+	int idle, want;
 
 	mutex_enter(&sc->sc_rt_lock);
 	sc->sc_rt_queued = 0;
 	if (sc->sc_rt_users == 0 && !sc->sc_rt_suspended &&
-	    hdaudio_power_save > 0)
-		hdaudio_rt_suspend_locked(sc);
+	    hdaudio_power_save > 0) {
+		/* A use since the timer was set restarts the interval. */
+		want = hz * hdaudio_power_save;
+		idle = getticks() - sc->sc_rt_lastbusy;
+		if (idle < want) {
+			sc->sc_rt_stale++;
+			callout_schedule(&sc->sc_rt_callout, want - idle);
+		} else
+			hdaudio_rt_suspend_locked(sc);
+	}
 	mutex_exit(&sc->sc_rt_lock);
 }
 
@@ -892,16 +916,27 @@ hdaudio_rt_init(struct hdaudio_softc *sc)
 	mutex_init(&sc->sc_rt_lock, MUTEX_DEFAULT, IPL_NONE);
 	callout_init(&sc->sc_rt_callout, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 	callout_setfunc(&sc->sc_rt_callout, hdaudio_rt_timeout, sc);
+	sc->sc_rt_lastbusy = getticks();
 	if (workqueue_create(&sc->sc_rt_wq, "hdaudiopm", hdaudio_rt_work, sc,
 	    PRI_NONE, IPL_NONE, WQ_MPSAFE) != 0) {
 		aprint_error_dev(sc->sc_dev, "no workqueue, runtime power management off\n");
 		sc->sc_rt_wq = NULL;
 	}
+	if (!hdaudio_rt_listinit) {
+		mutex_init(&hdaudio_rt_listlock, MUTEX_DEFAULT, IPL_NONE);
+		hdaudio_rt_listinit = true;
+	}
+	mutex_enter(&hdaudio_rt_listlock);
+	SLIST_INSERT_HEAD(&hdaudio_rt_list, sc, sc_rt_link);
+	mutex_exit(&hdaudio_rt_listlock);
 }
 
 static void
 hdaudio_rt_fini(struct hdaudio_softc *sc)
 {
+	mutex_enter(&hdaudio_rt_listlock);
+	SLIST_REMOVE(&hdaudio_rt_list, sc, hdaudio_softc, sc_rt_link);
+	mutex_exit(&hdaudio_rt_listlock);
 	callout_halt(&sc->sc_rt_callout, NULL);
 	callout_destroy(&sc->sc_rt_callout);
 	if (sc->sc_rt_wq != NULL)
@@ -909,38 +944,35 @@ hdaudio_rt_fini(struct hdaudio_softc *sc)
 	mutex_destroy(&sc->sc_rt_lock);
 }
 
-/* An audio device opened: keep (or make) the hardware awake. */
-void
+/*
+ * Take a use reference: the hardware is awake and stays so until the
+ * matching release.  Returns EIO when it could not be woken.
+ */
+int
 hdaudio_rt_use(struct hdaudio_softc *sc)
 {
+	int error = 0;
+
 	mutex_enter(&sc->sc_rt_lock);
-	sc->sc_rt_users++;
-	callout_stop(&sc->sc_rt_callout);
-	if (sc->sc_rt_suspended)
-		hdaudio_rt_resume_locked(sc);
+	if (sc->sc_rt_suspended && !hdaudio_rt_resume_locked(sc))
+		error = EIO;
+	else {
+		sc->sc_rt_users++;
+		callout_stop(&sc->sc_rt_callout);
+	}
 	mutex_exit(&sc->sc_rt_lock);
+	return error;
 }
 
-/* An audio device closed: start the idle clock when it was the last. */
+/* Drop a use reference; the last one starts the idle clock. */
 void
 hdaudio_rt_release(struct hdaudio_softc *sc)
 {
 	mutex_enter(&sc->sc_rt_lock);
 	if (sc->sc_rt_users > 0)
 		sc->sc_rt_users--;
-	if (sc->sc_rt_users == 0 && sc->sc_rt_wq != NULL)
-		hdaudio_rt_arm(sc);
-	mutex_exit(&sc->sc_rt_lock);
-}
-
-/* A one-off hardware access (mixer write): wake, and restart the clock. */
-void
-hdaudio_rt_touch(struct hdaudio_softc *sc)
-{
-	mutex_enter(&sc->sc_rt_lock);
-	if (sc->sc_rt_suspended)
-		hdaudio_rt_resume_locked(sc);
-	if (sc->sc_rt_users == 0 && sc->sc_rt_wq != NULL)
+	sc->sc_rt_lastbusy = getticks();
+	if (sc->sc_rt_users == 0)
 		hdaudio_rt_arm(sc);
 	mutex_exit(&sc->sc_rt_lock);
 }
@@ -951,9 +983,45 @@ hdaudio_rt_pmf_resumed(struct hdaudio_softc *sc)
 {
 	mutex_enter(&sc->sc_rt_lock);
 	sc->sc_rt_suspended = false;
-	if (sc->sc_rt_users == 0 && sc->sc_rt_wq != NULL)
+	sc->sc_rt_lastbusy = getticks();
+	if (sc->sc_rt_users == 0)
 		hdaudio_rt_arm(sc);
 	mutex_exit(&sc->sc_rt_lock);
+}
+
+/* hw.hdaudio.power_save: apply a new policy to every controller at once. */
+static int
+hdaudio_sysctl_power_save(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	struct hdaudio_softc *sc;
+	int error, v;
+
+	v = hdaudio_power_save;
+	node.sysctl_data = &v;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error || newp == NULL)
+		return error;
+	if (v < 0 || v > 3600)
+		return EINVAL;
+	hdaudio_power_save = v;
+	if (!hdaudio_rt_listinit)
+		return 0;
+	mutex_enter(&hdaudio_rt_listlock);
+	SLIST_FOREACH(sc, &hdaudio_rt_list, sc_rt_link) {
+		mutex_enter(&sc->sc_rt_lock);
+		if (v == 0) {
+			callout_stop(&sc->sc_rt_callout);
+			if (sc->sc_rt_suspended)
+				(void)hdaudio_rt_resume_locked(sc);
+		} else if (sc->sc_rt_users == 0 && !sc->sc_rt_suspended) {
+			sc->sc_rt_lastbusy = getticks();
+			hdaudio_rt_arm(sc);
+		}
+		mutex_exit(&sc->sc_rt_lock);
+	}
+	mutex_exit(&hdaudio_rt_listlock);
+	return 0;
 }
 
 SYSCTL_SETUP(sysctl_hw_hdaudio_setup, "hw.hdaudio")
@@ -967,8 +1035,8 @@ SYSCTL_SETUP(sysctl_hw_hdaudio_setup, "hw.hdaudio")
 		return;
 	sysctl_createv(clog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "power_save",
-	    SYSCTL_DESCR("Seconds without an open audio device before the codecs and controller power down (0: never)"),
-	    NULL, 0, &hdaudio_power_save, 0, CTL_CREATE, CTL_EOL);
+	    SYSCTL_DESCR("Seconds without an open audio device before the codecs and controller power down (0: never, and wake now)"),
+	    hdaudio_sysctl_power_save, 0, NULL, 0, CTL_CREATE, CTL_EOL);
 }
 
 int
@@ -1067,7 +1135,10 @@ hdaudio_attach(device_t dev, struct hdaudio_softc *sc)
 	hdaudio_intr_enable(sc);
 
 	/* Nothing is open yet: start the idle clock. */
-	hdaudio_rt_release(sc);
+	mutex_enter(&sc->sc_rt_lock);
+	sc->sc_rt_lastbusy = getticks();
+	hdaudio_rt_arm(sc);
+	mutex_exit(&sc->sc_rt_lock);
 
 fail:
 	if (err)

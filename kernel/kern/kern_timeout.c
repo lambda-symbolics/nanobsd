@@ -90,6 +90,7 @@ __KERNEL_RCSID(0, "$NetBSD: kern_timeout.c,v 1.79 2023/10/08 13:23:05 ad Exp $")
 #include <sys/callout.h>
 #include <sys/lwp.h>
 #include <sys/sysctl.h>
+#include <sys/atomic.h>
 #include <sys/mutex.h>
 #include <sys/proc.h>
 #include <sys/sleepq.h>
@@ -960,7 +961,7 @@ callout_next_ticks(void)
 				c = (callout_impl_t *)p;
 				if (callout_deferrable_enabled &&
 				    (c->c_flags & CALLOUT_DEFERRABLE) != 0) {
-					callout_deferred_skips++;
+					atomic_inc_64(&callout_deferred_skips);
 					continue;
 				}
 				delta = (int)((unsigned)c->c_time -
