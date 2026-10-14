@@ -3202,84 +3202,172 @@ sysctl_hw_acpi_s0freeze(SYSCTLFN_ARGS)
  * Apply ACPI device-state methods and target-state resource references after
  * driver quiescence.  acpi_power_set(D3) enables _PR3 resources, releases the
  * previous state's references and invokes _PS3; it does not imply D3cold.
- * Restore resources before resuming drivers.  Storage is excluded.
+ * Entries flagged ADRPWR_COLD go to D3cold instead: every power-resource
+ * reference of the device is released, so a resource shared by several
+ * functions (the TCSS D3C of the Thunderbolt DMA engines and the USB-C
+ * xHCI) goes _OFF with the last of them.  D3cold resets the PCI function
+ * (BARs, MSI, PMCSR; the firmware's TCOF loops until the vendor ID reads
+ * all-ones), so the configuration space is captured before and restored
+ * after the resource comes back.  Restore resources before resuming
+ * drivers.  Storage is excluded.
  */
+#ifndef ACPI_STATE_D3_COLD
+#define ACPI_STATE_D3_COLD	4	/* acpi_power.c: _PS3 + release every resource */
+#endif
+
+struct acpi_adr_pwr {
+	uint32_t		ap_adr;		/* PCI _ADR */
+	int			ap_flags;
+#define ADRPWR_COLD		0x01		/* D3cold instead of D3hot */
+#define ADRPWR_NODRIVER		0x02		/* only while no driver is attached */
+	ACPI_HANDLE		ap_changed;	/* set while moved away from D0 */
+	int			ap_previous;
+	bool			ap_saved;	/* ap_conf holds the config space */
+	pci_chipset_tag_t	ap_pc;
+	pcitag_t		ap_tag;
+	struct pci_conf_state	ap_conf;
+};
+
 /*
- * Move the ACPI devices at ADRS (by _ADR) to STATE, remembering what changed
- * in CHANGED/PREVIOUS so that a later call with ACPI_STATE_D0 restores exactly
- * those.  Devices already in STATE are left alone and not restored.
+ * Move the ACPI devices in the TABLE (by _ADR) to STATE, remembering what
+ * changed so that a later call with ACPI_STATE_D0 restores exactly those.
+ * Devices already in STATE are left alone and not restored.
  */
 static void
-acpi_adr_power(struct acpi_softc *sc, const char *what, const uint32_t *adrs,
-    unsigned n, ACPI_HANDLE *changed, int *previous, int state)
+acpi_adr_power(struct acpi_softc *sc, const char *what,
+    struct acpi_adr_pwr *table, unsigned n, int state)
 {
 	struct acpi_devnode *ad;
+	struct acpi_adr_pwr *ap;
 	unsigned i;
-	int old;
+	int old, target;
+	pcireg_t id;
+	bool ok;
 
 	if (state == ACPI_STATE_D0) {
 		for (i = 0; i < n; i++) {
-			if (changed[i] == NULL)
+			ap = &table[i];
+			if (ap->ap_changed == NULL)
 				continue;
-			if (!acpi_power_get(changed[i], &old) || old != previous[i])
-				aprint_normal_dev(sc->sc_dev,
-				    "%s: restore adr=0x%x D%d -> %d\n", what,
-				    adrs[i], previous[i],
-				    (int)acpi_power_set(changed[i], previous[i]));
-			changed[i] = NULL;
+			ok = acpi_power_set(ap->ap_changed, ap->ap_previous);
+			aprint_normal_dev(sc->sc_dev,
+			    "%s: restore adr=0x%x D%d -> %d\n", what,
+			    ap->ap_adr, ap->ap_previous, (int)ok);
+			if (ap->ap_saved) {
+				id = pci_conf_read(ap->ap_pc, ap->ap_tag,
+				    PCI_ID_REG);
+				if (id == 0xffffffff || id == 0) {
+					aprint_error_dev(sc->sc_dev,
+					    "%s: adr=0x%x absent after D0 "
+					    "(id 0x%x), config not restored\n",
+					    what, ap->ap_adr, id);
+				} else {
+					(void)pci_set_powerstate(ap->ap_pc,
+					    ap->ap_tag, PCI_PMCSR_STATE_D0);
+					pci_conf_restore(ap->ap_pc, ap->ap_tag,
+					    &ap->ap_conf);
+				}
+				ap->ap_saved = false;
+			}
+			ap->ap_changed = NULL;
 		}
 		return;
 	}
-	memset(changed, 0, n * sizeof(*changed));
+
+	for (i = 0; i < n; i++) {
+		table[i].ap_changed = NULL;
+		table[i].ap_saved = false;
+	}
 
 	SIMPLEQ_FOREACH(ad, &sc->sc_head, ad_list) {
 		if (ad->ad_devinfo->Type != ACPI_TYPE_DEVICE ||
 		    (ad->ad_devinfo->Valid & ACPI_VALID_ADR) == 0)
 			continue;
 		for (i = 0; i < n; i++) {
-			if ((uint32_t)ad->ad_devinfo->Address != adrs[i])
+			ap = &table[i];
+			if ((uint32_t)ad->ad_devinfo->Address != ap->ap_adr)
 				continue;
-			/* Do not power up devices on resume that were already off. */
-			old = ACPI_STATE_ERROR;
-			if (!acpi_power_get(ad->ad_handle, &old) || old == state) {
+			target = (ap->ap_flags & ADRPWR_COLD) ?
+			    ACPI_STATE_D3_COLD : state;
+			if ((ap->ap_flags & ADRPWR_NODRIVER) &&
+			    acpi_pcidev_find_dev(ad) != NULL) {
 				aprint_normal_dev(sc->sc_dev,
-				    "%s: ACPI adr=0x%x current=%d skipped\n",
-				    what, adrs[i], old);
+				    "%s: adr=0x%x has %s attached, skipped\n",
+				    what, ap->ap_adr,
+				    device_xname(acpi_pcidev_find_dev(ad)));
 				break;
 			}
+			/* Do not power up devices on resume that were already off. */
+			old = ACPI_STATE_ERROR;
+			if (!acpi_power_get(ad->ad_handle, &old) ||
+			    old == target) {
+				aprint_normal_dev(sc->sc_dev,
+				    "%s: ACPI adr=0x%x current=%d skipped\n",
+				    what, ap->ap_adr, old);
+				break;
+			}
+			/*
+			 * D3cold resets the function: keep its configuration
+			 * space and put it in D3hot first, as the PCI bus
+			 * driver does for the functions it suspends.
+			 */
+			if ((ap->ap_flags & ADRPWR_COLD) &&
+			    ad->ad_pciinfo != NULL) {
+				ap->ap_pc = ad->ad_pciinfo->ap_pc;
+				ap->ap_tag = pci_make_tag(ap->ap_pc,
+				    ad->ad_pciinfo->ap_bus,
+				    ad->ad_pciinfo->ap_device,
+				    ad->ad_pciinfo->ap_function);
+				id = pci_conf_read(ap->ap_pc, ap->ap_tag,
+				    PCI_ID_REG);
+				if (id != 0xffffffff && id != 0) {
+					pci_conf_capture(ap->ap_pc, ap->ap_tag,
+					    &ap->ap_conf);
+					ap->ap_saved = true;
+					(void)pci_set_powerstate(ap->ap_pc,
+					    ap->ap_tag, PCI_PMCSR_STATE_D3);
+				}
+			}
 			/* Retain the old state even if a resource operation fails partway. */
-			changed[i] = ad->ad_handle;
-			previous[i] = old;
+			ap->ap_changed = ad->ad_handle;
+			ap->ap_previous = old;
+			ok = acpi_power_set(ad->ad_handle, target);
 			aprint_normal_dev(sc->sc_dev,
-			    "%s: acpi_power_set adr=0x%x D%d -> %d\n",
-			    what, adrs[i], state,
-			    (int)acpi_power_set(ad->ad_handle, state));
+			    "%s: acpi_power_set adr=0x%x D%d%s -> %d\n",
+			    what, ap->ap_adr, target == ACPI_STATE_D3_COLD ?
+			    3 : target, target == ACPI_STATE_D3_COLD ?
+			    "cold" : "", (int)ok);
 			break;
 		}
 	}
 }
 
+/*
+ * The LPS0 "mode 0" PMC requirements (w1.22 LPSS_PG, w2.8 IS_D3) need the
+ * power resources of these functions off, not merely D3hot, hence D3cold
+ * for the driverless IPs and the Thunderbolt DMA engines.  The I2C
+ * controllers (dwiic) and the PCH xHCI keep their drivers' D3hot: the
+ * xHCI's internal devices (Bluetooth, camera, fingerprint) would not
+ * survive a controller reset.
+ */
 static void
 acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
 {
-	static const uint32_t adrs[] = {
-		0x00150000,	/* LPSS I2C0 -> LPSS_PG (w1.22, mode0 REQUIRED) */
-		0x00150003,	/* LPSS I2C3 -> LPSS_PG */
-		0x00050000,	/* IPU / image sensor -> IS_D3 (w2.8, mode0 REQUIRED) */
-		0x00120000,	/* ISH (sensor hub) */
-		0x00140000,	/* xHCI (USB2) */
-		0x00160000,	/* HECI / CSME */
-		0x00080000,	/* GNA */
-		0x000d0002,	/* Thunderbolt DMA 1 */
-		0x000d0003,	/* Thunderbolt DMA 2 */
-		0x00070000,	/* Thunderbolt PCIe root port 1 */
-		0x00070002,	/* Thunderbolt PCIe root port 2 */
+	static struct acpi_adr_pwr table[] = {
+		{ .ap_adr = 0x00150000 },	/* LPSS I2C0 -> LPSS_PG (w1.22, mode0 REQUIRED) */
+		{ .ap_adr = 0x00150003 },	/* LPSS I2C3 -> LPSS_PG */
+		{ .ap_adr = 0x00050000, .ap_flags = ADRPWR_COLD }, /* IPU / image sensor -> IS_D3 (w2.8, mode0 REQUIRED) */
+		{ .ap_adr = 0x00120000, .ap_flags = ADRPWR_COLD }, /* ISH (sensor hub) */
+		{ .ap_adr = 0x00140000 },	/* xHCI (USB2) */
+		{ .ap_adr = 0x00160000, .ap_flags = ADRPWR_COLD }, /* HECI / CSME */
+		{ .ap_adr = 0x00080000, .ap_flags = ADRPWR_COLD }, /* GNA */
+		{ .ap_adr = 0x000d0002, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 1 */
+		{ .ap_adr = 0x000d0003, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 2 */
+		{ .ap_adr = 0x00070000 },	/* Thunderbolt PCIe root port 1 */
+		{ .ap_adr = 0x00070002 },	/* Thunderbolt PCIe root port 2 */
 	};
-	static ACPI_HANDLE changed[__arraycount(adrs)];
-	static int previous[__arraycount(adrs)];
 
-	acpi_adr_power(sc, "s2idle", adrs, __arraycount(adrs), changed,
-	    previous, state);
+	acpi_adr_power(sc, "s2idle", table, __arraycount(table), state);
 }
 
 /*
@@ -3288,37 +3376,27 @@ acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
  * resources on, an idle package spends about half its time in PC3 instead of
  * PC10 (the same split the s2idle path used to show before its resource
  * power-down).  hw.acpi.sleep.idle_d3 applies that power-down while awake.
- * The Thunderbolt DMA functions share power with the USB-C host, so
- * /usr/local/bin/usb clears this before it resumes USB.  The I2C controllers
- * (touchpad) and xHCI have drivers and are left out.
+ * The Thunderbolt DMA functions share the TCSS D3C resource with the USB-C
+ * host (TXHC, 0:13:0): D3C goes _OFF (TCOF: IOM D3cold entry, the package
+ * can reach TC10/PC10) only when all three functions have released it.
+ * /usr/local/bin/usb detaches xhci0 before setting idle_d3 and rescans
+ * pci0 after clearing it; the I2C controllers (touchpad) and the PCH xHCI
+ * have drivers and are left out.
  */
 static void
 acpi_idle_powerdown(struct acpi_softc *sc, int state)
 {
-	static const uint32_t adrs[] = {
-		0x00050000,	/* IPU / image sensor */
-		0x00120000,	/* ISH (sensor hub) */
-		0x00160000,	/* HECI / CSME */
-		0x00080000,	/* GNA */
-		0x000d0002,	/* Thunderbolt DMA 1 */
-		0x000d0003,	/* Thunderbolt DMA 2 */
-		/*
-		 * 2026-10-14: the TCSS xHCI (0:13:0).  With the controller in
-		 * PCI D3hot from pmf (usb off) the package idles in either
-		 * PC10 or a PC3/PC10 split; the Tiger Lake datasheet's
-		 * TC-Cold (TCSS functions in D3, IOM active: PC3-PC10 allowed)
-		 * versus TC10 (IOM inactive: PC6-PC10) is the candidate, and
-		 * only the ACPI power resource reaches the IOM.  Only applied
-		 * with the xHCI driver suspended; the usb script clears
-		 * idle_d3 before resuming USB.
-		 */
-		0x000d0000,	/* TCSS xHCI */
+	static struct acpi_adr_pwr table[] = {
+		{ .ap_adr = 0x00050000, .ap_flags = ADRPWR_COLD }, /* IPU / image sensor */
+		{ .ap_adr = 0x00120000, .ap_flags = ADRPWR_COLD }, /* ISH (sensor hub) */
+		{ .ap_adr = 0x00160000, .ap_flags = ADRPWR_COLD }, /* HECI / CSME */
+		{ .ap_adr = 0x00080000, .ap_flags = ADRPWR_COLD }, /* GNA */
+		{ .ap_adr = 0x000d0002, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 1 */
+		{ .ap_adr = 0x000d0003, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 2 */
+		{ .ap_adr = 0x000d0000, .ap_flags = ADRPWR_COLD | ADRPWR_NODRIVER }, /* TCSS xHCI */
 	};
-	static ACPI_HANDLE changed[__arraycount(adrs)];
-	static int previous[__arraycount(adrs)];
 
-	acpi_adr_power(sc, "idle_d3", adrs, __arraycount(adrs), changed,
-	    previous, state);
+	acpi_adr_power(sc, "idle_d3", table, __arraycount(table), state);
 }
 
 static int
