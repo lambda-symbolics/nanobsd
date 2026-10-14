@@ -371,3 +371,18 @@ boot and the bluetooth/webcam scripts lose their =usb on= step.
   Wh delta and the rate sensor) decides today's policy.  Runtime suspend
   of the controllers themselves (v2) only makes sense once D3hot is
   reliably the PC10 state.
+
+* 10-minute pair with two sensors (2026-10-14 22:00, battery, panel off)
+
+| state                                 | package            | Wh delta | rate sensor |
+|---------------------------------------+--------------------+----------+-------------|
+| xHCI controllers off (PCI D3hot)      | PC3 52 %, PC10 46 % | 1.56 W   | 1.54 W      |
+| controllers on, every port in U3      | PC9 97 %            | 1.44 W   | 1.40 W      |
+| (16:12 today) controllers off, GOOD   | PC10 97 %           | 1.08 W   | n/a         |
+
+An all-core 75 s load does not clear the split.  Astra's reading of the
+Tiger Lake datasheet (TC-Cold: TCSS functions in D3 with the IOM active,
+PC3-PC10 allowed; TC10: IOM inactive, PC6-PC10) fits: NetBSD only ever
+puts the TCSS xHCI 0:13:0 in PCI D3hot and never drives its ACPI power
+resource, so the IOM's state is whatever it happens to be.  Kernel 157
+adds 0xd0000 to idle_d3 (usb off sets it, usb on clears it) to test that.
