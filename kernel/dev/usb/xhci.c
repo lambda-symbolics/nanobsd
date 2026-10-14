@@ -654,6 +654,15 @@ xhci_detach(struct xhci_softc *sc, int flags)
 
 	/* XXX unconfigure/free slots */
 
+	/*
+	 * LISPBSD: the runtime PM idle scan reschedules itself; stop it
+	 * before the softc goes away (a pending callout in freed memory
+	 * took the idle loop down in callout_next_ticks on a drvctl -d).
+	 */
+	sc->sc_dying = 1;
+	callout_halt(&sc->sc_rt_callout, NULL);
+	callout_destroy(&sc->sc_rt_callout);
+
 	/* verify: */
 	xhci_rt_write_4(sc, XHCI_IMAN(0), 0);
 	xhci_op_write_4(sc, XHCI_USBCMD, 0);
