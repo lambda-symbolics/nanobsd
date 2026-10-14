@@ -15,8 +15,13 @@ state(){ # crude: if uhub children exist, controller is up
 }
 case "${1:-status}" in
   off)  for c in $CTRLS; do $SUDO drvctl -S "$c" 2>/dev/null; done
+        # with the drivers suspended the ACPI power resources of the
+        # driverless platform IPs and the TCSS xHCI may go off too
+        $SUDO sysctl -w hw.acpi.sleep.idle_d3=1 >/dev/null 2>&1
         echo "usb: OFF (xhci suspended; charging unaffected)" ;;
-  on)   for c in $CTRLS; do $SUDO drvctl -R "$c" 2>/dev/null; done
+  on)   # power the TCSS block back before the xhci driver touches it
+        $SUDO sysctl -w hw.acpi.sleep.idle_d3=0 >/dev/null 2>&1
+        for c in $CTRLS; do $SUDO drvctl -R "$c" 2>/dev/null; done
         echo "usb: ON" ;;
   status) echo "usb: $(state)" ;;
   *) echo "usage: usb [on|off|status]" >&2; exit 1 ;;

@@ -3299,6 +3299,17 @@ acpi_idle_powerdown(struct acpi_softc *sc, int state)
 		0x00080000,	/* GNA */
 		0x000d0002,	/* Thunderbolt DMA 1 */
 		0x000d0003,	/* Thunderbolt DMA 2 */
+		/*
+		 * 2026-10-14: the TCSS xHCI (0:13:0).  With the controller in
+		 * PCI D3hot from pmf (usb off) the package idles in either
+		 * PC10 or a PC3/PC10 split; the Tiger Lake datasheet's
+		 * TC-Cold (TCSS functions in D3, IOM active: PC3-PC10 allowed)
+		 * versus TC10 (IOM inactive: PC6-PC10) is the candidate, and
+		 * only the ACPI power resource reaches the IOM.  Only applied
+		 * with the xHCI driver suspended; the usb script clears
+		 * idle_d3 before resuming USB.
+		 */
+		0x000d0000,	/* TCSS xHCI */
 	};
 	static ACPI_HANDLE changed[__arraycount(adrs)];
 	static int previous[__arraycount(adrs)];
