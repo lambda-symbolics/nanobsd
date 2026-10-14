@@ -862,6 +862,28 @@ xhci_suspend(device_t self, const pmf_qual_t *qual)
 	    xhci_op_read_4(sc, XHCI_USBCMD) & ~XHCI_CMD_RS);
 
 	/*
+	 * LispBSD: `The xHC shall halt within 16 ms after software clears
+	 * the Run/Stop bit' (5.4.1), and the state may only be saved from a
+	 * halted controller (4.23.2).  Saving before HCHalted is set is a
+	 * race that the TGL PCH sometimes lost (the PC3 idle state after a
+	 * suspend).  Wait, and fail the suspend rather than save garbage.
+	 */
+	for (i = 0; i < XHCI_WAIT_HCH; i++) {
+		if ((xhci_op_read_4(sc, XHCI_USBSTS) & XHCI_STS_HCH) != 0)
+			break;
+		usb_delay_ms(&sc->sc_bus, 1);
+	}
+	if (i >= XHCI_WAIT_HCH) {
+		device_printf(self, "suspend: controller did not halt "
+		    "(USBCMD=0x%08x USBSTS=0x%08x)\n",
+		    xhci_op_read_4(sc, XHCI_USBCMD),
+		    xhci_op_read_4(sc, XHCI_USBSTS));
+		goto out;
+	}
+	aprint_debug_dev(self, "suspend: halted, USBCMD=0x%08x USBSTS=0x%08x\n",
+	    xhci_op_read_4(sc, XHCI_USBCMD), xhci_op_read_4(sc, XHCI_USBSTS));
+
+	/*
 	 * `4. Read the Operational Runtime, and VTIO registers in the
 	 *     following order: USBCMD, DNCTRL, DCBAAP, CONFIG, ERSTSZ,
 	 *     ERSTBA, ERDP, IMAN, IMOD, and VTIO and save their
