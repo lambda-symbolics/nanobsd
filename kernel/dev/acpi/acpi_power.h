@@ -37,10 +37,18 @@
 
 #define ACPI_STATE_ERROR	-1
 
+/*
+ * Diagnostic D3cold entry after the caller has quiesced the device and
+ * prepared its native bus power state. Skip _PS3, retaining resource and
+ * wake ownership checks. Restore through ordinary acpi_power_set(D0).
+ */
+#define ACPI_POWER_NOPS3 0x01U
+
 bool		acpi_power_register(ACPI_HANDLE);
 void		acpi_power_deregister(ACPI_HANDLE);
 bool		acpi_power_get(ACPI_HANDLE, int *);
 bool		acpi_power_set(ACPI_HANDLE, int);
+bool		acpi_power_set_flags(ACPI_HANDLE, int, unsigned int);
 ACPI_STATUS	acpi_power_res(ACPI_HANDLE, ACPI_HANDLE, bool);
 void		acpi_power_add(struct acpi_devnode *);
 

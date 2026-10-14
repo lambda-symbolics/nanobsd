@@ -616,6 +616,13 @@ power_ps(struct power_device *dev, int state)
 bool
 acpi_power_set(ACPI_HANDLE handle, int state)
 {
+	return acpi_power_set_flags(handle, state, 0);
+}
+
+/* The diagnostic flag applies only to this cold entry, never its restore. */
+bool
+acpi_power_set_flags(ACPI_HANDLE handle, int state, unsigned int flags)
+{
 	struct power_device *dev;
 	struct acpi_power_res *res;
 	struct power_set *target = NULL;
@@ -623,6 +630,9 @@ acpi_power_set(ACPI_HANDLE handle, int state)
 	ACPI_STATUS rv;
 
 	if (handle == NULL || state < ACPI_STATE_D0 || state > ACPI_STATE_D3_COLD)
+		return false;
+	if ((flags & ~ACPI_POWER_NOPS3) != 0 ||
+	    (flags != 0 && state != ACPI_STATE_D3_COLD))
 		return false;
 	RUN_ONCE(&power_once, power_init);
 	mutex_enter(&power_lock);
@@ -654,10 +664,15 @@ acpi_power_set(ACPI_HANDLE handle, int state)
 		if (ACPI_FAILURE(rv))
 			goto out;
 	}
-	rv = power_ps(dev, state);
-	if (ACPI_FAILURE(rv))
-		goto out;
-	/* Cold executes _PS3 first; wake holds and common resources survive. */
+	if ((flags & ACPI_POWER_NOPS3) == 0) {
+		rv = power_ps(dev, state);
+		if (ACPI_FAILURE(rv))
+			goto out;
+	} else {
+		aprint_debug("acpi power: %s _PS3 skipped (resource-only D3cold)\n",
+		    acpi_xname(handle));
+	}
+	/* Release after _PSx, except for the explicit resource-only request. */
 	for (res = power_last; res != NULL; res = res->prev) {
 		if (power_contains(target, res))
 			continue;

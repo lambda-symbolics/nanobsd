@@ -514,12 +514,98 @@ static void cold_observation(void)
 	}
 	puts("ok initial and observed cold state survives sibling resource activation");
 }
+static void resource_only_cycle(void)
+{
+	struct fake_object *lo, *hi, *a;
+	int state;
+
+	reset(); hi = object("HI", true, 1); hi->order = 20;
+	lo = object("LO", true, 1); lo->order = 10;
+	a = object("A", false, 15);
+	package(a, 0, hi); package(a, 0, lo);
+	package(a, 3, hi); package(a, 3, lo);
+	assert(acpi_power_register(a));
+	assert(!acpi_power_set_flags(a, ACPI_STATE_D3, ACPI_POWER_NOPS3));
+	assert(!acpi_power_set_flags(a, ACPI_STATE_D0, ACPI_POWER_NOPS3));
+	assert(!acpi_power_set_flags(a, ACPI_STATE_D3_COLD, 0x02U));
+	assert(!acpi_power_set_flags(a, ACPI_STATE_D3_COLD, ACPI_POWER_NOPS3 | 0x02U));
+	assert(nevents == 0 && holds(lo) == 1 && holds(hi) == 1);
+	assert(a->ad.ad_state == ACPI_STATE_D0);
+	a->ps_error[3] = AE_ERROR; /* This method must not execute. */
+	assert(acpi_power_set_flags(a, ACPI_STATE_D3_COLD, ACPI_POWER_NOPS3));
+	assert(!strcmp(events, "HI_OFF LO_OFF "));
+	assert(holds(lo) == 0 && holds(hi) == 0);
+	assert(acpi_power_get(a, &state) && state == ACPI_STATE_D3_COLD);
+	clear_events();
+	assert(acpi_power_set(a, ACPI_STATE_D0));
+	assert(!strcmp(events, "LO_ON HI_ON A_PS0 "));
+	assert(acpi_power_get(a, &state) && state == ACPI_STATE_D0);
+
+	assert(acpi_power_set_flags(a, ACPI_STATE_D3_COLD, ACPI_POWER_NOPS3));
+	clear_events(); a->ps_error[0] = AE_ERROR;
+	assert(!acpi_power_set(a, ACPI_STATE_D0));
+	assert(!strcmp(events, "LO_ON HI_ON A_PS0 "));
+	assert(a->ad.ad_state == ACPI_STATE_ERROR);
+	a->ps_error[0] = AE_OK;
+	assert(acpi_power_set(a, ACPI_STATE_D0));
+	puts("ok resource-only cold ordering, flag validation and ordinary PS0 restore");
+}
+
+static void resource_only_shared(void)
+{
+	struct fake_object *r, *a, *b;
+
+	reset(); r = object("RA", true, 1);
+	a = object("A", false, 15); b = object("B", false, 15);
+	package(a, 0, r); package(a, 3, r); package(b, 0, r);
+	assert(acpi_power_set_flags(a, ACPI_STATE_D3_COLD, ACPI_POWER_NOPS3));
+	assert(nevents == 0 && holds(r) == 1); /* Untouched B protects the rail. */
+	assert(acpi_power_set(a, ACPI_STATE_D0));
+	assert(!r->on_calls && !r->off_calls && holds(r) == 2);
+	assert(acpi_power_res(r, a, true) == AE_OK);
+	clear_events();
+	assert(acpi_power_set_flags(a, ACPI_STATE_D3_COLD, ACPI_POWER_NOPS3));
+	assert(acpi_power_set_flags(b, ACPI_STATE_D3_COLD, ACPI_POWER_NOPS3));
+	assert(nevents == 0 && holds(r) == 1); /* A's wake hold is independent. */
+	assert(acpi_power_res(r, a, false) == AE_OK);
+	assert(!strcmp(events, "RA_OFF ") && holds(r) == 0);
+	puts("ok resource-only cold protects untouched siblings and wake ownership");
+}
+
+static void resource_only_failures(void)
+{
+	struct fake_object *lo, *hi, *a;
+	unsigned int which;
+
+	for (which = 0; which < 3; which++) {
+		reset(); hi = object("HI", true, 1); hi->order = 20;
+		lo = object("LO", true, 1); lo->order = 10;
+		a = object("A", false, 15);
+		package(a, 0, hi); package(a, 0, lo);
+		assert(acpi_power_register(a));
+		if (which == 0) lo->off_error = AE_ERROR;
+		if (which == 1) lo->off_mismatch = true;
+		if (which == 2) lo->sta_error = AE_ERROR;
+		assert(!acpi_power_set_flags(a, ACPI_STATE_D3_COLD, ACPI_POWER_NOPS3));
+		assert(!strcmp(events, "HI_OFF LO_OFF "));
+		assert(a->ad.ad_state == ACPI_STATE_ERROR);
+		assert(holds(hi) == 0 && holds(lo) == 1);
+		lo->off_error = lo->sta_error = AE_OK; lo->off_mismatch = false;
+		clear_events();
+		assert(acpi_power_set(a, ACPI_STATE_D0));
+		assert(holds(hi) == 1 && holds(lo) == 1);
+		assert(strstr(events, "A_PS0 ") != NULL);
+	}
+	puts("ok resource-only partial OFF/STA failures retain holds and recover");
+}
+
 int main(void)
 {
 	common_resources(); shared_and_untouched(); dedicated_order();
 	acquisition_failure(); method_failures(); many_and_wake();
 	initial_state(); package_errors(); edge_cases(); overlapping_targets();
 	cold_observation();
+	resource_only_cycle(); resource_only_shared(); resource_only_failures();
 	reset();
 	puts("all ACPI power production-backend tests passed");
 	return 0;
