@@ -386,3 +386,17 @@ PC3-PC10 allowed; TC10: IOM inactive, PC6-PC10) fits: NetBSD only ever
 puts the TCSS xHCI 0:13:0 in PCI D3hot and never drives its ACPI power
 resource, so the IOM's state is whatever it happens to be.  Kernel 157
 adds 0xd0000 to idle_d3 (usb off sets it, usb on clears it) to test that.
+
+* Kernel 157 (2026-10-14 21:45): the Type-C subsystem resource
+
+With the TCSS xHCI's ACPI power resource switched off at boot (idle_d3
+now lists 0xd0000; the usb script set it), PC10 97.7-98.2 % in every
+state over six usb on/off cycles, no PC3 split; that is the TC10 state
+Astra's datasheet reading predicted.  But the resource's _ON on =usb on=
+reports success and the controller then fails to resume (USBSTS.RSS
+timeout) and stays dead until reboot, and acpi_power_get keeps reading
+D3.  Until the restore works the switch is opt-in (USB_TCSS_D3=1 for the
+usb script); kernel 157 otherwise stays (xhci halt-before-save, the
+s2idle filesystem barrier).  Numbers from the 10-minute pair: controllers
+on with sleeping ports 1.40 W (PC9), the split D3hot state 1.54 W, the
+PC10 state 1.08 W.
