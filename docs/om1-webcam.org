@@ -32,3 +32,14 @@ v4l2loopback).  Here nothing polls:
 
 Untested with the camera itself (it is not here); the vcam device is
 tested with a synthetic feeder.
+
+* Tested 2026-10-14 (kernel 154)
+
+=video4 at vcam0=.  A feeder writing a 214 KB JPEG at 10 fps into
+=/dev/vcam=, and =v4l2cap= (userland/om1-webcam/v4l2cap.c: QUERYCAP,
+ENUM_FMT, G/S_FMT, REQBUFS 4, mmap, STREAMON, poll, DQBUF, the sequence
+Firefox's V4L2 capture performs) dequeues complete frames with the right
+sizes and sequence numbers; the feeder's counters show streaming=1 while a
+reader is on and the frames written before it dropped.  The plain =read(2)=
+path of video(4) does not return a frame for this device (=dd= blocks);
+Firefox does not use it, so it is noted, not chased.
