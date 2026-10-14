@@ -17,7 +17,12 @@ snap() {
 	sysctl -n machdep.cidle.residency > $T/r$1
 	envstat -d acpibat0 | awk '/charge:/{print $2}' > $T/c$1
 }
-snap 1; sleep "$n"; snap 2
+snap 1
+# the battery's Wh counter moves in coarse steps; average the rate sensor too
+rs=0; rk=0; t=0
+while [ $t -lt "$n" ]; do sleep 5; t=$((t+5)); r=$(envstat -d acpibat0 2>/dev/null | awk '/discharge rate/{print $3}'); [ -n "$r" ] && { rs=$(echo "$rs + $r" | bc); rk=$((rk+1)); }; done
+snap 2
+[ $rk -gt 0 ] && echo "-- discharge rate sensor: $(echo "scale=2; $rs / $rk" | bc) W average of $rk samples"
 delta() { awk -F'|' -v n="$n" 'NR==FNR{a[$1]=$2; next} ($1 in a){d=$2-a[$1]; if(d>0) printf "%8.2f/s  %s\n", d/n, $1}' "$1" "$2" | sort -rn; }
 echo "-- interrupts/s"; delta $T/i1 $T/i2 | head -12
 echo "-- kernel event counters/s"; delta $T/e1 $T/e2 | grep -vE "^ *[0-9.]+/s  (msi|msix|ioapic)" | head -20
