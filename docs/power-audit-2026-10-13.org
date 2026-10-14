@@ -269,3 +269,33 @@ hdafg_suspend_hw/hdafg_resume_hw.
 Fresh boot of 153 on the charger, panel on: PC8 67 %, PC3 0.7 %; the
 55 % PC3 seen at 22:28 on 152 (panel off, charger) was gone by 22:35
 without any sysctl change.  Intermittent; watched further below.
+
+* 2026-10-14: kernels 154 and 155
+
+- 154: the audio runtime PM hardening from the outside review (use
+  references around mixer writes, deadline revalidated in the worker,
+  resume failure propagated as EIO, =hw.hdaudio.power_save= handler that
+  wakes on 0 and re-arms on a delay) and vcam(4) (=om1-webcam.org=).
+  Verified: controller D3hot at idle, D0 for a write to =/dev/audio0=,
+  D3hot 12 s later, D0 for a mixer write, asleep through mixer reads.
+- 155: the tickless accounting cases the review constructed were real in
+  =lapic_oneshot_done()=: a timer interrupt already pending at entry made
+  the exit credit the whole requested skip, and an expiry between the IRR
+  and CCR reads credited one tick too many.  Now =lapic_oneshot()= refuses
+  to arm with the interrupt pending (=refused_pending= in
+  =machdep.cidle.tlstats=), CCR is read before IRR, and an expiry between
+  the reads and the reprogramming counts as the full interval with the
+  interrupt's own tick.  =tickrate= pinned to cpu0: 100.00 / 99.99 /
+  99.99 ticks/s over three 60 s samples, 100.02 with tickless off.  One
+  sample taken in the first minute after boot read 145/s; three minutes
+  later everything was exact, so either the boot event storm hits a case
+  still uncovered or the sampler caught cpu0 mid-interval; to repeat at
+  the next reboot with =tlstats= deltas.
+- Overnight battery run (10 min windows, battery): panel off 1.4 W at
+  best, but the audio controller stayed awake through the brightness
+  curve (the knob did not re-arm then) and PC3 held 50-55 % in every
+  panel-off window: the sticky PC3 state is on battery too and a CPU
+  burst does not clear it.  =battery-ab.sh= (counterbalanced 2x2, D-state
+  checked, windows stamped with idle_ms) and =pc3-kicks.sh= (net, disk,
+  modeset kicks) run via =when-idle.sh= when the laptop is untouched for
+  15 min on battery.
