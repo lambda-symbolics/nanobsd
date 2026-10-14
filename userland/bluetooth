@@ -11,8 +11,8 @@ case "${1:-status}" in
           present && echo "bluetooth: still on (detach failed)" || echo "bluetooth: OFF" ;;
   on)     # The xHCI controllers are suspended by `usb off` (rc.local at boot);
           # a rescan then blocks in the kernel and a later reboot wedges.
-          /usr/local/bin/usb on >/dev/null 2>&1
-  on)     $SUDO drvctl -r "$HUB" 2>/dev/null; sleep 1
+          $SUDO /usr/local/bin/usb on >/dev/null 2>&1
+          $SUDO drvctl -r "$HUB" 2>/dev/null; sleep 1
           present && echo "bluetooth: ON" || echo "bluetooth: on (re-attach pending; retry or reboot)" ;;
   status) present && echo "bluetooth: ON" || echo "bluetooth: OFF" ;;
   *) echo "usage: bluetooth [on|off|status]" >&2; exit 1 ;;
