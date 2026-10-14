@@ -123,6 +123,7 @@ __KERNEL_RCSID(0, "$NetBSD: acpi.c,v 1.303.2.1 2026/06/27 10:46:19 martin Exp $"
 #include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/timetc.h>
+#include <sys/vfs_s2idle.h>
 
 #include <dev/acpi/acpireg.h>
 #include <dev/acpi/acpivar.h>
@@ -2923,6 +2924,39 @@ acpi_s0_freeze_userspace(bool freeze)
 	mutex_exit(&proc_lock);
 }
 
+/* A requested suspension may still be waiting for a syscall to finish. */
+static bool
+acpi_s0_userspace_frozen(void)
+{
+	struct proc *p;
+	struct lwp *l;
+	bool frozen;
+
+	mutex_enter(&proc_lock);
+	PROCLIST_FOREACH(p, &allproc) {
+		mutex_enter(p->p_lock);
+		if ((p->p_flag & PK_SYSTEM) != 0) {
+			mutex_exit(p->p_lock);
+			continue;
+		}
+		LIST_FOREACH(l, &p->p_lwps, l_sibling) {
+			if (l == curlwp)
+				continue;
+			lwp_lock(l);
+			frozen = l->l_stat == LSSUSPENDED || l->l_stat == LSZOMB;
+			lwp_unlock(l);
+			if (!frozen) {
+				mutex_exit(p->p_lock);
+				mutex_exit(&proc_lock);
+				return false;
+			}
+		}
+		mutex_exit(p->p_lock);
+	}
+	mutex_exit(&proc_lock);
+	return true;
+}
+
 static void
 acpi_s0_freeze_test(void)
 {
@@ -3306,6 +3340,9 @@ acpi_enter_freeze(void)
 	deviter_t di;
 	device_t suspended[128];
 	unsigned nsuspended = 0;
+	struct vfs_s2idle_mount *suspended_mounts = NULL;
+	size_t nsuspended_mounts = 0;
+	int fs_error;
 	bool suspend_failed = false;
 	extern int i915_lispbsd_s0idle;
 	int s0idle_save;
@@ -3341,12 +3378,27 @@ acpi_enter_freeze(void)
 #endif
 
 	/*
-	 * Freeze userspace right after the X handoff and BEFORE suspending
-	 * devices, so no user thread can race device shutdown.  Thawed after
-	 * device resume, below.
+	 * Freeze userspace, then establish one filesystem transaction barrier
+	 * before suspending storage devices.  The helper retains mount lifetime
+	 * references and keeps the VFS suspension session locked until resume.
 	 */
 	acpi_s0_freeze_userspace(true);
 	kpause("s2qui", false, MAX(1, hz), NULL);	/* settle to LSSUSPENDED */
+	/* Do not race an in-flight mount syscall or suspend its lock owner. */
+	fs_error = acpi_s0_userspace_frozen() ?
+	    vfs_suspend_all(&suspended_mounts, &nsuspended_mounts) : EBUSY;
+	if (fs_error != 0) {
+		aprint_error_dev(sc->sc_dev,
+		    "s2idle: filesystem barrier failed (%d), aborting freeze\n",
+		    fs_error);
+		acpi_freeze_active = 0;
+		acpi_s0_freeze_userspace(false);
+#if NWSDISPLAY > 0
+		wsdisplay_handlex(1);
+#endif
+		sc->sc_sleepstate = ACPI_STATE_S0;
+		return;
+	}
 
 	/*
 	 * Preserve GPU RC6 across the i915 suspend: otherwise the i915 S3
@@ -3541,6 +3593,11 @@ resume_devices:
 	KERNEL_UNLOCK_ONE(NULL);
 
 	i915_lispbsd_s0idle = s0idle_save;	/* restore RC6-preserve latch */
+
+	/* Filesystems resume only after all devices and storage power do. */
+	vfs_resume_all(suspended_mounts, nsuspended_mounts);
+	suspended_mounts = NULL;
+	nsuspended_mounts = 0;
 
 	acpi_s0_freeze_userspace(false);	/* thaw userspace once devices are back */
 

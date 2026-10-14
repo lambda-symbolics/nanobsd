@@ -1,0 +1,63 @@
+--- sys/mount.h.orig
++++ sys/mount.h
+@@ -474,6 +474,7 @@
+ void	mountlist_iterator_destroy(mount_iterator_t *);
+ struct mount *mountlist_iterator_next(mount_iterator_t *);
+ struct mount *mountlist_iterator_trynext(mount_iterator_t *);
++struct mount *mountlist_iterator_trynext_ex(mount_iterator_t *, int *);
+ struct mount *_mountlist_next(struct mount *);
+ void	mountlist_append(struct mount *);
+ void	mountlist_remove(struct mount *);
+--- kern/vfs_mount.c.orig
++++ kern/vfs_mount.c
+@@ -1608,12 +1608,15 @@
+  * Mark it busy on success.
+  */
+ static inline struct mount *
+-_mountlist_iterator_next(mount_iterator_t *mi, bool wait)
++_mountlist_iterator_next(mount_iterator_t *mi, bool wait, int *skippedp)
+ {
+ 	struct mountlist_entry *me, *marker = &mi->mi_entry;
+ 	struct mount *mp;
+ 	int error;
+ 
++	if (skippedp != NULL)
++		*skippedp = 0;
++
+ 	if (marker->me_mount != NULL) {
+ 		vfs_unbusy(marker->me_mount);
+ 		marker->me_mount = NULL;
+@@ -1653,6 +1656,8 @@
+ 			return mp;
+ 		}
+ 		vfs_rele(mp);
++		if (skippedp != NULL)
++			*skippedp = 1;
+ 		mutex_enter(&mountlist_lock);
+ 	}
+ }
+@@ -1661,14 +1666,22 @@
+ mountlist_iterator_next(mount_iterator_t *mi)
+ {
+ 
+-	return _mountlist_iterator_next(mi, true);
++	return _mountlist_iterator_next(mi, true, NULL);
+ }
+ 
+ struct mount *
+ mountlist_iterator_trynext(mount_iterator_t *mi)
+ {
+ 
+-	return _mountlist_iterator_next(mi, false);
++	return _mountlist_iterator_next(mi, false, NULL);
++}
++
++/* Nonblocking iteration with explicit notice of any omitted mount. */
++struct mount *
++mountlist_iterator_trynext_ex(mount_iterator_t *mi, int *skippedp)
++{
++
++	return _mountlist_iterator_next(mi, false, skippedp);
+ }
+ 
+ /*

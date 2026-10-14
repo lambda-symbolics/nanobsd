@@ -220,6 +220,7 @@ file	kern/vfs_lockf.c		vfs
 file	kern/vfs_lookup.c		vfs
 file	kern/vfs_mount.c		vfs
 file	kern/vfs_quotactl.c		vfs
+file	kern/vfs_s2idle.c		vfs
 file	kern/vfs_subr.c			vfs
 file	kern/vfs_syscalls.c		vfs
 file	kern/vfs_trans.c		vfs
