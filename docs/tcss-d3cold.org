@@ -88,12 +88,43 @@ callout wheel.  Fixed in commit b72419f (=sc_dying=, =callout_halt=,
   Commit a866d5c allocates sc_maxslots + 1 entries.  Dump
   =/var/crash/netbsd.19= (deleted after analysis).
 
+* Kernel 161/162: the PC9 ceiling and its cause (00:00-00:20)
+
+With kernel 161 the complete cycle worked (TXHC/TDM/TRP all read 0xffffffff
+while cold, restore + pci0 rescan brought xhci0 back) but the package sat in
+PC9 at 97 %, where kernel 157's cold state had shown PC10.  Panel-off A/B on
+161: TCSS cold 1.35 W (PC9 97 %) versus plain usb off 1.95 W (PC3/PC10
+split).  Ruled out on kernel 162 with =hw.acpi.sleep.idle_d3_exp= (bit 1:
+root ports cold without _PS3 through Astra's =acpi_power_set_flags(...,
+ACPI_POWER_NOPS3)=; bit 2: no PMCSR D3hot before the cold-off): all four
+combinations PC9.  Cold-from-boot: PC9.  The -x trace showed every resource
+reaching _STA 0 (TBT0 _OFF, TBT1 _OFF, D3C _OFF).
+
+The cause was the USB-C controller's state at the moment the power went:
+kernel 157 had it *suspended* by the driver (ports quiesced, controller
+state saved, PMCSR D3hot from the PCI bus driver); the new script only
+*detached* it, which leaves a halted controller with its PHY/ports live, and
+the TCSS then stops at PC9 after the cold-off.  =drvctl -S xhci0= before
+=drvctl -d xhci0= gives PC10 at 97-98 % every time, restore works, and
+=usb off= now does that by default (commit a2bda6a; =USB_TCSS_D3=0= opts
+out).  Oddity: after a reattach xhci0 reports "xHCI version 1.10" instead of
+1.20; it works.
+
+s2idle caveat: TXHC is not in the s2idle table (its driver is suspended by
+pmf there, and a D3cold'ed controller cannot be warm-resumed), so with USB
+*on* at lid close the TCSS stays powered during s2idle and D3C is held;
+with the default boot state (usb off = cold) the cold state simply persists
+through s2idle (entries already in the target state are skipped and not
+restored).  A power-loss-aware xhci_resume (full reinit) would remove the
+caveat.
+
 * Status
 
-- Kernel 158 (building): pmcreqs probe (acpi_lps0_probe before the PMC
-  requirement dump) + the detach fix; acpi.c still at its pre-D3cold
-  commit, to test detach/rescan and capture pmcreqs.
-- Kernel 159: + Astra's backend + the D3cold tables.  Then: the TCSS
-  cold-off with a working restore (expected floor about 1.08 W, PC10
-  every cycle), same-kernel baseline without the TCSS action, and
-  USB_TCSS_D3 default once the restore is reliable.
+- Kernel 162 (default boot entry): Astra's backend (D3cold, resource-only
+  cold flag, host harness =tests/acpi-power.sh=), D3cold tables including
+  the Thunderbolt root ports, idle_d3_exp knobs, both xhci fixes.
+  =usb off= = TCSS cold = PC10 97 %, restore verified repeatedly.
+- Next: the Wh number for the default state (/var/tmp/cold-wh.txt),
+  xhci_resume after power loss (so TXHC can join the s2idle table), the
+  PMC latch capture Astra described for a PC10 state, lid test of s2idle
+  with usb on and off.

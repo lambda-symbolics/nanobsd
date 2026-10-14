@@ -3405,9 +3405,11 @@ acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
  * The Thunderbolt DMA functions share the TCSS D3C resource with the USB-C
  * host (TXHC, 0:13:0): D3C goes _OFF (TCOF: IOM D3cold entry, the package
  * can reach TC10/PC10) only when all three functions have released it.
- * /usr/local/bin/usb detaches xhci0 before setting idle_d3 and rescans
- * pci0 after clearing it; the I2C controllers (touchpad) and the PCH xHCI
- * have drivers and are left out.
+ * /usr/local/bin/usb suspends and then detaches xhci0 before setting
+ * idle_d3 (a merely halted controller leaves the TCSS at PC9 after the
+ * cold-off, a suspended one lets the package reach PC10) and rescans pci0
+ * after clearing it; the I2C controllers (touchpad) and the PCH xHCI have
+ * drivers and are left out.
  */
 static void
 acpi_idle_powerdown(struct acpi_softc *sc, int state)
