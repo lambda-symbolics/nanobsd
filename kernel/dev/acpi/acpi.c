@@ -3363,8 +3363,8 @@ acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
 		{ .ap_adr = 0x00080000, .ap_flags = ADRPWR_COLD }, /* GNA */
 		{ .ap_adr = 0x000d0002, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 1 */
 		{ .ap_adr = 0x000d0003, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 2 */
-		{ .ap_adr = 0x00070000 },	/* Thunderbolt PCIe root port 1 */
-		{ .ap_adr = 0x00070002 },	/* Thunderbolt PCIe root port 2 */
+		{ .ap_adr = 0x00070000, .ap_flags = ADRPWR_COLD }, /* Thunderbolt PCIe root port 1 (holds D3C/TBT0) */
+		{ .ap_adr = 0x00070002, .ap_flags = ADRPWR_COLD }, /* Thunderbolt PCIe root port 2 (holds D3C/TBT1) */
 	};
 
 	acpi_adr_power(sc, "s2idle", table, __arraycount(table), state);
@@ -3394,6 +3394,14 @@ acpi_idle_powerdown(struct acpi_softc *sc, int state)
 		{ .ap_adr = 0x000d0002, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 1 */
 		{ .ap_adr = 0x000d0003, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 2 */
 		{ .ap_adr = 0x000d0000, .ap_flags = ADRPWR_COLD | ADRPWR_NODRIVER }, /* TCSS xHCI */
+		/*
+		 * The Thunderbolt PCIe root ports (TRP0/TRP2, ppb drivers,
+		 * nothing behind them) list D3C and TBT0/TBT1 in _PR0 too;
+		 * D3C only goes _OFF once they have released it as well
+		 * (kernel 159: everything else cold, TXHC still visible).
+		 */
+		{ .ap_adr = 0x00070000, .ap_flags = ADRPWR_COLD }, /* Thunderbolt PCIe root port 1 */
+		{ .ap_adr = 0x00070002, .ap_flags = ADRPWR_COLD }, /* Thunderbolt PCIe root port 2 */
 	};
 
 	acpi_adr_power(sc, "idle_d3", table, __arraycount(table), state);
