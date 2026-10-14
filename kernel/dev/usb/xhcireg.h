@@ -133,6 +133,7 @@
 #define	XHCI_WAIT_CNR		100		/* in 1ms */
 #define	XHCI_WAIT_HCRST		100		/* in 1ms */
 #define	XHCI_WAIT_RSS		100		/* in 1ms */
+#define	XHCI_WAIT_HCH		32		/* in 1ms; the xHC must halt within 16 (5.4.1) */
 #define	XHCI_WAIT_SSS		100		/* in 1ms */
 #define	XHCI_WAIT_PLS_U0	100		/* in 1ms */
 #define	XHCI_WAIT_PLS_U3	10		/* in 1ms */

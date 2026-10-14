@@ -875,9 +875,12 @@ xhci_suspend(device_t self, const pmf_qual_t *qual)
 	}
 	if (i >= XHCI_WAIT_HCH) {
 		device_printf(self, "suspend: controller did not halt "
-		    "(USBCMD=0x%08x USBSTS=0x%08x)\n",
+		    "(USBCMD=0x%08x USBSTS=0x%08x), staying awake\n",
 		    xhci_op_read_4(sc, XHCI_USBCMD),
 		    xhci_op_read_4(sc, XHCI_USBSTS));
+		/* run it again rather than leave it halted and unsaved */
+		xhci_op_write_4(sc, XHCI_USBCMD,
+		    xhci_op_read_4(sc, XHCI_USBCMD) | XHCI_CMD_RS);
 		goto out;
 	}
 	aprint_debug_dev(self, "suspend: halted, USBCMD=0x%08x USBSTS=0x%08x\n",
