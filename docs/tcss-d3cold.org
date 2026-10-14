@@ -1,0 +1,82 @@
+#+TITLE: TCSS D3cold: the USB-C xHCI power resource and PC10
+#+DATE: 2026-10-14
+
+* What the firmware says (full disassembly 2026-10-14)
+
+All 14 ACPI tables disassembled standalone with iasl (the SSDTs redefine
+each other's names, so =-e= cross references fail; the per-table output is
+good enough to read method bodies).  Workstation copies:
+=/root/astra/acpi-dsl/*.dsl= and the concatenation =/root/astra/pc3-acpi.asl=.
+The TCSS table is SSDT9 (OEM id =TcssSsdt=).
+
+- =\_SB.PC00.TXHC= (_ADR 0x000D0000, the USB-C xHCI, pci 0:13:0) has
+  =_PR0 == _PR3 == { \_SB.PC00.D3C }= under =If (TRTD)=.  =_PS3= only sets
+  PME_EN in PMCSR, =_PS0= clears it.
+- =D3C._OFF= -> =TCOF=: refuses if any of =TXHC/TDM0/TDM1.SD3C= is set,
+  otherwise sends the TCSS device-disable through the pCode mailbox
+  (=DSCR=) and loops until =TXHC.VDID= reads 0xFFFFFFFF, then sets IOM
+  =TD3C = 1=.  That is TCSS D3cold: the function disappears from PCI.
+- =D3C._ON= -> =TCON=: clears =TD3C=, waits up to 100 ms for =TACK=, then
+  loops until =TXHC.VDID= reads back (re-enable through =DSCR=), runs the
+  TBT DMA re-init (=TXDC.SINT=) when =TDCE && IMRY=.  A timeout is only
+  logged, the method still returns.
+- =D3C._STA= returns a cached software flag, not =TD3C/TACK=.
+- The Thunderbolt DMA engines =TDM0/TDM1= (0:13:2, 0:13:3) reference the
+  same =D3C= (plus =TBT0/TBT1=) from both =_PR0= and =_PR3=.
+
+* Why kernel 157's restore killed xhci0
+
+Stock =acpi_power.c= keeps one reference list per resource.  Moving TXHC
+D3 -> D0 references the =_PR0= set (=D3C._ON=: TCON, the controller comes
+back) and then releases the =_PR3= set (=D3C._OFF=: TCOF, the controller
+goes away again).  The next xhci resume saw dead registers
+("resume timeout, USBSTS.RSS"), =acpi_power_get= then read D3.  Astra
+(follow-ups 8 and 9) predicted exactly this from the AML.
+
+The same bug is what made =idle_d3= and the s2idle table work so far: the
+"D3hot" requests for TDM0/TDM1, IPU, ISH, HECI and GNA released their
+resources through the broken bookkeeping, which is what the LPS0
+requirements (=LPSS_PG=, =IS_D3=) and the PC10 residency need.  A correct
+backend keeps every resource that is in both =_PR0= and =_PR3= on, so it
+must grow an explicit D3cold or we lose SLP_S0 and PC10.
+
+* The design
+
+1. =acpi_power.c= (Astra, brief in =/root/astra/brief-acpi-power.org=):
+   reference the target set before releasing the old one, shared
+   resources go _OFF only with their last consumer, failures propagate,
+   new =ACPI_STATE_D3_COLD= = _PS3 + release of every reference, D0 from
+   D3cold = reference _PR0 (_ON) then _PS0, host test harness.
+2. =acpi.c= (commit 38fb502): the =idle_d3= and =s2idle= ADR tables carry
+   per-entry flags.  =ADRPWR_COLD= entries (TDM0, TDM1, TXHC, IPU, ISH,
+   HECI, GNA) get PCI configuration space captured and PMCSR D3hot before
+   =acpi_power_set(D3_COLD)=, and after the D0 restore the function is
+   checked for presence (vendor id) and its configuration restored
+   (=pci_conf_restore=) and PMCSR set to D0.  =ADRPWR_NODRIVER= (TXHC) is
+   skipped while a driver is attached to the function.  The PCH xHCI
+   (Bluetooth, camera, fingerprint behind it) and the dwiic controllers
+   stay D3hot.
+3. =usb= script (commit cb62861): with =USB_TCSS_D3=1=, =usb off= detaches
+   xhci0 (=drvctl -d=; nothing internal is on the USB-C controller),
+   suspends xhci1 and sets =idle_d3=1=; =usb on= clears =idle_d3= (the
+   resource comes back, config restored), rescans pci0 so xhci0 attaches
+   fresh (xhci_init, no warm resume of a reset controller), resumes xhci1.
+
+* Detach panic (kernel 157, 22:15)
+
+=drvctl -d xhci0; drvctl -r pci0= on kernel 157 panicked in
+=callout_next_ticks= from the idle loop (NULL list link, cr2 0x2d): the
+runtime PM idle scan callout from kernel 156 (=sc_rt_callout=) was never
+halted or destroyed in =xhci_detach=, so the freed softc stayed on the
+callout wheel.  Fixed in commit b72419f (=sc_dying=, =callout_halt=,
+=callout_destroy= before the rings are freed).  Dump: =/var/crash/netbsd.18=.
+
+* Status
+
+- Kernel 158 (building): pmcreqs probe (acpi_lps0_probe before the PMC
+  requirement dump) + the detach fix; acpi.c still at its pre-D3cold
+  commit, to test detach/rescan and capture pmcreqs.
+- Kernel 159: + Astra's backend + the D3cold tables.  Then: the TCSS
+  cold-off with a working restore (expected floor about 1.08 W, PC10
+  every cycle), same-kernel baseline without the TCSS action, and
+  USB_TCSS_D3 default once the restore is reliable.
