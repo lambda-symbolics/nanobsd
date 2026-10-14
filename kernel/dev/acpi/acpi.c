@@ -1856,6 +1856,10 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
 	    "idle_d3", SYSCTL_DESCR("Power down driverless platform IPs while awake"),
 	    sysctl_hw_acpi_idle_d3, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "idle_d3_exp", SYSCTL_DESCR("idle_d3 experiment bits: 1 root ports cold without _PS3, 2 no PMCSR D3hot"),
+	    NULL, 0, &acpi_idle_d3_exp, 0, CTL_CREATE, CTL_EOL);
 
 	(void)sysctl_createv(NULL, 0, &snode, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
@@ -3220,6 +3224,7 @@ struct acpi_adr_pwr {
 	int			ap_flags;
 #define ADRPWR_COLD		0x01		/* D3cold instead of D3hot */
 #define ADRPWR_NODRIVER		0x02		/* only while no driver is attached */
+#define ADRPWR_NOPS3		0x04		/* with idle_d3_exp bit 0: cold without _PS3 */
 	ACPI_HANDLE		ap_changed;	/* set while moved away from D0 */
 	int			ap_previous;
 	bool			ap_saved;	/* ap_conf holds the config space */
@@ -3233,6 +3238,15 @@ struct acpi_adr_pwr {
  * changed so that a later call with ACPI_STATE_D0 restores exactly those.
  * Devices already in STATE are left alone and not restored.
  */
+/*
+ * hw.acpi.sleep.idle_d3_exp: experiment bits for the PC9-vs-PC10 hunt.
+ *   1: ADRPWR_NOPS3 entries (the Thunderbolt root ports) enter D3cold
+ *      without _PS3 (acpi_power_set_flags ACPI_POWER_NOPS3): _PS3 arms
+ *      hot-plug/PME SCI on the port (config 0xd8 bits 30/31).
+ *   2: do not write PMCSR D3hot before the cold-off.
+ */
+static int acpi_idle_d3_exp;
+
 static void
 acpi_adr_power(struct acpi_softc *sc, const char *what,
     struct acpi_adr_pwr *table, unsigned n, int state)
@@ -3241,8 +3255,8 @@ acpi_adr_power(struct acpi_softc *sc, const char *what,
 	struct acpi_adr_pwr *ap;
 	unsigned i;
 	int old, target;
-	pcireg_t id;
-	bool ok;
+	pcireg_t id, mpc;
+	bool ok, nops3;
 
 	if (state == ACPI_STATE_D0) {
 		for (i = 0; i < n; i++) {
@@ -3324,19 +3338,32 @@ acpi_adr_power(struct acpi_softc *sc, const char *what,
 					pci_conf_capture(ap->ap_pc, ap->ap_tag,
 					    &ap->ap_conf);
 					ap->ap_saved = true;
-					(void)pci_set_powerstate(ap->ap_pc,
-					    ap->ap_tag, PCI_PMCSR_STATE_D3);
+					mpc = pci_conf_read(ap->ap_pc,
+					    ap->ap_tag, 0xd8);
+					aprint_normal_dev(sc->sc_dev,
+					    "%s: adr=0x%x config 0xd8 = 0x%x "
+					    "before the cold-off\n", what,
+					    ap->ap_adr, mpc);
+					if ((acpi_idle_d3_exp & 2) == 0)
+						(void)pci_set_powerstate(
+						    ap->ap_pc, ap->ap_tag,
+						    PCI_PMCSR_STATE_D3);
 				}
 			}
 			/* Retain the old state even if a resource operation fails partway. */
 			ap->ap_changed = ad->ad_handle;
 			ap->ap_previous = old;
-			ok = acpi_power_set(ad->ad_handle, target);
+			nops3 = target == ACPI_STATE_D3_COLD &&
+			    (ap->ap_flags & ADRPWR_NOPS3) != 0 &&
+			    (acpi_idle_d3_exp & 1) != 0;
+			ok = nops3 ? acpi_power_set_flags(ad->ad_handle, target,
+			    ACPI_POWER_NOPS3) : acpi_power_set(ad->ad_handle,
+			    target);
 			aprint_normal_dev(sc->sc_dev,
-			    "%s: acpi_power_set adr=0x%x D%d%s -> %d\n",
+			    "%s: acpi_power_set adr=0x%x D%d%s%s -> %d\n",
 			    what, ap->ap_adr, target == ACPI_STATE_D3_COLD ?
 			    3 : target, target == ACPI_STATE_D3_COLD ?
-			    "cold" : "", (int)ok);
+			    "cold" : "", nops3 ? " (no _PS3)" : "", (int)ok);
 			break;
 		}
 	}
@@ -3400,8 +3427,8 @@ acpi_idle_powerdown(struct acpi_softc *sc, int state)
 		 * D3C only goes _OFF once they have released it as well
 		 * (kernel 159: everything else cold, TXHC still visible).
 		 */
-		{ .ap_adr = 0x00070000, .ap_flags = ADRPWR_COLD }, /* Thunderbolt PCIe root port 1 */
-		{ .ap_adr = 0x00070002, .ap_flags = ADRPWR_COLD }, /* Thunderbolt PCIe root port 2 */
+		{ .ap_adr = 0x00070000, .ap_flags = ADRPWR_COLD | ADRPWR_NOPS3 }, /* Thunderbolt PCIe root port 1 */
+		{ .ap_adr = 0x00070002, .ap_flags = ADRPWR_COLD | ADRPWR_NOPS3 }, /* Thunderbolt PCIe root port 2 */
 	};
 
 	acpi_adr_power(sc, "idle_d3", table, __arraycount(table), state);
