@@ -16,9 +16,13 @@ state() {
 echo "=== $(date '+%F %T') start W=$W kernel $(sysctl -n machdep.booted_kernel)" >> $OUT
 mh "(progn (setf mahogany::*idle-dim-seconds* 120 mahogany::*idle-blank-seconds* 300) (mahogany::idle-blank))"; sleep 20
 for s in a b c c b a; do
+	# the panel must be off for the whole run; re-blank if input brought it back
+	mh "(mahogany::idle-blank)"; sleep 5
 	state $s; sleep 25
 	i0=$(sysctl -n machdep.lpsched.idle_ms)
-	echo "-- state $s usbpm=$(sysctl -n hw.usbpm.autosuspend) stats=$(sysctl -n hw.usbpm.stats) devices=$(usbdevs 2>/dev/null | grep -c addr)" >> $OUT
+	# no usbdevs here: with the controllers suspended (state c) a control
+	# transfer blocks in the kernel for good
+	echo "-- state $s usbpm=$(sysctl -n hw.usbpm.autosuspend) stats=$(sysctl -n hw.usbpm.stats) pipe=$(( ($(/var/tmp/memread 0x603c070000 0x008 2>/dev/null | awk '{print $NF}') >> 31) & 1 ))" >> $OUT
 	wakecensus $W "usb-$s" 2>&1 | grep -E "^== wakecensus|  pc(3|10) |Total|battery" >> $OUT
 	i1=$(sysctl -n machdep.lpsched.idle_ms); [ $((i1 - i0)) -lt $((W*1000 - 5000)) ] && echo "-- TOUCHED: discard" >> $OUT
 done
