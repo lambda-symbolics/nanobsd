@@ -645,16 +645,28 @@ lapic_reset(void)
  *	hardclock when interrupts are re-enabled, so the caller replays only
  *	(elapsed - pending) ticks itself.  Keeps ci_lapic_counter consistent.
  */
-void lapic_oneshot(uint32_t);
+bool lapic_oneshot(uint32_t);
 unsigned lapic_oneshot_done(uint32_t, int *);
 
-void
+/*
+ * Returns false, with the timer untouched, when a periodic timer interrupt
+ * is already pending: lapic_oneshot_done() would then take that stale
+ * IRR bit for the one-shot's own expiry and credit the whole requested
+ * interval (up to the idle skip cap) for an idle period that MWAIT ends at
+ * once.  The caller lets the pending interrupt deliver its hardclock
+ * instead.
+ */
+bool
 lapic_oneshot(uint32_t nticks)
 {
 	struct cpu_info *ci = curcpu();
+	uint16_t irr = LAPIC_IRR + LAPIC_TIMER_VECTOR / 32 * 16;
 	u_int idx = ci->ci_index;
 	uint64_t count;
 	uint32_t ccr, used;
+
+	if ((lapic_readreg(irr) & (1u << (LAPIC_TIMER_VECTOR % 32))) != 0)
+		return false;
 
 	/*
 	 * Bank the part of the current periodic interval that has already
@@ -678,6 +690,7 @@ lapic_oneshot(uint32_t nticks)
 	lapic_writereg(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR);
 	lapic_writereg(LAPIC_DCR_TIMER, LAPIC_DCRT_DIV1);
 	lapic_writereg(LAPIC_ICR_TIMER, (uint32_t)count);
+	return true;
 }
 
 unsigned
@@ -687,16 +700,20 @@ lapic_oneshot_done(uint32_t nticks, int *pendingp)
 	uint16_t irr = LAPIC_IRR + LAPIC_TIMER_VECTOR / 32 * 16;
 	u_int idx = ci->ci_index;
 	uint64_t counted;
-	uint32_t rem, frac;
+	uint32_t rem, frac, frac_in;
 	unsigned elapsed;
 	int pending;
 
+	/*
+	 * Read the remaining count before the pending bit: an expiry between
+	 * the two reads then shows up as pending (the full interval counts),
+	 * never as a reloaded or zero CCR taken for "almost nothing left".
+	 */
+	rem = lapic_readreg(LAPIC_CCR_TIMER);
 	pending = (lapic_readreg(irr) & (1u << (LAPIC_TIMER_VECTOR % 32))) != 0;
 	counted = (uint64_t)lapic_tval * nticks;
-	if (!pending) {
-		rem = lapic_readreg(LAPIC_CCR_TIMER);
+	if (!pending)
 		counted = ((uint64_t)rem <= counted) ? counted - rem : 0;
-	}
 
 	/*
 	 * Credit whole ticks and CARRY the sub-tick remainder.  Truncating it
@@ -704,6 +721,7 @@ lapic_oneshot_done(uint32_t nticks, int *pendingp)
 	 * replayed hardclock count ran slow by a fraction of a tick per wake.
 	 */
 	frac = (idx < MAXCPUS) ? lapic_tlstate[idx].frac : 0;
+	frac_in = frac;
 	counted += frac;
 	elapsed = (unsigned)(counted / lapic_tval);
 	frac = (uint32_t)(counted % lapic_tval);
@@ -715,6 +733,21 @@ lapic_oneshot_done(uint32_t nticks, int *pendingp)
 	    LAPIC_LVT_TMM_PERIODIC | LAPIC_TIMER_VECTOR);
 	lapic_writereg(LAPIC_DCR_TIMER, LAPIC_DCRT_DIV1);
 	lapic_writereg(LAPIC_ICR_TIMER, lapic_tval);
+
+	/*
+	 * The one-shot may have expired after the reads above and before the
+	 * reprogramming: its interrupt is pending now and will add a hardclock
+	 * of its own, so count the interval as complete and let it.
+	 */
+	if (!pending &&
+	    (lapic_readreg(irr) & (1u << (LAPIC_TIMER_VECTOR % 32))) != 0) {
+		pending = 1;
+		counted = (uint64_t)lapic_tval * nticks + frac_in;
+		elapsed = (unsigned)(counted / lapic_tval);
+		frac = (uint32_t)(counted % lapic_tval);
+		if (idx < MAXCPUS)
+			lapic_tlstate[idx].frac = frac;
+	}
 
 	/*
 	 * Advance the LAPIC timecounter base by the elapsed ticks, except the

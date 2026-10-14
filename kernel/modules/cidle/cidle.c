@@ -53,7 +53,7 @@ void x86_cpu_idle_get(void (**)(void), char *, size_t);
 /* Tickless primitives exported by the kernel (lapic.c, kern_timeout.c,
  * kern_heartbeat.c, kern_clock.c). */
 struct clockframe;
-void		lapic_oneshot(uint32_t);
+bool		lapic_oneshot(uint32_t);
 unsigned	lapic_oneshot_done(uint32_t, int *);
 int		callout_next_ticks(void);
 void		heartbeat_suspend(void);
@@ -80,6 +80,7 @@ static char		cidle_tlstats[256];
 /* Tickless statistics (racy across CPUs; for observation only). */
 static volatile uint64_t cidle_tl_entries;	/* times we stopped the tick */
 static volatile uint64_t cidle_tl_ticks;	/* total hardclock ticks skipped */
+static volatile uint64_t cidle_tl_pending;	/* tickless entries refused: timer IRQ already pending */
 static volatile uint64_t cidle_tl_early;	/* woke before the one-shot fired */
 static volatile uint64_t cidle_tl_full;		/* one-shot expired (deep sleep) */
 
@@ -166,8 +167,9 @@ cidle_sysctl_tlstats(SYSCTLFN_ARGS)
 
 	snprintf(cidle_tlstats, sizeof(cidle_tlstats),
 	    "entries=%" PRIu64 " ticks_skipped=%" PRIu64 " deep=%" PRIu64
-	    " woke_early=%" PRIu64,
-	    cidle_tl_entries, cidle_tl_ticks, cidle_tl_full, cidle_tl_early);
+	    " woke_early=%" PRIu64 " refused_pending=%" PRIu64,
+	    cidle_tl_entries, cidle_tl_ticks, cidle_tl_full, cidle_tl_early,
+	    cidle_tl_pending);
 	node.sysctl_data = cidle_tlstats;
 	return sysctl_lookup(SYSCTLFN_CALL(&node));
 }
@@ -212,7 +214,14 @@ cidle_idle_tickless(struct cpu_info *ci)
 	/* Stop the tick and go deep. */
 	heartbeat_suspend();
 	lpsched_set_idle_depth(cpu_index(ci), LPSCHED_IDLE_DEEP);
-	lapic_oneshot((uint32_t)skip);
+	if (!lapic_oneshot((uint32_t)skip)) {
+		/* A timer interrupt is already pending: let it run its tick. */
+		lpsched_set_idle_depth(cpu_index(ci), LPSCHED_IDLE_ACTIVE);
+		heartbeat_resume();
+		atomic_inc_64(&cidle_tl_pending);
+		x86_enable_intr();
+		return;
+	}
 	x86_mwait((uint32_t)cidle_hint, 1);
 	lpsched_set_idle_depth(cpu_index(ci), LPSCHED_IDLE_ACTIVE);
 
