@@ -14,15 +14,32 @@ state(){ # crude: if uhub children exist, controller is up
   echo off
 }
 case "${1:-status}" in
-  off)  for c in $CTRLS; do $SUDO drvctl -S "$c" 2>/dev/null; done
-        # with the drivers suspended the ACPI power resources of the
-        # driverless platform IPs and the TCSS xHCI may go off too
-        $SUDO sysctl -w hw.acpi.sleep.idle_d3=1 >/dev/null 2>&1
-        echo "usb: OFF (xhci suspended; charging unaffected)" ;;
-  on)   # power the TCSS block back before the xhci driver touches it
-        $SUDO sysctl -w hw.acpi.sleep.idle_d3=0 >/dev/null 2>&1
-        for c in $CTRLS; do $SUDO drvctl -R "$c" 2>/dev/null; done
-        echo "usb: ON" ;;
+  off)  rc=0
+        for c in $CTRLS; do $SUDO drvctl -S "$c" 2>/dev/null || { echo "usb: $c did not suspend" >&2; rc=1; }; done
+        # Only with every driver suspended may the ACPI power resources of
+        # the TCSS xHCI (and the driverless platform IPs) go off.
+        # USB_TCSS_D3=1 also switches the TCSS xHCI's ACPI power resource
+        # off (idle_d3): PC10 reliably, but the resource's _ON on the way
+        # back does not restore the controller yet (kernel 157: xhci0
+        # "resume timeout, USBSTS.RSS", dead until reboot), so off by default.
+        if [ $rc -eq 0 ] && [ "${USB_TCSS_D3:-0}" = 1 ]; then
+          $SUDO sysctl -w hw.acpi.sleep.idle_d3=1 >/dev/null 2>&1 || echo "usb: idle_d3 not set" >&2
+          echo "usb: OFF (xhci suspended, TCSS power resource off; charging unaffected)"
+        elif [ $rc -eq 0 ]; then
+          echo "usb: OFF (xhci suspended; charging unaffected)"
+        else
+          echo "usb: partly OFF (a controller stayed up; power resources left alone)"
+        fi
+        exit $rc ;;
+  on)   # Power the TCSS block back before the xhci driver touches it; if
+        # that fails, resuming the driver would hang on dead registers.
+        if ! $SUDO sysctl -w hw.acpi.sleep.idle_d3=0 >/dev/null 2>&1; then
+          echo "usb: could not restore the ACPI power resources (idle_d3); not resuming" >&2; exit 1
+        fi
+        rc=0
+        for c in $CTRLS; do $SUDO drvctl -R "$c" 2>/dev/null || { echo "usb: $c did not resume" >&2; rc=1; }; done
+        [ $rc -eq 0 ] && echo "usb: ON" || echo "usb: partly ON"
+        exit $rc ;;
   status) echo "usb: $(state)" ;;
   *) echo "usage: usb [on|off|status]" >&2; exit 1 ;;
 esac

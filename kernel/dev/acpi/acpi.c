@@ -2565,6 +2565,7 @@ static const uint8_t acpi_lps0_uuid_msft[16] = {
 #define ACPI_LPS0_MS_DISPLAY_ON	9
 
 static ACPI_HANDLE	acpi_lps0_handle;
+static void		acpi_lps0_probe(void);
 static uint32_t		acpi_lps0_intel_mask;
 static uint32_t		acpi_lps0_msft_mask;
 static int		acpi_lps0_probed;
@@ -2649,6 +2650,8 @@ acpi_pmc_reqs_dump(void)
 	ACPI_OBJECT *ret;
 	ACPI_STATUS rv;
 
+	/* Discover PNP0D80 here too: only the sleep entry path probed it. */
+	acpi_lps0_probe();
 	if (acpi_lps0_handle == NULL) {
 		aprint_normal_dev(acpi_softc->sc_dev, "PMC reqs: no LPS0 handle\n");
 		return;
