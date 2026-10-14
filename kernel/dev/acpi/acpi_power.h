@@ -32,6 +32,9 @@
 #ifndef _SYS_DEV_ACPI_ACPI_POWER_H
 #define _SYS_DEV_ACPI_ACPI_POWER_H
 
+/* Explicit resource-off request; ACPICA D3 (3) means D3hot. */
+#define ACPI_STATE_D3_COLD 4
+
 #define ACPI_STATE_ERROR	-1
 
 bool		acpi_power_register(ACPI_HANDLE);
