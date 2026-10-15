@@ -64,7 +64,65 @@ struct xhci_pci_softc {
 	pcitag_t		sc_tag;
 	void			*sc_ih;
 	pci_intr_handle_t	*sc_pihp;
+	bool			sc_msi_off;	/* LISPBSD: MSI disabled for the suspend */
 };
+
+/*
+ * LISPBSD: a suspended controller with its MSI still enabled keeps the
+ * package out of PC10 once the TCSS power is cut (Tiger Lake: PC8 69 %
+ * versus PC10 98 % with the enable bit cleared, 2026-10-15), and detaching
+ * the driver only "fixed" it because pci_intr_disestablish clears that
+ * bit.  Disable the message signalling around the suspension; the driver
+ * resume runs after the bus has restored the configuration space.
+ */
+static void
+xhci_pci_msi(struct xhci_pci_softc *psc, bool enable)
+{
+	pcireg_t reg;
+	int off;
+
+	if (pci_get_capability(psc->sc_pc, psc->sc_tag, PCI_CAP_MSI, &off,
+	    &reg)) {
+		if (enable)
+			reg |= PCI_MSI_CTL_MSI_ENABLE;
+		else
+			reg &= ~PCI_MSI_CTL_MSI_ENABLE;
+		pci_conf_write(psc->sc_pc, psc->sc_tag, off, reg);
+	} else if (pci_get_capability(psc->sc_pc, psc->sc_tag, PCI_CAP_MSIX,
+	    &off, &reg)) {
+		if (enable)
+			reg |= PCI_MSIX_CTL_ENABLE;
+		else
+			reg &= ~PCI_MSIX_CTL_ENABLE;
+		pci_conf_write(psc->sc_pc, psc->sc_tag, off, reg);
+	}
+}
+
+static bool
+xhci_pci_suspend(device_t self, const pmf_qual_t *qual)
+{
+	struct xhci_pci_softc *psc = device_private(self);
+
+	if (!xhci_suspend(self, qual))
+		return false;
+	if (psc->sc_pihp != NULL) {
+		xhci_pci_msi(psc, false);
+		psc->sc_msi_off = true;
+	}
+	return true;
+}
+
+static bool
+xhci_pci_resume(device_t self, const pmf_qual_t *qual)
+{
+	struct xhci_pci_softc *psc = device_private(self);
+
+	if (psc->sc_msi_off) {
+		xhci_pci_msi(psc, true);
+		psc->sc_msi_off = false;
+	}
+	return xhci_resume(self, qual);
+}
 
 static int
 xhci_pci_match(device_t parent, cfdata_t match, void *aux)
@@ -283,7 +341,7 @@ xhci_pci_attach(device_t parent, device_t self, void *aux)
 	if ((sc->sc_quirks & XHCI_QUIRK_INTEL) != 0)
 		xhci_pci_port_route(psc);
 
-	if (!pmf_device_register1(self, xhci_suspend, xhci_resume,
+	if (!pmf_device_register1(self, xhci_pci_suspend, xhci_pci_resume,
 	                          xhci_shutdown))
 		aprint_error_dev(self, "couldn't establish power handler\n");
 
