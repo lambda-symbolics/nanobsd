@@ -199,6 +199,30 @@ e744b2c).  What it took on the hardware:
 - Result on 171: PCH controller on, radio up and parked, TCSS cold: PC10
   98 %; =btconfig ubt0 inquiry= wakes it (remote wake counted) and works.
 
+* Power-loss-aware resume and the suspend-only cold path (evening 2026-10-15)
+
+- Measured with the radio up and parked (kernel 171, panel off, battery,
+  240 s): 1.20 W, PC10 97 %, identical to everything-off.  The idle
+  Bluetooth cost went from ~1 W to nothing.
+- Cold recovery of the empty USB-C controller works (kernel 172+): the
+  controller cannot tell that it lost power (a CRS after power loss
+  reports success on Tiger Lake, no RSS, no SRE), so the ACPI power manager
+  tags the function with the device property =lispbsd-power-lost= when it
+  restores a D3cold entry, and xhci_resume takes Astra's cold path on that
+  tag ("resume: power was lost (ACPI), cold recovery" / "cold resume: empty
+  controller restarted"; root hubs retained).
+- Measurement rule learned the hard way: the package stays at PC8 for the
+  first several minutes after a boot regardless of the USB state.  Every
+  "PC8 69 %" reading today was inside that window, including the one that
+  briefly implicated the controller's MSI enable bit (reverted, 6b1b135).
+  Measure after ten minutes of uptime.
+- Kernel 174: xhci publishes =lispbsd-usb-populated= (a slot is bound), the
+  ADRPWR_NODRIVER guard refuses the cold-off only for an active or populated
+  controller, TXHC is in the s2idle table (its driver is suspended by the
+  freeze), and =usb off= no longer detaches xhci0 (USB_TCSS_DETACH=1 for the
+  old path).  Lid suspend with USB on therefore gets the cold TCSS as long
+  as nothing is plugged into USB-C.
+
 * Status
 
 - Kernel 162 (default boot entry): Astra's backend (D3cold, resource-only
