@@ -174,6 +174,31 @@ ubt runtime suspend/resume hook driven by the xhci idle scan (abort the
 pipes, port to U3 with remote wake, reopen on wake).  Until then
 =bt-headphones off= takes the radio down.
 
+* Bluetooth radio parking, kernels 165-171 (afternoon/evening 2026-10-15)
+
+Astra's xhci draft (52989d6: power-loss-aware resume + parking of a ubt
+slot with open pipes) plus my ubt pmf handlers (9454563, Astra's fix
+e744b2c).  What it took on the hardware:
+- 165: four build fixes (shadowed names, the stock XHCI_HCS2_MAXSPBUF macro
+  has no outer parentheses, device_pmf_is_registered is not exported).
+- 165: every warm resume of xhci1 refused: Tiger Lake reports HCIVERSION
+  1.10 after any PCI D3hot cycle (1.20 at attach).  The version is now
+  informational (34c10c3).
+- 166: every warm resume taken cold: the operational registers read zero
+  after D3hot, which the warm path expects and rewrites before CRS.  Now a
+  fatal USBSTS marks the state lost up front, otherwise the CRS timeout of
+  the warm path is the trigger for cold recovery (f9b3987).
+- 167: cycle works (park, inquiry wake, freeze with a parked radio) but the
+  radio never parked after a plain =usb on pch=: =drvctl -R= resumes the
+  named device and its *ancestors* only (kern_drvctl DRVRESUMEDEV without
+  DEVPM_F_SUBTREE, which drvctl(8) does not expose), so ubt0 kept its drvctl
+  pmf suspension from the boot-time =usb off= and the parkable predicate
+  (active ubt child) refused it.  Found with =hw.usbpm.debug= (ded9afb,
+  8125f62, dv_flags + suspensor names).  Fix: the usb script resumes the
+  whole subtree, leaves last (125f41d).
+- Result on 171: PCH controller on, radio up and parked, TCSS cold: PC10
+  98 %; =btconfig ubt0 inquiry= wakes it (remote wake counted) and works.
+
 * Status
 
 - Kernel 162 (default boot entry): Astra's backend (D3cold, resource-only
