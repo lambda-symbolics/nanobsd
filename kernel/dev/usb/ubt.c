@@ -185,6 +185,7 @@ struct ubt_softc {
 	int			 sc_refcnt;
 	int			 sc_dying;
 	int			 sc_enabled;
+	int			 sc_parked;	/* LISPBSD: inbound pipes aborted for a USB suspend */
 
 	/* Control Interface */
 	struct usbd_interface *	 sc_iface0;
@@ -310,6 +311,8 @@ static int	ubt_match(device_t, cfdata_t, void *);
 static void	ubt_attach(device_t, device_t, void *);
 static int	ubt_detach(device_t, int);
 static int	ubt_activate(device_t, enum devact);
+static bool	ubt_suspend(device_t, const pmf_qual_t *);
+static bool	ubt_resume(device_t, const pmf_qual_t *);
 
 CFATTACH_DECL_NEW(ubt, sizeof(struct ubt_softc), ubt_match, ubt_attach,
     ubt_detach, ubt_activate);
@@ -686,10 +689,76 @@ ubt_attach(device_t parent, device_t self, void *aux)
 
 	sc->sc_ok = 1;
 
-	if (!pmf_device_register(self, NULL, NULL))
+	if (!pmf_device_register(self, ubt_suspend, ubt_resume))
 		aprint_error_dev(self, "couldn't establish power handler\n");
 
 	return;
+}
+
+/*
+ * LISPBSD: USB runtime power management.  The xhci idle scan parks a
+ * device whose driver can let go of its pipes: here the three inbound
+ * pipes (events, ACL, SCO) are aborted but stay allocated, the port then
+ * goes to U3 with remote wakeup armed.  Commands and ACL writes keep
+ * working while parked (their doorbells are deferred and wake the port),
+ * and an event from the controller wakes it by itself.  resume reopens
+ * the event pipe (an interrupt pipe cannot be restarted after an abort)
+ * and re-queues the reads.  The same handlers serve system suspend.
+ */
+static bool
+ubt_suspend(device_t self, const pmf_qual_t *qual)
+{
+	struct ubt_softc *sc = device_private(self);
+	int s;
+
+	if (!sc->sc_enabled || sc->sc_parked || sc->sc_dying)
+		return true;
+	s = splusb();
+	sc->sc_parked = 1;
+	if (sc->sc_evt_pipe != NULL)
+		usbd_abort_pipe(sc->sc_evt_pipe);
+	if (sc->sc_aclrd_pipe != NULL)
+		usbd_abort_pipe(sc->sc_aclrd_pipe);
+	if (sc->sc_scord_pipe != NULL)
+		usbd_abort_pipe(sc->sc_scord_pipe);
+	splx(s);
+	DPRINTFN(1, "sc=%p parked\n", sc);
+	return true;
+}
+
+static bool
+ubt_resume(device_t self, const pmf_qual_t *qual)
+{
+	struct ubt_softc *sc = device_private(self);
+	usbd_status err;
+	int i, s;
+
+	if (!sc->sc_enabled || !sc->sc_parked || sc->sc_dying)
+		return true;
+	s = splusb();
+	sc->sc_parked = 0;
+	if (sc->sc_evt_pipe != NULL) {
+		usbd_close_pipe(sc->sc_evt_pipe);
+		sc->sc_evt_pipe = NULL;
+		err = usbd_open_pipe_intr(sc->sc_iface0, sc->sc_evt_addr,
+		    USBD_SHORT_XFER_OK, &sc->sc_evt_pipe, sc, sc->sc_evt_buf,
+		    UBT_BUFSIZ_EVENT, ubt_recv_event, USBD_DEFAULT_INTERVAL);
+		if (err != USBD_NORMAL_COMPLETION) {
+			splx(s);
+			aprint_error_dev(self,
+			    "event pipe did not reopen after suspend: %s\n",
+			    usbd_errstr(err));
+			return false;
+		}
+	}
+	if (sc->sc_aclrd_pipe != NULL)
+		ubt_recv_acl_start(sc);
+	if (sc->sc_scord_pipe != NULL && sc->sc_scord_size != 0)
+		for (i = 0; i < UBT_NXFERS; i++)
+			ubt_recv_sco_start1(sc, &sc->sc_scord[i]);
+	splx(s);
+	DPRINTFN(1, "sc=%p unparked\n", sc);
+	return true;
 }
 
 static int
