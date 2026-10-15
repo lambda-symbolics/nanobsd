@@ -683,6 +683,18 @@ struct wg_peer {
 #define WGP_TASK_ENDPOINT_CHANGED		__BIT(3)
 #define WGP_TASK_SEND_KEEPALIVE_MESSAGE		__BIT(4)
 #define WGP_TASK_DESTROY_PREV_SESSION		__BIT(5)
+#define WGP_TASK_PERSISTENT_KEEPALIVE		__BIT(6)
+
+	/*
+	 * LISPBSD: persistent keepalive (PersistentKeepalive in wg-quick
+	 * terms): every wgp_persistent_keepalive seconds without a packet
+	 * sent to the peer, send a keepalive message, or a handshake
+	 * initiation when there is no session.  Keeps a NAT mapping open
+	 * for a peer behind it.  0 = off.
+	 */
+	unsigned		wgp_persistent_keepalive;
+	callout_t		wgp_persistent_keepalive_timer;
+	volatile uint32_t	wgp_last_sent;	/* time_uptime32 of the last send */
 };
 
 struct wg_ops;
@@ -3577,6 +3589,39 @@ wg_task_send_keepalive_message(struct wg_softc *wg, struct wg_peer *wgp)
 	wg_send_keepalive_msg(wgp, wgs);
 }
 
+/*
+ * LISPBSD: the persistent keepalive.  With the peer lock held: if nothing
+ * went out to the peer for the configured interval, send a keepalive on
+ * the established session or start a handshake without one (the init task
+ * rate-limits itself), then re-arm for the remainder of the interval.
+ */
+static void
+wg_task_persistent_keepalive(struct wg_softc *wg, struct wg_peer *wgp)
+{
+	struct wg_session *wgs;
+	unsigned iv = wgp->wgp_persistent_keepalive;
+	uint32_t idle;
+
+	KASSERT(mutex_owned(wgp->wgp_lock));
+	if (iv == 0)
+		return;
+	idle = time_uptime32 - atomic_load_relaxed(&wgp->wgp_last_sent);
+	if (idle >= iv) {
+		wgs = wgp->wgp_session_stable;
+		if (wgs->wgs_state == WGS_STATE_ESTABLISHED) {
+			wg_send_keepalive_msg(wgp, wgs);
+		} else {
+			wg_task_send_init_message(wg, wgp);
+			/* an initiation counts: retry at the interval */
+			atomic_store_relaxed(&wgp->wgp_last_sent,
+			    time_uptime32);
+		}
+		idle = 0;
+	}
+	callout_schedule(&wgp->wgp_persistent_keepalive_timer,
+	    hz * (iv - idle));
+}
+
 static void
 wg_task_destroy_prev_session(struct wg_softc *wg, struct wg_peer *wgp)
 {
@@ -3661,6 +3706,8 @@ wg_peer_work(struct work *wk, void *cookie)
 			wg_task_send_keepalive_message(wg, wgp);
 		if (ISSET(tasks, WGP_TASK_DESTROY_PREV_SESSION))
 			wg_task_destroy_prev_session(wg, wgp);
+		if (ISSET(tasks, WGP_TASK_PERSISTENT_KEEPALIVE))
+			wg_task_persistent_keepalive(wg, wgp);
 		mutex_exit(wgp->wgp_lock);
 
 		mutex_enter(wgp->wgp_intr_lock);
@@ -3955,6 +4002,15 @@ wg_handshake_timeout_timer(void *arg)
 	wg_schedule_peer_task(wgp, WGP_TASK_RETRY_HANDSHAKE);
 }
 
+/* LISPBSD: persistent keepalive timer, see wgp_persistent_keepalive. */
+static void
+wg_persistent_keepalive_timer(void *arg)
+{
+	struct wg_peer *wgp = arg;
+
+	wg_schedule_peer_task(wgp, WGP_TASK_PERSISTENT_KEEPALIVE);
+}
+
 static struct wg_peer *
 wg_alloc_peer(struct wg_softc *wg)
 {
@@ -3969,6 +4025,10 @@ wg_alloc_peer(struct wg_softc *wg)
 	callout_init(&wgp->wgp_session_dtor_timer, CALLOUT_MPSAFE);
 	callout_setfunc(&wgp->wgp_session_dtor_timer,
 	    wg_session_dtor_timer, wgp);
+	callout_init(&wgp->wgp_persistent_keepalive_timer, CALLOUT_MPSAFE);
+	callout_setfunc(&wgp->wgp_persistent_keepalive_timer,
+	    wg_persistent_keepalive_timer, wgp);
+	wgp->wgp_last_sent = time_uptime32;
 	PSLIST_ENTRY_INIT(wgp, wgp_peerlist_entry);
 	wgp->wgp_endpoint_changing = false;
 	wgp->wgp_endpoint_available = false;
@@ -4043,6 +4103,7 @@ wg_destroy_peer(struct wg_peer *wgp)
 	/* Halt all packet processing and timeouts.  */
 	callout_halt(&wgp->wgp_handshake_timeout_timer, NULL);
 	callout_halt(&wgp->wgp_session_dtor_timer, NULL);
+	callout_halt(&wgp->wgp_persistent_keepalive_timer, NULL);
 
 	/* Wait for any queued work to complete.  */
 	workqueue_wait(wg_wq, &wgp->wgp_work);
@@ -4622,6 +4683,7 @@ wg_send_data_msg(struct wg_peer *wgp, struct wg_session *wgs, struct mbuf *m)
 	 */
 	const uint32_t now = time_uptime32;
 	atomic_store_relaxed(&wgs->wgs_time_last_data_sent, MAX(now, 1));
+	atomic_store_relaxed(&wgp->wgp_last_sent, now);
 
 	/*
 	 * Check rekey-after-time.
@@ -4913,6 +4975,20 @@ skip_endpoint:
 	}
 	KASSERT(wgp->wgp_n_allowedips <= WG_ALLOWEDIPS);
 skip:
+    {
+	uint32_t ka = 0;
+
+	if (prop_dictionary_get_uint32(peer, "persistent_keepalive_interval",
+	    &ka) && ka != 0) {
+		if (ka > 65535) {
+			error = EINVAL;
+			goto out;
+		}
+		wgp->wgp_persistent_keepalive = ka;
+		/* so that the first firing acts at once */
+		wgp->wgp_last_sent = time_uptime32 - ka;
+	}
+    }
 	*wgpp = wgp;
 	wgp = NULL;
 out:
@@ -5055,6 +5131,10 @@ wg_ioctl_add_peer(struct wg_softc *wg, struct ifdrv *ifd)
 	wg->wg_npeers++;
 	mutex_exit(wg->wg_lock);
 
+	/* LISPBSD: the first persistent keepalive kicks the handshake off. */
+	if (wgp->wgp_persistent_keepalive != 0)
+		callout_schedule(&wgp->wgp_persistent_keepalive_timer, hz);
+
 	if_link_state_change(&wg->wg_if, LINK_STATE_UP);
 
 out:
@@ -5190,6 +5270,10 @@ wg_ioctl_get(struct wg_softc *wg, struct ifdrv *ifd)
 			goto next;
 		if (!prop_dictionary_set_uint32(prop_peer,
 			"last_handshake_time_nsec", (uint32_t)t->tv_nsec))
+			goto next;
+		if (!prop_dictionary_set_uint32(prop_peer,
+			"persistent_keepalive_interval",
+			wgp->wgp_persistent_keepalive))
 			goto next;
 
 		if (wgp->wgp_n_allowedips == 0)

@@ -4,8 +4,10 @@
 # REQUIRE: NETWORKING mountcritremote
 # BEFORE:  LOGIN
 #
-# WireGuard link to velho (10.0.0.1) with a ping keepalive loop, because
-# NetBSD wg(4) has no persistent-keepalive option.
+# WireGuard link to velho (10.0.0.1).  LispBSD's wg(4) (nanobsd
+# kernel/net/if_wg.c) and wgconfig (/usr/local/sbin, userland/wgconfig) have
+# a persistent keepalive; with a stock wgconfig the old ping loop keeps the
+# NAT mapping open instead.
 
 $_rc_subr_loaded . /etc/rc.subr
 
@@ -27,6 +29,10 @@ WG_ENDPOINT="95.217.72.169:51871"
 WG_ALLOWED_IPS="10.0.0.0/24,fdc9:281f:4d7:9ee9::/64,10.20.0.0/16,10.21.0.0/16,10.22.0.0/16,10.33.0.0/16,10.34.0.0/16,10.35.0.0/16,10.36.0.0/16,10.37.0.0/16,10.254.0.0/16,172.22.6.0/23,172.22.10.0/23,172.23.0.0/16"
 WG_NETWORKS4="10.0.0.0/24 10.20.0.0/16 10.21.0.0/16 10.22.0.0/16 10.33.0.0/16 10.34.0.0/16 10.35.0.0/16 10.36.0.0/16 10.37.0.0/16 10.254.0.0/16 172.22.6.0/23 172.22.10.0/23 172.23.0.0/16"
 KEEPALIVE_PID="/var/run/wgpeer-keepalive.pid"
+WG_KEEPALIVE=25
+WGCONFIG=/usr/sbin/wgconfig
+[ -x /usr/local/sbin/wgconfig ] && WGCONFIG=/usr/local/sbin/wgconfig
+wg_has_keepalive() { $WGCONFIG 2>&1 | grep -q persistent-keepalive; }
 
 wgpeer_start()
 {
@@ -39,10 +45,16 @@ wgpeer_start()
 	fi
 	/sbin/ifconfig $WG_IF inet $WG_ADDRESS4 2>/dev/null || true
 	/sbin/ifconfig $WG_IF inet6 $WG_ADDRESS6 2>/dev/null || true
-	/usr/sbin/wgconfig $WG_IF set private-key $WG_PRIVATE
-	/usr/sbin/wgconfig $WG_IF delete peer velho >/dev/null 2>&1 || true
-	/usr/sbin/wgconfig $WG_IF add peer velho $WG_PEER_PUBLIC \
-		--allowed-ips=$WG_ALLOWED_IPS --endpoint=$WG_ENDPOINT
+	$WGCONFIG $WG_IF set private-key $WG_PRIVATE
+	$WGCONFIG $WG_IF delete peer velho >/dev/null 2>&1 || true
+	if wg_has_keepalive; then
+		$WGCONFIG $WG_IF add peer velho $WG_PEER_PUBLIC \
+			--allowed-ips=$WG_ALLOWED_IPS --endpoint=$WG_ENDPOINT \
+			--persistent-keepalive=$WG_KEEPALIVE
+	else
+		$WGCONFIG $WG_IF add peer velho $WG_PEER_PUBLIC \
+			--allowed-ips=$WG_ALLOWED_IPS --endpoint=$WG_ENDPOINT
+	fi
 	/sbin/ifconfig $WG_IF up
 	for net in $WG_NETWORKS4; do
 		/sbin/route -q delete -net $net >/dev/null 2>&1 || true
@@ -55,6 +67,7 @@ wgpeer_start()
 
 wgpeer_keepalive_start()
 {
+	wg_has_keepalive && return 0	# the kernel does it
 	if [ -r $KEEPALIVE_PID ] && kill -0 $(cat $KEEPALIVE_PID) 2>/dev/null; then
 		return 0
 	fi

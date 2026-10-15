@@ -69,7 +69,8 @@ usage(void)
 	P("set listen-port <port>");
 	P("add peer <peer name> <base64 public key>\n"
 	"\t                     [--preshared-key=<file path>] [--endpoint=<ip>:<port>]\n"
-	"\t                     [--allowed-ips=<ip1>/<cidr1>[,<ip2>/<cidr2>]...]");
+	"\t                     [--allowed-ips=<ip1>/<cidr1>[,<ip2>/<cidr2>]...]\n"
+	"\t                     [--persistent-keepalive=<seconds>]");
 	P("delete peer <peer name>");
 
 	exit(EXIT_FAILURE);
@@ -255,6 +256,13 @@ show_peer(prop_dictionary_t peer, const char *prefix, bool show_psk)
 		printf("%sendpoint: (none)\n", prefix);
 	else
 		printf("%sendpoint: %s\n", prefix, format_endpoint(prop_obj));
+
+	{
+		uint32_t ka;
+		if (prop_dictionary_get_uint32(peer,
+		    "persistent_keepalive_interval", &ka) && ka != 0)
+			printf("%spersistent-keepalive: %u\n", prefix, ka);
+	}
 
 	if (show_psk) {
 		prop_obj = prop_dictionary_get(peer, "preshared_key");
@@ -666,6 +674,22 @@ handle_option_preshared_key(const char *path, prop_dictionary_t prop_dict)
 		errx(EXIT_FAILURE, "prop_dictionary_set_data");
 }
 
+/* LISPBSD: wg(4) persistent keepalive (seconds, 0 = off). */
+static void
+handle_option_persistent_keepalive(const char *arg, prop_dictionary_t prop_dict)
+{
+	char *end;
+	unsigned long v;
+
+	errno = 0;
+	v = strtoul(arg, &end, 10);
+	if (errno != 0 || *end != '\0' || v > 65535)
+		errx(EXIT_FAILURE, "invalid persistent-keepalive: %s", arg);
+	if (!prop_dictionary_set_uint32(prop_dict,
+	    "persistent_keepalive_interval", (uint32_t)v))
+		errx(EXIT_FAILURE, "prop_dictionary_set_uint32");
+}
+
 static const struct option {
 	const char	*option;
 	void		(*func)(const char *, prop_dictionary_t);
@@ -673,6 +697,7 @@ static const struct option {
 	{"--endpoint=",		handle_option_endpoint},
 	{"--allowed-ips=",	handle_option_allowed_ips},
 	{"--preshared-key=",	handle_option_preshared_key},
+	{"--persistent-keepalive=",	handle_option_persistent_keepalive},
 };
 
 static void
