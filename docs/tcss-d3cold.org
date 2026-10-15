@@ -40,7 +40,7 @@ requirements (=LPSS_PG=, =IS_D3=) and the PC10 residency need.  A correct
 backend keeps every resource that is in both =_PR0= and =_PR3= on, so it
 must grow an explicit D3cold or we lose SLP_S0 and PC10.
 
-* The design
+* Initial design (kernel 157)
 
 1. =acpi_power.c= (Astra, brief in =/root/astra/brief-acpi-power.org=):
    reference the target set before releasing the old one, shared
@@ -230,8 +230,10 @@ e744b2c).  What it took on the hardware:
 - Bluetooth: =bt-headphones on= wakes only the PCH controller; an idle radio
   parks (U3, remote wake) and the package still reaches PC10 at 1.20 W.
 - Lid suspend with USB on and the radio up: the freeze colds the TCSS
-  (TXHC in the s2idle table), holds PC10 98 %, reaches SLP_S0, and the
-  controller comes back through cold recovery; Bluetooth works after wake.
-- Not covered: a USB-C device plugged in at lid close keeps the TCSS warm
-  (populated cold recovery is design-only in docs/xhci-powerloss.org).
+  (TXHC in the s2idle table), holds PC10 98 %, and records SLP_S0 delta
+  197978. The controller comes back through cold recovery; Bluetooth
+  inquiry works after wake.
+- A USB-C device plugged in at lid close keeps the TCSS warm. Populated
+  recovery requires either disconnect/re-enumeration or identity-preserving
+  USB-core recovery; see [[file:xhci-powerloss.org::*Populated cold recovery: lifecycle and policy][the lifecycle and policy discussion]].
 - Measure only after ten minutes of uptime.

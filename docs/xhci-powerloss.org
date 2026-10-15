@@ -1,36 +1,50 @@
-#+title: Draft: xHCI power-loss resume and ubt runtime parking
+#+title: xHCI power-loss resume and ubt runtime parking
 
 * Scope
 
-Updated through kernel 171, 2026-10-15. Runtime Bluetooth parking, inquiry
-wake and freeze/resume with a parked radio have been exercised on the laptop.
-With PCH on, the radio up and parked, and TCSS cold, PC10 residency was 98%.
-Empty-xhci0 cold recovery is the next experiment.
+Kernel 174 meets all three laptop goals, reported 2026-10-15 at 21:00:
 
-Copy =kernel/dev/usb/xhci.c=, =kernel/dev/usb/xhcivar.h= and
-=kernel/dev/usb/ubt.c= into the NetBSD tree. Install the updated =userland/usb=
-script too: controller resume alone does not resume its USB children.
+- =usb off=: TCSS cold under the suspended, attached xhci0; 1.20 W
+  panel-off on battery, PC10 98%.
+- PCH on, radio up and runtime-parked: 1.20 W, matching the USB-off
+  baseline; inquiry wakes the radio. The 240-second kernel 171 measurement
+  recorded PC10 97%.
+- Lid suspend with USB on and the radio up: empty TXHC goes D3cold,
+  PC10 residency is 98%, SLP_S0 advances by 197978, and cold recovery and
+  Bluetooth inquiry work after wake.
 
-Cold recovery requires no allocated slots, runtime parking ownership or
-downstream USB devices on either bus. The first target is empty external
-TCSS xhci0. Populated PCH xhci1 cold recovery is a later stage. This patch
-also enables ubt runtime parking on a powered controller, including warm
-system suspend/resume. ACPI power policy and the =usb= script are separate.
+Use the matching =kernel/dev/acpi/acpi.c=, =kernel/dev/usb/xhci.c=,
+=kernel/dev/usb/xhcivar.h= and =kernel/dev/usb/ubt.c= changes with the
+D3cold ACPI backend. Install the updated =userland/usb= script too:
+controller resume alone does not resume its USB children.
+
+Cold recovery currently requires no allocated slots, runtime parking
+ownership or downstream USB devices on either bus. ACPI checks the
+controller's activity and =lispbsd-usb-populated= before cutting TCSS power.
+A plugged USB-C device therefore keeps TCSS warm at lid close. Populated
+cold recovery needs the lifecycle and policy work described below.
 
 * Detect and restart an empty controller
+
+=acpi_adr_power()= restores the D3cold power resources and PCI configuration,
+then sets =lispbsd-power-lost=true= on the attached function. In =xhci_resume()=,
+consume that property into =sc_state_lost= before probing the controller.
+This is the cold-recovery trigger on the tested Tiger Lake hardware: CRS
+after power loss reports success, with no RSS or SRE, but the controller
+has lost its working state. Commit =3dba156= added the explicit handoff.
 
 =xhci_resume_check()= runs before resume writes an operational register.
 PCI must already have restored BARs, command and interrupt configuration
 through its PMF bus-resume callback. The probe rejects inaccessible MMIO,
 checks the attach-time layout, waits for USBSTS.CNR to clear and requires a
-saved suspend snapshot. HSE/HCE request cold recovery immediately.
+saved suspend snapshot. HSE/HCE also request cold recovery.
 
 Zero or changed DCBAAP, USBCMD, CONFIG and ERSTBA do not distinguish D3hot
-from power loss. Restore the saved registers and attempt CRS. In =f9b3987=,
-an RSS timeout requests cold recovery; =sc_state_lost= then remains set until
-successful recovery. Treat it as a reset-required flag, not proof that the
-controller physically lost power. A successful CRS may restore saved state
-after a power-down, so cold power alone need not require reinitialisation.
+from power loss. Without the ACPI tag or another reset requirement, restore
+the saved registers and attempt CRS. An RSS timeout requests cold recovery;
+it indicates failed restore completion, not proof of physical power loss.
+=sc_state_lost= is cleared only after successful recovery, so consuming the
+property does not lose the reset requirement if resume fails.
 
 Register offsets, slot/interrupter/port and scratchpad counts, and
 HCCPARAMS1 must match. HCIVERSION changes are informational: log them with
@@ -131,21 +145,40 @@ suspend rollback: PMF does not call driver resume after failed driver
 suspend. The separate =sc_resume_failed= flag avoids extending that legacy
 command failure into a new blanket traffic gate on suspend failure.
 
-* Populated cold recovery design
+* Populated cold recovery: lifecycle and policy
 
-For a later stage, retain the root hubs and retire downstream devices through
-their event-thread lifecycle. Add an explicit post-PMF handoff after
-=deviter_release()=; an ordinary USB task queued by =xhci_resume()= does not
-establish that ordering. Prevent old child resume callbacks from touching
-invalid slots while that handoff is pending.
+Removing the empty-slot check is insufficient. HCRST invalidates hardware
+slots while software pipes and devices still refer to them. PMF resumes the
+controller before its descendants, so those drivers can submit I/O before
+an asynchronous root-hub rescan retires the old tree. An =up_reattach= flag
+alone does not close that window.
 
-Block new I/O, join runtime and endpoint-restart tasks, cancel outstanding
-transfers in software and make close/abort/free paths avoid hardware commands
-against reset slots. Then detach downstream devices, free their rings and
-contexts, reinitialise the controller and enumerate current connections.
-Replacing whole USB buses instead would additionally require joining event
-threads and soft interrupts, releasing root transfers and arranging PMF for
-the replacement devices.
+Choose the device semantics before extending the ACPI cold-off policy:
+
+- Disconnect/re-enumerate: retire eligible downstream trees before the power
+  cut and before the PMF device snapshot. Use the USB event-thread lifecycle,
+  with command processing available and without xHCI sleep locks held. Gate
+  new enumeration while preparing the cold transition. Require successful
+  retirement of the whole tree before authorising power removal. Initially
+  exclude storage and unsupported drivers, including those behind hubs; on
+  refusal retain the warm path. Applications would observe a disconnect and
+  new attachment, and existing device handles would not survive.
+- Preserve device identity and open handles: add USB-core reset recovery that
+  verifies the same devices, restores addressing/configuration/interfaces and
+  rebuilds endpoint state before child PMF callbacks or I/O resume. Mounted
+  storage needs this kind of recovery rather than forced detach. The
+  filesystem suspension barrier alone does not make detach safe.
+
+If retirement is deferred until after power loss, add software-only
+abort/close/free paths for invalid slots, suppress old child resume callbacks,
+join runtime and endpoint tasks, and provide an explicit post-PMF handoff
+after =deviter_release()=. A USB task queued by =xhci_resume()= is not that
+barrier. Old slots must be fully retired before new enumeration can reuse IDs.
+
+The current =lispbsd-usb-populated= property counts bound slots; it is a
+conservative exclusion, not a completed cold-preparation transaction.
+Keep power-cut eligibility separate from reset recovery, with an explicit
+success/failure handoff and rollback. Neither populated path is implemented.
 
 * Kernel 165 result and build corrections
 
@@ -219,22 +252,43 @@ The 13:10 entry in =/root/astra/pc3-results.org= and
   =usb off=. The parking diagnostics added through kernel 171 identified
   the inactive child and its PMF suspensor.
 
-* Next validation: empty-xhci0 cold recovery
+* Kernel 174 cold recovery and default policy
 
-1. Start with xhci0 attached and empty. Enable =hw.acpi.sleep.idle_d3_exp=
-   mask =0x4= and use =USB_TCSS_DETACH=0= for the attached-driver experiment.
-   Suspend xhci0, remove TCSS power, restore power/PCI configuration and resume
-   through the updated USB script. These experiment switches were added in
-   =02bc0d5=; the default script path still uses suspend/detach/rescan.
-2. Record USBSTS, dmesg and capability registers. CRS may succeed directly.
-   On an RSS timeout, expect the timeout/cold-recovery diagnostic followed by
-   =cold resume: empty controller restarted=. Record SRE failures separately;
-   the kernel 171 path returns failure without cold fallback for SRE.
-3. Repeat warm/cold cycles, USB2/USB3 hotplug after recovery and a connection
-   made during the cold interval. Compare residency with the established
-   suspend/detach TCSS sequence.
+The 21:00 entry in =/root/astra/pc3-results.org= confirms the three results
+listed in Scope. Empty attached-controller cold recovery works from kernel
+172 onward through the ACPI power-loss property, not through CRS failure.
+The successful lid test on kernel 174 also exercised cold recovery after
+SLP_S0 and Bluetooth inquiry after wake.
 
-The 98% parking result does not validate attached-xhci0 cold recovery.
-Keep this experiment empty-controller only: refusal after power loss cannot
-protect an already-powered-down device. General policy needs pre-power-cut
-eligibility or populated recovery.
+Commit =0c98e67= changed the default policy:
+
+- xHCI publishes =lispbsd-usb-populated= when binding/unbinding device slots.
+- For TXHC, =ADRPWR_NODRIVER= permits an absent driver or a suspended,
+  unpopulated controller. An active or populated controller is skipped.
+- TXHC participates in the s2idle power table; suspend it through PMF before
+  removing the shared TCSS power resources.
+- =usb off= suspends xhci0 without detaching it. =usb on= restores power and
+  PCI configuration, cold-resumes the controller, then resumes the USB tree.
+  Use =USB_TCSS_DETACH=1= for the earlier suspend/detach/rescan path, or
+  =USB_TCSS_D3=0= for D3hot only.
+
+The earlier =hw.acpi.sleep.idle_d3_exp= mask =0x4= override is unnecessary
+for normal empty-controller cold recovery. It bypasses the active/populated
+guard and is not a populated-recovery enable switch.
+
+The package sits at PC8 for roughly the first eight minutes after boot,
+regardless of USB state. Measure after ten minutes of uptime. The transient
+briefly implicated xHCI MSI enable; that change was reverted in =6b1b135=.
+
+* Further validation
+
+Populated recovery needs an agreed device policy and implementation before
+hardware testing. Cover direct USB2/USB3 devices, hubs, removal or replacement
+while asleep, failed recovery, and repeated cold/warm cycles. For a
+re-enumeration policy, verify pre-cut rejection of every excluded subtree;
+for identity-preserving recovery, verify open handles and storage integrity.
+Record power and SLP_S0 only after the boot-transient window.
+
+Keep the existing SRE-only failure case separate: kernel 174 returns failure
+without cold fallback for RSS-clear/SRE-set. The explicit ACPI power-loss tag
+avoids that restore path for the tested TCSS cold transition.
