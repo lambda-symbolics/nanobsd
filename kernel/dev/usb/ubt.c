@@ -736,21 +736,23 @@ ubt_resume(device_t self, const pmf_qual_t *qual)
 	if (!sc->sc_enabled || !sc->sc_parked || sc->sc_dying)
 		return true;
 	s = splusb();
-	sc->sc_parked = 0;
 	if (sc->sc_evt_pipe != NULL) {
 		usbd_close_pipe(sc->sc_evt_pipe);
 		sc->sc_evt_pipe = NULL;
-		err = usbd_open_pipe_intr(sc->sc_iface0, sc->sc_evt_addr,
-		    USBD_SHORT_XFER_OK, &sc->sc_evt_pipe, sc, sc->sc_evt_buf,
-		    UBT_BUFSIZ_EVENT, ubt_recv_event, USBD_DEFAULT_INTERVAL);
-		if (err != USBD_NORMAL_COMPLETION) {
-			splx(s);
-			aprint_error_dev(self,
-			    "event pipe did not reopen after suspend: %s\n",
-			    usbd_errstr(err));
-			return false;
-		}
 	}
+	/* A failed reopen leaves the pipe NULL and sc_parked set for retry. */
+	err = usbd_open_pipe_intr(sc->sc_iface0, sc->sc_evt_addr,
+	    USBD_SHORT_XFER_OK, &sc->sc_evt_pipe, sc, sc->sc_evt_buf,
+	    UBT_BUFSIZ_EVENT, ubt_recv_event, USBD_DEFAULT_INTERVAL);
+	if (err != USBD_NORMAL_COMPLETION) {
+		sc->sc_evt_pipe = NULL; /* open_pipe_intr may publish then free it */
+		splx(s);
+		aprint_error_dev(self,
+		    "event pipe did not reopen after suspend: %s\n",
+		    usbd_errstr(err));
+		return false;
+	}
+	sc->sc_parked = 0;
 	if (sc->sc_aclrd_pipe != NULL)
 		ubt_recv_acl_start(sc);
 	if (sc->sc_scord_pipe != NULL && sc->sc_scord_size != 0)
@@ -1914,6 +1916,7 @@ ubt_disable(device_t self)
 	ubt_abortdealloc(sc);
 
 	sc->sc_enabled = 0;
+	sc->sc_parked = 0;
 	splx(s);
 }
 
