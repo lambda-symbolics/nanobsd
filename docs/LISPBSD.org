@@ -33,7 +33,14 @@ service wpa_supplicant restart; sleep 10; ifconfig iwx0
 Nuclear option: =modunload if_iwx; modload if_iwx; service wpa_supplicant restart=.
 ** WireGuard
 - Service: =service wgpeer status|restart= (script /etc/rc.d/wgpeer, key in /etc/wireguard/wg0.private).
-- It pings 10.0.0.1 in a loop because NetBSD wg(4) has no persistent-keepalive.
+- Stock NetBSD wg(4) has no persistent keepalive, so the script used to run a
+  ping loop to 10.0.0.1.  Since 2026-10-15 LispBSD's wg(4) (nanobsd
+  kernel/net/if_wg.c, built as the if_wg module in /stand) has one:
+  =wgconfig wg0 add peer ... --persistent-keepalive=25= with the wgconfig
+  from userland/wgconfig (installed in /usr/local/sbin), shown by
+  =wgconfig wg0 show peer velho=.  Without a packet for 25 s the kernel
+  sends a keepalive on the session, or a handshake when there is none.
+  The script falls back to the ping loop with a stock wgconfig.
 
 * Power
 ** Battery: how much, how long
