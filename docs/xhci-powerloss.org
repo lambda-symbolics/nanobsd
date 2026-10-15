@@ -2,11 +2,14 @@
 
 * Scope
 
-2026-10-15 draft, revised for kernel 167 after the kernel 165 and 166
-warm-resume failures. Copy =kernel/dev/usb/xhci.c=, =kernel/dev/usb/xhcivar.h=
-and =kernel/dev/usb/ubt.c= into the NetBSD tree. Initial verification was
-source-only. Laptop results and subsequent fixes are recorded below;
-kernel 167 validation is pending.
+Updated through kernel 171, 2026-10-15. Runtime Bluetooth parking, inquiry
+wake and freeze/resume with a parked radio have been exercised on the laptop.
+With PCH on, the radio up and parked, and TCSS cold, PC10 residency was 98%.
+Empty-xhci0 cold recovery is the next experiment.
+
+Copy =kernel/dev/usb/xhci.c=, =kernel/dev/usb/xhcivar.h= and
+=kernel/dev/usb/ubt.c= into the NetBSD tree. Install the updated =userland/usb=
+script too: controller resume alone does not resume its USB children.
 
 Cold recovery requires no allocated slots, runtime parking ownership or
 downstream USB devices on either bus. The first target is empty external
@@ -34,10 +37,11 @@ HCCPARAMS1 must match. HCIVERSION changes are informational: log them with
 =aprint_debug_dev()=, then check the actual layout and snapshot validity.
 Zero or all-ones HCIVERSION reads are rejected as unavailable MMIO.
 
-On the tested Tiger Lake xhci1, HCIVERSION changed from 0x0120 to 0x0110
-after a plain PCI D3hot -> D0 cycle. This is not evidence of cold power loss
-and does not by itself require detach/reattach. Commit =34c10c3= removes the
-version-equality requirement that prevented kernel 165 from resuming xhci1.
+On the tested Tiger Lake machine, HCIVERSION reads 0x0110 after every tested
+PCI D3hot cycle, versus 0x0120 at attach. Operational registers also read zero
+after D3hot; the warm path rewrites them before CRS. Neither observation is
+proof of cold power loss. Commits =34c10c3= and =f9b3987= remove the version
+and register-equality checks that blocked warm resume in kernels 165 and 166.
 
 =xhci_init()= owns allocations, mappings, locks, CVs, slots and callouts.
 After HCRST and the vendor hook, =xhci_init_hw()= reuses those allocations:
@@ -195,29 +199,42 @@ controller, the next recovery change should handle SRE alongside timeout,
 checking fresh HSE/HCE and rejecting all-ones MMIO before starting Run/Stop.
 The current timeout loop also treats all-ones USBSTS as RSS still set; the
 subsequent reset helper's CNR check rejects persistently inaccessible MMIO.
-Kernel 167 source was left unchanged during this review.
 
-* Laptop validation
+* Kernel 171 parking result and child resume
 
-1. With kernel 167 and all three source files, repeat =usb on pch= through a
-   plain D3hot -> D0 cycle. Confirm warm resume and working Bluetooth before
-   testing runtime parking or cold power removal.
-2. With Bluetooth up and idle, compare =hw.usbpm.stats=, power and PC10
-   before/after parking. Exercise an outbound command, inbound remote wake,
-   repeated idle cycles and radio down/up. Check inbound event/ACL traffic.
-3. Freeze/resume with ubt already runtime-parked and again while active.
-   Exercise traffic immediately after wake and check failure counters.
-4. Start with xhci0 empty. Retain the attached controller, suspend its driver,
-   remove TCSS power, restore power/PCI configuration and resume through PMF.
-   Record USBSTS, dmesg and capability registers. CRS may succeed directly.
+The 13:10 entry in =/root/astra/pc3-results.org= and
+[[file:tcss-d3cold.org::*Bluetooth radio parking, kernels 165-171 (afternoon/evening 2026-10-15)][the TCSS hardware notes]] record:
+
+- On kernels 167+, the radio parks, inquiry wakes it (=wakes=1=, =resumes=2=),
+  and inquiry works after freeze/resume with an already parked radio.
+- On kernel 171, PCH on, ubt0 up and parked, and TCSS cold yielded PC10 98%.
+  The Wh measurement window was still running at report time.
+- After a plain =usb on pch=, ubt0 initially kept its boot-time drvctl PMF
+  suspension. =drvctl -R= resumes the named device and its ancestors, not its
+  descendants: DRVRESUMEDEV is issued without DEVPM_F_SUBTREE. The active-child
+  predicate therefore correctly refused to runtime-park ubt0.
+- Commit =125f41d= adds =resume_tree()= to the USB script. Resume the controller
+  and then its descendants, leaves last, including when the controller is
+  already in D0. This releases the child suspension left by boot-time
+  =usb off=. The parking diagnostics added through kernel 171 identified
+  the inactive child and its PMF suspensor.
+
+* Next validation: empty-xhci0 cold recovery
+
+1. Start with xhci0 attached and empty. Enable =hw.acpi.sleep.idle_d3_exp=
+   mask =0x4= and use =USB_TCSS_DETACH=0= for the attached-driver experiment.
+   Suspend xhci0, remove TCSS power, restore power/PCI configuration and resume
+   through the updated USB script. These experiment switches were added in
+   =02bc0d5=; the default script path still uses suspend/detach/rescan.
+2. Record USBSTS, dmesg and capability registers. CRS may succeed directly.
    On an RSS timeout, expect the timeout/cold-recovery diagnostic followed by
    =cold resume: empty controller restarted=. Record SRE failures separately;
-   kernel 167 does not route that failure to cold recovery.
-5. Repeat warm/cold cycles, USB2/USB3 hotplug after recovery and a connection
-   made during the cold interval. Compare residency with the known
+   the kernel 171 path returns failure without cold fallback for SRE.
+3. Repeat warm/cold cycles, USB2/USB3 hotplug after recovery and a connection
+   made during the cold interval. Compare residency with the established
    suspend/detach TCSS sequence.
 
-Use ADRPWR_COLD without ADRPWR_NODRIVER for TXHC only in that empty-controller
-experiment. A refusal after power loss cannot protect an already-powered-down
-device. General policy needs pre-power-cut eligibility or populated recovery.
-Retain the detach/rescan script path until laptop tests establish the new path.
+The 98% parking result does not validate attached-xhci0 cold recovery.
+Keep this experiment empty-controller only: refusal after power loss cannot
+protect an already-powered-down device. General policy needs pre-power-cut
+eligibility or populated recovery.
