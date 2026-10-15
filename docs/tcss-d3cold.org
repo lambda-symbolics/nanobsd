@@ -154,6 +154,26 @@ defaults the Thunderbolt root ports to cold without _PS3 (f022b96).
 - Astra has the brief for the power-loss-aware xhci_resume
   (/root/astra/brief-xhci-powerloss.org).
 
+* Bluetooth radio A/B (kernel 164, panel off, battery, 240 s windows)
+
+| state                                    | Wh rate | sensor | pc10   |
+| everything off (boot state)              | 1.20 W  | 1.33 W | 97.0 % |
+| PCH on, ubt0 up, no stream, TCSS cold    | 2.25 W  | 2.14 W | 0.1 %  |
+| PCH on, ubt0 up, no stream, TCSS warm    | 2.55 W  | 2.53 W | 0.0 %  |
+| PCH on, ubt0 up, no stream, TCSS cold (2)| 2.40 W  | 2.16 W | 0.1 %  |
+
+The domain split is worth about 0.3 W while Bluetooth is up, but an idle,
+silent radio costs about 1 W by itself and removes PC10 entirely: ubt(4)
+keeps its interrupt and bulk-in pipes open from "up" onwards, and the
+kernel 156 runtime PM only parks devices with no open pipes, so the port
+stays in U0 and the PCH controller in D0.  (Controllers on with every port
+in U3 measured PC9 97 %, 1.40 W earlier.)  Linux parks btusb with the
+pipes conceptually open: the driver's suspend callback kills the URBs and
+its resume resubmits them, with remote wakeup.  The equivalent here is a
+ubt runtime suspend/resume hook driven by the xhci idle scan (abort the
+pipes, port to U3 with remote wake, reopen on wake).  Until then
+=bt-headphones off= takes the radio down.
+
 * Status
 
 - Kernel 162 (default boot entry): Astra's backend (D3cold, resource-only
