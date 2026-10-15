@@ -118,6 +118,22 @@ through s2idle (entries already in the target state are skipped and not
 restored).  A power-loss-aware xhci_resume (full reinit) would remove the
 caveat.
 
+* 2026-10-15: lid suspend broken by the filesystem barrier, kernel 163
+
+User report: lid close stalled Bluetooth audio for under a second and did not
+suspend.  /var/log/messages: every attempt ended one second after
+"s2idle: freezing" with "filesystem barrier failed (16), aborting freeze".
+The barrier (c45c6e0, first deployed on kernel 157) requires every non-system
+LWP to be in LSSUSPENDED one second after the freeze kick; LWPs in kernel
+waits (kevent/poll/select re-sleep without visiting userret, uninterruptible
+sleeps) never get there, so the precondition fails even on an idle machine
+(verified on kernel 163: "filesystem barrier not established (16)").
+Kernel 163 (e5f674d) makes the barrier best effort:
+=hw.acpi.sleep.freeze_fsbarrier= 0 off, 1 (default) try and continue
+without it, 2 the old abort.  Freeze test on 163: 20 s hold, PC10 97 %,
+resumed.  Astra was asked to redesign the precondition.  Kernel 163 also
+defaults the Thunderbolt root ports to cold without _PS3 (f022b96).
+
 * Status
 
 - Kernel 162 (default boot entry): Astra's backend (D3cold, resource-only
