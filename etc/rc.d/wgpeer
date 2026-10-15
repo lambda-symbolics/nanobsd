@@ -1,0 +1,95 @@
+#!/bin/sh
+#
+# PROVIDE: wgpeer
+# REQUIRE: NETWORKING mountcritremote
+# BEFORE:  LOGIN
+#
+# WireGuard link to velho (10.0.0.1) with a ping keepalive loop, because
+# NetBSD wg(4) has no persistent-keepalive option.
+
+$_rc_subr_loaded . /etc/rc.subr
+
+name="wgpeer"
+rcvar=$name
+start_cmd="wgpeer_start"
+stop_cmd="wgpeer_stop"
+status_cmd="wgpeer_status"
+extra_commands="status"
+
+WG_IF="wg0"
+WG_ADDRESS4="10.0.0.25/32"
+WG_LOCAL4="10.0.0.25"
+WG_ADDRESS6="fdc9:281f:4d7:9ee9::25/128"
+WG_LOCAL6="fdc9:281f:4d7:9ee9::25"
+WG_PRIVATE="/etc/wireguard/wg0.private"
+WG_PEER_PUBLIC="lQ7b0Yfqtb4MeXVs1y8OpMxGioS3JQeXYdlDrYJO134="
+WG_ENDPOINT="95.217.72.169:51871"
+WG_ALLOWED_IPS="10.0.0.0/24,fdc9:281f:4d7:9ee9::/64,10.20.0.0/16,10.21.0.0/16,10.22.0.0/16,10.33.0.0/16,10.34.0.0/16,10.35.0.0/16,10.36.0.0/16,10.37.0.0/16,10.254.0.0/16,172.22.6.0/23,172.22.10.0/23,172.23.0.0/16"
+WG_NETWORKS4="10.0.0.0/24 10.20.0.0/16 10.21.0.0/16 10.22.0.0/16 10.33.0.0/16 10.34.0.0/16 10.35.0.0/16 10.36.0.0/16 10.37.0.0/16 10.254.0.0/16 172.22.6.0/23 172.22.10.0/23 172.23.0.0/16"
+KEEPALIVE_PID="/var/run/wgpeer-keepalive.pid"
+
+wgpeer_start()
+{
+	echo "Starting WireGuard peer on ${WG_IF}."
+	if ! /sbin/ifconfig $WG_IF >/dev/null 2>&1; then
+		if ! /sbin/ifconfig $WG_IF create 2>/dev/null; then
+			/sbin/modload if_wg 2>/dev/null || true
+			/sbin/ifconfig $WG_IF create || return 1
+		fi
+	fi
+	/sbin/ifconfig $WG_IF inet $WG_ADDRESS4 2>/dev/null || true
+	/sbin/ifconfig $WG_IF inet6 $WG_ADDRESS6 2>/dev/null || true
+	/usr/sbin/wgconfig $WG_IF set private-key $WG_PRIVATE
+	/usr/sbin/wgconfig $WG_IF delete peer velho >/dev/null 2>&1 || true
+	/usr/sbin/wgconfig $WG_IF add peer velho $WG_PEER_PUBLIC \
+		--allowed-ips=$WG_ALLOWED_IPS --endpoint=$WG_ENDPOINT
+	/sbin/ifconfig $WG_IF up
+	for net in $WG_NETWORKS4; do
+		/sbin/route -q delete -net $net >/dev/null 2>&1 || true
+		/sbin/route -q add -net $net $WG_LOCAL4 >/dev/null 2>&1 || true
+	done
+	/sbin/route -q delete -inet6 -net fdc9:281f:4d7:9ee9::/64 >/dev/null 2>&1 || true
+	/sbin/route -q add -inet6 -net fdc9:281f:4d7:9ee9::/64 $WG_LOCAL6 >/dev/null 2>&1 || true
+	wgpeer_keepalive_start
+}
+
+wgpeer_keepalive_start()
+{
+	if [ -r $KEEPALIVE_PID ] && kill -0 $(cat $KEEPALIVE_PID) 2>/dev/null; then
+		return 0
+	fi
+	(
+		i=0
+		while :; do
+			/sbin/ping -n -c 1 -w 3 10.0.0.1 >/dev/null 2>&1 || true
+			if [ $i -lt 12 ]; then
+				i=$((i + 1)); /bin/sleep 5
+			else
+				/bin/sleep 20
+			fi
+		done
+	) >/dev/null 2>&1 </dev/null &
+	echo $! > $KEEPALIVE_PID
+}
+
+wgpeer_stop()
+{
+	if [ -r $KEEPALIVE_PID ]; then
+		kill $(cat $KEEPALIVE_PID) 2>/dev/null || true
+		rm -f $KEEPALIVE_PID
+	fi
+	/sbin/ifconfig $WG_IF destroy 2>/dev/null || true
+}
+
+wgpeer_status()
+{
+	/usr/sbin/wgconfig $WG_IF 2>&1 | sed -e 's/private-key.*/private-key REDACTED/'
+	if [ -r $KEEPALIVE_PID ] && kill -0 $(cat $KEEPALIVE_PID) 2>/dev/null; then
+		echo "keepalive running (pid $(cat $KEEPALIVE_PID))"
+	else
+		echo "keepalive not running"
+	fi
+}
+
+load_rc_config $name
+run_rc_command "$1"
