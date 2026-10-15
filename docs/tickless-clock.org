@@ -1,0 +1,55 @@
+#+TITLE: Tickless idle lost wall time; the screen would not wake (2026-10-15/16)
+
+* Symptom
+- The laptop clock ran slow (ntpdate stepped +3084 s after 80 min) and the
+  kernel logged "timecounter went backwards" and "monotonic clock has gone
+  backwards".
+- The panel blanked after the idle timeout and no key press woke it.
+
+* Measurement that located it
+Reference: the workstation's NTP clock, sampling the laptop over ssh every
+120 s window (scripts in the session scratchpad: sample.sh/clockexp.sh).
+
+| configuration (kernel 174)  | real  | kernel date | raw TSC | raw HPET | cpu0 hardclocks | PC10 |
+| tickless, maxskip 100       | 120.5 | 72          | 120.5   | 120.5    | 120.5           | 81 % |
+| tickless off                | 120.5 | 120         | 120.5   | 120.5    | 120.5           | 0.2 % |
+
+No counter stops and no tick is lost: the timecounter arithmetic loses it.
+
+* Root cause
+=binuptime()= and =tc_windup()= add =th_scale * delta= with =bintime_addx=.
+=th_scale= is about 2^64 / frequency, so the 64-bit product overflows once
+=delta= is worth a second.  With the periodic tick the timecounter is wound
+up every 10 ms and that never happens; with the tickless idle, CPU 0 (the
+only CPU calling =tc_ticktock=) sleeps up to =maxskip= = 100 ticks = 1 s,
+each overflow drops about a second, and readers on other CPUs see time go
+backwards meanwhile.  It explains why HPET lost time too (the overflow is
+in seconds, not counter width), why =maxskip 10= was fine, and the
+backwards-clock warnings.  A second limit sits behind it: the TSC
+timecounter is 32 bits wide (wraps in 2.03 s at 2.112 GHz).
+
+* Fix (kernel 175, nanobsd 7975d49; stock kern_tc.c imported in efbf725)
+- =kern_tc.c=: =tc_bintime_addscaled()= splits the multiply into 32-bit
+  halves (FreeBSD's large-delta method), used in =binuptime()= and
+  =tc_windup()=.
+- =cidle.c=: the primary CPU's skip is capped at half the current
+  timecounter's wrap interval (=tc_counter_mask * hz / tc_frequency / 2=,
+  101 ticks for the TSC).
+
+| configuration (kernel 175)       | real  | kernel date | PC10 |
+| tickless, maxskip 100            | 120.6 | 121         | 98.1 % |
+| tickless, maxskip 300 (cap test) | 120.5 | 121         | 98.3 % |
+
+No clock warnings on kernel 175.  Tickless stays on (=etc/sysctl.conf=,
+=rc.local=).
+
+* The screen
+Mahogany's wake path is event-driven (key press -> =hrt_idle_notify_activity=
+-> armed callback -> =idle-activity= -> =idle-unblank=) and does not read the
+clock.  On kernel 175, a natural blank followed by a simulated key press
+through that C entry point turned eDP-1 back on ("Output eDP-1 turned on",
+"Idle: panel on", modeset).  On kernel 174 the session's log showed "panel
+off" without a later "panel on", but Mahogany's log is buffered and that
+session ended in a reboot, so the log cannot show what happened last.  The
+broken clock is the likely cause; confirmation is the user's next real
+blank/wake on 175.

@@ -46,7 +46,8 @@ paths.
   `stuck-keys.org`, `braiins-wifi.org`, `emacs.org`, `video-power.org`,
   `reboot-wedge.org`, `epp-load.org`, `power-review-2026-10.org` and
   `power-audit-2026-10-13.org` (what is left, by layer), `tcss-d3cold.org`
-  (USB-C xHCI power resource, D3cold design, detach panic).
+  (USB-C xHCI power resource, D3cold design, detach panic), `tickless-clock.org`
+  (tickless idle timecounter overflow).
 - `userland/lsblk` — `lsblk`/`lsblock`; `userland/pcsample` — package C-state
   samples after charger/lid events (`/var/log/pcstate.log`).
 
