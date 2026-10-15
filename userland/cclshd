@@ -1,4 +1,7 @@
 #!/bin/sh
 export CCLSH_SBCL=/usr/local/bin/sbcl
 export CCLSH_QUICKLISP_SETUP=/usr/local/lib/cclsh/quicklisp/setup.lisp
+# The shared server runs from the saved image (fractions of a second), not
+# from the source launcher (several seconds of ASDF loading).
+export CCLSH_IMAGE=/usr/local/lib/cclsh/cclsh-image
 exec /usr/local/lib/cclsh/src/cclsh/scripts/cclshd "$@"

@@ -1,0 +1,36 @@
+#!/bin/sh
+#
+# PROVIDE: cclshd
+# REQUIRE: DAEMON
+# BEFORE:  LOGIN
+#
+# Prewarm the per-user cclsh session servers at boot, so the first terminal
+# of a login (ssh or the desktop) attaches to a running server instead of
+# waiting for one to start.
+
+$_rc_subr_loaded . /etc/rc.subr
+
+name="cclshd"
+rcvar=$name
+start_cmd="cclshd_start"
+stop_cmd="cclshd_stop"
+cclshd_users=${cclshd_users:-"root mag"}
+
+cclshd_start()
+{
+	for u in $cclshd_users; do
+		echo "Prewarming cclsh server for ${u}."
+		su -m "$u" -c "env HOME=$(getent passwd "$u" | cut -d: -f6) USER=$u LOGNAME=$u /usr/local/bin/cclshd start" \
+		    >/dev/null 2>&1 </dev/null &
+	done
+}
+
+cclshd_stop()
+{
+	for u in $cclshd_users; do
+		su -m "$u" -c "/usr/local/bin/cclshd stop" >/dev/null 2>&1 </dev/null
+	done
+}
+
+load_rc_config $name
+run_rc_command "$1"

@@ -23,7 +23,9 @@ fi
 if [ "$#" -eq 0 ] && [ -t 0 ] && [ -t 1 ] && [ -t 2 ] &&
    [ "${CCLSH_NO_DAEMON:-0}" != 1 ]; then
     /usr/local/bin/cclshd start >/dev/null 2>&1 || :
-    directory=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/cclshd-$(id -u)
+    # One directory per user whatever the session environment says (a daemon
+    # prewarmed at boot or started over ssh is the one a desktop terminal uses).
+    directory=${TMPDIR:-/tmp}/cclshd-$(id -u)
     socket=${CCLSH_DAEMON_SOCKET:-$directory/server.sock}
     exec "$base/src/cclsh/cclsh-session" attach "$socket" "$fallback"
 fi
