@@ -2,11 +2,11 @@
 
 * Scope
 
-2026-10-15 draft for kernel 165. Copy =kernel/dev/usb/xhci.c=,
-=kernel/dev/usb/xhcivar.h= and =kernel/dev/usb/ubt.c= into the NetBSD tree.
-Verification here is source review against NetBSD-11 PMF/USB APIs and
-=git diff --check=. No kernel or host test binary was built; laptop
-validation is pending.
+2026-10-15 draft, revised for kernel 166 after the kernel 165 warm-resume
+failure. Copy =kernel/dev/usb/xhci.c=, =kernel/dev/usb/xhcivar.h= and
+=kernel/dev/usb/ubt.c= into the NetBSD tree. Initial verification was
+source-only. The kernel 165 laptop result and subsequent fixes are recorded
+below; kernel 166 validation is pending.
 
 Cold recovery requires no allocated slots, runtime parking ownership or
 downstream USB devices on either bus. The first target is empty external
@@ -24,11 +24,15 @@ between live DCBAAP, CONFIG or ERSTBA and the suspend snapshot, or a fatal
 controller status, requires cold recovery instead of CRS. =sc_state_lost=
 is sticky until success, including after a partially programmed restart.
 
-Register offsets, slot/interrupter/port and scratchpad counts, context
-capabilities and HCIVERSION must match. The reported 1.20 -> 1.10 version
-change is deliberately rejected in this draft: use detach/reattach to
-rebuild mappings and descriptors. Capture before/after capabilities before
-considering a relaxed compatibility check.
+Register offsets, slot/interrupter/port and scratchpad counts, and
+HCCPARAMS1 must match. HCIVERSION changes are informational: log them with
+=aprint_debug_dev()=, then check the actual layout and saved register state.
+Zero or all-ones HCIVERSION reads are rejected as unavailable MMIO.
+
+On the tested Tiger Lake xhci1, HCIVERSION changed from 0x0120 to 0x0110
+after a plain PCI D3hot -> D0 cycle. This is not evidence of cold power loss
+and does not by itself require detach/reattach. Commit =34c10c3= removes the
+version-equality requirement that prevented kernel 165 from resuming xhci1.
 
 =xhci_init()= owns allocations, mappings, locks, CVs, slots and callouts.
 After HCRST and the vendor hook, =xhci_init_hw()= reuses those allocations:
@@ -75,10 +79,12 @@ sleeping may release that lock.
 * Runtime parking
 
 The idle policy accepts zero non-control pipes, or open pipes belonging
-only to active, PMF-registered ubt children. Require at least one child for
-that opt-in. HID policy and the direct-root-port restriction also apply.
-The callout queues candidates; inspect descriptors and subdevices in the
-non-MPSAFE USB task under KERNEL_LOCK, not in softint context.
+only to active ubt children. Require at least one child for that opt-in.
+The ubt driver registers its PMF handlers at attach; xHCI checks the result
+of =pmf_device_suspend()= rather than calling the private registration query.
+HID policy and the direct-root-port restriction also apply. The callout
+queues candidates; inspect descriptors and subdevices in the non-MPSAFE USB
+task under KERNEL_LOCK, not in softint context.
 
 For open-pipe parking, require remote-wakeup capability and successful
 SET_FEATURE. Suspend the drivers through =PMF_Q_SELF= before requesting U3.
@@ -132,19 +138,44 @@ Replacing whole USB buses instead would additionally require joining event
 threads and soft interrupts, releasing root transfers and arranging PMF for
 the replacement devices.
 
+* Kernel 165 result and build corrections
+
+The 12:00 entry in =/root/astra/pc3-results.org= records the first
+=usb on pch= failure on kernel 165: a normal D3hot -> D0 transition produced
+=capability layout changed (HCIVERSION 0120 -> 0110)=. The version check
+rejected warm resume, followed by =xhci_set_dequeue= timeouts and
+=btconfig up= returning EIO. Bluetooth parking could not be tested.
+
+Commit =51350c9= supplied four build corrections before that laptop run:
+
+- Rename local =version= to =hciver= to avoid shadowing the kernel global.
+- Rename local =cold= to =coldres= for the same reason.
+- Assign =XHCI_HCS2_MAXSPBUF(hcs2)= to =maxspbuf= before comparing it. The
+  macro has no outer parentheses; direct use in the compound condition
+  changes the comparison's meaning through operator precedence.
+- Remove =device_pmf_is_registered()= from the ubt eligibility predicate.
+  It is not a public NetBSD-11 driver API. Use ubt's attach-time registration
+  and the public PMF suspend/resume calls.
+
+Source review of both =51350c9= and the subsequent HCIVERSION correction
+=34c10c3= is complete. Kernel 166 was building when the result was reported;
+successful warm resume, Bluetooth parking and cold recovery await its tests.
+
 * Laptop validation
 
-1. Build kernel 165 with all three source files. With Bluetooth up and idle,
-   compare =hw.usbpm.stats=, power and PC10 before/after parking. Exercise an
-   outbound command, inbound remote wake, repeated idle cycles and radio
-   down/up. Check that inbound event/ACL traffic resumes.
-2. Freeze/resume with ubt already runtime-parked and again while active.
+1. With kernel 166 and all three source files, repeat =usb on pch= through a
+   plain D3hot -> D0 cycle. Confirm warm resume and working Bluetooth before
+   testing runtime parking or cold power removal.
+2. With Bluetooth up and idle, compare =hw.usbpm.stats=, power and PC10
+   before/after parking. Exercise an outbound command, inbound remote wake,
+   repeated idle cycles and radio down/up. Check inbound event/ACL traffic.
+3. Freeze/resume with ubt already runtime-parked and again while active.
    Exercise traffic immediately after wake and check failure counters.
-3. Start with xhci0 empty. Retain the attached controller, suspend its driver,
+4. Start with xhci0 empty. Retain the attached controller, suspend its driver,
    remove TCSS power, restore power/PCI configuration and resume through PMF.
    Expect =controller state lost= and =cold resume: empty controller restarted=,
    without CRS. Record dmesg and capability registers.
-4. Repeat warm/cold cycles, USB2/USB3 hotplug after recovery and a connection
+5. Repeat warm/cold cycles, USB2/USB3 hotplug after recovery and a connection
    made during the cold interval. Compare residency with the known
    suspend/detach TCSS sequence.
 
