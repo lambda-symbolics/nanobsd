@@ -1,66 +1,77 @@
 #!/bin/sh
-# usb on|off|status - suspend/resume BOTH USB xHCI controllers to save power.
-# "off" powers down all USB data (internal camera/BT/fingerprint + external
-# ports); USB-C charging (PD) is a separate controller and keeps working.
-# Keyboard/trackpoint are I2C-HID, not USB, so they are unaffected.
-# NetBSD has no per-device USB autosuspend, so this all-or-nothing gate is the
-# power lever; use webcam/bluetooth for granular control while usb is on.
-# "off" also powers the whole TCSS block down (see below); USB_TCSS_D3=0 to skip.
+# usb on|off|status [all|pch|usbc] - power policy for the two xHCI controllers.
+#   pch  : xhci1, the PCH controller with the internal devices (Bluetooth,
+#          camera, fingerprint).  off = driver suspended (D3hot).
+#   usbc : xhci0, the USB-C/Thunderbolt controller (external ports only).
+#          off = TCSS D3cold: xhci0 is suspended (ports quiesced, D3hot: a
+#          merely halted controller caps the package at PC9), detached, and
+#          the shared TCSS power resource (D3C, also held by the Thunderbolt
+#          DMA engines and root ports) is switched off through idle_d3; the
+#          package then idles in PC10 (about 1.1 W) instead of a PC3/PC10
+#          split (about 1.9 W).  on = resource back, pci0 rescan reattaches
+#          xhci0 fresh (a cold controller cannot be warm-resumed).
+#   all  : both (default).  rc.local does "usb off" at boot.
+# Keyboard/trackpoint are I2C-HID, USB-C charging (PD) is separate: both keep
+# working with everything off.  bluetooth/webcam/bt-headphones use "pch" so
+# the unused USB-C block stays cold.  USB_TCSS_D3=0 keeps usbc at D3hot only.
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="doas"
-CTRLS="xhci0 xhci1"
-up(){ drvctl -p "$1" 2>/dev/null | grep -qi 'state.*resumed\|active' ; }
-state(){ # crude: if uhub children exist, controller is up
-  for c in $CTRLS; do drvctl -l "$c" 2>/dev/null | grep -q uhub && { echo on; return; }; done
-  echo off
+attached(){ drvctl -l pci0 2>/dev/null | grep -q "^pci0 $1\$"; }
+# The PCI bus driver puts a suspended function in D3hot (PMCSR), so the
+# config-space power state tells a suspended controller from a running one.
+active(){ case $1 in xhci0) d=13 ;; xhci1) d=20 ;; esac
+  pcictl pci0 dump -d $d -f 0 2>/dev/null | grep -q 'Power state: D0'; }
+cold(){ [ "$(sysctl -n hw.acpi.sleep.idle_d3 2>/dev/null)" = 1 ]; }
+dom=${2:-all}
+case "$dom" in all|pch|usbc) ;; *) echo "usage: usb [on|off|status] [all|pch|usbc]" >&2; exit 1 ;; esac
+pch_off(){
+  attached xhci1 || return 0
+  active xhci1 || return 0
+  $SUDO drvctl -S xhci1 2>/dev/null || { echo "usb: xhci1 did not suspend" >&2; return 1; }
+}
+pch_on(){
+  attached xhci1 || { echo "usb: no xhci1" >&2; return 1; }
+  active xhci1 && return 0
+  $SUDO drvctl -R xhci1 2>/dev/null || { echo "usb: xhci1 did not resume" >&2; return 1; }
+}
+usbc_off(){
+  if attached xhci0 && active xhci0; then
+    $SUDO drvctl -S xhci0 2>/dev/null || { echo "usb: xhci0 did not suspend" >&2; return 1; }
+  fi
+  [ "${USB_TCSS_D3:-1}" = 1 ] || return 0
+  if attached xhci0; then
+    $SUDO drvctl -d xhci0 2>/dev/null || { echo "usb: xhci0 did not detach" >&2; return 1; }
+  fi
+  cold && return 0
+  $SUDO sysctl -w hw.acpi.sleep.idle_d3=1 >/dev/null 2>&1 || { echo "usb: TCSS power resources not switched off (idle_d3)" >&2; return 1; }
+  cold || { echo "usb: idle_d3 did not take" >&2; return 1; }
+}
+usbc_on(){
+  if cold; then
+    $SUDO sysctl -w hw.acpi.sleep.idle_d3=0 >/dev/null 2>&1 || { echo "usb: could not restore the TCSS power resources (idle_d3); not touching xhci0" >&2; return 1; }
+  fi
+  if ! attached xhci0; then
+    $SUDO drvctl -r pci0 2>/dev/null
+    attached xhci0 || { echo "usb: xhci0 did not reattach" >&2; return 1; }
+    return 0
+  fi
+  active xhci0 && return 0
+  $SUDO drvctl -R xhci0 2>/dev/null || { echo "usb: xhci0 did not resume" >&2; return 1; }
+}
+state(){
+  p=off; attached xhci1 && active xhci1 && p=on
+  u=off; if attached xhci0 && active xhci0; then u=on; elif cold; then u=cold; fi
+  echo "usb: pch $p, usbc $u"
 }
 case "${1:-status}" in
-  off)  rc=0
-        # Default: also switch the TCSS power resource (D3C, shared by the
-        # USB-C xHCI, the Thunderbolt DMA engines and the Thunderbolt root
-        # ports) off = TCSS D3cold; the package then idles in PC10 (about
-        # 1.1 W) instead of a PC3/PC10 split (about 1.9 W).  The USB-C
-        # controller comes back reset, so it is suspended (ports quiesced,
-        # D3hot: without this the TCSS only reaches PC9), then detached, and
-        # reattached by a pci0 rescan in "on".  USB_TCSS_D3=0 keeps the old
-        # D3hot-only behaviour.  The kernel refuses the cold-off while xhci0
-        # is attached.
-        cold=${USB_TCSS_D3:-1}
-        for c in $CTRLS; do
-          drvctl -l pci0 2>/dev/null | grep -q "$c" || continue
-          $SUDO drvctl -S "$c" 2>/dev/null || { echo "usb: $c did not suspend" >&2; rc=1; }
-        done
-        if [ $rc -eq 0 ] && [ "$cold" = 1 ] && drvctl -l pci0 2>/dev/null | grep -q xhci0; then
-          $SUDO drvctl -d xhci0 2>/dev/null || { echo "usb: xhci0 did not detach" >&2; rc=1; }
-        fi
-        # Only with every driver quiescent may the ACPI power resources of
-        # the TCSS functions and the driverless platform IPs go off.
-        if [ $rc -eq 0 ] && [ "$cold" = 1 ]; then
-          $SUDO sysctl -w hw.acpi.sleep.idle_d3=1 >/dev/null 2>&1 || echo "usb: idle_d3 not set" >&2
-          echo "usb: OFF (TCSS cold, PCH xhci suspended; charging unaffected)"
-        elif [ $rc -eq 0 ]; then
-          echo "usb: OFF (xhci suspended; charging unaffected)"
-        else
-          echo "usb: partly OFF (a controller stayed up; power resources left alone)"
-        fi
-        exit $rc ;;
-  on)   # Power the TCSS block back before the xhci driver touches it; if
-        # that fails, resuming the driver would hang on dead registers.
-        if ! $SUDO sysctl -w hw.acpi.sleep.idle_d3=0 >/dev/null 2>&1; then
-          echo "usb: could not restore the ACPI power resources (idle_d3); not resuming" >&2; exit 1
-        fi
-        rc=0
-        if ! drvctl -l pci0 2>/dev/null | grep -q xhci0; then
-          # Detached for the cold-off: reattach (fresh xhci_init).
-          $SUDO drvctl -r pci0 2>/dev/null
-          drvctl -l pci0 2>/dev/null | grep -q xhci0 || { echo "usb: xhci0 did not reattach" >&2; rc=1; }
-        fi
-        for c in $CTRLS; do
-          drvctl -l pci0 2>/dev/null | grep -q "$c" || continue
-          $SUDO drvctl -R "$c" 2>/dev/null || { echo "usb: $c did not resume" >&2; rc=1; }
-        done
-        [ $rc -eq 0 ] && echo "usb: ON" || echo "usb: partly ON"
-        exit $rc ;;
-  status) echo "usb: $(state)" ;;
-  *) echo "usage: usb [on|off|status]" >&2; exit 1 ;;
+  off) rc=0
+       case $dom in all) usbc_off || rc=1; pch_off || rc=1 ;; pch) pch_off || rc=$? ;; usbc) usbc_off || rc=$? ;; esac
+       [ $rc -eq 0 ] && echo "usb: OFF ($dom): $(state | sed 's/^usb: //')" || echo "usb: partly OFF: $(state | sed 's/^usb: //')"
+       exit $rc ;;
+  on)  rc=0
+       case $dom in all) usbc_on || rc=1; pch_on || rc=1 ;; pch) pch_on || rc=$? ;; usbc) usbc_on || rc=$? ;; esac
+       [ $rc -eq 0 ] && echo "usb: ON ($dom): $(state | sed 's/^usb: //')" || echo "usb: partly ON: $(state | sed 's/^usb: //')"
+       exit $rc ;;
+  status) state ;;
+  *) echo "usage: usb [on|off|status] [all|pch|usbc]" >&2; exit 1 ;;
 esac

@@ -1,7 +1,7 @@
 #!/bin/sh
 # bt-headphones on|off|status [bdaddr] - A2DP to Bluetooth headphones via
-# bta2dpd(8) reading pad(4).  on: resumes USB (rc.local suspends the xHCI
-# controllers), brings ubt0 up (the Intel firmware loads on the first up),
+# bta2dpd(8) reading pad(4).  on: resumes the PCH USB controller only (the
+# radio sits behind it; the USB-C block stays cold), brings ubt0 up (the Intel firmware loads on the first up),
 # starts the SSP-capable bthcid from /usr/local/sbin and sdpd, connects the
 # stream daemon with an authenticated and encrypted link, and makes the pad
 # the default audio device so every player ends up in the headphones.
@@ -15,7 +15,7 @@ pad_index(){ audiocfg list 2>/dev/null | awk '/@ pad0/ { sub(":", "", $1); print
 builtin_index(){ audiocfg list 2>/dev/null | awk '/hdafg0/ { sub(":", "", $1); print $1; exit }'; }
 case "${1:-status}" in
   on)
-	$SUDO usb on >/dev/null 2>&1
+	$SUDO usb on pch >/dev/null 2>&1
 	$SUDO btconfig $DEV up 2>&1 | grep -v "^$"
 	btconfig $DEV | grep -q UP || { echo "bt-headphones: $DEV did not come up (firmware? dmesg)"; exit 1; }
 	pgrep -x bthcid >/dev/null || $SUDO /usr/local/sbin/bthcid -d $DEV
@@ -40,6 +40,16 @@ case "${1:-status}" in
   off)
 	B=$(builtin_index); [ -n "$B" ] && $SUDO audiocfg default "$B"
 	$SUDO pkill -f "bta2dpd.*$ADDR"
+	# Release what nothing else uses: the radio goes down when no other
+	# stream daemon runs, and the PCH controller is suspended again unless
+	# the camera is attached (webcam on).
+	sleep 1
+	if ! pgrep -x bta2dpd >/dev/null; then
+		$SUDO btconfig $DEV down 2>/dev/null
+		if ! drvctl -l uhub3 2>/dev/null | grep -q uvideo; then
+			$SUDO usb off pch >/dev/null 2>&1
+		fi
+	fi
 	echo "bt-headphones: OFF, built-in audio is the default device"
 	;;
   status)
