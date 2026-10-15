@@ -223,16 +223,15 @@ e744b2c).  What it took on the hardware:
   old path).  Lid suspend with USB on therefore gets the cold TCSS as long
   as nothing is plugged into USB-C.
 
-* Status
+* Status (2026-10-15 21:00, kernel 174 default, 173 fallback)
 
-- Kernel 162 (default boot entry): Astra's backend (D3cold, resource-only
-  cold flag, host harness =tests/acpi-power.sh=), D3cold tables including
-  the Thunderbolt root ports, idle_d3_exp knobs, both xhci fixes.
-  =usb off= = TCSS cold = PC10 97 %, restore verified repeatedly.
-- Default state measured (panel off, battery, 300 s): PC10 97.0 %,
-  1.20 W by the Wh counter, 1.07 W by the discharge-rate sensor.  Same
-  kernel, plain usb off (USB_TCSS_D3=0): 1.95 W / 1.63 W.
-- Next:
-  xhci_resume after power loss (so TXHC can join the s2idle table), the
-  PMC latch capture Astra described for a PC10 state, lid test of s2idle
-  with usb on and off.
+- =usb off= (boot state): TCSS cold under the suspended xhci0, PC10 98 %,
+  1.20 W panel-off on battery.
+- Bluetooth: =bt-headphones on= wakes only the PCH controller; an idle radio
+  parks (U3, remote wake) and the package still reaches PC10 at 1.20 W.
+- Lid suspend with USB on and the radio up: the freeze colds the TCSS
+  (TXHC in the s2idle table), holds PC10 98 %, reaches SLP_S0, and the
+  controller comes back through cold recovery; Bluetooth works after wake.
+- Not covered: a USB-C device plugged in at lid close keeps the TCSS warm
+  (populated cold recovery is design-only in docs/xhci-powerloss.org).
+- Measure only after ten minutes of uptime.
