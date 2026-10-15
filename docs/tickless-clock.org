@@ -32,7 +32,7 @@ timecounter is 32 bits wide (wraps in 2.03 s at 2.112 GHz).
 - =kern_tc.c=: =tc_bintime_addscaled()= splits the multiply into 32-bit
   halves (FreeBSD's large-delta method), used in =binuptime()= and
   =tc_windup()=.
-- =cidle.c=: the primary CPU's skip is capped at half the current
+- =cidle.c=: the primary CPU's skip is capped at half the selected
   timecounter's wrap interval (=tc_counter_mask * hz / tc_frequency / 2=,
   101 ticks for the TSC).
 
@@ -51,5 +51,66 @@ through that C entry point turned eDP-1 back on ("Output eDP-1 turned on",
 "Idle: panel on", modeset).  On kernel 174 the session's log showed "panel
 off" without a later "panel on", but Mahogany's log is buffered and that
 session ended in a reboot, so the log cannot show what happened last.  The
-broken clock is the likely cause; confirmation is the user's next real
-blank/wake on 175.
+broken clock is the likely cause. The user has now confirmed real blank/wake
+on kernel 175; the earlier failure's exact causal path was not traced.
+
+* Patch review (7975d49, 2026-10-16)
+
+The split multiplication is correct. Keep the always-split path in both
+=binuptime()= and =tc_windup()=. Each 32-by-32-bit partial product fits in
+64 bits; the explicit seconds addition and both =bintime_addx()= carries
+preserve the full result, including the NTP-adjusted scale.
+
+The kernel175 measurements confirm the fix for the reported clock loss.
+Three P2 follow-ups concern cases outside those tests. The first is a defect
+in the new cap; the other two are stock paths not yet adapted to long normal
+windup intervals.
+
+** P2: Cap the active counter, not just the selected one
+
+=kernel/modules/cidle/cidle.c:208-215= reads global =timecounter=.
+The sysctl setter at =kernel/kern/kern_tc.c:300-315= changes that pointer
+without winding up. Readers still use =timehands->th_counter=, and the next
+windup consumes its delta before switching counters at =:1016-1019=.
+
+If an AP selects HPET after the last TSC windup but before CPU0 calculates
+its cap, maxskip=300 can permit three seconds of sleep while the active
+32-bit TSC wraps in 2.033602 seconds. The next windup can recover only
+0.966398 seconds. The steady-counter maxskip=300 test does not exercise this
+handoff. Obtain the budget from the active timehands, account for its age,
+and coordinate counter changes with an already-armed idle deadline.
+
+** P2: PPS absolute timestamps still use the overflowing product
+
+=kernel/kern/kern_tc.c:1347-1350= adds =th_scale * delta= through
+=bintime_addx()=. That delta starts at the captured timehands baseline, not
+at PPS interrupt entry. A PPS event on an AP with a baseline 1.005 seconds
+old can therefore receive a timestamp one second low even when processed
+promptly. Use the split helper for this conversion, preserving the bounded
+32-bit delta invariant. The =PPS_DEBUG= latency conversion at =:1411= has the
+same arithmetic limitation. The =PPS_SYNC= product at =:1478= deliberately
+computes a modulo-second frequency error and needs different treatment.
+
+** P2: NTP catch-up can skip a leap-second boundary
+
+=kernel/kern/kern_tc.c:993-1008= calls =ntp_update_second()= once per elapsed
+second, but supplies the final second on every call. If the last timestamp
+is D-0.01 and the next is D+1.01, for a UTC day boundary D, both calls receive
+D+1. The insertion test in stock =sys/kern/kern_ntptime.c:465-473= requires
+D modulo 86400 = 0; insertion and the TAI increment are missed. Deletion
+has the analogous boundary test at =:478-485=. Process crossed boundaries
+in order and propagate leap corrections into subsequent seconds and the
+final timebase, separately from the deliberate large-clock-step policy.
+
+** Verification
+
+- 100,096 boundary/generated split-multiply model cases passed against
+  exact integer arithmetic. These are model checks, not compiled C tests.
+- Targeted models reproduced the counter-switch loss, PPS whole-second
+  loss, and skipped insertion/deletion boundary arguments.
+- Replay calls =tc_ticktock()= on every primary =hardclock()= at hz=100,
+  even with interrupts disabled. The burst is not an extra interval with
+  no timehands updates (=cidle.c:248-253=, =kern_clock.c:333-337=).
+- Reviewed sources match 7975d49 at write-up commit 25fd96e;
+  =git diff --check 7975d49^ 7975d49= passed. Review work changed only
+  documentation; no kernel build, deployment, or live-machine test was run.
