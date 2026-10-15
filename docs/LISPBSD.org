@@ -131,6 +131,11 @@ After a NetBSD base upgrade the patch, the CSTATE kernel, if_iwx and hwp modules
   (exwm, parinfer-rust, ghostel) are guarded with =locate-library= / =system-type= checks — keep new ones guarded too.
 - cclsh Tab completion, Ctrl-C, window size: fixed in the SBCL layer (source in /usr/local/lib/cclsh/src/cclsh,
   rebuild with =cd /usr/local/lib/cclsh && sbcl --non-interactive --load build-image.lisp && mv cclsh-image.new cclsh-image=).
+- Interactive terminals attach to a per-user shared server (/tmp/cclshd-UID/server.sock,
+  =cclshd status|start|stop=), prewarmed at boot by rc.d/cclshd for root and mag and run
+  from the saved image.  A login taking seconds means the server is wedged: =cclshd start=
+  retires it (pid in server.sock.pid) and starts a fresh one.  After changing cclsh sources
+  rebuild =scripts/build-session= too (the session tool and libcclsh-session.so).
 - Logs: =/var/log/messages=, =dmesg=, X: =/var/log/Xorg.0.log=, StumpWM: run =stumpwm= from a console to see errors.
 
 * Update 2026-09-16 — corrections and fixes
