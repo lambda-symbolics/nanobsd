@@ -16,7 +16,19 @@ idle. They do not exercise deletion racing a timer or failed rekey recovery.
 The reported minute of silence has no captured session state or send errors;
 its cause is unresolved.
 
-* Findings
+* Follow-up: fixes applied
+
+Commit =0c8b0e8= applies the review fixes: close teardown admission under
+=wgp_lock= before halting timers; gate keepalives on session limits and
+request rekey; check =IFF_RUNNING=; reject empty or wrongly typed intervals;
+and confirm the configured interval through =show peer= before suppressing
+the fallback. The service status now reports the keepalive kind.
+
+The user verified five rapid restarts, interface down/up and server pings.
+The earlier minute of silence has no established cause; these successful
+checks do not attribute it.
+
+* Findings at c830f3d
 
 ** P1: queued work can rearm timers after teardown halts them
 
