@@ -271,6 +271,14 @@ static int		acpi_freeze_timeout = 120;
 static int		acpi_freeze_ltr_ignore;
 static int		acpi_freeze_storage;
 static int		acpi_freeze_keep_net;
+/*
+ * hw.acpi.sleep.freeze_fsbarrier: 0 = no filesystem barrier, 1 (default) =
+ * try it and go on without it when it cannot be established, 2 = abort the
+ * freeze when it cannot (the behaviour that broke lid suspend on 2026-10-15:
+ * acpi_s0_userspace_frozen() demands every LWP in LSSUSPENDED one second
+ * after the freeze request, which a process in a kernel wait never reaches).
+ */
+static int		acpi_freeze_fsbarrier = 1;
 static int		acpi_idle_d3;
 static int		acpi_idle_d3_exp;	/* see acpi_adr_power */
 static int		sysctl_hw_acpi_idle_d3(SYSCTLFN_PROTO);
@@ -1852,6 +1860,11 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
 	    "freeze_keep_net", SYSCTL_DESCR("Keep Wi-Fi running during s2idle (test aid)"),
 	    NULL, 0, &acpi_freeze_keep_net, 0, CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "freeze_fsbarrier", SYSCTL_DESCR("s2idle filesystem barrier: 0 off, 1 best effort, 2 required"),
+	    NULL, 0, &acpi_freeze_fsbarrier, 0, CTL_CREATE, CTL_EOL);
 
 	(void)sysctl_createv(NULL, 0, &snode, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
@@ -3513,9 +3526,13 @@ acpi_enter_freeze(void)
 	acpi_s0_freeze_userspace(true);
 	kpause("s2qui", false, MAX(1, hz), NULL);	/* settle to LSSUSPENDED */
 	/* Do not race an in-flight mount syscall or suspend its lock owner. */
-	fs_error = acpi_s0_userspace_frozen() ?
-	    vfs_suspend_all(&suspended_mounts, &nsuspended_mounts) : EBUSY;
-	if (fs_error != 0) {
+	if (acpi_freeze_fsbarrier == 0)
+		fs_error = 0;
+	else if (!acpi_s0_userspace_frozen())
+		fs_error = EBUSY;
+	else
+		fs_error = vfs_suspend_all(&suspended_mounts, &nsuspended_mounts);
+	if (fs_error != 0 && acpi_freeze_fsbarrier >= 2) {
 		aprint_error_dev(sc->sc_dev,
 		    "s2idle: filesystem barrier failed (%d), aborting freeze\n",
 		    fs_error);
@@ -3527,6 +3544,16 @@ acpi_enter_freeze(void)
 		sc->sc_sleepstate = ACPI_STATE_S0;
 		return;
 	}
+	if (fs_error != 0) {
+		aprint_error_dev(sc->sc_dev,
+		    "s2idle: filesystem barrier not established (%d), "
+		    "continuing without it\n", fs_error);
+		suspended_mounts = NULL;
+		nsuspended_mounts = 0;
+	} else if (acpi_freeze_fsbarrier != 0)
+		aprint_normal_dev(sc->sc_dev,
+		    "s2idle: filesystem barrier over %zu mounts\n",
+		    nsuspended_mounts);
 
 	/*
 	 * Preserve GPU RC6 across the i915 suspend: otherwise the i915 S3
