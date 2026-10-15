@@ -41,6 +41,8 @@ Nuclear option: =modunload if_iwx; modload if_iwx; service wpa_supplicant restar
   =wgconfig wg0 show peer velho=.  Without a packet for 25 s the kernel
   sends a keepalive on the session, or a handshake when there is none.
   The script falls back to the ping loop with a stock wgconfig.
+- See [[file:wg-keepalive-review.org][the c830f3d source review]] for the timer teardown race, module-capability
+  detection, key-expiry checks and unresolved transient tunnel outage.
 
 * Power
 ** Battery: how much, how long

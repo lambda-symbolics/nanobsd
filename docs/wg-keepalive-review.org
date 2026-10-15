@@ -1,0 +1,211 @@
+#+title: wg(4) persistent keepalive review
+#+date: 2026-10-15
+
+* Scope
+
+Source review of =c830f3d= at =a54f59c= against the imported NetBSD-11
+=if_wg.c= (=d429673=) and =wgconfig.c= (=b20922c=). The brief is
+=/root/astra/brief-wg-keepalive.org=. Line numbers below refer to =a54f59c=.
+No kernel or userland build, service restart, or laptop action was performed.
+Shell syntax checks pass for =etc/rc.d/wgpeer= and
+=userland/wgconfig/build.sh=.
+
+The reported successful tests cover initial initiation at about one second,
+confirmation, server pings at +3/+10/+30/+60 seconds and over 150 seconds
+idle. They do not exercise deletion racing a timer or failed rekey recovery.
+The reported minute of silence has no captured session state or send errors;
+its cause is unresolved.
+
+* Findings
+
+** P1: queued work can rearm timers after teardown halts them
+
+=kernel/net/if_wg.c:3599-3622,4007-4011,4103-4146=.
+
+The new callout only queues work. The worker unconditionally rearms that
+callout when the interval is nonzero. =wg_destroy_peer()= halts the callouts
+and then waits for queued work, without first closing task/rearm admission.
+A valid ordering is:
+
+1. The persistent timer queues work and returns.
+2. Destruction halts all three timers.
+3. The queued worker runs, sends or attempts initiation, and rearms the
+   persistent timer. Successful initiation can also rearm the handshake timer.
+4. =workqueue_wait()= returns; destruction frees the peer and its locks.
+5. The rearmed timer accesses freed storage.
+
+This can corrupt memory or panic on peer deletion, service restart or
+interface destruction. It is not evidence that this caused the reported
+self-recovering outage. Existing handshake work uses the same teardown
+pattern; the new periodic producer adds an unconditional rearm path.
+
+Repair the admission protocol, not just the order of two waits: mark the
+peer dying under the appropriate peer/task locks, reject new task requests,
+prevent queued/in-flight handlers from sending or rearming after that point,
+halt timers and drain work without holding locks the worker needs. Account
+for session-index receive references, which are removed later than peer-name
+references. Destroy the callout handles before freeing the peer. Halting only
+the new timer again is insufficient if it has already queued another work
+item or the worker has restarted another timer.
+
+The [[https://man.netbsd.org/callout.9][callout contract]] does not make halt a permanent ban on future scheduling.
+The [[https://man.netbsd.org/workqueue.9][workqueue contract]] requires the caller to prevent re-enqueue during wait.
+
+** P2: persistent sends bypass the transport-key rejection limits
+
+=kernel/net/if_wg.c:3610-3612,3897-3917,3955-3973=.
+
+The normal data path checks =wg_session_hit_limits()=. The persistent worker
+checks only =WGS_STATE_ESTABLISHED=, then calls =wg_send_keepalive_msg()= and
+=wg_send_data_msg()= directly. Neither helper checks the reject-after-time or
+reject-after-messages limit before encrypting/sending.
+
+An established state is not proof that the key is young enough. The periodic
+session destructor may be scheduled from an older session: at its next
+firing the current session can still be young, leaving it past the rejection
+age before a later firing. Failed rekey or a responder session makes that
+window relevant. A keepalive can therefore be sent with a key that the normal
+data path refuses and the peer discards. The older passive-keepalive helper
+shares this omission; the new periodic caller makes it independent of input.
+
+Apply the same validity gate to transport keepalives and request rekey rather
+than send on an expired key. Cover the common send path or both keepalive
+callers. This defect produces outbound UDP, so by itself it does not explain
+a capture with no packets in either direction.
+
+** P2: binary-only capability detection can remove the working fallback
+
+=etc/rc.d/wgpeer:33-35,48-70=.
+
+=wg_has_keepalive()= searches the selected binary's usage text. A patched
+=wgconfig= with a stock/older loaded =if_wg= passes that probe. The stock
+kernel ignores the unfamiliar property, yet the script suppresses its ping
+loop. The tunnel then lacks the persistent traffic needed to keep CGNAT open.
+Peer-add failure also falls through to a successful keepalive-helper return.
+
+Check the private-key and peer-add commands, read back the peer's configured
+interval through the selected binary, and suppress the fallback only after
+confirming the requested value. A module file on disk is not evidence that
+the loaded module supports the property.
+
+** P2: administrative interface-down does not stop persistent traffic
+
+=kernel/net/if_wg.c:3599-3622,5134-5136,5539-5546=.
+
+The timer starts on peer creation. Neither its worker nor the send helpers
+check =IFF_RUNNING=, and =wg_stop()= only clears that flag. Thus
+=ifconfig wg0 down= leaves periodic keepalives/initiations running while the
+peer exists. Service stop destroys the interface, so it follows the teardown
+path instead. Add synchronized stop/start handling for the persistent timer
+if administrative down is to quiesce the tunnel.
+
+** P3: empty numeric input silently means off
+
+=userland/wgconfig/wgconfig.c:679-690=.
+
+=--persistent-keepalive== passes the empty string to =strtoul()=; zero is
+returned with =end == arg= and no error. The parser accepts it as an explicit
+zero. Require at least one digit and reject signed input before conversion;
+then retain the 0..65535 bound. The kernel should also distinguish an absent
+property from a present property of the wrong type, rather than silently
+using zero (=if_wg.c:4981-4990=).
+
+** P3: service status reports only the legacy ping loop
+
+=etc/rc.d/wgpeer:97-104=.
+
+Startup selects =WGCONFIG=, but status hardcodes =/usr/sbin/wgconfig=. It then
+prints "keepalive not running" when no fallback PID exists, including during
+normal native operation. Use the selected binary and distinguish configured
+native keepalive, fallback process, and disabled state. Configuration alone
+does not prove that packets reached the endpoint.
+
+* Timestamp and handshake answers
+
+** wgp_last_sent
+
+All post-publication accesses added by this patch use relaxed atomics. Plain
+initialization happens before publication. Relaxed ordering is sufficient
+for this standalone timestamp; it does not publish session or endpoint data.
+The interval is immutable after peer creation, so its plain accesses do not
+currently constitute a live-update race.
+
+Concurrent senders can store an older sampled timestamp after a newer one.
+The idle expression can also sample the clock before another CPU publishes a
+later timestamp, yielding unsigned underflow. These cause early/redundant
+keepalives, not a demonstrated minute-long suppression. Load the timestamp
+before sampling the clock and use a wrap-aware monotonic update if exact
+idle accounting is required; stronger memory ordering alone is not that fix.
+
+The initiation branch stamps =wgp_last_sent= even when the void initiation
+helper returns without sending (no endpoint, an in-progress handshake, or a
+send error). Actual handshake sends/retries elsewhere do not update it.
+Thus the field mixes successful transport sends with initiation attempts.
+Separate retry scheduling from successful-send accounting. Keep bounded
+retry/backoff on failure rather than treating an attempt as wire activity.
+
+** INIT_ACTIVE and unavailable endpoints
+
+=wg_task_send_init_message()= leaves an existing active handshake alone.
+=wg_send_handshake_msg_init()= returns immediately in =INIT_ACTIVE=; the new
+25-second task does not restart its five-second retry timer or reset
+=wgp_handshake_start_time=. The existing retry task gives up after the
+90-second attempt window (the strict greater-than comparison takes effect
+at the next retry tick past that boundary), clears the pending packet, and
+permits a later attempt.
+Persistent keepalive will initiate again on a subsequent interval.
+
+If a locally attempted handshake send fails, the existing code clears that
+session and pending packet without scheduling a retry (=2056-2077=). The new
+timer supplies another attempt after up to the configured interval. For the
+script's interval of 25 seconds, one such failure is not a 60-second timer.
+Without a known endpoint, initiation must wait for configuration or
+authenticated peer traffic.
+
+** INIT_PASSIVE is a separate, pre-existing liveness hole
+
+=if_wg.c:1884-1923,2015-2017,3483-3485,3635-3668,3930-3953=.
+
+After responding to a peer's initiation, the unstable session waits for its
+first authenticated transport packet. If confirmation never arrives and no
+usable stable session exists, one local packet waits in the pending slot;
+subsequent packets replace it and discard the previous one. Local
+initiation refuses =INIT_PASSIVE=, handshake retry acts only on =INIT_ACTIVE=,
+and the session destructor explicitly skips the passive candidate. Persistent
+keepalive invokes the same no-op initiation path every interval. Another peer
+initiation or valid confirmation can recover it; no local one-minute recovery
+timer is established by this code. A bounded passive-candidate expiry/retry
+needs a separate state-machine fix.
+
+* The unexplained minute
+
+An =ESTABLISHED= label alone can accompany a silent normal-data path when
+=wg_session_hit_limits()= rejects it; the first packet requests rekey, later
+ones only replace the pending packet. A failed initiation, passive candidate,
+blocked worker or underlying UDP output failure can complicate recovery.
+An unexpired usable stable session, however, reaches =send_data_msg()= without
+consulting the persistent interval. Timestamp suppression is not a gate on
+ordinary outbound data.
+
+To distinguish these cases in a further laptop run, record state-only
+observations: both session states/ages, initiator and force-rekey flags,
+pending-packet presence, handshake-start age, queued task bits, persistent
+callout firing/rearm times, last successful send/attempt times, and UDP send
+return codes. Correlate those with simultaneous wg0 and physical-interface
+packet captures and the loaded-module/kernel version. Record metadata only,
+not private keys, preshared keys, derived keys or plaintext packet contents.
+No existing evidence in the brief selects one of these causes.
+
+* Configuration API
+
+=persistent_keepalive_interval= is a sensible property name. Kernel parse,
+kernel dump and userland use the same uint32 representation, with seconds
+0..65535 and zero disabled. Preserve that key; document the units.
+
+There is no existing peer =set= operation to extend: =wgconfig='s =set= commands
+are interface private-key and listen-port, and the kernel dispatch has only
+those two setters plus peer add/delete. Re-adding an existing peer returns
+=EEXIST=. Supporting live interval changes requires both a peer-update ioctl
+and a userland command, with peer-reference and timer/admission synchronization.
+An explicit zero should halt/drain the persistent timer; a nonzero update
+should reschedule it without deleting the peer or resetting its session.
