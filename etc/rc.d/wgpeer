@@ -33,6 +33,12 @@ WG_KEEPALIVE=25
 WGCONFIG=/usr/sbin/wgconfig
 [ -x /usr/local/sbin/wgconfig ] && WGCONFIG=/usr/local/sbin/wgconfig
 wg_has_keepalive() { $WGCONFIG 2>&1 | grep -q persistent-keepalive; }
+# The loaded wg(4) must have accepted the interval, not just the binary: a
+# stock module ignores the property and the ping loop must then stay.
+wg_keepalive_active() {
+	$WGCONFIG $WG_IF show peer velho 2>/dev/null |
+	    grep -q "persistent-keepalive: $WG_KEEPALIVE\$"
+}
 
 wgpeer_start()
 {
@@ -50,10 +56,10 @@ wgpeer_start()
 	if wg_has_keepalive; then
 		$WGCONFIG $WG_IF add peer velho $WG_PEER_PUBLIC \
 			--allowed-ips=$WG_ALLOWED_IPS --endpoint=$WG_ENDPOINT \
-			--persistent-keepalive=$WG_KEEPALIVE
+			--persistent-keepalive=$WG_KEEPALIVE || return 1
 	else
 		$WGCONFIG $WG_IF add peer velho $WG_PEER_PUBLIC \
-			--allowed-ips=$WG_ALLOWED_IPS --endpoint=$WG_ENDPOINT
+			--allowed-ips=$WG_ALLOWED_IPS --endpoint=$WG_ENDPOINT || return 1
 	fi
 	/sbin/ifconfig $WG_IF up
 	for net in $WG_NETWORKS4; do
@@ -67,7 +73,7 @@ wgpeer_start()
 
 wgpeer_keepalive_start()
 {
-	wg_has_keepalive && return 0	# the kernel does it
+	wg_keepalive_active && return 0	# the kernel does it
 	if [ -r $KEEPALIVE_PID ] && kill -0 $(cat $KEEPALIVE_PID) 2>/dev/null; then
 		return 0
 	fi
@@ -96,11 +102,13 @@ wgpeer_stop()
 
 wgpeer_status()
 {
-	/usr/sbin/wgconfig $WG_IF 2>&1 | sed -e 's/private-key.*/private-key REDACTED/'
-	if [ -r $KEEPALIVE_PID ] && kill -0 $(cat $KEEPALIVE_PID) 2>/dev/null; then
-		echo "keepalive running (pid $(cat $KEEPALIVE_PID))"
+	$WGCONFIG $WG_IF 2>&1 | sed -e 's/private-key.*/private-key REDACTED/'
+	if wg_keepalive_active; then
+		echo "keepalive: kernel, every ${WG_KEEPALIVE} s"
+	elif [ -r $KEEPALIVE_PID ] && kill -0 $(cat $KEEPALIVE_PID) 2>/dev/null; then
+		echo "keepalive: ping loop (pid $(cat $KEEPALIVE_PID))"
 	else
-		echo "keepalive not running"
+		echo "keepalive: none"
 	fi
 }
 

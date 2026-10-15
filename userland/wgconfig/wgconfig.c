@@ -683,7 +683,8 @@ handle_option_persistent_keepalive(const char *arg, prop_dictionary_t prop_dict)
 
 	errno = 0;
 	v = strtoul(arg, &end, 10);
-	if (errno != 0 || *end != '\0' || v > 65535)
+	if (*arg < '0' || *arg > '9' || errno != 0 || *end != '\0' ||
+	    v > 65535)
 		errx(EXIT_FAILURE, "invalid persistent-keepalive: %s", arg);
 	if (!prop_dictionary_set_uint32(prop_dict,
 	    "persistent_keepalive_interval", (uint32_t)v))
