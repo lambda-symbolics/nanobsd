@@ -1062,17 +1062,26 @@ xhci_resume_check(struct xhci_softc *sc)
 		device_printf(sc->sc_dev, "resume: no saved controller state\n");
 		return false;
 	}
-	if (dcbaap != sc->sc_regs.dcbaap ||
-	    config != sc->sc_regs.config || erstba != sc->sc_regs.erstba0 ||
-	    (sts & (XHCI_STS_HSE | XHCI_STS_HCE)) != 0) {
+	/*
+	 * LISPBSD: the operational registers read back as zero after an
+	 * ordinary D3hot cycle too (kernel 166: DCBAAP 0, USBCMD 0 on the
+	 * PCH controller), which is why the warm path rewrites them before
+	 * CRS.  Only a fatal status marks the state lost here; otherwise the
+	 * warm restore decides: a CRS that does not complete is the sign of
+	 * a controller that lost power.
+	 */
+	if ((sts & (XHCI_STS_HSE | XHCI_STS_HCE)) != 0) {
 		mutex_enter(&sc->sc_lock);
 		sc->sc_state_lost = true;
 		mutex_exit(&sc->sc_lock);
-		device_printf(sc->sc_dev, "resume: controller state lost, "
+		device_printf(sc->sc_dev, "resume: fatal controller status, "
 		    "USBCMD=%08x USBSTS=%08x DCBAAP=%016"PRIx64
 		    " (saved %016"PRIx64")\n", cmd, sts, dcbaap,
 		    sc->sc_regs.dcbaap);
-	}
+	} else if (dcbaap != sc->sc_regs.dcbaap)
+		aprint_debug_dev(sc->sc_dev, "resume: DCBAAP %016"PRIx64
+		    " (saved %016"PRIx64"), restoring\n", dcbaap,
+		    sc->sc_regs.dcbaap);
 	return true;
 }
 
@@ -1257,7 +1266,14 @@ xhci_resume(device_t self, const pmf_qual_t *qual)
 		usb_delay_ms(&sc->sc_bus, 1);
 	}
 	if (i >= XHCI_WAIT_RSS) {
-		device_printf(self, "resume timeout, USBSTS.RSS\n");
+		/* LISPBSD: a restore that never completes = power was lost. */
+		device_printf(self, "resume timeout, USBSTS.RSS: "
+		    "controller state lost, cold recovery\n");
+		mutex_enter(&sc->sc_lock);
+		sc->sc_state_lost = true;
+		mutex_exit(&sc->sc_lock);
+		coldres = true;
+		ok = xhci_resume_cold(sc);
 		goto out;
 	}
 
