@@ -1932,15 +1932,23 @@ xhci_rt_parkable(struct usbd_device *dev)
 	bool found = false;
 
 	KASSERT(KERNEL_LOCKED_P());
-	if (dev->ud_subdevs == NULL)
+	if (dev->ud_subdevs == NULL) {
+		if (xhci_rt_debug)
+			printf("xhci: addr %d: no subdevices\n", dev->ud_addr);
 		return false;
+	}
 	for (u_int i = 0; i < dev->ud_subdevlen; i++) {
 		device_t d = dev->ud_subdevs[i];
 		if (d == NULL)
 			continue;
 		/* ubt registers its park/unpark pmf handlers at attach. */
-		if (!device_is_a(d, "ubt") || !device_is_active(d))
+		if (!device_is_a(d, "ubt") || !device_is_active(d)) {
+			if (xhci_rt_debug)
+				printf("xhci: addr %d: subdevice %s active=%d\n",
+				    dev->ud_addr, device_xname(d),
+				    device_is_active(d));
 			return false;
+		}
 		found = true;
 	}
 	return found;
