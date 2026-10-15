@@ -422,6 +422,25 @@ static void tc_windup(void);
  * Return the difference between the timehands' counter value now and what
  * was when we copied it to the timehands' offset_count.
  */
+/*
+ * LISPBSD: add scale * delta to *bt without overflowing 64 bits.  The
+ * product overflows once delta is worth a second or more of counts, which
+ * the periodic tick never let happen (it winds up every 1/hz s); a CPU 0
+ * that sleeps tickless for a second did, and every such overflow threw a
+ * second of time away (the clock ran at 60 % and stepped backwards).
+ * FreeBSD handles the same case with its "large delta" split.
+ */
+static inline void
+tc_bintime_addscaled(struct bintime *bt, uint64_t scale, u_int delta)
+{
+	uint64_t x;
+
+	x = (scale >> 32) * delta;
+	bt->sec += x >> 32;
+	bintime_addx(bt, x << 32);
+	bintime_addx(bt, (scale & 0xffffffff) * delta);
+}
+
 static inline u_int
 tc_delta(struct timehands *th)
 {
@@ -485,7 +504,7 @@ binuptime(struct bintime *bt)
 		gen = th->th_generation;
 		membar_consumer();
 		*bt = th->th_offset;
-		bintime_addx(bt, th->th_scale * tc_delta(th));
+		tc_bintime_addscaled(bt, th->th_scale, tc_delta(th));
 		membar_consumer();
 	} while (gen == 0 || gen != th->th_generation);
 
@@ -947,7 +966,7 @@ tc_windup(void)
 	else
 		ncount = 0;
 	th->th_offset_count += delta;
-	bintime_addx(&th->th_offset, th->th_scale * delta);
+	tc_bintime_addscaled(&th->th_offset, th->th_scale, delta);
 
 	/*
 	 * Hardware latching timecounters may not generate interrupts on

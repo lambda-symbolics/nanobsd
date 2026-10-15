@@ -35,6 +35,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/systm.h>
 #include <sys/module.h>
 #include <sys/sysctl.h>
+#include <sys/timetc.h>
 #include <sys/mutex.h>
 #include <sys/cpu.h>
 #include <sys/xcall.h>
@@ -197,6 +198,22 @@ cidle_idle_tickless(struct cpu_info *ci)
 		skip = cidle_forceskip;	/* force sustained deep idle; callouts fire late but are replayed */
 	if (skip > cidle_maxskip)
 		skip = cidle_maxskip;	/* heartbeat safety: maxskip <= 1400 (< 15s) */
+	/*
+	 * The primary CPU's hardclock winds the timecounter up, and every
+	 * clock reader on every CPU measures from that windup with a counter
+	 * of tc_counter_mask + 1 counts: if it wraps before the next windup,
+	 * time is lost (TSC: 32 bits at 2.112 GHz = 2.03 s).  Keep the
+	 * primary's sleep to half the wrap interval of the current counter.
+	 */
+	if (CPU_IS_PRIMARY(ci)) {
+		struct timecounter *tc = atomic_load_relaxed(&timecounter);
+		if (tc != NULL && tc->tc_frequency != 0) {
+			uint64_t wrap = (uint64_t)tc->tc_counter_mask * hz /
+			    tc->tc_frequency / 2;
+			if (wrap < (uint64_t)skip)
+				skip = (int)wrap;
+		}
+	}
 
 	if (skip < cidle_minskip) {
 		/*
