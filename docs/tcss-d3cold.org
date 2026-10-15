@@ -134,6 +134,26 @@ without it, 2 the old abort.  Freeze test on 163: 20 s hold, PC10 97 %,
 resumed.  Astra was asked to redesign the precondition.  Kernel 163 also
 defaults the Thunderbolt root ports to cold without _PS3 (f022b96).
 
+* 2026-10-15 afternoon: USB domains, kernel 164
+
+- =usb= now has domains: =usb on|off pch= (xhci1, the internal devices)
+  and =usb on|off usbc= (xhci0 + the TCSS cold-off); =all= is the default.
+  Status is derived from PMCSR (the PCI bus driver puts a suspended function
+  in D3hot), the old "uhub children exist" check was meaningless.  A failed
+  =idle_d3=1= now fails the command.  bluetooth/webcam/bt-headphones use
+  =usb on pch=, so the USB-C block stays cold while Bluetooth plays;
+  =bt-headphones off= brings the radio down and suspends the PCH controller
+  again unless the camera is attached (commit 66e4379).
+- Evidence for the split: this morning's lid s2idle with USB fully on held
+  PC10 at only 50 % (TCSS warm, D3C held by the suspended xhci0) against
+  98 % cold.
+- Kernel 164 = 163 + Astra's 5081c25 (barrier gated on mount operations
+  instead of "every LWP suspended"; the vfs_mount patch also touches
+  vfs_syscalls.c now, re-applied on stock).  Freeze test on battery:
+  "filesystem barrier over 6 mounts", 20 s hold, PC10 98 %, resumed.
+- Astra has the brief for the power-loss-aware xhci_resume
+  (/root/astra/brief-xhci-powerloss.org).
+
 * Status
 
 - Kernel 162 (default boot entry): Astra's backend (D3cold, resource-only
