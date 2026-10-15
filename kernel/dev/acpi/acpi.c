@@ -1872,7 +1872,7 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 	    sysctl_hw_acpi_idle_d3, 0, NULL, 0, CTL_CREATE, CTL_EOL);
 	(void)sysctl_createv(NULL, 0, &snode, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
-	    "idle_d3_exp", SYSCTL_DESCR("idle_d3 experiment bits: 1 root ports cold without _PS3, 2 no PMCSR D3hot"),
+	    "idle_d3_exp", SYSCTL_DESCR("idle_d3 experiment bits: 1 run the root ports' _PS3 before cold, 2 no PMCSR D3hot"),
 	    NULL, 0, &acpi_idle_d3_exp, 0, CTL_CREATE, CTL_EOL);
 
 	(void)sysctl_createv(NULL, 0, &snode, NULL,
@@ -3238,7 +3238,7 @@ struct acpi_adr_pwr {
 	int			ap_flags;
 #define ADRPWR_COLD		0x01		/* D3cold instead of D3hot */
 #define ADRPWR_NODRIVER		0x02		/* only while no driver is attached */
-#define ADRPWR_NOPS3		0x04		/* with idle_d3_exp bit 0: cold without _PS3 */
+#define ADRPWR_NOPS3		0x04		/* cold without _PS3 (idle_d3_exp bit 0 runs it anyway) */
 	ACPI_HANDLE		ap_changed;	/* set while moved away from D0 */
 	int			ap_previous;
 	bool			ap_saved;	/* ap_conf holds the config space */
@@ -3253,10 +3253,13 @@ struct acpi_adr_pwr {
  * Devices already in STATE are left alone and not restored.
  */
 /*
- * hw.acpi.sleep.idle_d3_exp: experiment bits for the PC9-vs-PC10 hunt.
- *   1: ADRPWR_NOPS3 entries (the Thunderbolt root ports) enter D3cold
- *      without _PS3 (acpi_power_set_flags ACPI_POWER_NOPS3): _PS3 arms
- *      hot-plug/PME SCI on the port (config 0xd8 bits 30/31).
+ * hw.acpi.sleep.idle_d3_exp: experiment bits.
+ *   1: run _PS3 on ADRPWR_NOPS3 entries after all.  The Thunderbolt root
+ *      ports' _PS3 arms hot-plug/PME SCI on the port (config 0xd8 bits
+ *      30/31) right before it goes cold; it made no difference to the idle
+ *      residency (kernel 162 bisect) and an armed wake SCI on a cold port
+ *      is a wake source during s2idle, so by default it is skipped
+ *      (acpi_power_set_flags ACPI_POWER_NOPS3).
  *   2: do not write PMCSR D3hot before the cold-off.
  */
 static void
@@ -3367,7 +3370,7 @@ acpi_adr_power(struct acpi_softc *sc, const char *what,
 			ap->ap_previous = old;
 			nops3 = target == ACPI_STATE_D3_COLD &&
 			    (ap->ap_flags & ADRPWR_NOPS3) != 0 &&
-			    (acpi_idle_d3_exp & 1) != 0;
+			    (acpi_idle_d3_exp & 1) == 0;
 			ok = nops3 ? acpi_power_set_flags(ad->ad_handle, target,
 			    ACPI_POWER_NOPS3) : acpi_power_set(ad->ad_handle,
 			    target);
@@ -3402,8 +3405,8 @@ acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
 		{ .ap_adr = 0x00080000, .ap_flags = ADRPWR_COLD }, /* GNA */
 		{ .ap_adr = 0x000d0002, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 1 */
 		{ .ap_adr = 0x000d0003, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 2 */
-		{ .ap_adr = 0x00070000, .ap_flags = ADRPWR_COLD }, /* Thunderbolt PCIe root port 1 (holds D3C/TBT0) */
-		{ .ap_adr = 0x00070002, .ap_flags = ADRPWR_COLD }, /* Thunderbolt PCIe root port 2 (holds D3C/TBT1) */
+		{ .ap_adr = 0x00070000, .ap_flags = ADRPWR_COLD | ADRPWR_NOPS3 }, /* Thunderbolt PCIe root port 1 (holds D3C/TBT0) */
+		{ .ap_adr = 0x00070002, .ap_flags = ADRPWR_COLD | ADRPWR_NOPS3 }, /* Thunderbolt PCIe root port 2 (holds D3C/TBT1) */
 	};
 
 	acpi_adr_power(sc, "s2idle", table, __arraycount(table), state);
