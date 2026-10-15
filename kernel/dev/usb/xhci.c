@@ -1752,6 +1752,9 @@ xhci_start(struct xhci_softc *sc)
  */
 int xhci_autosuspend = 5;	/* seconds; 0: off */
 int xhci_autosuspend_hid = 0;
+int xhci_rt_debug = 0;		/* hw.usbpm.debug: say why a park is refused */
+#define XHCI_RT_WHY(sc, xs, fmt, ...) do { if (xhci_rt_debug) \
+	device_printf((sc)->sc_dev, "port %u: " fmt "\n", (xs)->xs_ctlrport, ##__VA_ARGS__); } while (0)
 
 static void xhci_rt_task(void *);
 static void xhci_rt_callout(void *);
@@ -2026,14 +2029,26 @@ xhci_rt_suspend_dev(struct xhci_softc *sc, struct xhci_slot *xs)
 
 	KASSERT(KERNEL_LOCKED_P());
 	if (dev == NULL || xs->xs_ctlrport == 0 || sc->sc_dying ||
-	    !xhci_rt_enabled() || !xhci_rt_idle_ok(sc, xs) ||
-	    (!xhci_autosuspend_hid && xhci_rt_has_hid(dev)))
+	    !xhci_rt_enabled())
 		return;
+	if (!xhci_rt_idle_ok(sc, xs)) {
+		XHCI_RT_WHY(sc, xs, "not parkable (%u pipes, driver not ubt)",
+		    xs->xs_npipes);
+		return;
+	}
+	if (!xhci_autosuspend_hid && xhci_rt_has_hid(dev)) {
+		XHCI_RT_WHY(sc, xs, "HID interface");
+		return;
+	}
 	mutex_enter(&sc->sc_intr_lock);
 	if (!xs->xs_rt_init || sc->sc_rt_paused ||
 	    xs->xs_suspended || xs->xs_resuming ||
 	    xs->xs_parked_drv ||
 	    getticks() - xs->xs_lastbusy < hz * xhci_autosuspend) {
+		XHCI_RT_WHY(sc, xs, "state: init=%d paused=%d susp=%d resuming=%d "
+		    "parked=%d idle=%d ticks", xs->xs_rt_init, sc->sc_rt_paused,
+		    xs->xs_suspended, xs->xs_resuming, xs->xs_parked_drv,
+		    getticks() - xs->xs_lastbusy);
 		mutex_exit(&sc->sc_intr_lock);
 		return;
 	}
@@ -2043,8 +2058,10 @@ xhci_rt_suspend_dev(struct xhci_softc *sc, struct xhci_slot *xs)
 	port = XHCI_PORTSC(xs->xs_ctlrport);
 	v = xhci_op_read_4(sc, port);
 	if (v == UINT32_MAX || (v & XHCI_PS_PED) == 0 ||
-	    XHCI_PS_PLS_GET(v) >= XHCI_PS_PLS_U3)
+	    XHCI_PS_PLS_GET(v) >= XHCI_PS_PLS_U3) {
+		XHCI_RT_WHY(sc, xs, "portsc 0x%08x", v);
 		return;
+	}
 
 	/* An open radio needs unsolicited events to be able to wake the port. */
 	if (dev->ud_cdesc != NULL &&
@@ -2056,10 +2073,14 @@ xhci_rt_suspend_dev(struct xhci_softc *sc, struct xhci_slot *xs)
 		USETW(req.wLength, 0);
 		err = usbd_do_request(dev, &req, NULL);
 		if (park && err != USBD_NORMAL_COMPLETION) {
+			XHCI_RT_WHY(sc, xs, "remote wakeup request: %s",
+			    usbd_errstr(err));
 			sc->sc_rt_failed++;
 			return;
 		}
 	} else if (park) {
+		XHCI_RT_WHY(sc, xs, "no remote wakeup capability (bmAttributes 0x%x)",
+		    dev->ud_cdesc != NULL ? dev->ud_cdesc->bmAttributes : 0);
 		return;
 	}
 
@@ -2380,6 +2401,10 @@ SYSCTL_SETUP(sysctl_hw_usbpm_setup, "hw.usbpm")
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "hid",
 	    SYSCTL_DESCR("Also sleep devices with a HID interface (keyboards, mice)"),
 	    NULL, 0, &xhci_autosuspend_hid, 0, CTL_CREATE, CTL_EOL);
+	sysctl_createv(clog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "debug",
+	    SYSCTL_DESCR("Report why a device is not parked"),
+	    NULL, 0, &xhci_rt_debug, 0, CTL_CREATE, CTL_EOL);
 	sysctl_createv(clog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING, "stats",
 	    SYSCTL_DESCR("suspends, resumes, remote wakes, failures"),
