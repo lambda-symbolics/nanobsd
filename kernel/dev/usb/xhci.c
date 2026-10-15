@@ -1001,30 +1001,32 @@ out:	mutex_exit(&sc->sc_rhlock);
 static bool
 xhci_resume_check(struct xhci_softc *sc)
 {
-	uint32_t hcs1, hcs2, cmd, sts, config;
+	uint32_t hcs1, hcs2, cmd, sts, config, maxspbuf;
 	uint64_t dcbaap, erstba;
-	uint16_t version;
+	uint16_t hciver;
 	int i;
 
-	version = xhci_read_2(sc, XHCI_HCIVERSION);
-	if (version == UINT16_MAX || version == 0) {
+	hciver = xhci_read_2(sc, XHCI_HCIVERSION);
+	if (hciver == UINT16_MAX || hciver == 0) {
 		device_printf(sc->sc_dev, "resume: controller MMIO unavailable\n");
 		return false;
 	}
 	hcs1 = xhci_cap_read_4(sc, XHCI_HCSPARAMS1);
 	hcs2 = xhci_cap_read_4(sc, XHCI_HCSPARAMS2);
-	if (version != sc->sc_hciversion ||
+	/* the stock macro has no outer parentheses */
+	maxspbuf = XHCI_HCS2_MAXSPBUF(hcs2);
+	if (hciver != sc->sc_hciversion ||
 	    xhci_read_1(sc, XHCI_CAPLENGTH) != sc->sc_caplength ||
 	    xhci_cap_read_4(sc, XHCI_DBOFF) != sc->sc_dboff ||
 	    xhci_cap_read_4(sc, XHCI_RTSOFF) != sc->sc_rtsoff ||
 	    XHCI_HCS1_MAXSLOTS(hcs1) != sc->sc_maxslots ||
 	    XHCI_HCS1_MAXINTRS(hcs1) != sc->sc_maxintrs ||
 	    XHCI_HCS1_MAXPORTS(hcs1) != sc->sc_maxports ||
-	    XHCI_HCS2_MAXSPBUF(hcs2) != sc->sc_maxspbuf ||
+	    maxspbuf != sc->sc_maxspbuf ||
 	    xhci_cap_read_4(sc, XHCI_HCCPARAMS) != sc->sc_hcc) {
 		device_printf(sc->sc_dev, "resume: capability layout changed "
 		    "(HCIVERSION %04x -> %04x); detach/reattach required\n",
-		    sc->sc_hciversion, version);
+		    sc->sc_hciversion, hciver);
 		return false;
 	}
 	for (i = 0; i < XHCI_WAIT_CNR; i++) {
@@ -1173,7 +1175,7 @@ xhci_resume(device_t self, const pmf_qual_t *qual)
 	size_t i, j, bn, dci;
 	int port;
 	uint32_t v;
-	bool ok = false, cold = false;
+	bool ok = false, coldres = false;
 
 	XHCIHIST_FUNC(); XHCIHIST_CALLED();
 
@@ -1202,7 +1204,7 @@ xhci_resume(device_t self, const pmf_qual_t *qual)
 	if (!xhci_resume_check(sc))
 		goto out;
 	if (sc->sc_state_lost) {
-		cold = true;
+		coldres = true;
 		ok = xhci_resume_cold(sc);
 		goto out;
 	}
@@ -1427,12 +1429,12 @@ out:
 			if (xs->xs_idx != 0 && xs->xs_rt_init && xs->xs_parked_drv)
 				xhci_rt_kick(sc, xs, 2);
 		}
-		/* Drain events received while cold reinitialisation was gated. */
+		/* Drain events received while coldres reinitialisation was gated. */
 		if (sc->sc_child != NULL)
 			usb_schedsoftintr(&sc->sc_bus);
 		if (sc->sc_child2 != NULL)
 			usb_schedsoftintr(&sc->sc_bus2);
-		if (cold) {
+		if (coldres) {
 			struct usbd_bus *buses[] = { &sc->sc_bus, &sc->sc_bus2 };
 			for (bn = 0; bn < __arraycount(buses); bn++) {
 				struct usbd_device *rh = buses[bn]->ub_roothub;
@@ -1910,8 +1912,8 @@ xhci_rt_parkable(struct usbd_device *dev)
 		device_t d = dev->ud_subdevs[i];
 		if (d == NULL)
 			continue;
-		if (!device_is_a(d, "ubt") || !device_pmf_is_registered(d) ||
-		    !device_is_active(d))
+		/* ubt registers its park/unpark pmf handlers at attach. */
+		if (!device_is_a(d, "ubt") || !device_is_active(d))
 			return false;
 		found = true;
 	}
