@@ -39,7 +39,10 @@ usbc_off(){
     $SUDO drvctl -S xhci0 2>/dev/null || { echo "usb: xhci0 did not suspend" >&2; return 1; }
   fi
   [ "${USB_TCSS_D3:-1}" = 1 ] || return 0
-  if attached xhci0; then
+  # USB_TCSS_DETACH=0: leave the suspended driver attached (the kernel then
+  # needs idle_d3_exp bit 4 to cold the controller, and a power-loss-aware
+  # xhci_resume to bring it back: experiment).
+  if attached xhci0 && [ "${USB_TCSS_DETACH:-1}" = 1 ]; then
     $SUDO drvctl -d xhci0 2>/dev/null || { echo "usb: xhci0 did not detach" >&2; return 1; }
   fi
   cold && return 0

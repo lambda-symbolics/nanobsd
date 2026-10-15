@@ -1869,7 +1869,7 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 	    sysctl_hw_acpi_idle_d3, 0, NULL, 0, CTL_CREATE, CTL_EOL);
 	(void)sysctl_createv(NULL, 0, &snode, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
-	    "idle_d3_exp", SYSCTL_DESCR("idle_d3 experiment bits: 1 run the root ports' _PS3 before cold, 2 no PMCSR D3hot"),
+	    "idle_d3_exp", SYSCTL_DESCR("idle_d3 experiment bits: 1 run the root ports' _PS3 before cold, 2 no PMCSR D3hot, 4 TCSS xHCI cold under its suspended driver"),
 	    NULL, 0, &acpi_idle_d3_exp, 0, CTL_CREATE, CTL_EOL);
 
 	(void)sysctl_createv(NULL, 0, &snode, NULL,
@@ -3225,6 +3225,8 @@ struct acpi_adr_pwr {
  *      is a wake source during s2idle, so by default it is skipped
  *      (acpi_power_set_flags ACPI_POWER_NOPS3).
  *   2: do not write PMCSR D3hot before the cold-off.
+ *   4: ignore ADRPWR_NODRIVER (the TCSS xHCI goes cold with its driver
+ *      attached and suspended: the power-loss-aware xhci_resume experiment).
  */
 static void
 acpi_adr_power(struct acpi_softc *sc, const char *what,
@@ -3283,6 +3285,7 @@ acpi_adr_power(struct acpi_softc *sc, const char *what,
 			target = (ap->ap_flags & ADRPWR_COLD) ?
 			    ACPI_STATE_D3_COLD : state;
 			if ((ap->ap_flags & ADRPWR_NODRIVER) &&
+			    (acpi_idle_d3_exp & 4) == 0 &&
 			    acpi_pcidev_find_dev(ad) != NULL) {
 				aprint_normal_dev(sc->sc_dev,
 				    "%s: adr=0x%x has %s attached, skipped\n",
