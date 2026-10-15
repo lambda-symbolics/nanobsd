@@ -1217,6 +1217,27 @@ xhci_resume(device_t self, const pmf_qual_t *qual)
 	 */
 	mutex_enter(&sc->sc_rhlock);
 
+	/*
+	 * LISPBSD: the ACPI power manager tags a function whose power it cut
+	 * (D3cold); on this hardware a CRS after power loss reports success
+	 * (no RSS, no SRE) while the controller has nothing, so the warm path
+	 * would come back dead.
+	 */
+	{
+		prop_dictionary_t pd = device_properties(self);
+		bool lost = false;
+
+		if (prop_dictionary_get_bool(pd, "lispbsd-power-lost", &lost) &&
+		    lost) {
+			prop_dictionary_remove(pd, "lispbsd-power-lost");
+			mutex_enter(&sc->sc_lock);
+			sc->sc_state_lost = true;
+			mutex_exit(&sc->sc_lock);
+			device_printf(self, "resume: power was lost (ACPI), "
+			    "cold recovery\n");
+		}
+	}
+
 	/* Sample the retained state before the first operational write. */
 	if (!xhci_resume_check(sc))
 		goto out;

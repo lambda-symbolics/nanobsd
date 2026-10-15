@@ -3257,10 +3257,27 @@ acpi_adr_power(struct acpi_softc *sc, const char *what,
 					    "(id 0x%x), config not restored\n",
 					    what, ap->ap_adr, id);
 				} else {
+					struct acpi_devnode *rad;
+					device_t rdv;
+
 					(void)pci_set_powerstate(ap->ap_pc,
 					    ap->ap_tag, PCI_PMCSR_STATE_D0);
 					pci_conf_restore(ap->ap_pc, ap->ap_tag,
 					    &ap->ap_conf);
+					/*
+					 * The function was reset by the power
+					 * loss; its driver's resume cannot tell
+					 * (Tiger Lake xHCI: CRS reports success
+					 * without RSS or SRE on a fresh
+					 * controller), so say so explicitly.
+					 */
+					rad = acpi_match_node(ap->ap_changed);
+					rdv = rad != NULL ?
+					    acpi_pcidev_find_dev(rad) : NULL;
+					if (rdv != NULL)
+						prop_dictionary_set_bool(
+						    device_properties(rdv),
+						    "lispbsd-power-lost", true);
 				}
 				ap->ap_saved = false;
 			}
