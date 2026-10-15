@@ -84,9 +84,9 @@ struct xhci_slot {
 
 	/*
 	 * LispBSD USB runtime power management (xhci.c, xhci_rt_*): a
-	 * device on a root hub port with no open pipe for hw.usbpm.autosuspend
-	 * seconds has its port put in U3 with remote wakeup enabled; the next
-	 * pipe open, transfer or remote wake brings it back to U0.
+	 * root-port device idle for hw.usbpm.autosuspend seconds enters U3.
+	 * Open pipes require an opted-in driver (currently ubt) parked by PMF.
+	 * A pipe open, transfer or remote wake brings the port back to U0.
 	 */
 	struct usbd_device *xs_dev;	/* the device in this slot */
 	u_int xs_npipes;		/* open pipes other than the control pipe */
@@ -94,8 +94,11 @@ struct xhci_slot {
 	u_int xs_ctlrport;		/* controller port (0: not on a root hub port) */
 	u_int xs_bus;			/* 0: USB3 root hub, 1: USB2 root hub */
 	bool xs_rt_init;
-	bool xs_suspended;		/* port in U3 by the idle policy */
-	bool xs_resuming;		/* resume in progress: doorbells deferred */
+	struct lwp *xs_rt_owner;		/* sc_intr_lock: serialize task/open wake */
+	bool xs_suspended;		/* U3, parking, or failed wake: defer I/O */
+	bool xs_resuming;		/* wake pending or PMF transition in progress */
+	bool xs_parked_drv;		/* PMF_Q_SELF holds for runtime parking */
+	u_int xs_parked_ndevs;		/* attempted prefix of ud_subdevs */
 	uint32_t xs_dbpending;		/* doorbells to ring after the resume, bit per dci */
 	int xs_rt_want;			/* 1: suspend, 2: resume (for xs_rt_task) */
 	struct usb_task xs_rt_task;
@@ -160,10 +163,15 @@ struct xhci_softc {
 
 	bool sc_dying;
 	bool sc_suspendresume_failed;
+	bool sc_resume_failed;		/* gate traffic only after failed resume */
 	struct lwp *sc_suspender;
+	bool sc_state_lost;		/* cold recovery required until successful */
 
 	/* LispBSD USB runtime power management */
 	callout_t sc_rt_callout;	/* the idle scan, deferrable */
+	bool sc_rt_paused;		/* sc_intr_lock: no new runtime PM tasks */
+	u_int sc_rt_openers;		/* sc_intr_lock: synchronous port wakes */
+	kcondvar_t sc_rt_cv;		/* drain sc_rt_openers before system suspend */
 	uint64_t sc_rt_suspends, sc_rt_resumes, sc_rt_wakes, sc_rt_failed;
 
 	void (*sc_vendor_init)(struct xhci_softc *);
@@ -175,6 +183,11 @@ struct xhci_softc {
 #define XHCI_32BIT_ACCESS	__BIT(2)
 	uint32_t sc_hcc;		/* copy of HCCPARAMS1 */
 	uint32_t sc_hcc2;		/* copy of HCCPARAMS2 */
+
+	/* Attach-time layout: reject cold reuse if the function changes shape. */
+	uint8_t sc_caplength;
+	uint16_t sc_hciversion;
+	uint32_t sc_dboff, sc_rtsoff;
 
 	struct xhci_registers {
 		uint32_t	usbcmd;

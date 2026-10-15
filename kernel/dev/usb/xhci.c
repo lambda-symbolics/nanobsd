@@ -144,9 +144,17 @@ static void xhci_close_pipe(struct usbd_pipe *);
 static int xhci_intr1(struct xhci_softc * const);
 static void xhci_softintr(void *);
 
+static int xhci_hc_reset(struct xhci_softc * const);
+static void xhci_init_hw(struct xhci_softc *, bool);
+static bool xhci_resume_check(struct xhci_softc *);
+static bool xhci_resume_cold(struct xhci_softc *);
+static void xhci_rt_pause(struct xhci_softc *);
+
 /* LispBSD USB runtime power management (defined before xhci_init) */
 static void xhci_rt_doorbell(struct xhci_softc *, struct xhci_slot *, u_int);
 static void xhci_rt_ring_pending(struct xhci_softc *, struct xhci_slot *);
+static void xhci_rt_kick(struct xhci_softc *, struct xhci_slot *, int);
+static void xhci_rt_resume_dev(struct xhci_softc *, struct xhci_slot *);
 static void xhci_poll(struct usbd_bus *);
 static struct usbd_xfer *xhci_allocx(struct usbd_bus *, unsigned int);
 static void xhci_freex(struct usbd_bus *, struct usbd_xfer *);
@@ -672,6 +680,7 @@ xhci_detach(struct xhci_softc *sc, int flags)
 	xhci_ring_free(sc, &sc->sc_cr);
 	cv_destroy(&sc->sc_command_cv);
 	cv_destroy(&sc->sc_cmdbusy_cv);
+	cv_destroy(&sc->sc_rt_cv);
 
 	xhci_rt_write_4(sc, XHCI_ERSTSZ(0), 0);
 	xhci_rt_write_8(sc, XHCI_ERSTBA(0), 0);
@@ -728,13 +737,18 @@ xhci_suspend(device_t self, const pmf_qual_t *qual)
 
 	XHCIHIST_FUNC(); XHCIHIST_CALLED();
 
+	/* Drain runtime work before blocking commands it may need to finish. */
+	xhci_rt_pause(sc);
+
 	/*
 	 * Block issuance of new commands, and wait for all pending
 	 * commands to complete.
 	 */
 	mutex_enter(&sc->sc_lock);
 	KASSERT(sc->sc_suspender == NULL);
+	mutex_enter(&sc->sc_intr_lock);
 	sc->sc_suspender = curlwp;
+	mutex_exit(&sc->sc_intr_lock);
 	while (sc->sc_command_addr != 0)
 		cv_wait(&sc->sc_cmdbusy_cv, &sc->sc_lock);
 	mutex_exit(&sc->sc_lock);
@@ -762,7 +776,7 @@ xhci_suspend(device_t self, const pmf_qual_t *qual)
 	 *     TR Dequeue Pointer, DCS, etc. fields.  Refer to
 	 *     Implementation Note "0".'
 	 */
-	for (i = 0; i < sc->sc_maxslots; i++) {
+	for (i = 1; i <= sc->sc_maxslots; i++) {
 		struct xhci_slot *xs = &sc->sc_slots[i];
 
 		/* Skip if the slot is not in use.  */
@@ -959,12 +973,197 @@ out:	mutex_exit(&sc->sc_rhlock);
 		 */
 		mutex_enter(&sc->sc_lock);
 		KASSERT(sc->sc_suspender == curlwp);
+		mutex_enter(&sc->sc_intr_lock);
 		sc->sc_suspender = NULL;
 		sc->sc_suspendresume_failed = true;
+		/* PMF will not call driver resume after a failed suspend. */
+		sc->sc_rt_paused = false;
+		mutex_exit(&sc->sc_intr_lock);
 		cv_broadcast(&sc->sc_cmdbusy_cv);
 		mutex_exit(&sc->sc_lock);
+		callout_schedule(&sc->sc_rt_callout, hz * 5);
+		for (i = 1; i <= sc->sc_maxslots; i++) {
+			struct xhci_slot *xs = &sc->sc_slots[i];
+			if (xs->xs_idx != 0 && xs->xs_rt_init &&
+			    (xs->xs_suspended || xs->xs_resuming ||
+			    xs->xs_parked_drv || xs->xs_dbpending != 0))
+				xhci_rt_kick(sc, xs, 2);
+		}
 	}
 	return ok;
+}
+
+/*
+ * PCI has restored configuration space before calling us.  All-ones MMIO is
+ * an inaccessible function, not evidence that it is safe to write a reset.
+ * Keep this probe read-only: restoring DCBAAP first would erase the evidence.
+ */
+static bool
+xhci_resume_check(struct xhci_softc *sc)
+{
+	uint32_t hcs1, hcs2, cmd, sts, config;
+	uint64_t dcbaap, erstba;
+	uint16_t version;
+	int i;
+
+	version = xhci_read_2(sc, XHCI_HCIVERSION);
+	if (version == UINT16_MAX || version == 0) {
+		device_printf(sc->sc_dev, "resume: controller MMIO unavailable\n");
+		return false;
+	}
+	hcs1 = xhci_cap_read_4(sc, XHCI_HCSPARAMS1);
+	hcs2 = xhci_cap_read_4(sc, XHCI_HCSPARAMS2);
+	if (version != sc->sc_hciversion ||
+	    xhci_read_1(sc, XHCI_CAPLENGTH) != sc->sc_caplength ||
+	    xhci_cap_read_4(sc, XHCI_DBOFF) != sc->sc_dboff ||
+	    xhci_cap_read_4(sc, XHCI_RTSOFF) != sc->sc_rtsoff ||
+	    XHCI_HCS1_MAXSLOTS(hcs1) != sc->sc_maxslots ||
+	    XHCI_HCS1_MAXINTRS(hcs1) != sc->sc_maxintrs ||
+	    XHCI_HCS1_MAXPORTS(hcs1) != sc->sc_maxports ||
+	    XHCI_HCS2_MAXSPBUF(hcs2) != sc->sc_maxspbuf ||
+	    xhci_cap_read_4(sc, XHCI_HCCPARAMS) != sc->sc_hcc) {
+		device_printf(sc->sc_dev, "resume: capability layout changed "
+		    "(HCIVERSION %04x -> %04x); detach/reattach required\n",
+		    sc->sc_hciversion, version);
+		return false;
+	}
+	for (i = 0; i < XHCI_WAIT_CNR; i++) {
+		sts = xhci_op_read_4(sc, XHCI_USBSTS);
+		if (sts == UINT32_MAX)
+			break;
+		if ((sts & XHCI_STS_CNR) == 0)
+			break;
+		usb_delay_ms(&sc->sc_bus, 1);
+	}
+	if (sts == UINT32_MAX || (sts & XHCI_STS_CNR) != 0) {
+		device_printf(sc->sc_dev, "resume: controller not ready, "
+		    "USBSTS=%08x\n", sts);
+		return false;
+	}
+	cmd = xhci_op_read_4(sc, XHCI_USBCMD);
+	dcbaap = xhci_op_read_8(sc, XHCI_DCBAAP);
+	config = xhci_op_read_4(sc, XHCI_CONFIG);
+	erstba = xhci_rt_read_8(sc, XHCI_ERSTBA(0));
+	if (cmd == UINT32_MAX || dcbaap == UINT64_MAX ||
+	    config == UINT32_MAX || erstba == UINT64_MAX) {
+		device_printf(sc->sc_dev, "resume: invalid register readback\n");
+		return false;
+	}
+	if (sc->sc_regs.dcbaap == 0) {
+		device_printf(sc->sc_dev, "resume: no saved controller state\n");
+		return false;
+	}
+	if (dcbaap != sc->sc_regs.dcbaap ||
+	    config != sc->sc_regs.config || erstba != sc->sc_regs.erstba0 ||
+	    (sts & (XHCI_STS_HSE | XHCI_STS_HCE)) != 0) {
+		mutex_enter(&sc->sc_lock);
+		sc->sc_state_lost = true;
+		mutex_exit(&sc->sc_lock);
+		device_printf(sc->sc_dev, "resume: controller state lost, "
+		    "USBCMD=%08x USBSTS=%08x DCBAAP=%016"PRIx64
+		    " (saved %016"PRIx64")\n", cmd, sts, dcbaap,
+		    sc->sc_regs.dcbaap);
+	}
+	return true;
+}
+
+/*
+ * First-stage cold recovery: keep the software root hubs, but only if there
+ * is no downstream topology to retire.  A device slot cannot survive HCRST.
+ * Keep the current PMF tree intact.  Child detach can wait on USB activity
+ * requiring locks held here; replacement devices need separate PMF ordering.
+ */
+static bool
+xhci_resume_cold(struct xhci_softc *sc)
+{
+	struct usbd_bus *buses[] = { &sc->sc_bus, &sc->sc_bus2 };
+	uint32_t v;
+	int i;
+
+	KASSERT(mutex_owned(&sc->sc_rhlock));
+	mutex_enter(&sc->sc_lock);
+	KASSERT(sc->sc_command_addr == 0);
+	for (i = 1; i <= sc->sc_maxslots; i++) {
+		struct xhci_slot *xs = &sc->sc_slots[i];
+		if (xs->xs_idx != 0 || xs->xs_dev != NULL || xs->xs_rt_init ||
+		    xs->xs_parked_drv || xs->xs_parked_ndevs != 0) {
+			device_printf(sc->sc_dev, "cold resume: slot %d still "
+			    "owned; populated recovery not implemented\n", i);
+			mutex_exit(&sc->sc_lock);
+			return false;
+		}
+	}
+	for (size_t bn = 0; bn < __arraycount(buses); bn++) {
+		struct usbd_bus *bus = buses[bn];
+		for (size_t a = 0; a < __arraycount(bus->ub_devices); a++) {
+			if (bus->ub_devices[a] != NULL &&
+			    bus->ub_devices[a] != bus->ub_roothub) {
+				device_printf(sc->sc_dev, "cold resume: bus %zu "
+				    "still has a device at %zu\n", bn, a);
+				mutex_exit(&sc->sc_lock);
+				return false;
+			}
+		}
+	}
+	mutex_exit(&sc->sc_lock);
+
+	if (xhci_hc_reset(sc) != 0)
+		return false;
+	if (sc->sc_vendor_init != NULL)
+		sc->sc_vendor_init(sc);
+	v = xhci_op_read_4(sc, XHCI_PAGESIZE);
+	if (v == UINT32_MAX || ffs(v) == 0 ||
+	    ((bus_size_t)1 << (12 + ffs(v) - 1)) != sc->sc_pgsz) {
+		device_printf(sc->sc_dev, "cold resume: page size changed\n");
+		return false;
+	}
+
+	mutex_enter(&sc->sc_lock);
+	xhci_init_hw(sc, true);
+	sc->sc_resultpending = false;
+	memset(&sc->sc_result_trb, 0, sizeof(sc->sc_result_trb));
+	for (i = 1; i <= sc->sc_maxslots; i++) {
+		struct xhci_slot *xs = &sc->sc_slots[i];
+		xs->xs_suspended = xs->xs_resuming = false;
+		xs->xs_dbpending = 0;
+		xs->xs_rt_want = 0;
+	}
+	xhci_start(sc);
+	mutex_exit(&sc->sc_lock);
+
+	for (i = 0; i < XHCI_WAIT_HCH; i++) {
+		v = xhci_op_read_4(sc, XHCI_USBSTS);
+		if (v == UINT32_MAX ||
+		    (v & (XHCI_STS_HSE | XHCI_STS_HCE)) != 0)
+			break;
+		if ((v & XHCI_STS_HCH) == 0)
+			break;
+		usb_delay_ms(&sc->sc_bus, 1);
+	}
+	if (v == UINT32_MAX ||
+	    (v & (XHCI_STS_HCH | XHCI_STS_HSE | XHCI_STS_HCE)) != 0) {
+		device_printf(sc->sc_dev, "cold resume: start failed, "
+		    "USBSTS=%08x\n", v);
+		if (v != UINT32_MAX) {
+			xhci_rt_write_4(sc, XHCI_IMAN(0), 0);
+			xhci_op_write_4(sc, XHCI_USBCMD, 0);
+		}
+		return false;
+	}
+	for (i = 1; i <= sc->sc_maxports; i++) {
+		v = xhci_op_read_4(sc, XHCI_PORTSC(i));
+		if (v == UINT32_MAX) {
+			device_printf(sc->sc_dev, "cold resume: port %d "
+			    "MMIO unavailable\n", i);
+			return false;
+		}
+		/* Preserve pending change bits for the retained root hubs. */
+		v &= ~(XHCI_PS_CLEAR | XHCI_PS_PED | XHCI_PS_LWS);
+		xhci_op_write_4(sc, XHCI_PORTSC(i), v | XHCI_PS_PP);
+	}
+	usb_delay_ms(&sc->sc_bus, USB_PORT_POWERUP_DELAY);
+	device_printf(sc->sc_dev, "cold resume: empty controller restarted\n");
+	return true;
 }
 
 bool
@@ -974,7 +1173,7 @@ xhci_resume(device_t self, const pmf_qual_t *qual)
 	size_t i, j, bn, dci;
 	int port;
 	uint32_t v;
-	bool ok = false;
+	bool ok = false, cold = false;
 
 	XHCIHIST_FUNC(); XHCIHIST_CALLED();
 
@@ -983,12 +1182,14 @@ xhci_resume(device_t self, const pmf_qual_t *qual)
 	 * things worse, probably.
 	 */
 	mutex_enter(&sc->sc_lock);
+	mutex_enter(&sc->sc_intr_lock);
 	if (sc->sc_suspendresume_failed) {
 		KASSERT(sc->sc_suspender == NULL);
 		sc->sc_suspender = curlwp;
 		sc->sc_suspendresume_failed = false;
 	}
 	KASSERT(sc->sc_suspender);
+	mutex_exit(&sc->sc_intr_lock);
 	mutex_exit(&sc->sc_lock);
 
 	/*
@@ -996,6 +1197,15 @@ xhci_resume(device_t self, const pmf_qual_t *qual)
 	 * we're done resuming.
 	 */
 	mutex_enter(&sc->sc_rhlock);
+
+	/* Sample the retained state before the first operational write. */
+	if (!xhci_resume_check(sc))
+		goto out;
+	if (sc->sc_state_lost) {
+		cold = true;
+		ok = xhci_resume_cold(sc);
+		goto out;
+	}
 
 	/*
 	 * xHCI Requirements Specification 1.2, May 2019, Sec. 4.23.2:
@@ -1020,8 +1230,6 @@ xhci_resume(device_t self, const pmf_qual_t *qual)
 	xhci_rt_write_8(sc, XHCI_ERDP(0), sc->sc_regs.erdp0);
 	xhci_rt_write_4(sc, XHCI_IMAN(0), sc->sc_regs.iman0);
 	xhci_rt_write_4(sc, XHCI_IMOD(0), sc->sc_regs.imod0);
-
-	memset(&sc->sc_regs, 0, sizeof(sc->sc_regs)); /* paranoia */
 
 	/*
 	 * `5. Set the Controller Restore State (CRS) flag in the
@@ -1142,7 +1350,7 @@ xhci_resume(device_t self, const pmf_qual_t *qual)
 	 * `10. Restart each of the previously Running endpoints by
 	 *      ringing their doorbells.'
 	 */
-	for (i = 0; i < sc->sc_maxslots; i++) {
+	for (i = 1; i <= sc->sc_maxslots; i++) {
 		struct xhci_slot *xs = &sc->sc_slots[i];
 
 		/* Skip if the slot is not in use.  */
@@ -1174,37 +1382,71 @@ xhci_resume(device_t self, const pmf_qual_t *qual)
 	/* Success!  */
 	ok = true;
 
-out:	/*
-	 * Resume command issuance.  If the hardware failed to resume,
-	 * well, tough -- deadlocking because everything is held up on
-	 * the suspension, with no opportunity to detach, isn't better
-	 * than timing out waiting for dead hardware.
-	 */
+out:
+	/* Only a successful resume may release old deferred doorbells. */
 	mutex_enter(&sc->sc_lock);
 	KASSERT(sc->sc_suspender);
+	mutex_enter(&sc->sc_intr_lock);
 	sc->sc_suspender = NULL;
 	sc->sc_suspendresume_failed = !ok;
-	cv_broadcast(&sc->sc_cmdbusy_cv);
-	mutex_exit(&sc->sc_lock);
-
-	/* LispBSD runtime PM: every port is in U0 again. */
-	mutex_enter(&sc->sc_intr_lock);
-	for (int si = 1; si <= sc->sc_maxslots; si++) {
-		struct xhci_slot *xs = &sc->sc_slots[si];
-		if (xs->xs_idx == 0 || !xs->xs_rt_init)
-			continue;
-		xs->xs_suspended = false;
-		xs->xs_resuming = false;
-		xs->xs_lastbusy = getticks();
+	sc->sc_resume_failed = !ok;
+	if (ok) {
+		sc->sc_state_lost = false;
+		memset(&sc->sc_regs, 0, sizeof(sc->sc_regs));
+		for (int si = 1; si <= sc->sc_maxslots; si++) {
+			struct xhci_slot *xs = &sc->sc_slots[si];
+			if (xs->xs_idx == 0 || !xs->xs_rt_init)
+				continue;
+			/* Keep I/O deferred until the parked driver's reads are rearmed. */
+			xs->xs_suspended = xs->xs_parked_drv;
+			xs->xs_resuming = false;
+			xs->xs_rt_want = 0;
+			xs->xs_lastbusy = getticks();
+		}
 	}
 	mutex_exit(&sc->sc_intr_lock);
-	for (int si = 1; si <= sc->sc_maxslots; si++) {
-		struct xhci_slot *xs = &sc->sc_slots[si];
-		if (xs->xs_idx != 0 && xs->xs_rt_init && xs->xs_dbpending != 0)
-			xhci_rt_ring_pending(sc, xs);
+	if (ok) {
+		for (int si = 1; si <= sc->sc_maxslots; si++) {
+			struct xhci_slot *xs = &sc->sc_slots[si];
+			if (xs->xs_idx != 0 && xs->xs_rt_init)
+				xhci_rt_ring_pending(sc, xs);
+		}
 	}
-
+	cv_broadcast(&sc->sc_cmdbusy_cv);
+	mutex_exit(&sc->sc_lock);
 	mutex_exit(&sc->sc_rhlock);
+
+	if (ok) {
+		mutex_enter(&sc->sc_intr_lock);
+		sc->sc_rt_paused = false;
+		mutex_exit(&sc->sc_intr_lock);
+		callout_schedule(&sc->sc_rt_callout, hz * 5);
+		/* Runtime-parked children were skipped by system PMF suspend. */
+		for (i = 1; i <= sc->sc_maxslots; i++) {
+			struct xhci_slot *xs = &sc->sc_slots[i];
+			if (xs->xs_idx != 0 && xs->xs_rt_init && xs->xs_parked_drv)
+				xhci_rt_kick(sc, xs, 2);
+		}
+		/* Drain events received while cold reinitialisation was gated. */
+		if (sc->sc_child != NULL)
+			usb_schedsoftintr(&sc->sc_bus);
+		if (sc->sc_child2 != NULL)
+			usb_schedsoftintr(&sc->sc_bus2);
+		if (cold) {
+			struct usbd_bus *buses[] = { &sc->sc_bus, &sc->sc_bus2 };
+			for (bn = 0; bn < __arraycount(buses); bn++) {
+				struct usbd_device *rh = buses[bn]->ub_roothub;
+				if (rh == NULL || rh->ud_hub == NULL)
+					continue;
+				/* NULL PMF callbacks on usb/uhub do not rescan. */
+				mutex_enter(&sc->sc_lock);
+				for (i = 0; i < rh->ud_hub->uh_hubdesc.bNbrPorts; i++)
+					rh->ud_hub->uh_ports[i].up_reattach = 1;
+				mutex_exit(&sc->sc_lock);
+				usb_needs_explore(rh);
+			}
+		}
+	}
 	return ok;
 }
 
@@ -1235,7 +1477,16 @@ xhci_hc_reset(struct xhci_softc * const sc)
 	/* Halt controller */
 	usbcmd = 0;
 	xhci_op_write_4(sc, XHCI_USBCMD, usbcmd);
-	usb_delay_ms(&sc->sc_bus, 1);
+	for (i = 0; i < XHCI_WAIT_HCH; i++) {
+		usbsts = xhci_op_read_4(sc, XHCI_USBSTS);
+		if (usbsts != UINT32_MAX && (usbsts & XHCI_STS_HCH) != 0)
+			break;
+		usb_delay_ms(&sc->sc_bus, 1);
+	}
+	if (i == XHCI_WAIT_HCH) {
+		aprint_error_dev(sc->sc_dev, "controller halt timeout before reset\n");
+		return EIO;
+	}
 
 	/* Reset controller */
 	usbcmd = XHCI_CMD_HCRST;
@@ -1453,14 +1704,19 @@ xhci_start(struct xhci_softc *sc)
 	xhci_op_write_4(sc, XHCI_USBCMD, XHCI_CMD_INTE|XHCI_CMD_RS);
 	aprint_debug_dev(sc->sc_dev, "USBCMD 0x%08"PRIx32"\n",
 	    xhci_op_read_4(sc, XHCI_USBCMD));
+	/* Deferred-start frontends must start the runtime scan here too. */
+	mutex_enter(&sc->sc_intr_lock);
+	if (!sc->sc_rt_paused)
+		callout_schedule(&sc->sc_rt_callout, hz * 5);
+	mutex_exit(&sc->sc_intr_lock);
 }
 
 /*
  * LispBSD USB runtime power management.
  *
- * A device on a root hub port that has had no pipe open and no transfer
- * for hw.usbpm.autosuspend seconds gets DEVICE_REMOTE_WAKEUP set (when it
- * supports it) and its port put in U3.  While the port sleeps, transfers
+ * An idle root-port device enters U3 after hw.usbpm.autosuspend seconds.
+ * Open pipes require PMF parking of an opted-in driver (currently ubt) and
+ * successful DEVICE_REMOTE_WAKEUP arming.  While the port sleeps, transfers
  * are queued on the rings but the doorbells are not rung; a pipe open, a
  * transfer or a remote wakeup (a port status change with the link in
  * Resume) brings the port back to U0 and rings the deferred doorbells.
@@ -1486,12 +1742,16 @@ static void
 xhci_rt_bind(struct xhci_softc *sc, struct xhci_slot *xs,
     struct usbd_device *dev)
 {
-	if (xs->xs_rt_init)
+	if (xs->xs_rt_init || xs->xs_dev != NULL)
 		return;
 	xs->xs_dev = dev;
 	xs->xs_npipes = 0;
 	xs->xs_lastbusy = getticks();
 	xs->xs_suspended = xs->xs_resuming = false;
+	xs->xs_parked_drv = false;
+	xs->xs_parked_ndevs = 0;
+	xs->xs_rt_owner = NULL;
+	xs->xs_rt_want = 0;
 	xs->xs_dbpending = 0;
 	xs->xs_ctlrport = 0;
 	if (dev->ud_depth == 1 && dev->ud_powersrc != NULL) {
@@ -1499,23 +1759,44 @@ xhci_rt_bind(struct xhci_softc *sc, struct xhci_slot *xs,
 		xs->xs_ctlrport = xhci_rhport2ctlrport(sc, xs->xs_bus,
 		    dev->ud_powersrc->up_portno);
 	}
-	usb_init_task(&xs->xs_rt_task, xhci_rt_task, xs, USB_TASKQ_MPSAFE);
+	/* PMF callbacks and the subdevice walk require KERNEL_LOCK. */
+	usb_init_task(&xs->xs_rt_task, xhci_rt_task, xs, 0);
 	xs->xs_rt_init = true;
 }
 
 static void
 xhci_rt_unbind(struct xhci_softc *sc, struct xhci_slot *xs)
 {
-	if (!xs->xs_rt_init)
+	bool locked = mutex_owned(&sc->sc_lock);
+
+	mutex_enter(&sc->sc_intr_lock);
+	if (!xs->xs_rt_init) {
+		mutex_exit(&sc->sc_intr_lock);
 		return;
-	if (xs->xs_dev != NULL)
-		usb_rem_task_wait(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC,
-		    mutex_owned(&sc->sc_lock) ? &sc->sc_lock : NULL);
-	xs->xs_dev = NULL;
+	}
+	/* Close admission before removing a queued rerun and joining the task. */
 	xs->xs_rt_init = false;
+	mutex_exit(&sc->sc_intr_lock);
+	if (locked)
+		mutex_exit(&sc->sc_lock);
+	if (xs->xs_dev != NULL) {
+		usb_rem_task(xs->xs_dev, &xs->xs_rt_task);
+		usb_rem_task_wait(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC,
+		    NULL);
+	}
+	mutex_enter(&sc->sc_intr_lock);
+	while (xs->xs_rt_owner != NULL)
+		cv_wait(&sc->sc_rt_cv, &sc->sc_intr_lock);
+	xs->xs_dev = NULL;
 	xs->xs_suspended = xs->xs_resuming = false;
+	xs->xs_parked_drv = false;
+	xs->xs_parked_ndevs = 0;
 	xs->xs_dbpending = 0;
 	xs->xs_ctlrport = 0;
+	xs->xs_rt_want = 0;
+	mutex_exit(&sc->sc_intr_lock);
+	if (locked)
+		mutex_enter(&sc->sc_lock);
 }
 
 static bool
@@ -1533,13 +1814,41 @@ xhci_rt_has_hid(struct usbd_device *dev)
 	return false;
 }
 
+/* Called with neither xHCI lock held, before sc_suspender is installed. */
+static void
+xhci_rt_pause(struct xhci_softc *sc)
+{
+	mutex_enter(&sc->sc_intr_lock);
+	sc->sc_rt_paused = true;
+	mutex_exit(&sc->sc_intr_lock);
+	callout_halt(&sc->sc_rt_callout, NULL);
+	for (int i = 1; i <= sc->sc_maxslots; i++) {
+		struct xhci_slot *xs = &sc->sc_slots[i];
+		if (xs->xs_rt_init && xs->xs_dev != NULL) {
+			/* A running task can also have a queued rerun. Remove
+			 * that first, then join the current execution. */
+			usb_rem_task(xs->xs_dev, &xs->xs_rt_task);
+			usb_rem_task_wait(xs->xs_dev, &xs->xs_rt_task,
+			    USB_TASKQ_HC, NULL);
+		}
+	}
+	mutex_enter(&sc->sc_intr_lock);
+	while (sc->sc_rt_openers != 0)
+		cv_wait(&sc->sc_rt_cv, &sc->sc_intr_lock);
+	mutex_exit(&sc->sc_intr_lock);
+}
+
 static void
 xhci_rt_kick(struct xhci_softc *sc, struct xhci_slot *xs, int want)
 {
-	if (xs->xs_dev == NULL || !xs->xs_rt_init)
-		return;
-	xs->xs_rt_want = want;
-	usb_add_task(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC);
+	mutex_enter(&sc->sc_intr_lock);
+	if (!sc->sc_rt_paused && !sc->sc_dying &&
+	    xs->xs_dev != NULL && xs->xs_rt_init) {
+		/* An idle scan must not overwrite an already requested wake. */
+		xs->xs_rt_want = MAX(xs->xs_rt_want, want);
+		usb_add_task(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC);
+	}
+	mutex_exit(&sc->sc_intr_lock);
 }
 
 /*
@@ -1549,21 +1858,21 @@ xhci_rt_kick(struct xhci_softc *sc, struct xhci_slot *xs, int want)
 static void
 xhci_rt_doorbell(struct xhci_softc *sc, struct xhci_slot *xs, u_int dci)
 {
-	bool defer, resume = false;
+	bool blocked, defer, resume = false;
 
 	mutex_enter(&sc->sc_intr_lock);
-	defer = xs->xs_suspended || xs->xs_resuming;
+	blocked = sc->sc_suspender != NULL || sc->sc_resume_failed;
+	defer = blocked || xs->xs_suspended || xs->xs_resuming;
 	if (defer) {
 		xs->xs_dbpending |= 1u << dci;
-		resume = xs->xs_suspended && !xs->xs_resuming;
+		resume = !blocked && !sc->sc_rt_paused &&
+		    xs->xs_suspended && !xs->xs_resuming;
 		if (resume)
 			xs->xs_resuming = true;
 	}
-	mutex_exit(&sc->sc_intr_lock);
-	if (!defer) {
+	if (!defer)
 		xhci_db_write_4(sc, XHCI_DOORBELL(xs->xs_idx), dci);
-		return;
-	}
+	mutex_exit(&sc->sc_intr_lock);
 	if (resume)
 		xhci_rt_kick(sc, xs, 2);
 }
@@ -1575,15 +1884,110 @@ xhci_rt_ring_pending(struct xhci_softc *sc, struct xhci_slot *xs)
 	u_int dci;
 
 	mutex_enter(&sc->sc_intr_lock);
+	if (sc->sc_suspender != NULL || sc->sc_resume_failed ||
+	    xs->xs_suspended || xs->xs_resuming) {
+		mutex_exit(&sc->sc_intr_lock);
+		return;
+	}
 	pending = xs->xs_dbpending;
 	xs->xs_dbpending = 0;
-	mutex_exit(&sc->sc_intr_lock);
 	for (dci = 1; dci <= XHCI_MAX_DCI; dci++)
 		if (pending & (1u << dci))
 			xhci_db_write_4(sc, XHCI_DOORBELL(xs->xs_idx), dci);
+	mutex_exit(&sc->sc_intr_lock);
 }
 
-/* process context */
+/* Process context, KERNEL_LOCK held: an explicit driver opt-in list. */
+static bool
+xhci_rt_parkable(struct usbd_device *dev)
+{
+	bool found = false;
+
+	KASSERT(KERNEL_LOCKED_P());
+	if (dev->ud_subdevs == NULL)
+		return false;
+	for (u_int i = 0; i < dev->ud_subdevlen; i++) {
+		device_t d = dev->ud_subdevs[i];
+		if (d == NULL)
+			continue;
+		if (!device_is_a(d, "ubt") || !device_pmf_is_registered(d) ||
+		    !device_is_active(d))
+			return false;
+		found = true;
+	}
+	return found;
+}
+
+static bool
+xhci_rt_idle_ok(struct xhci_softc *sc, struct xhci_slot *xs)
+{
+	bool empty;
+
+	mutex_enter(&sc->sc_intr_lock);
+	empty = xs->xs_npipes == 0;
+	mutex_exit(&sc->sc_intr_lock);
+	return empty || xhci_rt_parkable(xs->xs_dev);
+}
+
+/* No xHCI lock held.  Keep failed PMF resumes owned for a later retry. */
+static bool
+xhci_rt_unpark(struct xhci_softc *sc, struct xhci_slot *xs)
+{
+	struct usbd_device *dev = xs->xs_dev;
+	u_int n;
+	bool ok = true;
+
+	KERNEL_LOCK(1, NULL);
+	mutex_enter(&sc->sc_intr_lock);
+	n = xs->xs_parked_ndevs;
+	mutex_exit(&sc->sc_intr_lock);
+	/* Detach may have removed children while a callback slept. */
+	for (u_int i = 0; i < n && i < dev->ud_subdevlen; i++) {
+		device_t d = dev->ud_subdevs[i];
+		if (d != NULL && !pmf_device_resume(d, PMF_Q_SELF)) {
+			aprint_error_dev(sc->sc_dev, "runtime resume of %s failed\n",
+			    device_xname(d));
+			ok = false;
+		}
+	}
+	mutex_enter(&sc->sc_intr_lock);
+	if (ok) {
+		xs->xs_parked_drv = false;
+		xs->xs_parked_ndevs = 0;
+	} else {
+		sc->sc_rt_failed++;
+	}
+	mutex_exit(&sc->sc_intr_lock);
+	KERNEL_UNLOCK_ONE(NULL);
+	return ok;
+}
+
+static bool
+xhci_rt_park(struct xhci_softc *sc, struct xhci_slot *xs)
+{
+	struct usbd_device *dev = xs->xs_dev;
+
+	KASSERT(KERNEL_LOCKED_P());
+	if (!xhci_rt_parkable(dev))
+		return false;
+	for (u_int i = 0; i < dev->ud_subdevlen; i++) {
+		device_t d = dev->ud_subdevs[i];
+		if (d == NULL)
+			continue;
+		/* Even a failed suspend may have installed its PMF suspensor. */
+		mutex_enter(&sc->sc_intr_lock);
+		xs->xs_parked_drv = true;
+		xs->xs_parked_ndevs = i + 1;
+		mutex_exit(&sc->sc_intr_lock);
+		if (!pmf_device_suspend(d, PMF_Q_SELF)) {
+			sc->sc_rt_failed++;
+			return false;
+		}
+	}
+	return true;
+}
+
+/* process context, KERNEL_LOCK held by the USB task */
 static void
 xhci_rt_suspend_dev(struct xhci_softc *sc, struct xhci_slot *xs)
 {
@@ -1591,20 +1995,33 @@ xhci_rt_suspend_dev(struct xhci_softc *sc, struct xhci_slot *xs)
 	usb_device_request_t req;
 	bus_size_t port;
 	uint32_t v;
-	int j;
+	int j, lastbusy;
+	bool park, wake;
+	usbd_status err;
 
+	KASSERT(KERNEL_LOCKED_P());
 	if (dev == NULL || xs->xs_ctlrport == 0 || sc->sc_dying ||
-	    sc->sc_suspender != NULL)
+	    !xhci_rt_enabled() || !xhci_rt_idle_ok(sc, xs) ||
+	    (!xhci_autosuspend_hid && xhci_rt_has_hid(dev)))
 		return;
 	mutex_enter(&sc->sc_intr_lock);
-	if (xs->xs_suspended || xs->xs_resuming || xs->xs_npipes != 0 ||
+	if (!xs->xs_rt_init || sc->sc_rt_paused ||
+	    xs->xs_suspended || xs->xs_resuming ||
+	    xs->xs_parked_drv ||
 	    getticks() - xs->xs_lastbusy < hz * xhci_autosuspend) {
 		mutex_exit(&sc->sc_intr_lock);
 		return;
 	}
+	park = xs->xs_npipes != 0;
 	mutex_exit(&sc->sc_intr_lock);
 
-	/* Remote wakeup, so an event (a Bluetooth connection) wakes it. */
+	port = XHCI_PORTSC(xs->xs_ctlrport);
+	v = xhci_op_read_4(sc, port);
+	if (v == UINT32_MAX || (v & XHCI_PS_PED) == 0 ||
+	    XHCI_PS_PLS_GET(v) >= XHCI_PS_PLS_U3)
+		return;
+
+	/* An open radio needs unsolicited events to be able to wake the port. */
 	if (dev->ud_cdesc != NULL &&
 	    (dev->ud_cdesc->bmAttributes & UC_REMOTE_WAKEUP) != 0) {
 		req.bmRequestType = UT_WRITE_DEVICE;
@@ -1612,20 +2029,45 @@ xhci_rt_suspend_dev(struct xhci_softc *sc, struct xhci_slot *xs)
 		USETW(req.wValue, UF_DEVICE_REMOTE_WAKEUP);
 		USETW(req.wIndex, 0);
 		USETW(req.wLength, 0);
-		(void)usbd_do_request(dev, &req, NULL);
+		err = usbd_do_request(dev, &req, NULL);
+		if (park && err != USBD_NORMAL_COMPLETION) {
+			sc->sc_rt_failed++;
+			return;
+		}
+	} else if (park) {
+		return;
 	}
 
-	port = XHCI_PORTSC(xs->xs_ctlrport);
-	v = xhci_op_read_4(sc, port);
-	if ((v & XHCI_PS_PED) == 0 || XHCI_PS_PLS_GET(v) >= XHCI_PS_PLS_U3)
-		return;
-
 	mutex_enter(&sc->sc_intr_lock);
-	if (xs->xs_npipes != 0 || xs->xs_resuming) {
+	if (!xs->xs_rt_init || sc->sc_rt_paused) {
 		mutex_exit(&sc->sc_intr_lock);
 		return;
 	}
-	xs->xs_suspended = true;	/* doorbells defer from here on */
+	if (park) {
+		/* Defer writes throughout PMF parking, including within one tick. */
+		xs->xs_suspended = xs->xs_resuming = true;
+	}
+	lastbusy = xs->xs_lastbusy;
+	mutex_exit(&sc->sc_intr_lock);
+	if (park && !xhci_rt_park(sc, xs)) {
+		xhci_rt_resume_dev(sc, xs);
+		return;
+	}
+
+	v = xhci_op_read_4(sc, port);
+	if (v == UINT32_MAX || (v & XHCI_PS_PED) == 0 ||
+	    XHCI_PS_PLS_GET(v) >= XHCI_PS_PLS_U3)
+		goto unpark;
+
+	mutex_enter(&sc->sc_intr_lock);
+	if (!xs->xs_rt_init || sc->sc_rt_paused ||
+	    (!park && xs->xs_resuming) || xs->xs_dbpending != 0 ||
+	    (xs->xs_npipes != 0 && !xs->xs_parked_drv) ||
+	    xs->xs_lastbusy != lastbusy) {
+		mutex_exit(&sc->sc_intr_lock);
+		goto unpark;
+	}
+	xs->xs_suspended = true;	/* subsequent doorbells defer */
 	mutex_exit(&sc->sc_intr_lock);
 
 	v &= ~(XHCI_PS_PLS_MASK | XHCI_PS_CLEAR);
@@ -1633,20 +2075,32 @@ xhci_rt_suspend_dev(struct xhci_softc *sc, struct xhci_slot *xs)
 	xhci_op_write_4(sc, port, v);
 	for (j = 0; j < XHCI_WAIT_PLS_U3; j++) {
 		v = xhci_op_read_4(sc, port);
-		if (XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_U3)
+		if (v == UINT32_MAX || XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_U3)
 			break;
 		usb_delay_ms(&sc->sc_bus, 1);
 	}
-	if (j == XHCI_WAIT_PLS_U3) {
-		aprint_debug_dev(sc->sc_dev, "port %u: U3 timeout\n",
-		    xs->xs_ctlrport);
+	if (v == UINT32_MAX || j == XHCI_WAIT_PLS_U3) {
 		sc->sc_rt_failed++;
-		/* leave it: a later resume puts it in a known state */
+		/* Restore the link before rearming the driver's inbound pipes. */
+		xhci_rt_resume_dev(sc, xs);
+		return;
 	}
 	sc->sc_rt_suspends++;
+	mutex_enter(&sc->sc_intr_lock);
+	xs->xs_resuming = false;
+	/* Catch a remote wake whose event arrived during the PMF transition. */
+	v = xhci_op_read_4(sc, port);
+	wake = xs->xs_dbpending != 0 || v == UINT32_MAX ||
+	    XHCI_PS_PLS_GET(v) != XHCI_PS_PLS_U3;
+	mutex_exit(&sc->sc_intr_lock);
 	aprint_debug_dev(sc->sc_dev, "port %u suspended\n", xs->xs_ctlrport);
-	if (xs->xs_dbpending != 0)
+	if (wake)
 		xhci_rt_kick(sc, xs, 2);
+	return;
+
+unpark:
+	if (park)
+		xhci_rt_resume_dev(sc, xs);
 }
 
 /* process context */
@@ -1658,12 +2112,15 @@ xhci_rt_resume_dev(struct xhci_softc *sc, struct xhci_slot *xs)
 	int j;
 
 	if (xs->xs_ctlrport == 0 || sc->sc_dying)
-		goto done;
+		return;
 	mutex_enter(&sc->sc_intr_lock);
 	xs->xs_resuming = true;
 	mutex_exit(&sc->sc_intr_lock);
 
 	v = xhci_op_read_4(sc, port);
+	if (v == UINT32_MAX || (v & (XHCI_PS_CCS | XHCI_PS_PED)) !=
+	    (XHCI_PS_CCS | XHCI_PS_PED))
+		goto failed;
 	if (XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_U3 && xs->xs_bus == 1) {
 		/* USB2: drive resume signalling for T_DRSMDN, then U0. */
 		v &= ~(XHCI_PS_PLS_MASK | XHCI_PS_CLEAR);
@@ -1676,31 +2133,50 @@ xhci_rt_resume_dev(struct xhci_softc *sc, struct xhci_slot *xs)
 		usb_delay_ms(&sc->sc_bus, 20);
 		v = xhci_op_read_4(sc, port);
 	}
+	if (v == UINT32_MAX)
+		goto failed;
 	if (XHCI_PS_PLS_GET(v) != XHCI_PS_PLS_U0) {
 		v &= ~(XHCI_PS_PLS_MASK | XHCI_PS_CLEAR);
 		v |= XHCI_PS_LWS | XHCI_PS_PLS_SET(XHCI_PS_PLS_SETU0);
 		xhci_op_write_4(sc, port, v);
 		for (j = 0; j < XHCI_WAIT_PLS_U0; j++) {
 			v = xhci_op_read_4(sc, port);
-			if (XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_U0)
+			if (v == UINT32_MAX || XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_U0)
 				break;
 			usb_delay_ms(&sc->sc_bus, 1);
 		}
-		if (j == XHCI_WAIT_PLS_U0) {
+		if (v == UINT32_MAX || j == XHCI_WAIT_PLS_U0) {
 			aprint_debug_dev(sc->sc_dev, "port %u: U0 timeout\n",
 			    xs->xs_ctlrport);
-			sc->sc_rt_failed++;
+			goto failed;
 		}
 	}
 	usb_delay_ms(&sc->sc_bus, USB_RESUME_RECOVERY);
+	v = xhci_op_read_4(sc, port);
+	if (v == UINT32_MAX || (v & (XHCI_PS_CCS | XHCI_PS_PED)) !=
+	    (XHCI_PS_CCS | XHCI_PS_PED) ||
+	    XHCI_PS_PLS_GET(v) != XHCI_PS_PLS_U0)
+		goto failed;
+	/* The callback queues inbound reads while all doorbells are deferred. */
+	if (xs->xs_parked_drv && !xhci_rt_unpark(sc, xs))
+		goto failed;
 	sc->sc_rt_resumes++;
-done:
 	mutex_enter(&sc->sc_intr_lock);
 	xs->xs_suspended = false;
 	xs->xs_resuming = false;
 	xs->xs_lastbusy = getticks();
+	xs->xs_rt_want = 0;
 	mutex_exit(&sc->sc_intr_lock);
 	xhci_rt_ring_pending(sc, xs);
+	return;
+
+failed:
+	mutex_enter(&sc->sc_intr_lock);
+	xs->xs_suspended = true;
+	xs->xs_resuming = false;
+	xs->xs_rt_want = 2; /* Retry at the next scan, without a busy loop. */
+	sc->sc_rt_failed++;
+	mutex_exit(&sc->sc_intr_lock);
 }
 
 static void
@@ -1713,12 +2189,24 @@ xhci_rt_task(void *arg)
 	if (xs->xs_dev == NULL)
 		return;
 	sc = XHCI_BUS2SC(xs->xs_dev->ud_bus);
+	mutex_enter(&sc->sc_intr_lock);
+	if (!xs->xs_rt_init || sc->sc_rt_paused || sc->sc_dying ||
+	    xs->xs_rt_owner != NULL) {
+		mutex_exit(&sc->sc_intr_lock);
+		return;
+	}
+	xs->xs_rt_owner = curlwp;
 	want = xs->xs_rt_want;
 	xs->xs_rt_want = 0;
+	mutex_exit(&sc->sc_intr_lock);
 	if (want == 2 || xs->xs_resuming)
 		xhci_rt_resume_dev(sc, xs);
 	else if (want == 1)
 		xhci_rt_suspend_dev(sc, xs);
+	mutex_enter(&sc->sc_intr_lock);
+	xs->xs_rt_owner = NULL;
+	cv_broadcast(&sc->sc_rt_cv);
+	mutex_exit(&sc->sc_intr_lock);
 }
 
 /* Pipe open on a sleeping device (process context): wake it first. */
@@ -1728,12 +2216,27 @@ xhci_rt_wake_for_open(struct xhci_softc *sc, struct xhci_slot *xs)
 	bool need;
 
 	mutex_enter(&sc->sc_intr_lock);
-	need = xs->xs_suspended && !xs->xs_resuming;
-	if (need)
+	/* The PMF resume callback may open a pipe on this same thread. */
+	while (xs->xs_rt_owner != NULL && xs->xs_rt_owner != curlwp &&
+	    xs->xs_rt_init && !sc->sc_rt_paused)
+		cv_wait(&sc->sc_rt_cv, &sc->sc_intr_lock);
+	need = xs->xs_rt_init && !sc->sc_rt_paused &&
+	    xs->xs_rt_owner == NULL && xs->xs_suspended;
+	if (need) {
 		xs->xs_resuming = true;
+		xs->xs_rt_owner = curlwp;
+		sc->sc_rt_openers++;
+	}
 	mutex_exit(&sc->sc_intr_lock);
-	if (need)
+	if (need) {
 		xhci_rt_resume_dev(sc, xs);
+		mutex_enter(&sc->sc_intr_lock);
+		KASSERT(sc->sc_rt_openers != 0);
+		sc->sc_rt_openers--;
+		xs->xs_rt_owner = NULL;
+		cv_broadcast(&sc->sc_rt_cv);
+		mutex_exit(&sc->sc_intr_lock);
+	}
 }
 
 /* softint: the idle scan */
@@ -1744,25 +2247,37 @@ xhci_rt_callout(void *arg)
 	struct xhci_slot *xs;
 	int i, idle;
 
-	if (sc->sc_dying)
+	mutex_enter(&sc->sc_intr_lock);
+	if (sc->sc_dying || sc->sc_rt_paused) {
+		mutex_exit(&sc->sc_intr_lock);
 		return;
-	if (xhci_rt_enabled() && sc->sc_suspender == NULL) {
-		idle = hz * xhci_autosuspend;
-		for (i = 1; i <= sc->sc_maxslots; i++) {
-			xs = &sc->sc_slots[i];
-			if (xs->xs_idx == 0 || !xs->xs_rt_init ||
-			    xs->xs_dev == NULL || xs->xs_ctlrport == 0 ||
-			    xs->xs_suspended || xs->xs_resuming ||
-			    xs->xs_npipes != 0 ||
-			    getticks() - xs->xs_lastbusy < idle)
-				continue;
-			if (!xhci_autosuspend_hid && xhci_rt_has_hid(xs->xs_dev))
-				continue;
-			xhci_rt_kick(sc, xs, 1);
-		}
 	}
-	callout_schedule(&sc->sc_rt_callout,
-	    hz * (xhci_autosuspend > 0 ? xhci_autosuspend : 5));
+	idle = hz * xhci_autosuspend;
+	for (i = 1; i <= sc->sc_maxslots; i++) {
+		int want;
+
+		xs = &sc->sc_slots[i];
+		if (xs->xs_idx == 0 || !xs->xs_rt_init ||
+		    xs->xs_dev == NULL || xs->xs_ctlrport == 0 ||
+		    xs->xs_rt_owner != NULL || xs->xs_resuming)
+			continue;
+		/* Retry failed unparks and wakes, even with autosuspend disabled. */
+		if (xs->xs_rt_want == 2 ||
+		    (xs->xs_parked_drv && !xs->xs_suspended) ||
+		    (xs->xs_suspended && xs->xs_dbpending != 0))
+			want = 2;
+		else if (xhci_rt_enabled() && !xs->xs_suspended &&
+		    getticks() - xs->xs_lastbusy >= idle)
+			want = 1; /* Check driver eligibility in process context. */
+		else
+			continue;
+		xs->xs_rt_want = MAX(xs->xs_rt_want, want);
+		usb_add_task(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC);
+	}
+	if (!sc->sc_rt_paused && !sc->sc_dying)
+		callout_schedule(&sc->sc_rt_callout,
+		    hz * (xhci_autosuspend > 0 ? xhci_autosuspend : 5));
+	mutex_exit(&sc->sc_intr_lock);
 }
 
 /* A port status change: a remote wakeup of a sleeping device? */
@@ -1773,6 +2288,12 @@ xhci_rt_portchange(struct xhci_softc *sc, u_int ctlrport)
 	uint32_t v;
 	int i;
 
+	mutex_enter(&sc->sc_intr_lock);
+	if (sc->sc_rt_paused) {
+		mutex_exit(&sc->sc_intr_lock);
+		return;
+	}
+	mutex_exit(&sc->sc_intr_lock);
 	for (i = 1; i <= sc->sc_maxslots; i++) {
 		xs = &sc->sc_slots[i];
 		if (xs->xs_idx == 0 || !xs->xs_rt_init ||
@@ -1840,12 +2361,76 @@ SYSCTL_SETUP(sysctl_hw_usbpm_setup, "hw.usbpm")
 	    sysctl_hw_usbpm_stats, 0, NULL, 128, CTL_CREATE, CTL_EOL);
 }
 
+/*
+ * Program a reset controller using attach-time allocations.  No device
+ * contexts may be live.  On reuse, the caller has stopped DMA with HCRST and
+ * holds sc_lock; sc_state_lost also excludes stale soft interrupt work.
+ */
+static void
+xhci_init_hw(struct xhci_softc *sc, bool reuse)
+{
+	struct xhci_erste *erst = KERNADDR(&sc->sc_eventst_dma, 0);
+	uint64_t *dcbaa = KERNADDR(&sc->sc_dcbaa_dma, 0);
+	size_t dcbaasz = (sc->sc_maxslots + 1) * sizeof(*dcbaa);
+
+	if (reuse) {
+		usb_syncmem(&sc->sc_cr->xr_dma, 0,
+		    sc->sc_cr->xr_ntrb * XHCI_TRB_SIZE, BUS_DMASYNC_POSTWRITE);
+		usb_syncmem(&sc->sc_er->xr_dma, 0,
+		    sc->sc_er->xr_ntrb * XHCI_TRB_SIZE,
+		    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+		usb_syncmem(&sc->sc_dcbaa_dma, 0, dcbaasz, BUS_DMASYNC_POSTWRITE);
+		usb_syncmem(&sc->sc_eventst_dma, 0,
+		    XHCI_ERSTE_SIZE * XHCI_EVENT_RING_SEGMENTS,
+		    BUS_DMASYNC_POSTWRITE);
+	}
+	xhci_host_dequeue(sc->sc_cr);
+	xhci_host_dequeue(sc->sc_er);
+	sc->sc_cr->is_halted = sc->sc_er->is_halted = false;
+	usb_syncmem(&sc->sc_er->xr_dma, 0,
+	    sc->sc_er->xr_ntrb * XHCI_TRB_SIZE, BUS_DMASYNC_PREREAD);
+
+	/* CSS scratchpads are not valid state after cold power loss. */
+	for (int i = 0; i < sc->sc_maxspbuf; i++) {
+		usb_dma_t *dma = &sc->sc_spbuf_dma[i];
+		if (reuse)
+			usb_syncmem(dma, 0, sc->sc_pgsz,
+			    BUS_DMASYNC_POSTREAD | BUS_DMASYNC_POSTWRITE);
+		memset(KERNADDR(dma, 0), 0, sc->sc_pgsz);
+		usb_syncmem(dma, 0, sc->sc_pgsz,
+		    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
+	}
+	memset(dcbaa, 0, dcbaasz);
+	if (sc->sc_maxspbuf != 0)
+		dcbaa[0] = htole64(DMAADDR(&sc->sc_spbufarray_dma, 0));
+	usb_syncmem(&sc->sc_dcbaa_dma, 0, dcbaasz, BUS_DMASYNC_PREWRITE);
+
+	erst[0].erste_0 = htole64(xhci_ring_trbp(sc->sc_er, 0));
+	erst[0].erste_2 = htole32(sc->sc_er->xr_ntrb);
+	erst[0].erste_3 = 0;
+	usb_syncmem(&sc->sc_eventst_dma, 0,
+	    XHCI_ERSTE_SIZE * XHCI_EVENT_RING_SEGMENTS, BUS_DMASYNC_PREWRITE);
+
+	xhci_op_write_4(sc, XHCI_DNCTRL, 0);
+	xhci_op_write_8(sc, XHCI_DCBAAP, DMAADDR(&sc->sc_dcbaa_dma, 0));
+	xhci_op_write_4(sc, XHCI_CONFIG,
+	    (xhci_op_read_4(sc, XHCI_CONFIG) & ~0xffU) |
+	    (sc->sc_maxslots & 0xff));
+	xhci_op_write_8(sc, XHCI_CRCR, xhci_ring_trbp(sc->sc_cr, 0) |
+	    sc->sc_cr->xr_cs);
+	xhci_rt_write_4(sc, XHCI_ERSTSZ(0), XHCI_EVENT_RING_SEGMENTS);
+	xhci_rt_write_8(sc, XHCI_ERSTBA(0), DMAADDR(&sc->sc_eventst_dma, 0));
+	xhci_rt_write_8(sc, XHCI_ERDP(0), xhci_ring_trbp(sc->sc_er, 0) |
+	    XHCI_ERDP_BUSY);
+	/* xhci_start supplies IMAN, IMOD and USBCMD, including deferred attach. */
+}
+
 int
 xhci_init(struct xhci_softc *sc)
 {
 	bus_size_t bsz;
 	uint32_t hcs1, hcs2, hcs3, dboff, rtsoff;
-	uint32_t pagesize, config;
+	uint32_t pagesize;
 	int i = 0;
 	uint16_t hciversion;
 	uint8_t caplength;
@@ -1867,6 +2452,8 @@ xhci_init(struct xhci_softc *sc)
 
 	caplength = xhci_read_1(sc, XHCI_CAPLENGTH);
 	hciversion = xhci_read_2(sc, XHCI_HCIVERSION);
+	sc->sc_caplength = caplength;
+	sc->sc_hciversion = hciversion;
 
 	if (hciversion < XHCI_HCIVERSION_0_96 ||
 	    hciversion >= 0x0200) {
@@ -1935,6 +2522,7 @@ xhci_init(struct xhci_softc *sc)
 	}
 
 	dboff = xhci_cap_read_4(sc, XHCI_DBOFF);
+	sc->sc_dboff = dboff;
 	if (bus_space_subregion(sc->sc_iot, sc->sc_ioh, dboff,
 	    sc->sc_maxslots * 4, &sc->sc_dbh) != 0) {
 		aprint_error_dev(sc->sc_dev, "doorbell subregion failure\n");
@@ -1942,6 +2530,7 @@ xhci_init(struct xhci_softc *sc)
 	}
 
 	rtsoff = xhci_cap_read_4(sc, XHCI_RTSOFF);
+	sc->sc_rtsoff = rtsoff;
 	if (bus_space_subregion(sc->sc_iot, sc->sc_ioh, rtsoff,
 	    sc->sc_maxintrs * 0x20, &sc->sc_rbh) != 0) {
 		aprint_error_dev(sc->sc_dev, "runtime subregion failure\n");
@@ -2006,11 +2595,6 @@ xhci_init(struct xhci_softc *sc)
 		    sizeof(uint64_t) * sc->sc_maxspbuf, BUS_DMASYNC_PREWRITE);
 	}
 
-	config = xhci_op_read_4(sc, XHCI_CONFIG);
-	config &= ~0xFF;
-	config |= sc->sc_maxslots & 0xFF;
-	xhci_op_write_4(sc, XHCI_CONFIG, config);
-
 	err = xhci_ring_init(sc, &sc->sc_cr, XHCI_COMMAND_RING_TRBS,
 	    XHCI_COMMAND_RING_SEGMENTS_ALIGN);
 	if (err) {
@@ -2068,15 +2652,6 @@ xhci_init(struct xhci_softc *sc)
 	    KERNADDR(&sc->sc_dcbaa_dma, 0),
 	    sc->sc_dcbaa_dma.udma_block->size);
 
-	if (sc->sc_maxspbuf != 0) {
-		/*
-		 * DCBA entry 0 hold the scratchbuf array pointer.
-		 */
-		*(uint64_t *)KERNADDR(dma, 0) =
-		    htole64(DMAADDR(&sc->sc_spbufarray_dma, 0));
-		usb_syncmem(dma, 0, size, BUS_DMASYNC_PREWRITE);
-	}
-
 	/*
 	 * LispBSD: slot ids are 1..sc_maxslots and the runtime PM scans
 	 * walk that whole range, so keep sc_maxslots + 1 entries (one past
@@ -2088,7 +2663,6 @@ xhci_init(struct xhci_softc *sc)
 	/* LispBSD USB runtime power management: the idle scan */
 	callout_init(&sc->sc_rt_callout, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 	callout_setfunc(&sc->sc_rt_callout, xhci_rt_callout, sc);
-	callout_schedule(&sc->sc_rt_callout, hz * 5);
 	if (sc->sc_slots == NULL) {
 		aprint_error_dev(sc->sc_dev, "slots init fail, err %d\n", err);
 		rv = ENOMEM;
@@ -2106,29 +2680,12 @@ xhci_init(struct xhci_softc *sc)
 
 	cv_init(&sc->sc_command_cv, "xhcicmd");
 	cv_init(&sc->sc_cmdbusy_cv, "xhcicmdq");
+	cv_init(&sc->sc_rt_cv, "xhcirt");
 	mutex_init(&sc->sc_rhlock, MUTEX_DEFAULT, IPL_NONE);
 	mutex_init(&sc->sc_lock, MUTEX_DEFAULT, IPL_SOFTUSB);
 	mutex_init(&sc->sc_intr_lock, MUTEX_DEFAULT, IPL_USB);
 
-	struct xhci_erste *erst;
-	erst = KERNADDR(&sc->sc_eventst_dma, 0);
-	erst[0].erste_0 = htole64(xhci_ring_trbp(sc->sc_er, 0));
-	erst[0].erste_2 = htole32(sc->sc_er->xr_ntrb);
-	erst[0].erste_3 = htole32(0);
-	usb_syncmem(&sc->sc_eventst_dma, 0,
-	    XHCI_ERSTE_SIZE * XHCI_EVENT_RING_SEGMENTS, BUS_DMASYNC_PREWRITE);
-
-	xhci_rt_write_4(sc, XHCI_ERSTSZ(0), XHCI_EVENT_RING_SEGMENTS);
-	xhci_rt_write_8(sc, XHCI_ERSTBA(0), DMAADDR(&sc->sc_eventst_dma, 0));
-	xhci_rt_write_8(sc, XHCI_ERDP(0), xhci_ring_trbp(sc->sc_er, 0) |
-	    XHCI_ERDP_BUSY);
-
-	xhci_op_write_8(sc, XHCI_DCBAAP, DMAADDR(&sc->sc_dcbaa_dma, 0));
-	xhci_op_write_8(sc, XHCI_CRCR, xhci_ring_trbp(sc->sc_cr, 0) |
-	    sc->sc_cr->xr_cs);
-
-	HEXDUMP("eventst", KERNADDR(&sc->sc_eventst_dma, 0),
-	    XHCI_ERSTE_SIZE * XHCI_EVENT_RING_SEGMENTS);
+	xhci_init_hw(sc, false);
 
 	if ((sc->sc_quirks & XHCI_DEFERRED_START) == 0)
 		xhci_start(sc);
@@ -2182,7 +2739,8 @@ xhci_intr(void *v)
 
 	mutex_spin_enter(&sc->sc_intr_lock);
 
-	if (sc->sc_dying || !device_has_power(sc->sc_dev))
+	if (sc->sc_dying || sc->sc_resume_failed ||
+	    !device_has_power(sc->sc_dev))
 		goto done;
 
 	/* If we get an interrupt while polling, then just ignore it. */
@@ -2539,6 +3097,8 @@ xhci_open(struct usbd_pipe *pipe)
 	KASSERT(xs != NULL);
 	xhci_rt_bind(sc, xs, dev);
 	xhci_rt_wake_for_open(sc, xs);
+	if (!xs->xs_rt_init)
+		return USBD_IOERROR;
 
 	switch (xfertype) {
 	case UE_CONTROL:
@@ -3162,6 +3722,10 @@ xhci_softintr(void *v)
 	XHCIHIST_FUNC();
 
 	KASSERT(xhci_polling_p(sc) || mutex_owned(&sc->sc_lock));
+
+	/* Old event TRBs cannot be interpreted after the hardware lost slots. */
+	if (sc->sc_state_lost || sc->sc_resume_failed)
+		return;
 
 	i = er->xr_ep;
 	j = er->xr_cs;
@@ -4819,9 +5383,15 @@ xhci_roothub_ctrl(struct usbd_bus *bus, usb_device_request_t *req,
 {
 	struct xhci_softc *sc = XHCI_BUS2SC(bus);
 	int actlen;
+	bool blocked;
 
 	mutex_enter(&sc->sc_rhlock);
-	actlen = xhci_roothub_ctrl_locked(bus, req, buf, buflen);
+	if (!xhci_polling_p(sc))
+		mutex_enter(&sc->sc_lock);
+	blocked = sc->sc_suspender != NULL || sc->sc_resume_failed;
+	if (!xhci_polling_p(sc))
+		mutex_exit(&sc->sc_lock);
+	actlen = blocked ? -1 : xhci_roothub_ctrl_locked(bus, req, buf, buflen);
 	mutex_exit(&sc->sc_rhlock);
 
 	return actlen;

@@ -1,0 +1,154 @@
+#+title: Draft: xHCI power-loss resume and ubt runtime parking
+
+* Scope
+
+2026-10-15 draft for kernel 165. Copy =kernel/dev/usb/xhci.c=,
+=kernel/dev/usb/xhcivar.h= and =kernel/dev/usb/ubt.c= into the NetBSD tree.
+Verification here is source review against NetBSD-11 PMF/USB APIs and
+=git diff --check=. No kernel or host test binary was built; laptop
+validation is pending.
+
+Cold recovery requires no allocated slots, runtime parking ownership or
+downstream USB devices on either bus. The first target is empty external
+TCSS xhci0. Populated PCH xhci1 cold recovery is a later stage. This patch
+also enables ubt runtime parking on a powered controller, including warm
+system suspend/resume. ACPI power policy and the =usb= script are separate.
+
+* Detect and restart an empty controller
+
+=xhci_resume_check()= runs before resume writes an operational register.
+PCI must already have restored BARs, command and interrupt configuration
+through its PMF bus-resume callback. The probe rejects inaccessible MMIO,
+checks the attach-time layout and waits for USBSTS.CNR to clear. A mismatch
+between live DCBAAP, CONFIG or ERSTBA and the suspend snapshot, or a fatal
+controller status, requires cold recovery instead of CRS. =sc_state_lost=
+is sticky until success, including after a partially programmed restart.
+
+Register offsets, slot/interrupter/port and scratchpad counts, context
+capabilities and HCIVERSION must match. The reported 1.20 -> 1.10 version
+change is deliberately rejected in this draft: use detach/reattach to
+rebuild mappings and descriptors. Capture before/after capabilities before
+considering a relaxed compatibility check.
+
+=xhci_init()= owns allocations, mappings, locks, CVs, slots and callouts.
+After HCRST and the vendor hook, =xhci_init_hw()= reuses those allocations:
+
+1. Clear command/event rings and cookies; reset indices, cycle states and
+   halted flags. Synchronise DMA memory and event-ring read ownership.
+2. Clear scratchpads and DCBAA slot entries; restore the scratchpad-array
+   pointer in DCBAA[0] and rebuild the event segment table.
+3. Program DNCTRL, DCBAAP, CONFIG, CRCR, ERSTSZ, ERSTBA and ERDP.
+4. Use =xhci_start()= for IMAN, IMOD and Run/Stop; wait for HCH to clear and
+   check fatal status. Reset itself now waits for HCH before HCRST.
+5. Power ports without acknowledging pending change bits and wait for
+   power to settle.
+
+* Root hubs and PMF ordering
+
+Retain the software USB buses and root hubs. After successful cold restart,
+mark every root-hub port =up_reattach= and call =usb_needs_explore()= without
+=sc_lock= or =sc_rhlock=. The normal USB event thread then checks each port,
+including connections made while power was off. An exploration request
+alone would not pass =uhub_explore()='s port-change/reattach filter.
+
+Relevant NetBSD-11 contracts:
+
+- =pmf_device_resume()= holds the device PMF lock. Its locked implementation
+  resumes bus, driver, then class.
+- =usb_attach()= and =uhub_attach()= register NULL PMF callbacks, so there is
+  no automatic resume rescan to rely on.
+- =usb_discover()= enters with KERNEL_LOCK and the bus lock, then drops the
+  bus lock for hub exploration. =uhub_explore()= requires the USB event
+  thread. =usb_needs_explore()= acquires the bus lock itself.
+- =usb_disconnect_port()= performs driver detach and device teardown;
+  =usb_detach()= also joins its event thread. These paths may need root
+  control requests and HCD commands. They cannot safely run behind the
+  resume locks and command gate used here.
+- =deviter_init()/device_exists_at()= use a generation snapshot. Attach and
+  detach during iteration are permitted, but replacement devices are outside
+  that snapshot and removed devices can still belong to it.
+
+No child detach/reattach occurs inside the PMF callback. Queuing work under
+KERNEL_LOCK does not establish a barrier after the entire ACPI resume walk:
+sleeping may release that lock.
+
+* Runtime parking
+
+The idle policy accepts zero non-control pipes, or open pipes belonging
+only to active, PMF-registered ubt children. Require at least one child for
+that opt-in. HID policy and the direct-root-port restriction also apply.
+The callout queues candidates; inspect descriptors and subdevices in the
+non-MPSAFE USB task under KERNEL_LOCK, not in softint context.
+
+For open-pipe parking, require remote-wakeup capability and successful
+SET_FEATURE. Suspend the drivers through =PMF_Q_SELF= before requesting U3.
+Track the attempted child prefix, including a failed suspend that may have
+installed a suspensor, so rollback owns exactly those PMF requests. Recheck
+activity and runtime admission after callbacks. Rearm inbound pipes only
+after confirming an enabled, connected U0 link.
+
+Defer endpoint doorbells throughout parking and wake. Restore U0, resume
+the parked drivers to queue inbound reads, then release pending doorbells.
+Retain failed PMF resumes and deferred I/O for the next idle-scan retry,
+even with autosuspend disabled. Serialize runtime tasks and synchronous
+wake-for-open with a per-slot owner; permit recursive pipe opens by the
+PMF resume callback on that same thread. The ubt event-pipe reopen preserves
+its parked state on failure and retries with a NULL pipe pointer. Disabling
+ubt clears its parked flag before a later enable cycle.
+
+Before system suspend installs =sc_suspender=, pause runtime admission,
+halt the callout, remove queued reruns, join executing tasks and drain
+synchronous wake-for-open operations. Wait without either xHCI sleep lock
+while commands needed by existing runtime work can complete. Unbinding a
+slot likewise closes task admission and removes a rerun before joining.
+
+After successful warm resume, replay pending doorbells for ordinary slots.
+For runtime-parked drivers, which system PMF suspend skipped as inactive,
+queue resume work and keep I/O deferred until their inbound reads are queued.
+Cold recovery has no owned slots to replay. Both slot walks include IDs 1
+through =sc_maxslots=.
+
+A failed resume preserves the snapshot and cold-recovery requirement, gates
+interrupts/root requests/doorbells and leaves runtime admission paused.
+A failed suspend reopens runtime admission, but retains the pre-existing
+=sc_suspendresume_failed= command-error policy. This is not a complete
+suspend rollback: PMF does not call driver resume after failed driver
+suspend. The separate =sc_resume_failed= flag avoids extending that legacy
+command failure into a new blanket traffic gate on suspend failure.
+
+* Populated cold recovery design
+
+For a later stage, retain the root hubs and retire downstream devices through
+their event-thread lifecycle. Add an explicit post-PMF handoff after
+=deviter_release()=; an ordinary USB task queued by =xhci_resume()= does not
+establish that ordering. Prevent old child resume callbacks from touching
+invalid slots while that handoff is pending.
+
+Block new I/O, join runtime and endpoint-restart tasks, cancel outstanding
+transfers in software and make close/abort/free paths avoid hardware commands
+against reset slots. Then detach downstream devices, free their rings and
+contexts, reinitialise the controller and enumerate current connections.
+Replacing whole USB buses instead would additionally require joining event
+threads and soft interrupts, releasing root transfers and arranging PMF for
+the replacement devices.
+
+* Laptop validation
+
+1. Build kernel 165 with all three source files. With Bluetooth up and idle,
+   compare =hw.usbpm.stats=, power and PC10 before/after parking. Exercise an
+   outbound command, inbound remote wake, repeated idle cycles and radio
+   down/up. Check that inbound event/ACL traffic resumes.
+2. Freeze/resume with ubt already runtime-parked and again while active.
+   Exercise traffic immediately after wake and check failure counters.
+3. Start with xhci0 empty. Retain the attached controller, suspend its driver,
+   remove TCSS power, restore power/PCI configuration and resume through PMF.
+   Expect =controller state lost= and =cold resume: empty controller restarted=,
+   without CRS. Record dmesg and capability registers.
+4. Repeat warm/cold cycles, USB2/USB3 hotplug after recovery and a connection
+   made during the cold interval. Compare residency with the known
+   suspend/detach TCSS sequence.
+
+Use ADRPWR_COLD without ADRPWR_NODRIVER for TXHC only in that empty-controller
+experiment. A refusal after power loss cannot protect an already-powered-down
+device. General policy needs pre-power-cut eligibility or populated recovery.
+Retain the detach/rescan script path until laptop tests establish the new path.
