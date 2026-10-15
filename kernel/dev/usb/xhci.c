@@ -1944,11 +1944,21 @@ xhci_rt_parkable(struct usbd_device *dev)
 			continue;
 		/* ubt registers its park/unpark pmf handlers at attach. */
 		if (!device_is_a(d, "ubt") || !device_is_active(d)) {
-			if (xhci_rt_debug)
+			if (xhci_rt_debug) {
 				printf("xhci: addr %d: subdevice %s active=%d "
-				    "dv_flags=0x%x\n", dev->ud_addr,
+				    "dv_flags=0x%x suspensors:", dev->ud_addr,
 				    device_xname(d), device_is_active(d),
 				    d->dv_flags);
+				for (int k = 0; k < DEVICE_SUSPENSORS_MAX; k++) {
+					if (d->dv_class_suspensors[k] != NULL)
+						printf(" class=%s", d->dv_class_suspensors[k]->ds_name);
+					if (d->dv_driver_suspensors[k] != NULL)
+						printf(" driver=%s", d->dv_driver_suspensors[k]->ds_name);
+					if (d->dv_bus_suspensors[k] != NULL)
+						printf(" bus=%s", d->dv_bus_suspensors[k]->ds_name);
+				}
+				printf("\n");
+			}
 			return false;
 		}
 		found = true;
