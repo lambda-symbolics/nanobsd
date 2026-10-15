@@ -1015,8 +1015,15 @@ xhci_resume_check(struct xhci_softc *sc)
 	hcs2 = xhci_cap_read_4(sc, XHCI_HCSPARAMS2);
 	/* the stock macro has no outer parentheses */
 	maxspbuf = XHCI_HCS2_MAXSPBUF(hcs2);
-	if (hciver != sc->sc_hciversion ||
-	    xhci_read_1(sc, XHCI_CAPLENGTH) != sc->sc_caplength ||
+	/*
+	 * LISPBSD: Tiger Lake's controllers report HCIVERSION 1.20 at attach
+	 * and 1.10 after any PCI D3hot -> D0 transition (no power loss
+	 * involved, kernel 165), so the version is informational here.
+	 */
+	if (hciver != sc->sc_hciversion)
+		aprint_debug_dev(sc->sc_dev, "resume: HCIVERSION %04x -> %04x\n",
+		    sc->sc_hciversion, hciver);
+	if (xhci_read_1(sc, XHCI_CAPLENGTH) != sc->sc_caplength ||
 	    xhci_cap_read_4(sc, XHCI_DBOFF) != sc->sc_dboff ||
 	    xhci_cap_read_4(sc, XHCI_RTSOFF) != sc->sc_rtsoff ||
 	    XHCI_HCS1_MAXSLOTS(hcs1) != sc->sc_maxslots ||
