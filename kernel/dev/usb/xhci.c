@@ -66,6 +66,7 @@ __KERNEL_RCSID(0, "$NetBSD: xhci.c,v 1.188.2.4 2026/07/05 07:37:09 martin Exp $"
 
 #include <dev/usb/xhcireg.h>
 #include <dev/usb/xhcivar.h>
+#include <sys/device_impl.h>	/* LISPBSD: dv_flags in the park diagnostics */
 #include <dev/usb/usbroothub.h>
 
 
@@ -1944,9 +1945,10 @@ xhci_rt_parkable(struct usbd_device *dev)
 		/* ubt registers its park/unpark pmf handlers at attach. */
 		if (!device_is_a(d, "ubt") || !device_is_active(d)) {
 			if (xhci_rt_debug)
-				printf("xhci: addr %d: subdevice %s active=%d\n",
-				    dev->ud_addr, device_xname(d),
-				    device_is_active(d));
+				printf("xhci: addr %d: subdevice %s active=%d "
+				    "dv_flags=0x%x\n", dev->ud_addr,
+				    device_xname(d), device_is_active(d),
+				    d->dv_flags);
 			return false;
 		}
 		found = true;
