@@ -27,6 +27,8 @@ extern struct lwp *curlwp;
 #define MNT_ASYNC 0x01
 #define MNT_WAIT 0x02
 #define SUSPEND_SUSPEND 1
+#define MUTEX_DEFAULT 0
+#define IPL_NONE 0
 #define SUSPEND_RESUME 2
 #define VFS_SUSPENDCTL(mp, action) fake_suspendctl((mp), (action))
 #define VFS_SYNC(mp, flags, cred) fake_sync((mp), (flags), (cred))
@@ -35,6 +37,8 @@ void *kmem_alloc(size_t, int);
 void kmem_free(void *, size_t);
 int fake_suspendctl(struct mount *, int);
 int fake_sync(struct mount *, int, void *);
+void mutex_init(kmutex_t *, int, int);
+void mutex_enter(kmutex_t *);
 int mutex_tryenter(kmutex_t *);
 void mutex_exit(kmutex_t *);
 int vfs_trybusy(struct mount *);
@@ -63,6 +67,6 @@ cat >"$tmp/sys/vfs_s2idle.h" <<EOF
 #include "$root/kernel/sys/vfs_s2idle.h"
 EOF
 
-cc -std=c11 -Wall -Wextra -Werror -D_KERNEL -I"$tmp" \
+${CC:-cc} -std=c11 -Wall -Wextra -Werror -pthread ${CFLAGS:-} -D_KERNEL -I"$tmp" \
     "$root/tests/s2idle-harness.c" -o "$tmp/s2idle-harness"
 "$tmp/s2idle-harness"

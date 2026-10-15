@@ -1,5 +1,8 @@
 #include <assert.h>
 #include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +15,8 @@
 struct fake_mutex {
 	int held;
 	int id;
+	/* Used only by the admission gate, not the mock updater locks. */
+	pthread_mutex_t native;
 };
 
 struct mount {
@@ -46,7 +51,7 @@ static int update_failure = -1;
 static int suspend_failure = -1;
 static int suspendctl_failure = -1;
 static int sync_failure = -1;
-static int global_held;
+static int fake_global_held;
 static int resume_count[MAX_MOUNTS];
 static int event_kind[MAX_EVENTS];
 static int event_mount[MAX_EVENTS];
@@ -62,8 +67,16 @@ fail(const char *what)
 }
 
 static void
+assert_mounts_excluded(void)
+{
+	if (vfs_s2idle_mount_enter() != EBUSY)
+		fail("mount operation admitted inside barrier");
+}
+
+static void
 record_event(int kind, int id)
 {
+	assert_mounts_excluded();
 	if (nevents == MAX_EVENTS)
 		fail("event log overflow");
 	event_kind[nevents] = kind;
@@ -101,6 +114,7 @@ kmem_free(void *ptr, size_t size)
 void
 mountlist_iterator_init(mount_iterator_t **ip)
 {
+	assert_mounts_excluded();
 	if (iterator_live)
 		fail("iterator initialized twice");
 	iterator_live = 1;
@@ -165,9 +179,31 @@ vfs_trybusy(struct mount *mp)
 void
 vfs_unbusy(struct mount *mp)
 {
+	assert_mounts_excluded();
 	if (mp->busy <= 0)
 		fail("busy hold rollback mismatch");
 	mp->busy--;
+}
+
+void
+mutex_init(struct fake_mutex *mtx, int type, int ipl)
+{
+	(void)type;
+	(void)ipl;
+	mtx->held = 0;
+	mtx->id = -2;
+	if (pthread_mutex_init(&mtx->native, NULL) != 0)
+		fail("pthread_mutex_init");
+}
+
+void
+mutex_enter(struct fake_mutex *mtx)
+{
+	if (pthread_mutex_lock(&mtx->native) != 0)
+		fail("pthread_mutex_lock");
+	if (mtx->held)
+		fail("recursive gate mutex acquisition");
+	mtx->held = 1;
 }
 
 int
@@ -185,6 +221,8 @@ mutex_exit(struct fake_mutex *mtx)
 	if (mtx == NULL || !mtx->held)
 		fail("mutex rollback mismatch");
 	mtx->held = 0;
+	if (mtx->id == -2 && pthread_mutex_unlock(&mtx->native) != 0)
+		fail("pthread_mutex_unlock");
 }
 
 int
@@ -213,24 +251,24 @@ fake_suspendctl(struct mount *mp, int action)
 int
 vfs_suspend(struct mount *mp, int nowait)
 {
-	if (!nowait || global_held)
+	if (!nowait || fake_global_held)
 		fail("suspend was not a nonblocking first admission");
 	if (mp->id == suspend_failure)
 		return EIO;
 	if (fake_suspendctl(mp, SUSPEND_SUSPEND) != 0)
 		return EIO;
-	global_held = 1;
+	fake_global_held = 1;
 	return 0;
 }
 
 void
 vfs_resume(struct mount *mp)
 {
-	if (!global_held)
+	if (!fake_global_held)
 		fail("global suspension lock was not held");
 	if (fake_suspendctl(mp, SUSPEND_RESUME) != 0)
 		fail("global resume failed");
-	global_held = 0;
+	fake_global_held = 0;
 }
 
 int
@@ -268,7 +306,7 @@ reset_case(size_t count)
 	iterator_skip = -1;
 	busy_failure = update_failure = suspend_failure = -1;
 	suspendctl_failure = sync_failure = -1;
-	global_held = 0;
+	fake_global_held = 0;
 	for (size_t i = 0; i < count; i++) {
 		mounts[i].id = (int)i;
 		mounts[i].mnt_updating = &mutexes[i];
@@ -294,7 +332,10 @@ assert_events(const int *kinds, const int *ids, size_t n)
 static void
 assert_clean(void)
 {
-	if (global_held || nallocations != 0 || iterator_live)
+	if (vfs_s2idle_owner != NULL || vfs_s2idle_mountops != 0 ||
+	    vfs_s2idle_lock.held)
+		fail("mount admission gate leaked");
+	if (fake_global_held || nallocations != 0 || iterator_live)
 		fail("session or allocation leaked");
 	for (size_t i = 0; i < nall_mounts; i++) {
 		if (all_mounts[i]->busy || all_mounts[i]->suspended ||
@@ -320,6 +361,7 @@ test_success(size_t count)
 		kinds[n] = EVENT_SYNC;
 		ids[n++] = (int)(count - i - 1);
 	}
+	assert_mounts_excluded();
 	vfs_resume_all(session, nsession);
 	for (size_t i = 0; i < count; i++) {
 		kinds[n] = EVENT_RESUME;
@@ -422,15 +464,106 @@ test_failures(void)
 	assert_clean();
 }
 
+static void
+test_mount_admission(void)
+{
+	struct vfs_s2idle_mount *session, *other;
+	size_t nsession, nother;
+
+	reset_case(3);
+	if (vfs_s2idle_mount_enter() != 0 || vfs_s2idle_mount_enter() != 0)
+		fail("nested mount operation rejected");
+	if (vfs_suspend_all(&session, &nsession) != EBUSY ||
+	    session != NULL || nsession != 0 || iterator_live || nevents != 0)
+		fail("active mount operation did not prevent barrier admission");
+	vfs_s2idle_mount_exit();
+	if (vfs_suspend_all(&session, &nsession) != EBUSY)
+		fail("outer mount operation lost its admission");
+	vfs_s2idle_mount_exit();
+	if (vfs_suspend_all(&session, &nsession) != 0)
+		fail("completed mount operation still prevents barrier");
+	assert_mounts_excluded();
+	if (vfs_suspend_all(&other, &nother) != EBUSY ||
+	    other != NULL || nother != 0)
+		fail("second barrier admitted");
+	assert_mounts_excluded();
+	vfs_resume_all(session, nsession);
+	if (vfs_s2idle_mount_enter() != 0)
+		fail("mount operation rejected after resume");
+	vfs_s2idle_mount_exit();
+	assert_clean();
+}
+
+static atomic_bool mount_inside;
+
+static void *
+mount_racer(void *arg)
+{
+	(void)arg;
+	for (unsigned i = 0; i < 4000; i++) {
+		int error = vfs_s2idle_mount_enter();
+		if (error == EBUSY) {
+			sched_yield();
+			continue;
+		}
+		if (error != 0)
+			fail("concurrent mount admission error");
+		atomic_store(&mount_inside, true);
+		sched_yield();
+		atomic_store(&mount_inside, false);
+		vfs_s2idle_mount_exit();
+	}
+	return NULL;
+}
+
+static void
+test_concurrent_admission(void)
+{
+	pthread_t thread;
+	struct vfs_s2idle_mount *session;
+	size_t nsession;
+
+	reset_case(0);
+	if (pthread_create(&thread, NULL, mount_racer, NULL) != 0)
+		fail("pthread_create");
+	for (unsigned i = 0; i < 4000; i++) {
+		int error = vfs_suspend_all(&session, &nsession);
+		if (error == EBUSY) {
+			sched_yield();
+			continue;
+		}
+		if (error != 0 || atomic_load(&mount_inside))
+			fail("barrier overlaps a mount operation");
+		sched_yield();
+		if (atomic_load(&mount_inside))
+			fail("mount entered after barrier admission");
+		vfs_resume_all(session, nsession);
+	}
+	if (pthread_join(thread, NULL) != 0)
+		fail("pthread_join");
+	assert_clean();
+}
+
 int
 main(void)
 {
+	struct vfs_s2idle_mount *session;
+	size_t nsession;
+
+	if (vfs_suspend_all(&session, &nsession) != ENXIO ||
+	    session != NULL || nsession != 0 ||
+	    vfs_s2idle_mount_enter() != ENXIO)
+		fail("uninitialized admission hooks accepted");
+	vfs_s2idle_init();
+	test_success(0);
+	test_mount_admission();
 	test_success(1);
 	test_success(3);
 	test_success(17);
 	test_duplicate_lower();
 	test_backing_alias();
 	test_failures();
+	test_concurrent_admission();
 	puts("s2idle behavioral protocol checks passed");
 	return 0;
 }

@@ -10,7 +10,118 @@
  void	mountlist_remove(struct mount *);
 --- kern/vfs_mount.c.orig
 +++ kern/vfs_mount.c
-@@ -1608,12 +1608,15 @@
+@@ -86,6 +86,7 @@
+ #include <sys/kmem.h>
+ #include <sys/module.h>
+ #include <sys/mount.h>
++#include <sys/vfs_s2idle.h>
+ #include <sys/namei.h>
+ #include <sys/sdt.h>
+ #include <sys/syscallargs.h>
+@@ -146,6 +147,7 @@
+ 	mount_specificdata_domain = specificdata_domain_create();
+ 	mutex_init(&mntid_lock, MUTEX_DEFAULT, IPL_NONE);
+ 	mutex_init(&mountgen_lock, MUTEX_DEFAULT, IPL_NONE);
++	vfs_s2idle_init();
+ 	mountgen = 0;
+ }
+ 
+@@ -798,8 +800,8 @@
+ 	return error;
+ }
+ 
+-int
+-mount_domount(struct lwp *l, vnode_t **vpp, struct vfsops *vfsops,
++static int
++mount_domount_inner(struct lwp *l, vnode_t **vpp, struct vfsops *vfsops,
+     const char *path, int flags, void *data, size_t *data_len)
+ {
+ 	vnode_t *vp = *vpp;
+@@ -929,14 +931,30 @@
+ 	return error;
+ }
+ 
++int
++mount_domount(struct lwp *l, vnode_t **vpp, struct vfsops *vfsops,
++    const char *path, int flags, void *data, size_t *data_len)
++{
++	int error;
++
++	error = vfs_s2idle_mount_enter();
++	if (error != 0) {
++		vfs_delref(vfsops);
++		return error;
++	}
++	error = mount_domount_inner(l, vpp, vfsops, path, flags, data, data_len);
++	vfs_s2idle_mount_exit();
++	return error;
++}
++
+ /*
+  * Do the actual file system unmount.  File system is assumed to have
+  * been locked by the caller.
+  *
+  * => Caller hold reference to the mount, explicitly for dounmount().
+  */
+-int
+-dounmount(struct mount *mp, int flags, struct lwp *l)
++static int
++dounmount_inner(struct mount *mp, int flags, struct lwp *l)
+ {
+ 	struct vnode *coveredvp, *vp;
+ 	struct vnode_impl *vip;
+@@ -1026,6 +1044,19 @@
+ 	return (0);
+ }
+ 
++int
++dounmount(struct mount *mp, int flags, struct lwp *l)
++{
++	int error;
++
++	error = vfs_s2idle_mount_enter();
++	if (error != 0)
++		return error;
++	error = dounmount_inner(mp, flags, l);
++	vfs_s2idle_mount_exit();
++	return error;
++}
++
+ /*
+  * Unmount all file systems.
+  * We traverse the list in reverse order under the assumption that doing so
+@@ -1233,8 +1264,8 @@
+  * file system to use, try all possible file systems until one
+  * succeeds.
+  */
+-int
+-vfs_mountroot(void)
++static int
++vfs_mountroot_inner(void)
+ {
+ 	struct vfsops *v;
+ 	int error = ENODEV;
+@@ -1370,6 +1401,19 @@
+ 	return (error);
+ }
+ 
++int
++vfs_mountroot(void)
++{
++	int error;
++
++	error = vfs_s2idle_mount_enter();
++	if (error != 0)
++		return error;
++	error = vfs_mountroot_inner();
++	vfs_s2idle_mount_exit();
++	return error;
++}
++
+ /*
+  * mount_specific_key_create --
+  *	Create a key for subsystem mount-specific data.
+@@ -1608,12 +1652,15 @@
   * Mark it busy on success.
   */
  static inline struct mount *
@@ -27,7 +138,7 @@
  	if (marker->me_mount != NULL) {
  		vfs_unbusy(marker->me_mount);
  		marker->me_mount = NULL;
-@@ -1653,6 +1656,8 @@
+@@ -1653,6 +1700,8 @@
  			return mp;
  		}
  		vfs_rele(mp);
@@ -36,7 +147,7 @@
  		mutex_enter(&mountlist_lock);
  	}
  }
-@@ -1661,14 +1666,22 @@
+@@ -1661,14 +1710,22 @@
  mountlist_iterator_next(mount_iterator_t *mi)
  {
  
@@ -61,3 +172,43 @@
  }
  
  /*
+--- kern/vfs_syscalls.c.orig
++++ kern/vfs_syscalls.c
+@@ -99,6 +99,7 @@
+ #include <sys/ktrace.h>
+ #include <sys/module.h>
+ #include <sys/mount.h>
++#include <sys/vfs_s2idle.h>
+ #include <sys/namei.h>
+ #include <sys/proc.h>
+ #include <sys/quota.h>
+@@ -336,7 +337,7 @@
+ }
+ 
+ static int
+-mount_update(struct lwp *l, struct vnode *vp, const char *path, int flags,
++mount_update_inner(struct lwp *l, struct vnode *vp, const char *path, int flags,
+     void *data, size_t *data_len)
+ {
+ 	struct mount *mp;
+@@ -460,6 +461,20 @@
+ }
+ 
+ static int
++mount_update(struct lwp *l, struct vnode *vp, const char *path, int flags,
++    void *data, size_t *data_len)
++{
++	int error;
++
++	error = vfs_s2idle_mount_enter();
++	if (error != 0)
++		return error;
++	error = mount_update_inner(l, vp, path, flags, data, data_len);
++	vfs_s2idle_mount_exit();
++	return error;
++}
++
++static int
+ mount_get_vfsops(const char *fstype, enum uio_seg type_seg,
+     struct vfsops **vfsops)
+ {

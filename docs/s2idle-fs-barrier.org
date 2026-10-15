@@ -2,16 +2,23 @@
 
 * Contract
 
-=acpi_enter_freeze()= requests userspace suspension, then verifies that every
-other non-system LWP has reached =LSSUSPENDED= or exited. In-flight syscalls
-or newly created LWPs cause an =EBUSY= abort and thaw, before storage suspend.
-It then calls =vfs_suspend_all()=. The helper takes a
-nonblocking iterator pass over the live mount list.  The base VFS iterator
-extension in =kernel/kern/vfs_mount_s2idle.patch= reports mounts that its
-try-busy operation skipped; any such skip aborts the session rather than
-silently producing a partial barrier.  Each admitted mount receives an
-additional busy hold, and =mnt_updating= is try-locked before fstrans state is
-changed.
+=acpi_enter_freeze()= requests userspace suspension, then calls
+=vfs_suspend_all()=. Admission depends on VFS activity, not LWP sleep states.
+An idle LWP in =kevent=, =poll= or =select= can re-sleep after a suspension
+request without reaching =userret=; it need not acknowledge suspension for
+VFS to exclude its later filesystem transactions.
+
+A mutex-protected admission counter covers complete mount, update, unmount
+and mountroot operations. The barrier returns =EBUSY= if any such operation
+is active. Otherwise it excludes new operations before enumerating mounts,
+through filesystem resume and release of mount references. Nested operations
+count separately. Operations attempted during the barrier return =EBUSY=;
+no admission mutex is held across a filesystem callback.
+
+The base patch adds the mount-operation hooks and an iterator extension that
+reports mounts skipped by try-busy. Any skipped mount aborts the session.
+Each admitted mount receives an additional busy hold, and =mnt_updating= is
+try-locked before fstrans state is changed.
 
 The helper uses one try-locking =vfs_suspend()= call to acquire NetBSD's
 non-recursive global suspension lock, then invokes
@@ -29,12 +36,22 @@ fstrans state or a suspend handler error aborts the transaction.  The helper
 does not claim to quiesce an unsupported filesystem.  Layer handlers must not
 recursively suspend lower mounts.
 
-The returned =struct vfs_s2idle_mount= entries keep the mounts alive and the
-global suspension lock held across device suspend.  =vfs_resume_all()= resumes
-only successful entries in reverse order, releases the global owner through
-=vfs_resume()=, and drops the busy holds.  ACPI calls it only after device and
-storage power resume.  Any admission, suspend, or synchronous-sync error
-rolls the session back and aborts selective s2idle.
+The returned =struct vfs_s2idle_mount= entries keep mounts alive and the
+suspension session held across device suspend. After every successful call,
+including an empty mount set, the same LWP calls =vfs_resume_all()= after
+device resume. It resumes successful entries in reverse order, releases the
+VFS suspension lock, updater locks and busy holds, then opens mount admission.
+Any admission, suspend or sync error unwinds the acquired state before return.
+
+=hw.acpi.sleep.freeze_fsbarrier= selects 0 (skip), 1 (best effort, default),
+or 2 (required). Required mode aborts on error; best-effort mode continues.
+=freeze_storage= permits NVMe suspension only when a barrier was actually
+established. ACPI snapshots both settings per attempt.
+
+Admission is non-waiting. Filesystem transaction draining and synchronous
+writes can sleep; =vfs_suspend(mp, 1)= only try-locks the global suspension
+mutex. Filesystems needing a frozen userspace server can therefore block
+preparation and need a separate freezer policy.
 
 GEFS supplies filesystem-specific =vfs_suspendctl= behavior.  Its handler may
 flush pages, commit and drain synchronous work as the suspension owner, and
@@ -46,29 +63,39 @@ entered the barrier.
 
 - =kernel/kern/vfs_s2idle.c=: generic all-mount barrier and unwind.
 - =kernel/sys/vfs_s2idle.h=: kernel API used by ACPI and filesystem code.
-- =kernel/kern/vfs_mount_s2idle.patch=: base mount-iterator status extension.
+- =kernel/kern/vfs_mount_s2idle.patch=: mount-operation hooks and iterator status.
 - =kernel/dev/acpi/acpi.c=: barrier placement and post-device resume.
 
 * Verification
 
-Run =tests/s2idle-barrier.sh= from this checkout for the host behavioral
-protocol checks.  It covers reverse suspend/sync/resume order, layered mount
-handling, skipped-iterator admission, updater and lock failures, rollback,
-allocation-size accounting, and lower-mount cycle rejection.
+Run =tests/s2idle-barrier.sh= for host protocol checks against the production
+helper, with optional =CC= and =CFLAGS=. These cover active and nested mount
+operations, concurrent mount/barrier admission, exclusion during enumeration,
+callbacks and rollback, empty sessions, reverse suspend/sync/resume order,
+layered mounts, skipped-iterator admission, updater and lock failures,
+allocation sizes and lower-mount cycles.
 
-Apply =kernel/kern/vfs_mount_s2idle.patch= with =patch -p0= from the assembled
-=sys/= source root as well as copying the overlay files. The patch extends the
-base iterator API; copying =vfs_s2idle.c= alone is insufficient.
+Apply =kernel/kern/vfs_mount_s2idle.patch= with =patch -p0= from a clean
+NetBSD-11 =sys/= source tree, and copy the overlay files. This patch includes
+the earlier iterator change: replace an older application rather than applying
+the full patch twice. It now modifies =kern/vfs_syscalls.c= as well as
+=kern/vfs_mount.c= and =sys/mount.h=.
+The helper returns =ENXIO= if the new VFS initialization hook is missing.
+
+The admission redesign has host checks only. Native build and laptop testing
+are pending.
+
+* Earlier native verification (before the admission redesign)
 
 The complete overlay kernel, including ACPI and the iterator extension, built
 with NetBSD 11.0's native compiler and GENERIC configuration in the development
 VM. Use =tests/s2idle-native/= on that kernel for an all-mount hold and resume:
 build with matching headers, run =modload ./s2idletest.kmod=, then
 =modunload s2idletest=. The optional =-i seconds=35= spans the syncer interval.
-Keep mount administration idle during this probe. It tests the VFS protocol,
-not ACPI device suspension.
+The earlier probe ran with mount administration idle. It tested the VFS
+protocol, not ACPI device suspension.
 
-The final helper passed a 35-second native hold with eight mounts: root FFS,
+The earlier helper passed a 35-second native hold with eight mounts: root FFS,
 ptyfs, tmpfs, the /build FFS, two GEFS labels on one vnd device, FFS on a
 second vnd image, and a later null mount of /build. Dirty writes preceded the
 hold. Every canonical state reached =FSTRANS_SUSPENDED=; resume, the GEFS
@@ -76,4 +103,4 @@ online check, and normal cleanup succeeded. GEFS timer deadlines were set to
 one second during the test. Its separate native suspension tests measured
 zero reads, writes and flushes during holds, plus error and unmount rollback.
 Build logs and images are under =/build/gefs-followup-20261014/= in the VM.
-The laptop was not changed; physical storage/device suspend remains untested.
+Physical storage/device suspension was not tested in that VM.

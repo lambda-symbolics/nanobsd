@@ -21,14 +21,27 @@ struct vfs_s2idle_mount {
 	int updating_held;
 };
 
+/* Initialize once from vfs_mount_sysinit(). */
+void	vfs_s2idle_init(void);
+
 /*
- * Suspend every mounted filesystem as one transaction session.  On success
- * the returned entries retain busy mount holds and the VFS suspension lock
- * remains held; the caller must call vfs_resume_all() after device resume.
- * Admission is nonblocking: the base mount iterator reports a mount skipped
- * by try-busy admission, and any such skip aborts the session.  The helper
- * also aborts on updater, fstrans, suspend, or sync errors and unwinds all
- * state before returning no session.
+ * Cover complete mount, update, unmount and mountroot operations. Entry is
+ * non-waiting and returns EBUSY while an all-mount barrier is held. Every
+ * successful entry needs an exit, including nested operations and failures.
+ */
+int	vfs_s2idle_mount_enter(void);
+void	vfs_s2idle_mount_exit(void);
+
+/*
+ * Suspend every mounted filesystem as one transaction session. The helper
+ * first excludes mount administration, then retains busy mount holds, updater
+ * locks and the VFS suspension lock. Admission returns EBUSY if a mount
+ * operation is active, or the iterator skips a mount. Filesystem transaction
+ * draining and synchronous writes may sleep.
+ *
+ * On every success, even an empty mount set, the same LWP must call
+ * vfs_resume_all() after device resume. On error all acquired state is unwound;
+ * do not call vfs_resume_all() for a failed or skipped attempt.
  */
 int	vfs_suspend_all(struct vfs_s2idle_mount **, size_t *);
 void	vfs_resume_all(struct vfs_s2idle_mount *, size_t);

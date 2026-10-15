@@ -272,11 +272,8 @@ static int		acpi_freeze_ltr_ignore;
 static int		acpi_freeze_storage;
 static int		acpi_freeze_keep_net;
 /*
- * hw.acpi.sleep.freeze_fsbarrier: 0 = no filesystem barrier, 1 (default) =
- * try it and go on without it when it cannot be established, 2 = abort the
- * freeze when it cannot (the behaviour that broke lid suspend on 2026-10-15:
- * acpi_s0_userspace_frozen() demands every LWP in LSSUSPENDED one second
- * after the freeze request, which a process in a kernel wait never reaches).
+ * hw.acpi.sleep.freeze_fsbarrier: 0 = skip, 1 = best effort, 2 = required.
+ * Optional NVMe suspension requires an established barrier.
  */
 static int		acpi_freeze_fsbarrier = 1;
 static int		acpi_idle_d3;
@@ -2423,7 +2420,7 @@ out:
  * S3 transition (acpi_md_sleep), which never resumes on this platform.
  */
 static bool
-acpi_s2idle_keep(device_t dev)
+acpi_s2idle_keep(device_t dev, bool suspend_storage)
 {
 	const char *n = device_xname(dev);
 	device_t ancestor;
@@ -2432,8 +2429,8 @@ acpi_s2idle_keep(device_t dev)
 	for (ancestor = dev; ancestor != NULL; ancestor = device_parent(ancestor)) {
 		if (device_is_a(ancestor, "dwiic"))
 			return false;
-		if (acpi_freeze_storage && device_is_a(ancestor, "nvme"))
-			return false;
+		if (device_is_a(ancestor, "nvme"))
+			return !suspend_storage;
 	}
 
 	/* Test aid: freeze and wake without dropping the Wi-Fi association. */
@@ -2943,39 +2940,6 @@ acpi_s0_freeze_userspace(bool freeze)
 		mutex_exit(p->p_lock);
 	}
 	mutex_exit(&proc_lock);
-}
-
-/* A requested suspension may still be waiting for a syscall to finish. */
-static bool
-acpi_s0_userspace_frozen(void)
-{
-	struct proc *p;
-	struct lwp *l;
-	bool frozen;
-
-	mutex_enter(&proc_lock);
-	PROCLIST_FOREACH(p, &allproc) {
-		mutex_enter(p->p_lock);
-		if ((p->p_flag & PK_SYSTEM) != 0) {
-			mutex_exit(p->p_lock);
-			continue;
-		}
-		LIST_FOREACH(l, &p->p_lwps, l_sibling) {
-			if (l == curlwp)
-				continue;
-			lwp_lock(l);
-			frozen = l->l_stat == LSSUSPENDED || l->l_stat == LSZOMB;
-			lwp_unlock(l);
-			if (!frozen) {
-				mutex_exit(p->p_lock);
-				mutex_exit(&proc_lock);
-				return false;
-			}
-		}
-		mutex_exit(p->p_lock);
-	}
-	mutex_exit(&proc_lock);
-	return true;
 }
 
 static void
@@ -3488,6 +3452,10 @@ acpi_enter_freeze(void)
 	size_t nsuspended_mounts = 0;
 	int fs_error;
 	bool suspend_failed = false;
+	const int fsbarrier_policy = acpi_freeze_fsbarrier;
+	const bool storage_requested = acpi_freeze_storage != 0;
+	bool fsbarrier_held = false;
+	bool suspend_storage;
 	extern int i915_lispbsd_s0idle;
 	int s0idle_save;
 	uint64_t h_tsc0 = 0, h_pc10_0 = 0, h_s0_0 = 0, h_rapl0 = 0;
@@ -3522,20 +3490,19 @@ acpi_enter_freeze(void)
 #endif
 
 	/*
-	 * Freeze userspace, then establish one filesystem transaction barrier
-	 * before suspending storage devices.  The helper retains mount lifetime
-	 * references and keeps the VFS suspension session locked until resume.
+	 * Request userspace suspension, then let VFS exclude mount administration
+	 * and drain filesystem transactions. Kernel sleepers need not return to
+	 * userret before this barrier can be established.
 	 */
 	acpi_s0_freeze_userspace(true);
-	kpause("s2qui", false, MAX(1, hz), NULL);	/* settle to LSSUSPENDED */
-	/* Do not race an in-flight mount syscall or suspend its lock owner. */
-	if (acpi_freeze_fsbarrier == 0)
+	/* Give runnable LWPs time to process their suspension requests. */
+	kpause("s2qui", false, MAX(1, hz), NULL);
+	if (fsbarrier_policy == 0)
 		fs_error = 0;
-	else if (!acpi_s0_userspace_frozen())
-		fs_error = EBUSY;
 	else
 		fs_error = vfs_suspend_all(&suspended_mounts, &nsuspended_mounts);
-	if (fs_error != 0 && acpi_freeze_fsbarrier >= 2) {
+	fsbarrier_held = fsbarrier_policy != 0 && fs_error == 0;
+	if (fs_error != 0 && fsbarrier_policy >= 2) {
 		aprint_error_dev(sc->sc_dev,
 		    "s2idle: filesystem barrier failed (%d), aborting freeze\n",
 		    fs_error);
@@ -3553,10 +3520,14 @@ acpi_enter_freeze(void)
 		    "continuing without it\n", fs_error);
 		suspended_mounts = NULL;
 		nsuspended_mounts = 0;
-	} else if (acpi_freeze_fsbarrier != 0)
+	} else if (fsbarrier_held)
 		aprint_normal_dev(sc->sc_dev,
 		    "s2idle: filesystem barrier over %zu mounts\n",
 		    nsuspended_mounts);
+	suspend_storage = storage_requested && fsbarrier_held;
+	if (storage_requested && !fsbarrier_held)
+		aprint_normal_dev(sc->sc_dev,
+		    "s2idle: keeping NVMe active without a filesystem barrier\n");
 
 	/*
 	 * Preserve GPU RC6 across the i915 suspend: otherwise the i915 S3
@@ -3571,7 +3542,8 @@ acpi_enter_freeze(void)
 	KERNEL_LOCK(1, NULL);
 	for (curdev = deviter_first(&di, DEVITER_F_LEAVES_FIRST);
 	     curdev != NULL; curdev = deviter_next(&di)) {
-		if (!device_is_active(curdev) || acpi_s2idle_keep(curdev))
+		if (!device_is_active(curdev) ||
+		    acpi_s2idle_keep(curdev, suspend_storage))
 			continue;
 		if (nsuspended == __arraycount(suspended)) {
 			suspend_failed = true;
@@ -3753,7 +3725,8 @@ resume_devices:
 	i915_lispbsd_s0idle = s0idle_save;	/* restore RC6-preserve latch */
 
 	/* Filesystems resume only after all devices and storage power do. */
-	vfs_resume_all(suspended_mounts, nsuspended_mounts);
+	if (fsbarrier_held)
+		vfs_resume_all(suspended_mounts, nsuspended_mounts);
 	suspended_mounts = NULL;
 	nsuspended_mounts = 0;
 

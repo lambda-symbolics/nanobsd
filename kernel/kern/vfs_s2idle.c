@@ -13,6 +13,82 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/systm.h>
 #include <sys/vfs_s2idle.h>
 
+/*
+ * Mount administration and all-mount suspension share an admission gate.
+ * Count complete operations, including nested ones, rather than holding a
+ * lock across filesystem callbacks. A callback that tries to mount while
+ * the barrier is held gets EBUSY instead of waiting on its own suspension.
+ */
+static kmutex_t vfs_s2idle_lock;
+static size_t vfs_s2idle_mountops;
+static struct lwp *vfs_s2idle_owner;
+/* Published once during VFS initialization, before runtime mount activity. */
+static bool vfs_s2idle_ready;
+
+void
+vfs_s2idle_init(void)
+{
+
+	KASSERT(!vfs_s2idle_ready);
+	mutex_init(&vfs_s2idle_lock, MUTEX_DEFAULT, IPL_NONE);
+	vfs_s2idle_ready = true;
+}
+
+int
+vfs_s2idle_mount_enter(void)
+{
+	int error = 0;
+
+	if (!vfs_s2idle_ready)
+		return ENXIO;
+	mutex_enter(&vfs_s2idle_lock);
+	if (vfs_s2idle_owner != NULL || vfs_s2idle_mountops == SIZE_MAX)
+		error = EBUSY;
+	else
+		vfs_s2idle_mountops++;
+	mutex_exit(&vfs_s2idle_lock);
+	return error;
+}
+
+void
+vfs_s2idle_mount_exit(void)
+{
+
+	mutex_enter(&vfs_s2idle_lock);
+	KASSERT(vfs_s2idle_owner == NULL);
+	KASSERT(vfs_s2idle_mountops != 0);
+	vfs_s2idle_mountops--;
+	mutex_exit(&vfs_s2idle_lock);
+}
+
+static int
+vfs_s2idle_barrier_enter(void)
+{
+	int error = 0;
+
+	/* Reject an assembled kernel that still has only the old iterator patch. */
+	if (!vfs_s2idle_ready)
+		return ENXIO;
+	mutex_enter(&vfs_s2idle_lock);
+	if (vfs_s2idle_owner != NULL || vfs_s2idle_mountops != 0)
+		error = EBUSY;
+	else
+		vfs_s2idle_owner = curlwp;
+	mutex_exit(&vfs_s2idle_lock);
+	return error;
+}
+
+static void
+vfs_s2idle_barrier_exit(void)
+{
+
+	mutex_enter(&vfs_s2idle_lock);
+	KASSERT(vfs_s2idle_owner == curlwp);
+	KASSERT(vfs_s2idle_mountops == 0);
+	vfs_s2idle_owner = NULL;
+	mutex_exit(&vfs_s2idle_lock);
+}
+
 static struct mount *
 vfs_s2idle_canonical_mount(struct mount *mp)
 {
@@ -93,19 +169,16 @@ vfs_s2idle_resume_suspended(struct vfs_s2idle_mount *mounts, size_t nmounts)
 /*
  * Suspend the filesystem set as one vfs_suspend() session.
  *
- * Admission is entirely nonblocking: the extended mount iterator reports
- * mounts it had to skip because vfs_trybusy() could not admit them.  A
- * skipped mount aborts this transaction instead of silently producing a
- * partial filesystem set.  Each saved mount then takes an additional
- * try-busy hold, and mnt_updating is try-locked before the first filesystem
- * is suspended.  Holding those update locks across suspend and sync prevents
- * an updater that owns the mutex from waiting for the fstrans state that this
- * session is about to change.
+ * Admission rejects active mount operations and excludes new ones until
+ * resume. The extended mount iterator reports mounts skipped by try-busy;
+ * any skip aborts rather than producing a partial filesystem set. Each saved
+ * mount takes an additional busy hold and an updater try-lock before any
+ * filesystem is suspended. Transaction draining and synchronous writes may
+ * sleep; only admission is non-waiting.
  *
  * Suspend and sync each canonical mount in reverse creation order before
  * stopping its backing filesystem. Aliases share their canonical mount's
  * position. Dependencies must follow that order; mnt_lower cycles are errors.
- * The caller must stop mount-creating threads before collecting this set.
  */
 int
 vfs_suspend_all(struct vfs_s2idle_mount **mpp, size_t *nmpp)
@@ -123,6 +196,9 @@ vfs_suspend_all(struct vfs_s2idle_mount **mpp, size_t *nmpp)
 	KASSERT(nmpp != NULL);
 	*mpp = NULL;
 	*nmpp = 0;
+
+	if ((error = vfs_s2idle_barrier_enter()) != 0)
+		return error;
 
 	mountlist_iterator_init(&iter);
 	for (;;) {
@@ -253,6 +329,7 @@ fail:
 		vfs_unbusy(mounts[i].mp);
 	if (mounts != NULL)
 		kmem_free(mounts, capacity * sizeof(*mounts));
+	vfs_s2idle_barrier_exit();
 	return error;
 }
 
@@ -261,12 +338,15 @@ vfs_resume_all(struct vfs_s2idle_mount *mounts, size_t nmounts)
 {
 
 	KASSERT(mounts != NULL || nmounts == 0);
-	if (nmounts == 0)
+	if (nmounts == 0) {
+		vfs_s2idle_barrier_exit();
 		return;
+	}
 
 	vfs_s2idle_resume_suspended(mounts, nmounts);
 	vfs_s2idle_unlock_updates(mounts, nmounts);
 	for (size_t i = 0; i < nmounts; i++)
 		vfs_unbusy(mounts[i].mp);
 	kmem_free(mounts, nmounts * sizeof(*mounts));
+	vfs_s2idle_barrier_exit();
 }
