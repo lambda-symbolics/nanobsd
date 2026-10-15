@@ -17,6 +17,14 @@
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin; export PATH
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="doas"
 attached(){ drvctl -l pci0 2>/dev/null | grep -q "^pci0 $1\$"; }
+# drvctl -R resumes a device and its ancestors, not its children, so a
+# resumed controller leaves every USB device under it marked suspended in
+# pmf (harmless for drivers without handlers, but the runtime PM only parks
+# an *active* ubt).  Resume the whole subtree, leaves last.
+resume_tree(){
+  $SUDO drvctl -R "$1" 2>/dev/null
+  for c in $(drvctl -l "$1" 2>/dev/null | awk '{print $2}'); do resume_tree "$c"; done
+}
 # The PCI bus driver puts a suspended function in D3hot (PMCSR), so the
 # config-space power state tells a suspended controller from a running one.
 active(){ case $1 in xhci0) d=13 ;; xhci1) d=20 ;; esac
@@ -31,8 +39,10 @@ pch_off(){
 }
 pch_on(){
   attached xhci1 || { echo "usb: no xhci1" >&2; return 1; }
-  active xhci1 && return 0
-  $SUDO drvctl -R xhci1 2>/dev/null || { echo "usb: xhci1 did not resume" >&2; return 1; }
+  if ! active xhci1; then
+    $SUDO drvctl -R xhci1 2>/dev/null || { echo "usb: xhci1 did not resume" >&2; return 1; }
+  fi
+  resume_tree xhci1
 }
 usbc_off(){
   if attached xhci0 && active xhci0; then
@@ -58,8 +68,10 @@ usbc_on(){
     attached xhci0 || { echo "usb: xhci0 did not reattach" >&2; return 1; }
     return 0
   fi
-  active xhci0 && return 0
-  $SUDO drvctl -R xhci0 2>/dev/null || { echo "usb: xhci0 did not resume" >&2; return 1; }
+  if ! active xhci0; then
+    $SUDO drvctl -R xhci0 2>/dev/null || { echo "usb: xhci0 did not resume" >&2; return 1; }
+  fi
+  resume_tree xhci0
 }
 state(){
   p=off; attached xhci1 && active xhci1 && p=on
