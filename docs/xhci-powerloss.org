@@ -2,11 +2,11 @@
 
 * Scope
 
-2026-10-15 draft, revised for kernel 166 after the kernel 165 warm-resume
-failure. Copy =kernel/dev/usb/xhci.c=, =kernel/dev/usb/xhcivar.h= and
-=kernel/dev/usb/ubt.c= into the NetBSD tree. Initial verification was
-source-only. The kernel 165 laptop result and subsequent fixes are recorded
-below; kernel 166 validation is pending.
+2026-10-15 draft, revised for kernel 167 after the kernel 165 and 166
+warm-resume failures. Copy =kernel/dev/usb/xhci.c=, =kernel/dev/usb/xhcivar.h=
+and =kernel/dev/usb/ubt.c= into the NetBSD tree. Initial verification was
+source-only. Laptop results and subsequent fixes are recorded below;
+kernel 167 validation is pending.
 
 Cold recovery requires no allocated slots, runtime parking ownership or
 downstream USB devices on either bus. The first target is empty external
@@ -19,14 +19,19 @@ system suspend/resume. ACPI power policy and the =usb= script are separate.
 =xhci_resume_check()= runs before resume writes an operational register.
 PCI must already have restored BARs, command and interrupt configuration
 through its PMF bus-resume callback. The probe rejects inaccessible MMIO,
-checks the attach-time layout and waits for USBSTS.CNR to clear. A mismatch
-between live DCBAAP, CONFIG or ERSTBA and the suspend snapshot, or a fatal
-controller status, requires cold recovery instead of CRS. =sc_state_lost=
-is sticky until success, including after a partially programmed restart.
+checks the attach-time layout, waits for USBSTS.CNR to clear and requires a
+saved suspend snapshot. HSE/HCE request cold recovery immediately.
+
+Zero or changed DCBAAP, USBCMD, CONFIG and ERSTBA do not distinguish D3hot
+from power loss. Restore the saved registers and attempt CRS. In =f9b3987=,
+an RSS timeout requests cold recovery; =sc_state_lost= then remains set until
+successful recovery. Treat it as a reset-required flag, not proof that the
+controller physically lost power. A successful CRS may restore saved state
+after a power-down, so cold power alone need not require reinitialisation.
 
 Register offsets, slot/interrupter/port and scratchpad counts, and
 HCCPARAMS1 must match. HCIVERSION changes are informational: log them with
-=aprint_debug_dev()=, then check the actual layout and saved register state.
+=aprint_debug_dev()=, then check the actual layout and snapshot validity.
 Zero or all-ones HCIVERSION reads are rejected as unavailable MMIO.
 
 On the tested Tiger Lake xhci1, HCIVERSION changed from 0x0120 to 0x0110
@@ -157,13 +162,44 @@ Commit =51350c9= supplied four build corrections before that laptop run:
   It is not a public NetBSD-11 driver API. Use ubt's attach-time registration
   and the public PMF suspend/resume calls.
 
-Source review of both =51350c9= and the subsequent HCIVERSION correction
-=34c10c3= is complete. Kernel 166 was building when the result was reported;
-successful warm resume, Bluetooth parking and cold recovery await its tests.
+Source review of =51350c9= and the HCIVERSION correction =34c10c3= is complete.
+
+* Kernel 166 restore decision and review
+
+The 12:20 entry in =/root/astra/pc3-results.org= records DCBAAP and USBCMD
+reading zero after an ordinary D3hot resume on xhci1. Kernel 166 incorrectly
+classified this as lost state and attempted cold recovery. The populated
+controller failed the empty-slot guard, so the helper refused recovery before
+issuing HCRST. The failed-resume gates then prevented normal use.
+
+Commit =f9b3987= removes the register-equality trigger. The probe now requests
+cold recovery only on HSE/HCE; otherwise it tries the normal register restore
+and CRS sequence, with an RSS timeout as a fallback trigger. This addresses
+the observed false positive. Kernel 167 was building when the result arrived.
+
+The [[https://www.intel.com/content/dam/www/public/us/en/documents/technical-specifications/extensible-host-controler-interface-usb-xhci.pdf][xHCI 1.2 specification]], sections 4.23.1 and 4.23.2.1, supports trying the
+restore: core-well registers reset on D3hot -> D0, and saved state can be
+restored across power events. Timeout indicates failed completion, not its
+cause. Section 4.23.2.1 also requires a corrupt-state restore to terminate
+with RSS clear and SRE set. Thus RSS clear alone does not establish success.
+
+The new timeout fallback has the required lock/admission ordering: runtime
+work is paused, =sc_rhlock= is held, and =sc_lock= is released before calling
+=xhci_resume_cold()=. The helper rechecks slot and topology ownership before
+reset. Populated recovery is still refused; success alone releases deferred
+I/O and restarts runtime admission.
+
+One recovery gap is present in =f9b3987=: an RSS-clear/SRE-set result reaches
+the late SRE check and returns failure without cold fallback. For an empty
+controller, the next recovery change should handle SRE alongside timeout,
+checking fresh HSE/HCE and rejecting all-ones MMIO before starting Run/Stop.
+The current timeout loop also treats all-ones USBSTS as RSS still set; the
+subsequent reset helper's CNR check rejects persistently inaccessible MMIO.
+Kernel 167 source was left unchanged during this review.
 
 * Laptop validation
 
-1. With kernel 166 and all three source files, repeat =usb on pch= through a
+1. With kernel 167 and all three source files, repeat =usb on pch= through a
    plain D3hot -> D0 cycle. Confirm warm resume and working Bluetooth before
    testing runtime parking or cold power removal.
 2. With Bluetooth up and idle, compare =hw.usbpm.stats=, power and PC10
@@ -173,8 +209,10 @@ successful warm resume, Bluetooth parking and cold recovery await its tests.
    Exercise traffic immediately after wake and check failure counters.
 4. Start with xhci0 empty. Retain the attached controller, suspend its driver,
    remove TCSS power, restore power/PCI configuration and resume through PMF.
-   Expect =controller state lost= and =cold resume: empty controller restarted=,
-   without CRS. Record dmesg and capability registers.
+   Record USBSTS, dmesg and capability registers. CRS may succeed directly.
+   On an RSS timeout, expect the timeout/cold-recovery diagnostic followed by
+   =cold resume: empty controller restarted=. Record SRE failures separately;
+   kernel 167 does not route that failure to cold recovery.
 5. Repeat warm/cold cycles, USB2/USB3 hotplug after recovery and a connection
    made during the cold interval. Compare residency with the known
    suspend/detach TCSS sequence.
