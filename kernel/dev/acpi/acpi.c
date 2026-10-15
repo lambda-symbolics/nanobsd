@@ -3201,7 +3201,7 @@ struct acpi_adr_pwr {
 	uint32_t		ap_adr;		/* PCI _ADR */
 	int			ap_flags;
 #define ADRPWR_COLD		0x01		/* D3cold instead of D3hot */
-#define ADRPWR_NODRIVER		0x02		/* only while no driver is attached */
+#define ADRPWR_NODRIVER		0x02		/* only with the driver absent or suspended and no device bound */
 #define ADRPWR_NOPS3		0x04		/* cold without _PS3 (idle_d3_exp bit 0 runs it anyway) */
 	ACPI_HANDLE		ap_changed;	/* set while moved away from D0 */
 	int			ap_previous;
@@ -3302,13 +3302,29 @@ acpi_adr_power(struct acpi_softc *sc, const char *what,
 			target = (ap->ap_flags & ADRPWR_COLD) ?
 			    ACPI_STATE_D3_COLD : state;
 			if ((ap->ap_flags & ADRPWR_NODRIVER) &&
-			    (acpi_idle_d3_exp & 4) == 0 &&
-			    acpi_pcidev_find_dev(ad) != NULL) {
-				aprint_normal_dev(sc->sc_dev,
-				    "%s: adr=0x%x has %s attached, skipped\n",
-				    what, ap->ap_adr,
-				    device_xname(acpi_pcidev_find_dev(ad)));
-				break;
+			    (acpi_idle_d3_exp & 4) == 0) {
+				device_t gdv = acpi_pcidev_find_dev(ad);
+				bool populated = false;
+
+				if (gdv != NULL)
+					(void)prop_dictionary_get_bool(
+					    device_properties(gdv),
+					    "lispbsd-usb-populated",
+					    &populated);
+				/*
+				 * The power loss resets the function: only
+				 * with its driver suspended (cold recovery
+				 * restarts an empty controller on resume) or
+				 * absent, and never with a device bound.
+				 */
+				if (gdv != NULL &&
+				    (device_is_active(gdv) || populated)) {
+					aprint_normal_dev(sc->sc_dev,
+					    "%s: adr=0x%x %s is %s, skipped\n",
+					    what, ap->ap_adr, device_xname(gdv),
+					    populated ? "populated" : "active");
+					break;
+				}
 			}
 			/* Do not power up devices on resume that were already off. */
 			old = ACPI_STATE_ERROR;
@@ -3385,6 +3401,7 @@ acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
 		{ .ap_adr = 0x00050000, .ap_flags = ADRPWR_COLD }, /* IPU / image sensor -> IS_D3 (w2.8, mode0 REQUIRED) */
 		{ .ap_adr = 0x00120000, .ap_flags = ADRPWR_COLD }, /* ISH (sensor hub) */
 		{ .ap_adr = 0x00140000 },	/* xHCI (USB2) */
+		{ .ap_adr = 0x000d0000, .ap_flags = ADRPWR_COLD | ADRPWR_NODRIVER }, /* TCSS xHCI: cold when empty (its driver is suspended by the freeze) */
 		{ .ap_adr = 0x00160000, .ap_flags = ADRPWR_COLD }, /* HECI / CSME */
 		{ .ap_adr = 0x00080000, .ap_flags = ADRPWR_COLD }, /* GNA */
 		{ .ap_adr = 0x000d0002, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 1 */

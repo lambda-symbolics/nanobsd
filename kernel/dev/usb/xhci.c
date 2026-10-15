@@ -1788,6 +1788,20 @@ xhci_rt_enabled(void)
 }
 
 /* Bind a slot to its device the first time a pipe on it is opened. */
+/*
+ * LISPBSD: "lispbsd-usb-populated" on the controller's device tells the
+ * ACPI power manager whether a device slot is bound, so that it only cuts
+ * the power of an empty controller (cold recovery of a populated one is
+ * not implemented).
+ */
+static void
+xhci_populated_update(struct xhci_softc *sc, int delta)
+{
+	sc->sc_rt_bound += delta;
+	prop_dictionary_set_bool(device_properties(sc->sc_dev),
+	    "lispbsd-usb-populated", sc->sc_rt_bound > 0);
+}
+
 static void
 xhci_rt_bind(struct xhci_softc *sc, struct xhci_slot *xs,
     struct usbd_device *dev)
@@ -1812,6 +1826,7 @@ xhci_rt_bind(struct xhci_softc *sc, struct xhci_slot *xs,
 	/* PMF callbacks and the subdevice walk require KERNEL_LOCK. */
 	usb_init_task(&xs->xs_rt_task, xhci_rt_task, xs, 0);
 	xs->xs_rt_init = true;
+	xhci_populated_update(sc, 1);
 }
 
 static void
@@ -1826,6 +1841,7 @@ xhci_rt_unbind(struct xhci_softc *sc, struct xhci_slot *xs)
 	}
 	/* Close admission before removing a queued rerun and joining the task. */
 	xs->xs_rt_init = false;
+	xhci_populated_update(sc, -1);
 	mutex_exit(&sc->sc_intr_lock);
 	if (locked)
 		mutex_exit(&sc->sc_lock);

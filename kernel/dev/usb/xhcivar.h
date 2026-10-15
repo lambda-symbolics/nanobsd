@@ -169,6 +169,7 @@ struct xhci_softc {
 
 	/* LispBSD USB runtime power management */
 	callout_t sc_rt_callout;	/* the idle scan, deferrable */
+	int sc_rt_bound;		/* device slots bound (populated) */
 	bool sc_rt_paused;		/* sc_intr_lock: no new runtime PM tasks */
 	u_int sc_rt_openers;		/* sc_intr_lock: synchronous port wakes */
 	kcondvar_t sc_rt_cv;		/* drain sc_rt_openers before system suspend */

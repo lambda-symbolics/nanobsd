@@ -4,12 +4,14 @@
 #          camera, fingerprint).  off = driver suspended (D3hot).
 #   usbc : xhci0, the USB-C/Thunderbolt controller (external ports only).
 #          off = TCSS D3cold: xhci0 is suspended (ports quiesced, D3hot: a
-#          merely halted controller caps the package at PC9), detached, and
-#          the shared TCSS power resource (D3C, also held by the Thunderbolt
-#          DMA engines and root ports) is switched off through idle_d3; the
-#          package then idles in PC10 (about 1.1 W) instead of a PC3/PC10
-#          split (about 1.9 W).  on = resource back, pci0 rescan reattaches
-#          xhci0 fresh (a cold controller cannot be warm-resumed).
+#          merely halted controller caps the package at PC9) and the shared
+#          TCSS power resource (D3C, also held by the Thunderbolt DMA engines
+#          and root ports) is switched off through idle_d3; the package then
+#          idles in PC10 (about 1.1 W) instead of a PC3/PC10 split (about
+#          1.9 W).  on = resource back (the kernel tags the function as
+#          power-lost), the driver's resume restarts the empty controller.
+#          The kernel refuses the cold-off while a USB-C device is attached.
+#          USB_TCSS_DETACH=1 uses the older detach + pci0 rescan path.
 #   all  : both (default).  rc.local does "usb off" at boot.
 # Keyboard/trackpoint are I2C-HID, USB-C charging (PD) is separate: both keep
 # working with everything off.  bluetooth/webcam/bt-headphones use "pch" so
@@ -49,15 +51,14 @@ usbc_off(){
     $SUDO drvctl -S xhci0 2>/dev/null || { echo "usb: xhci0 did not suspend" >&2; return 1; }
   fi
   [ "${USB_TCSS_D3:-1}" = 1 ] || return 0
-  # USB_TCSS_DETACH=0: leave the suspended driver attached (the kernel then
-  # needs idle_d3_exp bit 4 to cold the controller, and a power-loss-aware
-  # xhci_resume to bring it back: experiment).
-  if attached xhci0 && [ "${USB_TCSS_DETACH:-1}" = 1 ]; then
+  if attached xhci0 && [ "${USB_TCSS_DETACH:-0}" = 1 ]; then
     $SUDO drvctl -d xhci0 2>/dev/null || { echo "usb: xhci0 did not detach" >&2; return 1; }
   fi
   cold && return 0
   $SUDO sysctl -w hw.acpi.sleep.idle_d3=1 >/dev/null 2>&1 || { echo "usb: TCSS power resources not switched off (idle_d3)" >&2; return 1; }
   cold || { echo "usb: idle_d3 did not take" >&2; return 1; }
+  # The kernel skips a populated or active controller: say so.
+  [ "$(pcictl pci0 read -d 13 -f 0 0 2>/dev/null | head -1)" = ffffffff ] || echo "usb: TCSS stayed powered (a USB-C device attached? see dmesg idle_d3)" >&2
 }
 usbc_on(){
   if cold; then
