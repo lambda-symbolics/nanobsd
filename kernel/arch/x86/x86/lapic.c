@@ -68,6 +68,7 @@ __KERNEL_RCSID(0, "$NetBSD: lapic.c,v 1.93 2025/05/02 07:08:11 imil Exp $");
 #include <machine/specialreg.h>
 #include <machine/segments.h>
 #include <x86/x86/tsc.h>
+#include <x86/x86/lapic_tl.h>
 #include <x86/i82093var.h>
 
 #include <machine/apicvar.h>
@@ -538,6 +539,7 @@ uint32_t lapic_tval;
  */
 struct lapic_tlstate {
 	uint32_t	frac;
+	uint64_t	entry_tsc;	/* TSC when the entry sample was taken */
 } __aligned(COHERENCY_UNIT);
 static struct lapic_tlstate lapic_tlstate[MAXCPUS];
 
@@ -676,7 +678,18 @@ lapic_oneshot(uint32_t nticks)
 	 * which lapic_oneshot_done() credits normally.
 	 */
 	if (idx < MAXCPUS) {
+		uint64_t t0, t1;
+
+		/*
+		 * Sample the count and the TSC together: the TSC measures
+		 * the sleep from the instant CCR was read (lapic_tl.h).  The
+		 * read takes time (a VM exit under a hypervisor), so take
+		 * the midpoint of the TSC around it.
+		 */
+		t0 = cpu_counter();
 		ccr = lapic_readreg(LAPIC_CCR_TIMER);
+		t1 = cpu_counter();
+		lapic_tlstate[idx].entry_tsc = t0 + (t1 - t0) / 2;
 		used = (ccr < lapic_tval) ? lapic_tval - ccr : 0;
 		lapic_tlstate[idx].frac += used;
 	}
@@ -699,61 +712,57 @@ lapic_oneshot_done(uint32_t nticks, int *pendingp)
 	struct cpu_info *ci = curcpu();
 	uint16_t irr = LAPIC_IRR + LAPIC_TIMER_VECTOR / 32 * 16;
 	u_int idx = ci->ci_index;
-	uint64_t counted;
-	uint32_t rem, frac, frac_in;
-	unsigned elapsed;
+	uint64_t counted, tsc_hz = ci->ci_data.cpu_cc_freq, since = 0, now = 0;
+	uint32_t rem = 0, frac, carried;
+	unsigned elapsed, manual;
 	int pending;
 
 	/*
-	 * Read the remaining count before the pending bit: an expiry between
-	 * the two reads then shows up as pending (the full interval counts),
-	 * never as a reloaded or zero CCR taken for "almost nothing left".
+	 * Elapsed time: the TSC since the entry sample (lapic_tl.h).  Without
+	 * a known TSC rate, fall back to the timer's own remaining count.
 	 */
-	rem = lapic_readreg(LAPIC_CCR_TIMER);
-	pending = (lapic_readreg(irr) & (1u << (LAPIC_TIMER_VECTOR % 32))) != 0;
-	counted = (uint64_t)lapic_tval * nticks;
-	if (!pending)
-		counted = ((uint64_t)rem <= counted) ? counted - rem : 0;
+	if (tsc_hz == 0 || idx >= MAXCPUS)
+		rem = lapic_readreg(LAPIC_CCR_TIMER);
 
 	/*
-	 * Credit whole ticks and CARRY the sub-tick remainder.  Truncating it
-	 * away here discarded up to a tick of real time on every wake, so the
-	 * replayed hardclock count ran slow by a fraction of a tick per wake.
+	 * Restore the periodic tick; whatever is pending now is delivered.
+	 * The new periodic interval starts at the ICR write, so that is
+	 * where the measured sleep ends: anything between an earlier
+	 * sample and the write would be credited to neither (each LAPIC
+	 * access is a VM exit under a hypervisor, ~2 us).
 	 */
-	frac = (idx < MAXCPUS) ? lapic_tlstate[idx].frac : 0;
-	frac_in = frac;
-	counted += frac;
-	elapsed = (unsigned)(counted / lapic_tval);
-	frac = (uint32_t)(counted % lapic_tval);
-	if (idx < MAXCPUS)
-		lapic_tlstate[idx].frac = frac;
-
-	/* Restore the periodic tick. */
 	lapic_writereg(LAPIC_LVT_TIMER,
 	    LAPIC_LVT_TMM_PERIODIC | LAPIC_TIMER_VECTOR);
 	lapic_writereg(LAPIC_DCR_TIMER, LAPIC_DCRT_DIV1);
-	lapic_writereg(LAPIC_ICR_TIMER, lapic_tval);
+	if (tsc_hz != 0 && idx < MAXCPUS) {
+		uint64_t t0 = cpu_counter();
 
-	/*
-	 * The one-shot may have expired after the reads above and before the
-	 * reprogramming: its interrupt is pending now and will add a hardclock
-	 * of its own, so count the interval as complete and let it.
-	 */
-	if (!pending &&
-	    (lapic_readreg(irr) & (1u << (LAPIC_TIMER_VECTOR % 32))) != 0) {
-		pending = 1;
-		counted = (uint64_t)lapic_tval * nticks + frac_in;
-		elapsed = (unsigned)(counted / lapic_tval);
-		frac = (uint32_t)(counted % lapic_tval);
-		if (idx < MAXCPUS)
-			lapic_tlstate[idx].frac = frac;
+		lapic_writereg(LAPIC_ICR_TIMER, lapic_tval);
+		now = t0 + (cpu_counter() - t0) / 2;
+	} else
+		lapic_writereg(LAPIC_ICR_TIMER, lapic_tval);
+	pending = (lapic_readreg(irr) & (1u << (LAPIC_TIMER_VECTOR % 32))) != 0;
+
+	carried = (idx < MAXCPUS) ? lapic_tlstate[idx].frac : 0;
+	if (tsc_hz != 0 && idx < MAXCPUS) {
+		since = lapic_tl_counts(now - lapic_tlstate[idx].entry_tsc,
+		    tsc_hz, lapic_per_second);
+	} else {
+		/* Fallback (no TSC rate): the old inference from the timer. */
+		counted = (uint64_t)lapic_tval * nticks;
+		since = pending ? counted :
+		    (((uint64_t)rem <= counted) ? counted - rem : 0);
 	}
+	elapsed = lapic_tl_credit(carried, since, lapic_tval, pending, &frac,
+	    &manual);
+	if (idx < MAXCPUS)
+		lapic_tlstate[idx].frac = frac;
 
 	/*
-	 * Advance the LAPIC timecounter base by the elapsed ticks, except the
-	 * one the pending interrupt (if any) will add itself in lapic_clockintr.
+	 * Advance the LAPIC timecounter base by the ticks the caller replays;
+	 * the pending interrupt (if any) adds its own in lapic_clockintr.
 	 */
-	ci->ci_lapic_counter += (uint64_t)(elapsed - pending) * lapic_tval;
+	ci->ci_lapic_counter += (uint64_t)manual * lapic_tval;
 
 	*pendingp = pending;
 	return elapsed;
