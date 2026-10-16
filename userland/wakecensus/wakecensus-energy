@@ -1,0 +1,59 @@
+#!/bin/sh
+# wakecensus-energy [-p SECS] [SECONDS] [LABEL]: low-interference energy window.
+# The census proper (wakecensus) disturbs what it measures: crash(8) walks the
+# callout wheel, and it polls the battery through the EC every 5 s.  This mode
+# reads everything ONCE at each end of the window and sleeps in between, so
+# the only wake-up it adds is its own sleep(1).  The window length is measured
+# (TSC from machdep.cidle.residency and the wall clock), not assumed, and the
+# raw endpoint values are printed so a result can be recomputed later.
+# -p SECS polls the discharge-rate sensor every SECS (off by default: each
+# poll is an EC transaction and a wake-up).
+# Measure after 10 min of uptime (PC8 boot transient), on the battery.
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin:/usr/local/sbin:/usr/local/bin
+poll=0
+[ "${1:-}" = -p ] && { poll=$2; shift 2; }
+n=${1:-600}; label=${2:-energy}
+T=/tmp/wakecensus-energy.$$; mkdir -p $T
+hz=$(sysctl -n machdep.tsc_freq 2>/dev/null); hz=${hz:-2112000000}
+end() {
+	# battery first and last: the window is bracketed by the EC reads
+	envstat -d acpibat0 > $T/b$1
+	date +%s > $T/w$1
+	sysctl -n machdep.cidle.residency > $T/r$1
+	vmstat -i | awk 'NF>=3 && $NF ~ /^[0-9]+$/ {n=$(NF-1); $(NF-1)=""; $NF=""; sub(/ +$/,""); print $0 "|" n}' > $T/i$1
+	sysctl -n machdep.lpsched.idle_ms > $T/u$1 2>/dev/null
+}
+field() { tr ' \t' '\n' < $1 | awk -F= -v k="$2" '$1==k{print $2}'; }
+wh() { awk '/charge:/{print $2; exit}' $1; }
+ac=$(envstat -d acpiacad0 | awk '/connected/{print $2}')
+end 1
+if [ "$poll" -gt 0 ]; then
+	t=0; : > $T/rate
+	while [ $t -lt "$n" ]; do
+		sleep $poll; t=$((t+poll))
+		envstat -d acpibat0 2>/dev/null | awk '/discharge rate/{print $3}' >> $T/rate
+	done
+else
+	sleep $n
+fi
+end 2
+tsc0=$(field $T/r1 tsc); tsc1=$(field $T/r2 tsc)
+w0=$(cat $T/w1); w1=$(cat $T/w2); c0=$(wh $T/b1); c1=$(wh $T/b2)
+u0=$(cat $T/u1 2>/dev/null); u1=$(cat $T/u2 2>/dev/null)
+el=$(echo "scale=3; ($tsc1 - $tsc0) / $hz" | bc)
+echo "== wakecensus-energy $label: asked ${n}s, measured ${el}s (wall $((w1-w0))s), $(date), kernel $(sysctl -n machdep.booted_kernel), ac=$ac"
+echo "-- raw: tsc $tsc0 $tsc1 hz $hz | wall $w0 $w1 | Wh $c0 $c1 | idle_ms $u0 $u1"
+[ "$ac" = TRUE ] && echo "-- WARNING: on the charger: the Wh delta is not the machine's draw"
+if [ -n "$u0" ] && [ -n "$u1" ] && [ $((u1 - u0)) -lt $(( (w1-w0)*1000 - 5000 )) ]; then
+	echo "-- TOUCHED: user input during the window (idle_ms $u0 -> $u1): discard"
+fi
+awk -v a="$c0" -v b="$c1" -v s="$el" 'BEGIN{ if (a!="" && b!="" && s>0) printf "-- battery: %.3f -> %.3f Wh = %.3f W over %.1f s (counter steps are coarse: use windows of 10 min or more)\n", a, b, (a-b)*3600/s, s }'
+[ -s $T/rate ] && awk '{s+=$1; k++} END{ if (k) printf "-- discharge rate sensor: %.2f W average of %d samples\n", s/k, k }' $T/rate
+echo "-- package residency"
+for k in c7 pc2 pc3 pc6 pc8 pc10; do
+	a=$(field $T/r1 $k); b=$(field $T/r2 $k)
+	[ -n "$a" ] && [ -n "$b" ] && awk -v k=$k -v a=$a -v b=$b -v t=$((tsc1 - tsc0)) 'BEGIN{printf "  %s %.1f %%\n", k, 100*(b-a)/t}'
+done
+echo "-- interrupts/s"
+awk -F'|' -v s="$el" 'NR==FNR{a[$1]=$2; next} ($1 in a){d=$2-a[$1]; if(d>0) printf "%8.2f/s  %s\n", d/s, $1}' $T/i1 $T/i2 | sort -rn | head -12
+rm -rf $T
