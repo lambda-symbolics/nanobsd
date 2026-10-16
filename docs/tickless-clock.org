@@ -114,3 +114,20 @@ final timebase, separately from the deliberate large-clock-step policy.
 - Reviewed sources match 7975d49 at write-up commit 25fd96e;
   =git diff --check 7975d49^ 7975d49= passed. Review work changed only
   documentation; no kernel build, deployment, or live-machine test was run.
+
+* Review follow-ups, kernel 176 (nanobsd 32c4737)
+Astra's review (/root/astra/tickless-clock-review.org) kept the fix and found
+three P2 defects nearby, all fixed: the bound now comes from kern_tc
+(=tc_max_windup_ticks()=, active and selected counter, a counter switch
+wakes the primary), PPS conversions add without overflow, and a sleep
+crossing several seconds presents each one to =ntp_update_second= in order
+(leap seconds).  cidle looks the bound up at load, so one module serves
+kernels 175 and 176.  Measured with =userland/wakecensus/clock-check.sh=:
+
+| kernel 176                     | real    | kernel | PC10   |
+| tickless, maxskip 100          | 120.5 s | 121 s  | 98.5 % |
+| tickless, maxskip 300          | 120.5 s | 121 s  | 98.8 % |
+| maxskip 300, switch to hpet0   | 90.5 s  | 90 s   | 98.6 % |
+| maxskip 300, back to TSC       | 90.5 s  | 90 s   | 98.9 % |
+
+No clock warnings on 176.
