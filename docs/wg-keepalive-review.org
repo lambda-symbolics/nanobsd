@@ -221,3 +221,13 @@ those two setters plus peer add/delete. Re-adding an existing peer returns
 and a userland command, with peer-reference and timer/admission synchronization.
 An explicit zero should halt/drain the persistent timer; a nonzero update
 should reschedule it without deleting the peer or resetting its session.
+
+* Timer owned by the running interface (435aa40, 2026-10-17)
+Astra's follow-up: a down interface kept the keepalive callout firing every
+interval (quiet, but a wake-up).  Now =wg_stop()= clears IFF_RUNNING and
+cancels every peer's timer, =wg_init()= arms them again, and a peer added to
+a stopped interface waits for =wg_init()=.  A worker that read the flag just
+before the stop can re-arm once; that firing sees the flag and stops.
+VM test (wg0 <-> wg1 over lo0, keepalive 2 s, =crash= =show callout=):
+up 12 s: handshake + keepalives, 1 timer armed; down 12 s: no packet, 0
+armed; up again: keepalives resume, 1 armed; module unloads cleanly.
