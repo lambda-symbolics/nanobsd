@@ -1040,6 +1040,27 @@ cpu_hatch(void *v)
 	(*x86_initclock_func)();
 	cpu_get_tsc_freq(ci);
 
+	/*
+	 * LISPBSD: program the Page Attribute Table on this secondary CPU.
+	 * pat_init() otherwise only runs from cpu_attach() on the BP, so
+	 * secondaries keep the power-on PAT where entry 1 is Write-Through,
+	 * not Write-Combining.  That makes every PMAP_WRITE_COMBINE mapping
+	 * (the i915 framebuffer console) uncached and ~100x slower on CPUs
+	 * 1..N, which stalls the vcons redraw at boot.  Done here -- AFTER
+	 * cpu_get_tsc_freq() so the TSC calibration is not perturbed -- and
+	 * with the SDM vol.3A 11.12.4 cache-flush protocol, before autoconf/
+	 * wsdisplay.  Makes the patfix(4) module unnecessary.
+	 */
+	{
+		u_long psl = x86_read_psl();
+		x86_disable_intr();
+		wbinvd();
+		pat_init(ci);		/* writes MSR_CR_PAT */
+		wbinvd();
+		tlbflushg();
+		x86_write_psl(psl);
+	}
+
 	s = splhigh();
 #if NLAPIC > 0
 	lapic_write_tpri(0);

@@ -1,0 +1,4 @@
+# CSTATE - GENERIC plus deep ACPI C-states (acpicpu C2/C3), see
+# /root/nbsd11/acpicpu-cstate-tsc.patch for the matching acpi_cpu_cstate.c change.
+include "arch/amd64/conf/GENERIC"
+options 	ACPICPU_ENABLE_C3

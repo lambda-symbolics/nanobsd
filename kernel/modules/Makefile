@@ -271,6 +271,7 @@ SUBDIR+=	nvmm
      ${MACHINE_ARCH} == "x86_64"
 #SUBDIR+=	hifn
 SUBDIR+=	if_iavf
+SUBDIR+=	if_iwx
 SUBDIR+=	if_ixl
 SUBDIR+=	ubsec
 .endif
