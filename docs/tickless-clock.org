@@ -131,3 +131,61 @@ kernels 175 and 176.  Measured with =userland/wakecensus/clock-check.sh=:
 | maxskip 300, back to TSC       | 90.5 s  | 90 s   | 98.9 % |
 
 No clock warnings on 176.
+
+* Kernel 177 candidates (2026-10-17 night, built and VM-tested, not on the laptop)
+From Astra's second review: tick accounting, the idle-path cost, and the
+1 Hz primary wake-up the 32-bit TSC counter forces.
+
+** LAPIC tick accounting from the TSC (6ca5ac1)
+176 inferred the sleep from the one-shot's remaining count, read after the
+IRR.  An expiry between the two reads, or a stale periodic interrupt already
+pending at entry, credits a tick twice (tests/lapic-tickless-harness.c
+reproduces both: +99 ticks per race, +204762 over 2e6 random episodes; the
+new code is exact).  177 measures the sleep with the TSC from the CCR read
+at entry to the ICR write that restarts the periodic tick, each sampled as
+the TSC midpoint around that register access (=lapic_tl.h=, shared with the
+harness).  The restart point matters: anything between an earlier sample
+and the ICR write belongs to no interval.
+
+VM test (throwaway KVM guest, =-overcommit cpu-pm=on= for native MWAIT,
+cidle tickless, maxskip 300; MWAIT returns at once there, so ~75000 early
+wakes per CPU per second, every LAPIC access a VM exit):
+
+| 90.2 s real                      | wall clock | hardclock ticks (per CPU) |
+| 176 lapic.c (CCR inference)      | 90-91 s    | 31.6-32.8 s (-64 %)        |
+| TSC, sample before the restore   | 90 s       | 71.8-73.0 s (-20 %)        |
+| TSC, midpoints (committed)       | 90 s       | 91.8-91.9 s (+1.8 %)       |
+| TSC, sample after the ICR write  | 90-91 s    | 97.4-98.0 s (+8 %)         |
+| periodic, no tickless            | 60 of 60.2 | 60.2 of 60.2               |
+
+On the laptop the early-wake rate is hundreds per second, not 75000, and an
+x2APIC access is tens of ns, so the residual is ppm-level; 176's loss grows
+with the interrupt rate (video, network), which is where it was invisible.
+The wall clock never depended on this (timecounter), only hardclock-driven
+things: callouts, cp_time, scheduler ticks.
+
+** Callout next-deadline cache (223d16b)
+=callout_next_ticks()= walked all 1024 buckets on every idle entry.  The
+wheel gains entries in one place only (softclock filing a callout), which
+now lowers a per-CPU cached earliest; removals and firings leave it early,
+which costs one wake-up that finds nothing due and rescans.  A generation
+bumped by =kern.callout_deferrable= invalidates it.  The deferred-skip
+counter is per CPU (was a global atomic).  =kern.callout_nextcache= shows
+=hits= / =scans=; VM: 57.2 M hits, 639 scans.
+
+** TSC-low timecounter (090ec16)
+The 32-bit TSC counter wraps in 2.03 s, so =tc_max_windup_ticks()= keeps
+the tickless primary from sleeping past ~1 s: a 1 Hz wake-up on CPU 0
+forever.  TSC-low is the TSC shifted (FreeBSD's idea) to a half wrap of at
+least 16 s: shift 4 at 2.112 GHz (132 MHz, 7.6 ns resolution, 16.3 s half
+wrap; the VM's 2.92 GHz TSC got shift 5).  Quality 2900, so it is chosen
+only by =sysctl kern.timecounter.hardware=TSC-low= (a counter switch wakes
+the primary, 176).  VM: wall clock exact on it.
+
+** Not done: batching the hardclock replay
+cidle replays one =hardclock()= per skipped tick.  A batched catch-up
+(cp_time, sched ticks, one windup, the wheel advanced bucket by bucket under
+one lock) is possible but each replayed tick costs ~0.5 us: 300 ticks per
+wake, a wake every few seconds, is ~0.005 % of a CPU.  Not worth the risk to
+=hardclock= now; revisit if replay shows up in a profile, or for the
+interrupt-latency spike (maxskip 1400 replays with interrupts at splclock).
