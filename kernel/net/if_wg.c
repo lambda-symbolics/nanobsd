@@ -3604,16 +3604,21 @@ wg_task_persistent_keepalive(struct wg_softc *wg, struct wg_peer *wgp)
 	uint32_t last, now, idle;
 
 	KASSERT(mutex_owned(wgp->wgp_lock));
-	/* 0 also while the peer is being destroyed: never re-arm then. */
-	if (iv == 0)
+	/*
+	 * 0 also while the peer is being destroyed: never re-arm then.  A
+	 * stopped interface owns no timer either: wg_stop() cancels it and
+	 * wg_init() arms it again.  A worker that read the flag just before
+	 * the stop can still re-arm it once; that firing sees the flag and
+	 * ends the chain.
+	 */
+	if (iv == 0 || (wg->wg_if.if_flags & IFF_RUNNING) == 0)
 		return;
 	last = atomic_load_relaxed(&wgp->wgp_last_sent);
 	now = time_uptime32;
 	idle = now - last;
 	if (idle > iv)	/* wrap or a concurrent newer stamp */
 		idle = iv;
-	/* An administratively down interface stays quiet (timer kept). */
-	if (idle >= iv && (wg->wg_if.if_flags & IFF_RUNNING) != 0) {
+	if (idle >= iv) {
 		wgs = wgp->wgp_session_stable;
 		if (wgs->wgs_state == WGS_STATE_ESTABLISHED &&
 		    !wg_session_hit_limits(wgs)) {
@@ -3628,10 +3633,36 @@ wg_task_persistent_keepalive(struct wg_softc *wg, struct wg_peer *wgp)
 			atomic_store_relaxed(&wgp->wgp_last_sent, now);
 		}
 		idle = 0;
-	} else if (idle >= iv)
-		idle = 0;
+	}
 	callout_schedule(&wgp->wgp_persistent_keepalive_timer,
 	    hz * (iv - idle));
+}
+
+/*
+ * LISPBSD: arm (interface up) or cancel (interface down) every peer's
+ * persistent keepalive.  Arming fires within a second; the worker then
+ * keeps its own schedule.  Cancelling cannot wait for a running worker
+ * (no sleeping in a pserialize read section), so the worker checks
+ * IFF_RUNNING, which the caller clears first, before it re-arms: at most
+ * one stray firing after a stop, which then stays quiet.
+ */
+static void
+wg_persistent_keepalive_all(struct wg_softc *wg, bool arm)
+{
+	struct wg_peer *wgp;
+	int s;
+
+	s = pserialize_read_enter();
+	WG_PEER_READER_FOREACH(wgp, wg) {
+		if (atomic_load_relaxed(&wgp->wgp_persistent_keepalive) == 0)
+			continue;
+		if (arm)
+			callout_schedule(&wgp->wgp_persistent_keepalive_timer,
+			    hz);
+		else
+			callout_stop(&wgp->wgp_persistent_keepalive_timer);
+	}
+	pserialize_read_exit(s);
 }
 
 static void
@@ -5157,8 +5188,10 @@ wg_ioctl_add_peer(struct wg_softc *wg, struct ifdrv *ifd)
 	wg->wg_npeers++;
 	mutex_exit(wg->wg_lock);
 
-	/* LISPBSD: the first persistent keepalive kicks the handshake off. */
-	if (wgp->wgp_persistent_keepalive != 0)
+	/* LISPBSD: the first persistent keepalive kicks the handshake off
+	 * (on a stopped interface wg_init() arms it later). */
+	if (wgp->wgp_persistent_keepalive != 0 &&
+	    (wg->wg_if.if_flags & IFF_RUNNING) != 0)
 		callout_schedule(&wgp->wgp_persistent_keepalive_timer, hz);
 
 	if_link_state_change(&wg->wg_if, LINK_STATE_UP);
@@ -5531,8 +5564,10 @@ wg_ioctl(struct ifnet *ifp, u_long cmd, void *data)
 static int
 wg_init(struct ifnet *ifp)
 {
+	struct wg_softc *wg = container_of(ifp, struct wg_softc, wg_if);
 
 	ifp->if_flags |= IFF_RUNNING;
+	wg_persistent_keepalive_all(wg, true);
 
 	/* TODO flush pending packets. */
 	return 0;
@@ -5564,11 +5599,11 @@ wg_start(struct ifnet *ifp)
 static void
 wg_stop(struct ifnet *ifp, int disable)
 {
+	struct wg_softc *wg = container_of(ifp, struct wg_softc, wg_if);
 
 	KASSERT((ifp->if_flags & IFF_RUNNING) != 0);
 	ifp->if_flags &= ~IFF_RUNNING;
-
-	/* Need to do something? */
+	wg_persistent_keepalive_all(wg, false);
 }
 
 #ifdef WG_DEBUG_PARAMS
