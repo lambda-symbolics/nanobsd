@@ -36,6 +36,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/module.h>
 #include <sys/sysctl.h>
 #include <sys/timetc.h>
+#include <sys/ksyms.h>
 #include <sys/mutex.h>
 #include <sys/cpu.h>
 #include <sys/xcall.h>
@@ -180,6 +181,29 @@ cidle_sysctl_tlstats(SYSCTLFN_ARGS)
  * due (or maxskip ticks), then restore the tick and replay elapsed ticks.
  * Runs on every idle CPU independently.  Returns with interrupts enabled.
  */
+/*
+ * The tickless primary's bound.  Kernels from 176 export
+ * tc_max_windup_ticks() (active and selected counter); older ones get the
+ * selected counter's half wrap.  Looked up at load, so one module serves
+ * both kernels (a direct reference would make it unloadable on 175).
+ */
+static int (*cidle_tc_bound)(void);
+
+static int
+cidle_windup_ticks(void)
+{
+	struct timecounter *tc;
+	uint64_t wrap;
+
+	if (cidle_tc_bound != NULL)
+		return (*cidle_tc_bound)();
+	tc = atomic_load_relaxed(&timecounter);
+	if (tc == NULL || tc->tc_frequency == 0)
+		return INT_MAX;
+	wrap = (uint64_t)tc->tc_counter_mask * hz / tc->tc_frequency / 2;
+	return wrap > INT_MAX ? INT_MAX : (int)wrap;
+}
+
 static void
 cidle_idle_tickless(struct cpu_info *ci)
 {
@@ -200,19 +224,15 @@ cidle_idle_tickless(struct cpu_info *ci)
 		skip = cidle_maxskip;	/* heartbeat safety: maxskip <= 1400 (< 15s) */
 	/*
 	 * The primary CPU's hardclock winds the timecounter up, and every
-	 * clock reader on every CPU measures from that windup with a counter
-	 * of tc_counter_mask + 1 counts: if it wraps before the next windup,
-	 * time is lost (TSC: 32 bits at 2.112 GHz = 2.03 s).  Keep the
-	 * primary's sleep to half the wrap interval of the current counter.
+	 * clock reader on every CPU measures from that windup: if the counter
+	 * wraps before the next windup, time is lost (TSC: 32 bits at
+	 * 2.112 GHz = 2.03 s).  kern_tc gives the bound for both the active
+	 * and the selected counter.
 	 */
 	if (CPU_IS_PRIMARY(ci)) {
-		struct timecounter *tc = atomic_load_relaxed(&timecounter);
-		if (tc != NULL && tc->tc_frequency != 0) {
-			uint64_t wrap = (uint64_t)tc->tc_counter_mask * hz /
-			    tc->tc_frequency / 2;
-			if (wrap < (uint64_t)skip)
-				skip = (int)wrap;
-		}
+		int cap = cidle_windup_ticks();
+		if (cap < skip)
+			skip = cap;
 	}
 
 	if (skip < cidle_minskip) {
@@ -493,6 +513,13 @@ cidle_modcmd(modcmd_t cmd, void *arg)
 		x86_cpuid(5, regs);
 		cidle_cpuid5_edx = regs[3];
 		cidle_cpuid5_ecx = regs[2];
+		{
+			unsigned long fn;
+
+			if (ksyms_getval(NULL, "tc_max_windup_ticks", &fn,
+			    KSYMS_PROC) == 0)
+				cidle_tc_bound = (int (*)(void))fn;
+		}
 		mutex_init(&cidle_lock, MUTEX_DEFAULT, IPL_NONE);
 		x86_cpu_idle_get(&cidle_prev_func, cidle_prev_text,
 		    sizeof(cidle_prev_text));

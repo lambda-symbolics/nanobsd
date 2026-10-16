@@ -86,6 +86,7 @@ int	tc_detach(struct timecounter *);
 void	tc_setclock(const struct timespec *ts);
 void	tc_ticktock(void);
 void	tc_gonebad(struct timecounter *);
+int	tc_max_windup_ticks(void);	/* LISPBSD: tickless primary bound */
 
 #ifdef SYSCTL_DECL
 SYSCTL_DECL(_kern_timecounter);

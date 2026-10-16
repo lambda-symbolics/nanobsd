@@ -267,6 +267,47 @@ getuptime32(void)
 #endif	/* !defined(__HAVE_ATOMIC64_LOADSTORE) */
 
 /*
+ * LISPBSD: half the wrap period, in hardclock ticks, of TC's counter.
+ */
+static uint64_t
+tc_half_wrap_ticks(const struct timecounter *tc)
+{
+
+	if (tc == NULL || tc->tc_frequency == 0)
+		return UINT64_MAX;
+	return (uint64_t)tc->tc_counter_mask * hz / tc->tc_frequency / 2;
+}
+
+/*
+ * LISPBSD: the longest a tickless primary CPU may go without winding the
+ * timecounter up, in hardclock ticks.  Clock readers measure from the last
+ * windup with the ACTIVE counter (timehands), and the next windup switches
+ * to the SELECTED one (timecounter): bound both, so that neither wraps.
+ * A selection made while the primary sleeps wakes it (see the sysctl
+ * handler below), so the bound is recomputed before its next sleep.
+ */
+int
+tc_max_windup_ticks(void)
+{
+	struct timehands *th;
+	uint64_t a, b;
+
+	th = atomic_load_consume(&timehands);
+	a = tc_half_wrap_ticks(th->th_counter);
+	b = tc_half_wrap_ticks(atomic_load_relaxed(&timecounter));
+	if (b < a)
+		a = b;
+	return a > INT_MAX ? INT_MAX : (int)a;
+}
+
+static void
+tc_kick_primary_xc(void *arg1, void *arg2)
+{
+
+	/* Nothing: the interrupt ends the primary's tickless sleep. */
+}
+
+/*
  * sysctl helper routine for kern.timercounter.hardware
  */
 static int
@@ -312,6 +353,23 @@ sysctl_kern_timecounter_hardware(SYSCTLFN_ARGS)
 	}
 	if (!cold)
 		mutex_spin_exit(&timecounter_lock);
+	/*
+	 * LISPBSD: a tickless primary asleep under the old counter's bound
+	 * must not sleep past the new counter's wrap once a windup (also
+	 * tc_setclock) switches over: wake it so it re-plans its sleep.
+	 */
+	if (error == 0 && !cold) {
+		struct cpu_info *ci;
+		CPU_INFO_ITERATOR cii;
+
+		for (CPU_INFO_FOREACH(cii, ci)) {
+			if (CPU_IS_PRIMARY(ci)) {
+				xc_wait(xc_unicast(XC_HIGHPRI,
+				    tc_kick_primary_xc, NULL, NULL, ci));
+				break;
+			}
+		}
+	}
 	return error;
 }
 
@@ -440,6 +498,8 @@ tc_bintime_addscaled(struct bintime *bt, uint64_t scale, u_int delta)
 	bintime_addx(bt, x << 32);
 	bintime_addx(bt, (scale & 0xffffffff) * delta);
 }
+
+static uint64_t tc_half_wrap_ticks(const struct timecounter *);
 
 static inline u_int
 tc_delta(struct timehands *th)
@@ -993,16 +1053,46 @@ tc_windup(void)
 	bt = th->th_offset;
 	bintime_add(&bt, &timebase.bin);
 	i = bt.sec - tho->th_microtime.tv_sec;
-	if (i > LARGE_STEP)
-		i = 2;
-	for (; i > 0; i--) {
-		t = bt.sec;
-		ntp_update_second(&th->th_adjustment, &bt.sec);
-		s_update = 1;
-		if (bt.sec != t) {
+	if (i > LARGE_STEP) {
+		/* A large step (TOD read at boot): twice, as before. */
+		for (i = 2; i > 0; i--) {
+			t = bt.sec;
+			ntp_update_second(&th->th_adjustment, &bt.sec);
+			s_update = 1;
+			if (bt.sec != t) {
+				timebase.gen |= 1;	/* change in progress */
+				membar_producer();
+				timebase.bin.sec += bt.sec - t;
+				membar_producer();
+				timebase.gen++;		/* commit change */
+			}
+		}
+	} else if (i > 0) {
+		/*
+		 * LISPBSD: a tickless primary can cross more than one second
+		 * between windups.  Present each crossed second to
+		 * ntp_update_second in order, so a leap insertion or deletion
+		 * at a day boundary is seen at that boundary (stock code
+		 * passed the final second every time and could skip it), and
+		 * carry its correction into the later seconds and bt.
+		 */
+		time_t first = tho->th_microtime.tv_sec, sec, adj = 0;
+
+		for (t = 1; t <= i; t++) {
+			time_t seen;
+
+			sec = first + t + adj;
+			seen = sec;
+			ntp_update_second(&th->th_adjustment, &sec);
+			s_update = 1;
+			if (sec != seen)
+				adj += sec - seen;
+		}
+		if (adj != 0) {
+			bt.sec += adj;
 			timebase.gen |= 1;	/* change in progress */
 			membar_producer();
-			timebase.bin.sec += bt.sec - t;
+			timebase.bin.sec += adj;
 			membar_producer();
 			timebase.gen++;		/* commit change */
 		}
@@ -1346,7 +1436,19 @@ pps_ref_event(struct pps_state *pps,
 
 	/* Convert the count to a bintime. */
 	bt = pps->capth->th_offset;
-	bintime_addx(&bt, pps->capth->th_scale * (acount - pps->capth->th_offset_count));
+	{
+		/*
+		 * LISPBSD: measured from the captured windup, which a tickless
+		 * primary can leave more than a second old: add without the
+		 * 64-bit overflow.  A count beyond 32 bits from that baseline
+		 * is not a sane capture; drop the event rather than truncate.
+		 */
+		uint64_t since = acount - pps->capth->th_offset_count;
+
+		if (__predict_false(since > UINT_MAX))
+			return;
+		tc_bintime_addscaled(&bt, pps->capth->th_scale, (u_int)since);
+	}
 	bintime_add(&bt, &timebase.bin);
 
 	if ((refmode & PPS_REFEVNT_PPS) == 0) {
@@ -1408,7 +1510,9 @@ pps_ref_event(struct pps_state *pps,
 		bt.frac = 0;
 
 		if (refmode & PPS_REFEVNT_CAPCUR) {
-			    bintime_addx(&bt, pps->capth->th_scale * dcount);
+			if (dcount <= UINT_MAX)
+				tc_bintime_addscaled(&bt,
+				    pps->capth->th_scale, (u_int)dcount);
 		}
 		bintime2timespec(&bt, &ts3);
 
