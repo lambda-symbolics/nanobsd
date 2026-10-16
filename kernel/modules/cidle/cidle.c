@@ -114,6 +114,15 @@ static uint8_t		cidle_cf[256] __aligned(16);
 #define MSR_PKG_ENERGY_STATUS	0x611
 #define MSR_PP1_ENERGY_STATUS	0x641	/* graphics (GT) plane */
 
+/* Diagnostic MSRs read as 0 where absent (virtual machines) instead of #GP. */
+static uint64_t
+cidle_rdmsr(u_int msr)
+{
+	uint64_t v;
+
+	return rdmsr_safe(msr, &v) == 0 ? v : 0;
+}
+
 static void
 cidle_xc_resid(void *arg1, void *arg2)
 {
@@ -123,11 +132,13 @@ cidle_xc_resid(void *arg1, void *arg2)
 	    " pc2=%" PRIu64 " pc3=%" PRIu64 " pc6=%" PRIu64 " pc7=%" PRIu64
 	    " pc8=%" PRIu64 " pc9=%" PRIu64 " pc10=%" PRIu64 " cstcfg=%#" PRIx64
 	    " smi=%" PRIu64,
-	    rdtsc(), rdmsr(MSR_CORE_C3_RES), rdmsr(MSR_CORE_C6_RES),
-	    rdmsr(MSR_CORE_C7_RES), rdmsr(MSR_PKG_C2_RES), rdmsr(MSR_PKG_C3_RES),
-	    rdmsr(MSR_PKG_C6_RES), rdmsr(MSR_PKG_C7_RES), rdmsr(MSR_PKG_C8_RES),
-	    rdmsr(MSR_PKG_C9_RES), rdmsr(MSR_PKG_C10_RES), rdmsr(MSR_PKG_CST_CFG),
-	    rdmsr(MSR_SMI_COUNT));
+	    rdtsc(), cidle_rdmsr(MSR_CORE_C3_RES),
+	    cidle_rdmsr(MSR_CORE_C6_RES), cidle_rdmsr(MSR_CORE_C7_RES),
+	    cidle_rdmsr(MSR_PKG_C2_RES), cidle_rdmsr(MSR_PKG_C3_RES),
+	    cidle_rdmsr(MSR_PKG_C6_RES), cidle_rdmsr(MSR_PKG_C7_RES),
+	    cidle_rdmsr(MSR_PKG_C8_RES), cidle_rdmsr(MSR_PKG_C9_RES),
+	    cidle_rdmsr(MSR_PKG_C10_RES), cidle_rdmsr(MSR_PKG_CST_CFG),
+	    cidle_rdmsr(MSR_SMI_COUNT));
 }
 
 static int
@@ -151,10 +162,10 @@ cidle_sysctl_rapl(SYSCTLFN_ARGS)
 	uint64_t units;
 	uint32_t raw, esu, pp1;
 
-	units = rdmsr(MSR_RAPL_POWER_UNIT);
+	units = cidle_rdmsr(MSR_RAPL_POWER_UNIT);
 	esu = (uint32_t)((units >> 8) & 0x1f);
-	raw = (uint32_t)rdmsr(MSR_PKG_ENERGY_STATUS);
-	pp1 = (uint32_t)rdmsr(MSR_PP1_ENERGY_STATUS);
+	raw = (uint32_t)cidle_rdmsr(MSR_PKG_ENERGY_STATUS);
+	pp1 = (uint32_t)cidle_rdmsr(MSR_PP1_ENERGY_STATUS);
 	snprintf(cidle_rapl, sizeof(cidle_rapl),
 	    "raw=%u esu=%u uj_per_unit=%u pp1=%u", raw, esu,
 	    (esu < 31) ? (1000000u >> esu) : 0, pp1);
