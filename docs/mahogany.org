@@ -760,3 +760,22 @@ live =mahoganyctl '(setf mahogany::*refresh-enabled* nil)'= to stop the
 refresh switching; =alacritty -o debug.highlight_damage=true= shows what it
 redraws.  If scanout off cures it, the kernel's flip completion (EBUSY)
 under knob 3 is the next suspect.
+
+* 2026-10-16: lid state from the lid file; control requests logged (mahogany 4f03900, 8574513)
+Twice (10-15 night, 10-16 22:19) the panel blanked and no input woke it.
+Mahogany kept the lid state in a sticky flag set by =(lid-closed)=; while
+it was set, =idle-activity= and =idle-poke= skipped the unblank.  The lid
+was open, no lid event had been logged, and the live image showed only
+=lid-closed= sets the flag and nothing compiled calls it: something sent
+=(lid-closed)= through the control socket (caller unknown, the socket kept
+no record).  Now:
+- the lid state is read from =/var/run/lid-closed= (created and removed by
+  the powerd lid script on every lid event, suspend and nosuspend mode)
+  whenever it matters, so a stray =(lid-closed)= acts like monitors-off and
+  the next input wakes the panel (verified live);
+- every control request except the status sampler's =(bar-status-changed)=
+  is logged as "control: FORM from PID COMMAND <- PPID PARENT" (NetBSD
+  LOCAL_PEEREID), so the next unexpected caller is identifiable;
+- recovery without a reboot: =mahoganyctl '(lid-opened)'= as mag.
+Installed /usr/local/bin/mahogany (previous kept as mahogany.pre-lidfile);
+the running session was hot-loaded with the changed functions.
