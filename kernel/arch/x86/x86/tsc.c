@@ -55,6 +55,7 @@ __KERNEL_RCSID(0, "$NetBSD: tsc.c,v 1.63.2.1 2026/04/03 11:47:37 martin Exp $");
 #define	ABS(a)			((a) >= 0 ? (a) : -(a))
 
 static u_int	tsc_get_timecount(struct timecounter *);
+static u_int	tsc_low_get_timecount(struct timecounter *);
 
 static void	tsc_delay(unsigned int);
 
@@ -80,6 +81,26 @@ static struct timecounter tsc_timecounter = {
 	.tc_counter_mask = ~0U,
 	.tc_name = "TSC",
 	.tc_quality = 3000,
+};
+
+/*
+ * LISPBSD: the TSC shifted right so its low 32 bits wrap slowly (FreeBSD's
+ * "TSC-low").  The plain TSC timecounter wraps its 32 bits in 2.03 s at
+ * 2.112 GHz, so the timecounter must be wound up every ~1 s and the tickless
+ * idle cannot let the primary CPU sleep longer than that.  Shifted by
+ * tsc_low_shift (the smallest shift giving a half wrap of at least
+ * TSC_LOW_HALFWRAP_S seconds: 4 on the Nano, 7.6 ns resolution, 16 s half
+ * wrap) the bound moves past machdep.cidle.maxskip.  Lower quality than
+ * "TSC", so selected only by kern.timecounter.hardware=TSC-low.
+ */
+#define	TSC_LOW_HALFWRAP_S	16
+static u_int	tsc_low_shift;
+
+static struct timecounter tsc_low_timecounter = {
+	.tc_get_timecount = tsc_low_get_timecount,
+	.tc_counter_mask = ~0U,
+	.tc_name = "TSC-low",
+	.tc_quality = 2900,
 };
 
 bool
@@ -255,6 +276,16 @@ tsc_tc_init(void)
 	if (tsc_freq != 0) {
 		tsc_timecounter.tc_frequency = tsc_freq;
 		tc_init(&tsc_timecounter);
+
+		/* 2^32 counts at freq >> shift last 2 * HALFWRAP seconds. */
+		while (tsc_low_shift < 16 &&
+		    ((uint64_t)1 << (32 + tsc_low_shift)) / tsc_freq <
+		    2 * TSC_LOW_HALFWRAP_S)
+			tsc_low_shift++;
+		tsc_low_timecounter.tc_frequency = tsc_freq >> tsc_low_shift;
+		tsc_low_timecounter.tc_quality =
+		    tsc_timecounter.tc_quality < 0 ? -100 : 2900;
+		tc_init(&tsc_low_timecounter);
 	}
 }
 
@@ -470,6 +501,13 @@ tsc_get_timecount(struct timecounter *tc)
 #else
 	return cpu_counter32();
 #endif
+}
+
+static u_int
+tsc_low_get_timecount(struct timecounter *tc)
+{
+
+	return (u_int)(cpu_counter() >> tsc_low_shift);
 }
 
 /*
