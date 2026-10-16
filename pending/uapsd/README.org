@@ -1,0 +1,383 @@
+#+TITLE: U-APSD (WMM power save) for iwx on LispBSD
+#+DATE: 2026-10-17
+
+Status: written and compile-tested (VM: GENERIC kernel and if_iwx.kmod, both
+-Werror, exit 0).  Not run on hardware.  Nothing committed.  Default OFF.
+
+* What this is
+
+U-APSD lets the radio doze between sparse frames: the AP buffers frames for
+us per access category and releases them when we send a trigger frame (any
+uplink QoS frame, or a QoS Null the firmware sends on its own), instead of
+the station staying awake for the legacy power-save idle timeouts.  With
+U-APSD on, the firmware uses 50 ms idle timeouts for the U-APSD ACs instead
+of the PS level 2 timeouts this port uses today (rx 200 ms, tx 300 ms).
+
+Switch: =hw.iwx.uapsd= (int, 0/1, *default 0*), next to =hw.iwx.beacon_filter=.
+Diagnostics: =hw.iwx.uapsd_status= (read-only string) and two dmesg lines per
+association while the switch is on.
+
+* Files
+
+| file                                    | change                                                    |
+|-----------------------------------------+-----------------------------------------------------------|
+| sys/net80211/ieee80211.h                | WMM QoS Info defines (OpenBSD/Linux names)                |
+| sys/net80211/ieee80211_var.h            | =IEEE80211_FEXT_UAPSD=, =ic_uapsd_ac/maxsp=, 3 inlines    |
+| sys/net80211/ieee80211_node.h           | =IEEE80211_NODE_UAPSD=, =ni_uapsd_ac/maxsp/qosinfo=       |
+| sys/net80211/ieee80211_proto.h          | prototype =ieee80211_setup_uapsd()=                       |
+| sys/net80211/ieee80211_input.c          | negotiation in assoc response; EDCA reparse; QoS-Null     |
+| sys/net80211/ieee80211_output.c         | QoS Info of the WMM element in (re)assoc requests         |
+| sys/net80211/ieee80211_crypto_ccmp.c    | per-TID receive replay counters                           |
+| sys/dev/pci/if_iwx.c                    | power table, STA cmds, fallback, switch, diagnostics      |
+| sys/dev/pci/if_iwxvar.h                 | =struct iwx_uapsd_diag=, =uapsd_task=                     |
+| uapsd.diff                              | all of the above against =/root/lispbsd/sys= (=patch -p1= in =/usr/src=) |
+| uapsd-ab.sh                             | morning A/B script (run on the laptop)                    |
+
+=if_iwxreg.h= needs no change: the laptop copy already has the OpenBSD 1.229
+register definitions (=IWX_STA_MODIFY_UAPSD_ACS=, =IWX_UAPSD_PS_*_TIMEOUT=,
+=struct iwx_uapsd_misbehaving_ap_notif=, the power flags).
+
+* Which net80211 this is, and how iwx sits on it
+
+NetBSD 11's =sys/net80211= is the *old NetBSD stack*: FreeBSD's net80211 as of
+2005 (=$FreeBSD: ieee80211_input.c,v 1.81 2005/08/10 sam=), single
+=struct ieee80211com= per interface, no vaps, no HT/VHT.  The FreeBSD-derived
+vap stack (the "phil-wifi" branch) is not in netbsd-11; there is no
+=ieee80211_vap.c=/=ieee80211_ht.c= in the tree.  OpenBSD's net80211 is a
+different descendant (EDCA in =ic_edca_ac[]=, nwflags in =ic_userflags=, 11n/ac).
+
+The iwx port (OpenBSD if_iwx.c 1.229) glues to it by overriding
+=ic_newstate= (firmware work in =iwx_newstate_task=, then net80211's handler),
+=ic_node_alloc=, doing all crypto in software through net80211, and sending
+every frame on one Tx queue.  It runs legacy 11a/b/g only and has never
+advertised =IEEE80211_C_WME=, so every association so far has been non-QoS.
+That matters: *U-APSD only exists inside a WMM (QoS) association*.  This old
+stack does have FreeBSD's 2005 WME code (WMM Information element in the
+association request when =IEEE80211_F_WME= is set, parameter parsing, QoS data
+encapsulation with per-AC classification, QoS decap and per-TID duplicate
+detection), but it was dead code on this laptop until now.
+
+* What was ported from the OpenBSD patch
+
+Source: openbsd-tech thread "sys/ieee80211: support of uAPSD; sys/iwx: enable
+uAPSD when supported by AP" (Kirill A. Korinsky, 2026-03-20 .. 05-28).  The
+latest revision is the one quoted in Kirill's ping of 2026-05-28 (diff dated
+19 May, against if_iwx.c 1.228), ok'd by stsp the same day
+(marc.info m=177996219830355).  Earlier revisions fixed AC bit typos, made it
+depend on the firmware's UAPSD_SUPPORT flag, moved it under a default-off
+nwflag (Kirill measured added latency for sparse traffic, as on Linux, where
+iwlwifi also defaults BSS U-APSD off), and, after stsp's review, renamed the
+node state to the =IEEE80211_NODE_UAPSD= flag and only sends WME in 11n/ac
+association requests.
+
+Ported as is (names kept):
+- =IEEE80211_WMM_IE_*= QoS Info defines.
+- =ic_uapsd_ac=, =ic_uapsd_maxsp= (driver: all four ACs, unlimited SP),
+  =ni_uapsd_ac=, =ni_uapsd_maxsp=, =IEEE80211_NODE_UAPSD=.
+- =ieee80211_parse_wmm_qosinfo()=, =ieee80211_setup_uapsd()=,
+  =ieee80211_uapsd_qosinfo()=; QoS Info in the WMM Information element of
+  (re)association requests; " uAPSD enabled/disabled" in the association
+  message.
+- iwx: =iwx_uapsd_qndp_tid()=, =iwx_uapsd_acs()=, =iwx_uapsd_ac_flags()=,
+  =iwx_uapsd_sp_length()=; in =iwx_set_pslevel()= (level != 0) the
+  ADVANCE_PM and UAPSD_MISBEHAVING flags, 50 ms U-APSD rx/tx timeouts, QNDP
+  TID, AC flags, max SP; =uapsd_acs=/=sp_length= with
+  =IWX_STA_MODIFY_UAPSD_ACS= in ADD_STA and in the MLD STA_CONFIG command; the
+  =IWX_PSM_UAPSD_AP_MISBEHAVING_NOTIFICATION= fallback (U-APSD off until the
+  next association, power table resent); everything gated on
+  =IWX_UCODE_TLV_FLAGS_UAPSD_SUPPORT=.
+
+Adapted for NetBSD (minimal, each one marked LISPBSD in the code):
+1. *Switch.*  OpenBSD: =ifconfig iwx0 nwflag uapsd= (=IEEE80211_F_UAPSD= in
+   =ic_userflags=).  NetBSD's ifconfig has no nwflags and the stack has no
+   =ic_userflags=, so net80211 gets =IEEE80211_FEXT_UAPSD= in =ic_flags_ext=
+   (FreeBSD's later name and value) and the driver sets it from
+   =hw.iwx.uapsd=.  The ifconfig.8 text of the patch is not ported.
+2. *WME at all.*  OpenBSD only uses WMM in 11n/ac mode; this port has
+   neither.  While =hw.iwx.uapsd=1= the driver sets =IEEE80211_C_WME= and
+   =IEEE80211_F_WME= (and =ieee80211_wme_initparams()=), so the next
+   association is a WMM one; at 0 both are cleared, which is exactly
+   today's behaviour.  The driver provides the =wme_update= callback the
+   stack calls (a no-op: EDCA reaches the firmware with the MAC context at
+   association; mid-association EDCA changes wait for the next one).
+   =iwx_get_edca_params()= uses =ic_wme= only for a WMM association; with
+   the switch on and a non-WMM AP it keeps the driver defaults, because
+   net80211's "aggressive mode" rewrites BE for non-QoS stations (AIFSN 2
+   instead of 3) (review F5).  So a non-WMM association is the same with
+   the switch on or off.
+3. *EDCA/ACM source.*  =ic_edca_ac[EDCA_AC_x].ac_acm= becomes
+   =ic_wme.wme_wmeChanParams.cap_wmeParams[WME_AC_x].wmep_acm=.
+4. *When negotiation is decided.*  OpenBSD also re-runs
+   =ieee80211_setup_uapsd()= on every beacon/probe response.  Here it runs
+   once per (re)association response, so the negotiated state is fixed for
+   the association and the misbehaving-AP fallback stays until the next
+   association (Kirill's stated intent; on OpenBSD the next beacon would set
+   the node flag again without telling the firmware).
+5. *Asking only APs that offer it.*  OpenBSD puts the U-APSD ACs in every
+   WMM association request while the flag is on.  Here they are only
+   requested when the AP's beacon WMM element advertises U-APSD (as the WMM
+   spec asks of a station), and the node flag is only set if we asked.
+   What we asked is the QoS Info actually put in the request, kept in
+   =ni_uapsd_qosinfo= when the request is built; =ieee80211_setup_uapsd()=
+   takes the ACs and max SP from it instead of re-reading the switch, so a
+   sysctl write between request and response cannot make them disagree
+   (review F3).
+6. *Inlines.*  =ieee80211_parse_wmm_qosinfo()= and
+   =ieee80211_uapsd_qosinfo()= (plus =ieee80211_node_uapsd_capable()=) are
+   =static __inline= in =ieee80211_var.h=, so =if_iwx.kmod= uses no new
+   kernel symbol (checked: every undefined symbol of the module resolves in
+   the stock NetBSD 11 GENERIC kernel).
+7. *No layout change.*  The new u_int8_t fields sit in alignment holes:
+   =ic_uapsd_ac/maxsp= at offsets 2540/2541 of =struct ieee80211com= (hole
+   before =ic_media=), =ni_uapsd_ac/maxsp/qosinfo= at 297/298/299 of
+   =struct ieee80211_node= (hole before =ni_tstamp=).  Checked in the VM:
+   =sizeof= (3328, 600) and all other offsets unchanged.  The new node flag
+   is a free bit of the 16-bit =ni_flags= (0x0040).  So a kernel and a module
+   from either side of the patch still agree on the structures; an old kernel
+   with the new module can at most make a WMM association without U-APSD.
+8. *Fallback context.*  OpenBSD resends the power table from the interrupt
+   handler; here the notification (softint), and =hw.iwx.uapsd=0=, queue
+   =uapsd_task= on the *newstate* task queue, so it is serialised with state
+   changes and never runs inside a RUN -> x teardown (=ic_state= still reads
+   RUN until the end of =iwx_newstate_task=).  It only sends the power table
+   if the MAC is active, =ic_state= is RUN and no transition away from RUN
+   has been requested (=ns_nstate= == RUN), and a misbehaving notification is
+   ignored if a new association happened since it arrived (review F1).  It
+   uses this port's association
+   PS level (2, from =ifconfig iwx0 powersave=) instead of OpenBSD's 3, and
+   logs always (OpenBSD: only with IFF_DEBUG).
+9. *=uapsd_ac_flags=.*  The firmware API comment says it takes
+   =IEEE80211_WMM_IE_STA_QOSINFO_AC_*= bits, so it gets =ni_uapsd_ac=.
+   OpenBSD sets =1 << EDCA_AC_x= (BE=bit0 .. VO=bit3), Linux =BIT(IEEE80211_AC_x)=
+   (VO=bit0 .. BK=bit3); all three give 0x0f for the only configuration
+   used (all four ACs).
+10. *The association message* is a net80211 =IEEE80211_DPRINTF= on NetBSD,
+    compiled out without =options IEEE80211_DEBUG= (not in GENERIC); the
+    driver's own lines below are the ones to read.
+
+Needed because WMM had never been used on this stack (not in the OpenBSD
+patch; small, and inert for non-QoS traffic):
+- *Per-TID CCMP replay counters* (=ieee80211_crypto_ccmp.c=).  The old stack
+  keeps one receive PN per key.  The AP numbers frames from one PN counter but
+  sends each AC from its own queue, so with WMM a BE frame can legitimately
+  arrive after a VO frame with a higher PN and would be dropped as a replay.
+  The counters are in CCMP's private context (=struct ieee80211_key= keeps its
+  layout), seeded from =wk_keyrsc= at key installation; non-QoS frames use
+  their own counter, which behaves exactly as the old single one.  TKIP keeps
+  the single counter (a WPA2-CCMP home AP does not use TKIP pairwise).
+- *EDCA parameters parsed on every association* (=ieee80211_input.c=).
+  =ieee80211_parse_wmeparams()= skips an element whose parameter-set count
+  equals the last one seen, and both start at 0, so a fresh association never
+  parsed the AP's EDCA/ACM values.  With =F_WME= set the count is invalidated
+  before parsing the association response.
+- *QoS Null frames* (the AP ends U-APSD service periods with them) are not
+  counted as decap errors, like Null frames already were.
+
+Not ported / not done:
+- Linux extras OpenBSD also lacks: snooze (=POWER_FLAGS_SNOOZE_ENA_MSK=) when
+  all ACs are U-APSD, heavy tx/rx thresholds, remembering misbehaving APs
+  across associations.
+- Re-sending EDCA to the firmware when the AP changes it mid-association.
+- U-APSD for TKIP-per-TID replay counters (see above), hostap/IBSS (station
+  mode only, as the port).
+
+* Runtime switch and what toggling does
+
+- =sysctl -w hw.iwx.uapsd=1=: advertises WME and asks for U-APSD *at the next
+  (re)association*.  If associated, dmesg says
+  =iwx0: hw.iwx.uapsd=1 takes effect at the next association=.  Nothing else
+  changes until then; reassociate with =wpa_cli -i iwx0 reassociate= (which
+  may scan once; do it at the laptop, or let =uapsd-ab.sh= do it).
+- =sysctl -w hw.iwx.uapsd=0=: takes U-APSD out of the firmware power table
+  within milliseconds, from =uapsd_task= on the newstate queue
+  (=iwx0: hw.iwx.uapsd=0, U-APSD off until the next association=) and
+  stops advertising WME.  The current association stays a WMM one (QoS data
+  frames, the AP still thinks our ACs are U-APSD; the firmware falls back to
+  legacy PS-Poll, the same state as after the misbehaving-AP fallback) until
+  the next reassociation, which returns to today's exact behaviour.
+- At boot: setting it in =/etc/sysctl.conf= applies to the first association
+  (rc runs sysctl.conf before wpa_supplicant; the driver applies the value
+  whether it was set before or after iwx attached).  Do not add it there
+  until the morning test says so.
+- U-APSD is only sent to the firmware when power save is on (PS level != 0,
+  =ifconfig iwx0 powersave=, set in rc.local).  Without it =negotiated=1
+  active=0=.
+
+* Diagnostics
+
+=sysctl hw.iwx.uapsd_status= (one line per device; all fields always valid,
+also with the switch off):
+
+| field                    | meaning                                                                     |
+|--------------------------+-----------------------------------------------------------------------------|
+| switch                   | hw.iwx.uapsd                                                                |
+| fw                       | firmware advertises =UAPSD_SUPPORT= (needed, else nothing is sent)          |
+| assoc                    | associated (iwx_run done)                                                   |
+| ap_wmm, ap_uapsd         | the AP's beacon WMM element exists / has the U-APSD bit (works with switch=0) |
+| req                      | QoS Info we asked for (0x0f = all ACs, max SP all; 0 = not asked)           |
+| qos                      | the association is a WMM one                                                |
+| negotiated               | =IEEE80211_NODE_UAPSD= (cleared by the fallback or switch=0)                |
+| active                   | the last MAC power table sent had U-APSD (flags bit 0x0200)                 |
+| assocs, uapsd_assocs     | associations seen / of which with U-APSD                                    |
+| misbehaving              | firmware misbehaving-AP notifications                                       |
+| level, flags             | PS level and flags word of the last MAC power table                          |
+| rx_to, tx_to             | legacy PS idle timeouts sent (us; level 2: 204800/307200)                   |
+| rx_to_uapsd, tx_to_uapsd | U-APSD idle timeouts sent (us; 50000/50000 when active, else 0)             |
+| qndp_tid                 | TID of the firmware's trigger QoS Nulls (6 = VO unless the AP sets ACM)     |
+| ac_flags, max_sp         | U-APSD ACs (0x0f) and max SP (0 = all) in the power table                   |
+| skip_dtim, keep_alive    | power table, for completeness                                               |
+| sta_acs, sp_length       | ADD_STA/STA_CONFIG fields (0xff, 128 when U-APSD; 0, 0 otherwise)           |
+
+Expected when it works (PS level 2, U-APSD AP):
+#+begin_example
+iwx0: switch=1 fw=1 assoc=1 ap_wmm=1 ap_uapsd=1 req=0x0f qos=1 negotiated=1 active=1 ...
+  level=2 flags=0x1203 rx_to=204800 tx_to=307200 rx_to_uapsd=50000 tx_to_uapsd=50000
+  qndp_tid=6 ac_flags=0x0f max_sp=0 ... sta_acs=0xff sp_length=128
+#+end_example
+Today's state for comparison (switch 0): =qos=0 negotiated=0 active=0 flags=0x0003=
+and =rx_to_uapsd=0 tx_to_uapsd=0=.
+
+dmesg / /var/log/messages, per association while the switch is on:
+#+begin_example
+iwx0: U-APSD: AP WMM yes, AP U-APSD yes, requested 0x0f, WMM association yes, U-APSD negotiated, firmware support yes
+iwx0: U-APSD power table: level 2 flags 0x1203 rx/tx timeout 204800/307200 us, U-APSD rx/tx timeout 50000/50000 us, qndp tid 6, ac flags 0x0f, max sp 0; sta acs 0xff sp length 128
+#+end_example
+and on fallback: =iwx0: firmware reports U-APSD misbehaving AP, U-APSD off until the next association=.
+
+* Risks
+
+- *First WMM associations on this machine.*  The bigger change is not
+  U-APSD but WMM: QoS data frames through net80211's 2005 WME code and the
+  port's single Tx queue (OpenBSD sends non-aggregated QoS frames on the same
+  queue, so the firmware side is known to work), uplink classification by IP
+  TOS into four ACs, per-TID sequence numbers.  stsp's review comment was
+  exactly that enabling WME in 11a/b/g mode could break older drivers; here
+  it is confined to iwx and to =hw.iwx.uapsd=1=.  Watch for: association
+  failures, input errors in =netstat -i -I iwx0=, TCP retransmits
+  (=netstat -s -p tcp | grep -i retrans=) and stalled transfers.
+- *Latency.*  Downlink frames that are not answers to our own traffic wait
+  for the next beacon's TIM and a trigger (up to one beacon interval, ~102 ms,
+  more with DTIM skipping).  Kirill saw added latency for sparse traffic;
+  Linux disables BSS U-APSD by default for the same reason.  Interactive ssh
+  into the laptop is the case to feel.
+- *Misbehaving APs.*  Some APs announce U-APSD and then lose frames or never
+  close service periods.  The firmware detects this and sends a notification;
+  the driver then turns U-APSD off until the next association (logged,
+  =misbehaving= counter).  An AP that misbehaves in ways the firmware does not
+  detect shows as stalls; recover with =sysctl -w hw.iwx.uapsd=0= (immediate)
+  and a reassociation.
+- *ADD_STA =uapsd_acs= in client mode.*  OpenBSD sets the AP station's
+  =uapsd_acs=/=sp_length= in ADD_STA; Linux leaves them 0 for the AP in
+  client mode (it fills them for clients of its own AP).  Ported as OpenBSD
+  (tested there on AX201 fw 77 and AX211).  If anything odd shows up only
+  with the switch on, this is the first suspect.
+- *EDCA changes mid-association* are not pushed to the firmware (see 2).
+- *Power gain may be small.*  Beacon filtering and PS level 2 already let the
+  radio sleep most of the time; U-APSD mainly shortens the 200/300 ms awake
+  tails after each burst to 50 ms.  With an idle laptop the difference may be
+  below the 1 mWh resolution over a short window; that is why the windows are
+  6 minutes and alternate.
+
+* Build result (VM, NetBSD 11.0 amd64)
+
+Tree: =/build/agent-uapsd/sys= (copy of =/build/lispsys/sys= = the laptop tree,
+md5-checked against =/root/lispbsd/sys=; =/build/agent-uapsd-sys= links to
+it; =common= -> =/build/src/common=).
+- Module: =cd /build/agent-uapsd/sys/modules/if_iwx && make= (module dir
+  symlinks repointed into this tree): exit 0, no warnings (-Werror).
+- Kernel: =config GENERIC && make depend && make -j4= in
+  =arch/amd64/compile/GENERIC=: exit 0 (-Werror).  The only 5 warnings in the
+  log are the pre-existing =-Wenum-conversion= ones in =dev/ic/ath.c=, same
+  count as the unpatched lispsys build.  Result:
+  =/build/agent-uapsd/sys/arch/amd64/compile/GENERIC/netbsd= (not meant for
+  installing; build kernel 177 your usual way).
+- Module smoke test on the VM's stock kernel: =modload if_iwx.kmod= (no iwx
+  device there, so nothing attaches): =hw.iwx.uapsd= and
+  =hw.iwx.uapsd_status= exist with their descriptions, 0 -> 1 -> 0 works,
+  2 gives EINVAL, writing the status node gives EPERM; =modunload= clean.
+- Layout probe and =nm -u= check as described above; =uapsd.diff= applied to
+  a fresh copy of =/root/lispbsd/sys= reproduces the patched files exactly.
+- After the review fixes (F1, F3, F5; see REVIEW.org): module and kernel
+  rebuilt incrementally in the same tree, both exit 0 with -Werror, the
+  kernel log again only has the 5 ath.c warnings; layout probe: the new
+  =ni_uapsd_qosinfo= is at 299, still inside the hole, sizes unchanged; the
+  module still needs no new kernel symbol; the regenerated =uapsd.diff=
+  reproduces the patched files.
+- Not done: running it on hardware (no iwx in the VM).
+
+* Deploying on the laptop (when you choose to)
+
+1. =cd /usr/src && patch -p1 < uapsd.diff= (paths are =sys/...=).  The diff
+   is against the laptop tree as of kernel 176 (=/root/lispbsd/sys=).
+2. Build the kernel the usual way (GENERIC with your i915 bits, e.g. kernel
+   177), install it under a new name and add a boot.cfg menu entry; keep 176
+   as the default until the test passes.  iwx is built into GENERIC; also
+   rebuild =/usr/src/sys/modules/if_iwx= so the module (modules.conf) matches.
+3. nanobsd: stock-then-change for the seven net80211 files (they are not in
+   nanobsd yet), the two iwx files, this README into docs/, =uapsd-ab.sh= into
+   userland/.
+
+* Morning test plan
+
+Do steps 1-3 at the laptop (step 2 reassociates).  Never run Wi-Fi scans
+remotely (=wifi= TUI scan, =wpa_cli scan=); reassociations are done at the
+laptop or by the detached script.
+
+1. *Boot the new kernel, check the AP before enabling anything.*
+   #+begin_src sh
+   sysctl hw.iwx.uapsd hw.iwx.uapsd_status   # switch=0 fw=1 ap_wmm=? ap_uapsd=?
+   ifconfig iwx0 | grep -i powersave          # must be on (rc.local)
+   #+end_src
+   =fw=0= or =ap_uapsd=0=: U-APSD cannot be negotiated with this AP/firmware;
+   stop (a WMM-only association brings nothing).
+
+2. *Enable and confirm negotiation.*
+   #+begin_src sh
+   sysctl -w hw.iwx.uapsd=1
+   wpa_cli -i iwx0 reassociate; sleep 15
+   dmesg | grep -i u-apsd | tail -3
+   sysctl hw.iwx.uapsd_status   # qos=1 negotiated=1 active=1 flags=0x1203 rx_to_uapsd=50000 ac_flags=0x0f
+   ping -c 20 <gateway>          # works, no loss
+   #+end_src
+   If =qos=0=: the AP did not accept WMM; =negotiated=0= with =qos=1=: the
+   association response lacked the U-APSD bit.  Then =sysctl -w hw.iwx.uapsd=0=,
+   reassociate, stop.
+
+3. *Quick functional check (5 min, switch=1):* browse, an scp of a large file
+   both ways, an ssh session from the other machine; =netstat -i -I iwx0=
+   errors unchanged; =grep misbehaving /var/log/messages= empty.
+
+4. *Power A/B (battery, hands off).*  Requirements: charger unplugged,
+   >= 10 minutes since boot (wait the 10 minutes before starting), panel
+   blanked (Mahogany idle blank or =(mahogany::idle-blank)= via mahoganyctl as
+   in rr30-ab6.sh; NOT the lid, which suspends), no Firefox video, nothing
+   else running.  Then:
+   #+begin_src sh
+   intrctl list | grep iwx0            # note the msixN; default IRQPAT is 'msix3 vec'
+   cp uapsd-ab.sh /var/tmp/ && nohup sh /var/tmp/uapsd-ab.sh 6 2 > /dev/null 2>&1 &
+   #+end_src
+   It runs 0,1,0,1: set the switch, reassociate, wait for association, settle
+   120 s, log =hw.iwx.uapsd_status=, measure the battery charge delta over 6
+   minutes (watts = Wh delta x 3600 / s; one step of the charge counter,
+   1-10 mWh, is 0.01-0.1 W over 6 min),
+   iwx interrupts/s, then 30 pings at 1/s to the gateway.  About 40 minutes.
+   Leaves =hw.iwx.uapsd=0= and reassociates.  Results:
+   #+begin_src sh
+   grep RESULT /var/tmp/uapsd-ab/log.txt; grep 'ping' /var/tmp/uapsd-ab/log.txt
+   #+end_src
+   Verdict: the two uapsd=1 windows vs the two uapsd=0 windows; a gain
+   smaller than the spread between the two windows of the same mode is no
+   gain.  Check that every uapsd=1 window logged =negotiated=1 active=1=.
+
+5. *Latency and interactivity (switch=1 vs 0, panel may be on).*  From the
+   laptop: =ping -c 60 -i 1 <gateway>= in each state (uplink-triggered:
+   should be similar).  From the other machine on the LAN (or over wg):
+   =ping -c 60 -i 1 192.168.1.254= in each state (downlink-initiated: expect
+   up to ~100 ms more with U-APSD), and an ssh session with typing and
+   =top= running; note any lag.  Switching for this step: at the laptop,
+   =sysctl -w hw.iwx.uapsd=N; wpa_cli -i iwx0 reassociate=.
+
+6. *Afterwards.*  Keep =hw.iwx.uapsd=0= unless step 4 shows a real gain and
+   step 5 shows acceptable latency; only then add =hw.iwx.uapsd=1= to
+   =/etc/sysctl.conf=.  Rollback at any time: =sysctl -w hw.iwx.uapsd=0= and
+   reassociate, or boot kernel 176.

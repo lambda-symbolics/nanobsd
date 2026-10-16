@@ -1,0 +1,1006 @@
+--- a/sys/dev/pci/if_iwx.c
++++ b/sys/dev/pci/if_iwx.c
+@@ -268,7 +268,8 @@
+ /*
+  * Default EDCA parameters (802.11-2012 Table 8-105 for OFDM PHYs).
+  * NetBSD's net80211 only fills in ic_wme when IEEE80211_C_WME is
+- * advertised, which we do not do, so use these for the MAC context.
++ * advertised, which we only do while hw.iwx.uapsd is set (LISPBSD),
++ * so otherwise use these for the MAC context.
+  */
+ static const struct iwx_edca_defaults {
+ 	uint8_t ecwmin;
+@@ -570,6 +571,13 @@
+ static int	iwx_set_pslevel(struct iwx_softc *, int, int, int);
+ static int	iwx_disable_beacon_filter(struct iwx_softc *);
+ static int	iwx_enable_beacon_filter(struct iwx_softc *, struct iwx_node *);
++static int	iwx_wme_update(struct ieee80211com *);
++static void	iwx_uapsd_caps(struct iwx_softc *, int);
++static void	iwx_uapsd_request_off(struct iwx_softc *, int);
++static void	iwx_add_task(struct iwx_softc *, struct iwx_taskq *,
++		    struct iwx_task *);
++static void	iwx_uapsd_task(void *);
++static void	iwx_uapsd_note_assoc(struct iwx_softc *, struct iwx_node *);
+ static int	iwx_sf_config(struct iwx_softc *, int);
+ static int	iwx_allow_mcast(struct iwx_softc *);
+ static int	iwx_clear_statistics(struct iwx_softc *);
+@@ -5534,6 +5542,107 @@
+ 	return iwx_beacon_filter_send_cmd(sc, &cmd);
+ }
+ 
++/*
++ * LISPBSD: U-APSD (WMM power save), ported from OpenBSD's 2026-05
++ * U-APSD support by Kirill A. Korinsky (net80211 + iwx).  Off until
++ * hw.iwx.uapsd is set.  U-APSD needs a WMM (QoS) association, which this
++ * port otherwise never makes; while hw.iwx.uapsd=1 the driver advertises
++ * WME to net80211, whose (re)association requests then carry a WMM
++ * Information element asking for U-APSD on all four ACs if the AP
++ * advertises it.  Setting it takes effect at the next association;
++ * clearing it stops U-APSD in the firmware at once (the WMM association
++ * itself lasts until the next association).
++ */
++static int iwx_uapsd = 0;
++
++/* PS level used while associated: `ifconfig iwx0 powersave` gives 2. */
++static int
++iwx_assoc_pslevel(struct ieee80211com *ic)
++{
++	return (ic->ic_flags & IEEE80211_F_PMGTON) ? 2 : 0;
++}
++
++/*
++ * TID of the QoS Null frames the firmware sends as U-APSD triggers: the
++ * highest-priority U-APSD AC without admission control.  OpenBSD reads
++ * the AP's ACM bits from ic_edca_ac[]; NetBSD's net80211 keeps them in
++ * ic_wme.wme_wmeChanParams.
++ */
++static uint8_t
++iwx_uapsd_qndp_tid(struct ieee80211com *ic, uint8_t acs)
++{
++	const struct wmeParams *wp =
++	    ic->ic_wme.wme_wmeChanParams.cap_wmeParams;
++
++	if ((acs & IEEE80211_WMM_IE_STA_QOSINFO_AC_VO) &&
++	    !wp[WME_AC_VO].wmep_acm)
++		return 6;
++	if ((acs & IEEE80211_WMM_IE_STA_QOSINFO_AC_VI) &&
++	    !wp[WME_AC_VI].wmep_acm)
++		return 5;
++	if ((acs & IEEE80211_WMM_IE_STA_QOSINFO_AC_BE) &&
++	    !wp[WME_AC_BE].wmep_acm)
++		return 0;
++	if ((acs & IEEE80211_WMM_IE_STA_QOSINFO_AC_BK) &&
++	    !wp[WME_AC_BK].wmep_acm)
++		return 1;
++	return 0;
++}
++
++/* ADD_STA/STA_CONFIG: trigger-enabled ACs (low nibble), delivery (high). */
++static uint8_t
++iwx_uapsd_acs(struct ieee80211_node *ni)
++{
++	uint8_t acs = 0;
++
++	if (ni->ni_uapsd_ac & IEEE80211_WMM_IE_STA_QOSINFO_AC_VO)
++		acs |= 1 << IWX_AC_VO;
++	if (ni->ni_uapsd_ac & IEEE80211_WMM_IE_STA_QOSINFO_AC_VI)
++		acs |= 1 << IWX_AC_VI;
++	if (ni->ni_uapsd_ac & IEEE80211_WMM_IE_STA_QOSINFO_AC_BE)
++		acs |= 1 << IWX_AC_BE;
++	if (ni->ni_uapsd_ac & IEEE80211_WMM_IE_STA_QOSINFO_AC_BK)
++		acs |= 1 << IWX_AC_BK;
++
++	return acs | (acs << IWX_AC_NUM);
++}
++
++/*
++ * MAC power table uapsd_ac_flags.  The firmware API documents this field
++ * as IEEE80211_WMM_IE_STA_QOSINFO_AC_* bits, so pass the QoS Info ACs.
++ * (OpenBSD sets bit EDCA_AC_x per AC and Linux bit IEEE80211_AC_x; all
++ * three agree on 0x0f, the only value used since ic_uapsd_ac always
++ * names all four ACs.)
++ */
++static uint8_t
++iwx_uapsd_ac_flags(struct ieee80211_node *ni)
++{
++	return ni->ni_uapsd_ac & IEEE80211_WMM_IE_STA_QOSINFO_AC_MASK;
++}
++
++static uint8_t
++iwx_uapsd_sp_length(struct ieee80211_node *ni)
++{
++	switch (ni->ni_uapsd_maxsp & IEEE80211_WMM_IE_STA_QOSINFO_SP_MASK) {
++	case IEEE80211_WMM_IE_STA_QOSINFO_SP_2:
++		return 2;
++	case IEEE80211_WMM_IE_STA_QOSINFO_SP_4:
++		return 4;
++	case IEEE80211_WMM_IE_STA_QOSINFO_SP_6:
++		return 6;
++	default:
++		return 128;
++	}
++}
++
++/* U-APSD in use with the BSS node and supported by the firmware? */
++static int
++iwx_uapsd_usable(struct iwx_softc *sc, struct ieee80211_node *ni)
++{
++	return (ni->ni_flags & IEEE80211_NODE_UAPSD) &&
++	    (sc->sc_capaflags & IWX_UCODE_TLV_FLAGS_UAPSD_SUPPORT);
++}
++
+ static int
+ iwx_set_pslevel(struct iwx_softc *sc, int dtim, int level, int async)
+ {
+@@ -5595,6 +5704,20 @@
+ 		    IWX_POWER_FLAGS_POWER_MANAGEMENT_ENA_MSK);
+ 		mcmd.rx_data_timeout = htole32(pmgt->rxtimeout * 1024);
+ 		mcmd.tx_data_timeout = htole32(pmgt->txtimeout * 1024);
++		if (iwx_uapsd_usable(sc, ni)) {
++			mcmd.flags |=
++			    htole16(IWX_POWER_FLAGS_ADVANCE_PM_ENA_MSK);
++			mcmd.flags |=
++			    htole16(IWX_POWER_FLAGS_UAPSD_MISBEHAVING_ENA_MSK);
++			mcmd.rx_data_timeout_uapsd =
++			    htole32(IWX_UAPSD_PS_RX_DATA_TIMEOUT);
++			mcmd.tx_data_timeout_uapsd =
++			    htole32(IWX_UAPSD_PS_TX_DATA_TIMEOUT);
++			mcmd.qndp_tid = iwx_uapsd_qndp_tid(ic, ni->ni_uapsd_ac);
++			mcmd.uapsd_ac_flags = iwx_uapsd_ac_flags(ni);
++			mcmd.uapsd_max_sp = ni->ni_uapsd_maxsp &
++			    IEEE80211_WMM_IE_STA_QOSINFO_SP_MASK;
++		}
+ 		if (skip_dtim != 0) {
+ 			mcmd.flags |= htole16(IWX_POWER_FLAGS_SKIP_OVER_DTIM_MSK);
+ 			mcmd.skip_dtim_periods = skip_dtim + 1;
+@@ -5606,6 +5729,12 @@
+ 	if (err != 0)
+ 		return err;
+ 
++	/* LISPBSD: keep what the firmware got for hw.iwx.uapsd_status. */
++	sc->sc_uapsd.ud_pm = mcmd;
++	sc->sc_uapsd.ud_pslevel = level;
++	sc->sc_uapsd.ud_active = (mcmd.flags &
++	    htole16(IWX_POWER_FLAGS_ADVANCE_PM_ENA_MSK)) != 0;
++
+ 	return iwx_update_beacon_abort(sc, in, !!(mcmd.flags &
+ 	    htole16(IWX_POWER_FLAGS_POWER_MANAGEMENT_ENA_MSK)));
+ }
+@@ -5656,6 +5785,152 @@
+ 	return err;
+ }
+ 
++/*
++ * LISPBSD: net80211 calls this when the WME parameters change, which only
++ * happens while hw.iwx.uapsd advertises WME.  The EDCA parameters reach
++ * the firmware with the MAC context command at association (iwx_run);
++ * a change announced later in a beacon waits for the next association.
++ */
++static int
++iwx_wme_update(struct ieee80211com *ic)
++{
++	return 0;
++}
++
++/*
++ * LISPBSD: advertise WME and request U-APSD (on) or neither (off).  Both
++ * only affect the next (re)association request.  Off, net80211 behaves
++ * exactly as without U-APSD support (no WME capability, no WMM element).
++ */
++static void
++iwx_uapsd_caps(struct iwx_softc *sc, int on)
++{
++	struct ieee80211com *ic = &sc->sc_ic;
++
++	if (on) {
++		if ((ic->ic_caps & IEEE80211_C_WME) == 0) {
++			ic->ic_caps |= IEEE80211_C_WME;
++			ieee80211_wme_initparams(ic);
++		}
++		ic->ic_flags |= IEEE80211_F_WME;
++		ic->ic_flags_ext |= IEEE80211_FEXT_UAPSD;
++	} else {
++		ic->ic_caps &= ~IEEE80211_C_WME;
++		ic->ic_flags &= ~IEEE80211_F_WME;
++		ic->ic_flags_ext &= ~IEEE80211_FEXT_UAPSD;
++	}
++}
++
++/*
++ * LISPBSD: stop using U-APSD with the current AP until the next
++ * association (OpenBSD's misbehaving-AP fallback; also used when
++ * hw.iwx.uapsd is cleared).  The AP still treats our ACs as U-APSD ones;
++ * as in OpenBSD and Linux the firmware then falls back to legacy power
++ * save (PS-Poll), which an AP has to serve for delivery-enabled ACs when
++ * all ACs are delivery-enabled.
++ *
++ * The work runs in uapsd_task on the newstate task queue, so it is
++ * serialised with state changes: it never runs in the middle of a
++ * RUN -> x teardown in iwx_newstate_task (where ic_state still says RUN
++ * until the very end), and it sends nothing if a transition away from
++ * RUN has been requested (ns_nstate) or has happened.
++ */
++#define	IWX_UAPSD_OFF_MISBEHAVING	1
++#define	IWX_UAPSD_OFF_SWITCH		2
++
++static void
++iwx_uapsd_request_off(struct iwx_softc *sc, int why)
++{
++	sc->sc_uapsd.ud_off_why = why;
++	sc->sc_uapsd.ud_off_gen = sc->sc_uapsd.ud_assocs;
++	iwx_add_task(sc, sc->sc_nswq, &sc->uapsd_task);
++}
++
++static void
++iwx_uapsd_task(void *arg)
++{
++	struct iwx_softc *sc = arg;
++	struct ieee80211com *ic = &sc->sc_ic;
++	struct ieee80211_node *ni = ic->ic_bss;
++	int why = sc->sc_uapsd.ud_off_why, err, s = splnet();
++
++	if (sc->sc_flags & IWX_FLAG_SHUTDOWN)
++		goto out;
++	if (ni == NULL || (ni->ni_flags & IEEE80211_NODE_UAPSD) == 0)
++		goto out;
++	/*
++	 * A misbehaving-AP notification only concerns the association it
++	 * arrived in; the switch applies to whatever association is up.
++	 */
++	if (why == IWX_UAPSD_OFF_MISBEHAVING ?
++	    sc->sc_uapsd.ud_off_gen != sc->sc_uapsd.ud_assocs : iwx_uapsd)
++		goto out;
++
++	printf("%s: %s, U-APSD off until the next association\n",
++	    DEVNAME(sc), why == IWX_UAPSD_OFF_MISBEHAVING ?
++	    "firmware reports U-APSD misbehaving AP" : "hw.iwx.uapsd=0");
++	ni->ni_flags &= ~IEEE80211_NODE_UAPSD;
++	ni->ni_uapsd_ac = 0;
++	ni->ni_uapsd_maxsp = 0;
++	sc->sc_uapsd.ud_negotiated = 0;
++
++	if ((sc->sc_flags & IWX_FLAG_MAC_ACTIVE) &&
++	    ic->ic_state == IEEE80211_S_RUN &&
++	    sc->ns_nstate == IEEE80211_S_RUN) {
++		err = iwx_set_pslevel(sc, 0, iwx_assoc_pslevel(ic), 0);
++		if (err)
++			printf("%s: could not send power command "
++			    "(error %d)\n", DEVNAME(sc), err);
++	}
++out:
++	iwx_refcnt_rele_wake(sc);
++	splx(s);
++}
++
++/* LISPBSD: record (and with hw.iwx.uapsd=1 log) what was negotiated. */
++static void
++iwx_uapsd_note_assoc(struct iwx_softc *sc, struct iwx_node *in)
++{
++	struct ieee80211_node *ni = &in->in_ni;
++	struct iwx_uapsd_diag *ud = &sc->sc_uapsd;
++	int fw = (sc->sc_capaflags & IWX_UCODE_TLV_FLAGS_UAPSD_SUPPORT) != 0;
++
++	ud->ud_assoc = 1;
++	ud->ud_ap_wmm = ni->ni_wme_ie != NULL;
++	ud->ud_ap_uapsd = ieee80211_node_uapsd_capable(ni);
++	ud->ud_req = ni->ni_uapsd_qosinfo;
++	ud->ud_qos = (ni->ni_flags & IEEE80211_NODE_QOS) != 0;
++	ud->ud_negotiated = (ni->ni_flags & IEEE80211_NODE_UAPSD) != 0;
++	ud->ud_assocs++;
++	if (ud->ud_negotiated)
++		ud->ud_uapsd_assocs++;
++
++	if (!iwx_uapsd)
++		return;
++
++	printf("%s: U-APSD: AP WMM %s, AP U-APSD %s, requested 0x%02x, "
++	    "WMM association %s, U-APSD %s, firmware support %s\n",
++	    DEVNAME(sc), ud->ud_ap_wmm ? "yes" : "no",
++	    ud->ud_ap_uapsd ? "yes" : "no", ud->ud_req,
++	    ud->ud_qos ? "yes" : "no",
++	    ud->ud_negotiated ? "negotiated" : "not negotiated",
++	    fw ? "yes" : "no");
++	if (ud->ud_negotiated && fw)
++		printf("%s: U-APSD power table: level %d flags 0x%04x "
++		    "rx/tx timeout %u/%u us, U-APSD rx/tx timeout %u/%u us, "
++		    "qndp tid %u, ac flags 0x%02x, max sp %u; "
++		    "sta acs 0x%02x sp length %u%s\n", DEVNAME(sc),
++		    ud->ud_pslevel, le16toh(ud->ud_pm.flags),
++		    le32toh(ud->ud_pm.rx_data_timeout),
++		    le32toh(ud->ud_pm.tx_data_timeout),
++		    le32toh(ud->ud_pm.rx_data_timeout_uapsd),
++		    le32toh(ud->ud_pm.tx_data_timeout_uapsd),
++		    ud->ud_pm.qndp_tid, ud->ud_pm.uapsd_ac_flags,
++		    ud->ud_pm.uapsd_max_sp, ud->ud_sta_acs, ud->ud_sp_length,
++		    ud->ud_active ? "" :
++		    " (inactive: power save off, ifconfig iwx0 powersave)");
++}
++
+ static int
+ iwx_add_sta_cmd(struct iwx_softc *sc, struct iwx_node *in, int update)
+ {
+@@ -5692,6 +5967,13 @@
+ 	add_sta_cmd.add_modify = update ? 1 : 0;
+ 	add_sta_cmd.station_flags_msk
+ 	    |= htole32(IWX_STA_FLG_FAT_EN_MSK | IWX_STA_FLG_MIMO_EN_MSK);
++	if (iwx_uapsd_usable(sc, &in->in_ni)) {
++		add_sta_cmd.modify_mask |= IWX_STA_MODIFY_UAPSD_ACS;
++		add_sta_cmd.uapsd_acs = iwx_uapsd_acs(&in->in_ni);
++		add_sta_cmd.sp_length = iwx_uapsd_sp_length(&in->in_ni);
++	}
++	sc->sc_uapsd.ud_sta_acs = add_sta_cmd.uapsd_acs;
++	sc->sc_uapsd.ud_sp_length = add_sta_cmd.sp_length;
+ 
+ 	status = IWX_ADD_STA_SUCCESS;
+ 	err = iwx_send_cmd_pdu_status(sc, IWX_ADD_STA, sizeof(add_sta_cmd),
+@@ -5716,7 +5998,14 @@
+ 	const struct wmeParams *wmep =
+ 	    &ic->ic_wme.wme_chanParams.cap_wmeParams[ac];
+ 
+-	if ((ic->ic_caps & IEEE80211_C_WME) && wmep->wmep_logcwmax != 0) {
++	/*
++	 * LISPBSD: ic_wme only while hw.iwx.uapsd advertises WME and only for
++	 * a WMM association.  For a non-QoS BSS net80211's "aggressive mode"
++	 * rewrites BE (AIFSN 2); keep the defaults used without the switch.
++	 */
++	if ((ic->ic_caps & IEEE80211_C_WME) && ic->ic_bss != NULL &&
++	    (ic->ic_bss->ni_flags & IEEE80211_NODE_QOS) &&
++	    wmep->wmep_logcwmax != 0) {
+ 		*cw_min = IWX_EXP2(wmep->wmep_logcwmin);
+ 		*cw_max = IWX_EXP2(wmep->wmep_logcwmax);
+ 		*aifsn = wmep->wmep_aifsn;
+@@ -5863,6 +6152,13 @@
+ 	IEEE80211_ADDR_COPY(sta_cmd.peer_mld_address, in->in_macaddr);
+ 	IEEE80211_ADDR_COPY(sta_cmd.peer_link_address, in->in_macaddr);
+ 	sta_cmd.assoc_id = htole32(IEEE80211_AID(in->in_ni.ni_associd));
++	if (iwx_uapsd_usable(sc, &in->in_ni)) {
++		sta_cmd.sp_length =
++		    htole32(iwx_uapsd_sp_length(&in->in_ni));
++		sta_cmd.uapsd_acs = htole32(iwx_uapsd_acs(&in->in_ni));
++	}
++	sc->sc_uapsd.ud_sta_acs = le32toh(sta_cmd.uapsd_acs);
++	sc->sc_uapsd.ud_sp_length = le32toh(sta_cmd.sp_length);
+ 
+ 	return iwx_send_cmd_pdu(sc,
+ 	    IWX_WIDE_ID(IWX_MAC_CONF_GROUP, IWX_STA_CONFIG_CMD),
+@@ -7265,6 +7561,12 @@
+ 	in->in_phyctxt = &sc->sc_phyctxt[0];
+ 	IEEE80211_ADDR_COPY(in->in_macaddr, in->in_ni.ni_macaddr);
+ 
++	/*
++	 * LISPBSD: U-APSD is decided by the coming (re)association response;
++	 * do not hand the firmware a stale node flag with the new station.
++	 */
++	in->in_ni.ni_flags &= ~IEEE80211_NODE_UAPSD;
++
+ 	err = iwx_mac_ctxt_cmd(sc, in, IWX_FW_CTXT_ACTION_ADD, 0);
+ 	if (err) {
+ 		printf("%s: could not add MAC context (error %d)\n",
+@@ -7438,14 +7740,16 @@
+ 	}
+ 
+ 	/* LISPBSD: `ifconfig iwx0 powersave` selects PS level 2, else CAM. */
+-	err = iwx_set_pslevel(sc, 0,
+-	    (ic->ic_flags & IEEE80211_F_PMGTON) ? 2 : 0, 1);
++	err = iwx_set_pslevel(sc, 0, iwx_assoc_pslevel(ic), 1);
+ 	if (err) {
+ 		printf("%s: could not send power command (error %d)\n",
+ 		    DEVNAME(sc), err);
+ 		/* LISPBSD: PS/power cmd is an optimization; never abort assoc */
+ 	}
+ 
++	if (ic->ic_opmode == IEEE80211_M_STA)
++		iwx_uapsd_note_assoc(sc, in);
++
+ 	if (iwx_beacon_filter) {
+ 		err = iwx_enable_beacon_filter(sc, in);
+ 		if (err)
+@@ -7487,6 +7791,9 @@
+ 	if (err)
+ 		return err;
+ 
++	sc->sc_uapsd.ud_assoc = 0;
++	sc->sc_uapsd.ud_active = 0;
++
+ 	err = iwx_disable_beacon_filter(sc);
+ 	if (err) {
+ 		printf("%s: could not disable beacon filter (error %d)\n",
+@@ -8271,6 +8578,7 @@
+ 	/* Cancel scheduled tasks and let any stale tasks finish up. */
+ 	iwx_task_del(sc->sc_systq, &sc->init_task);
+ 	iwx_del_task(sc, sc->sc_nswq, &sc->newstate_task);
++	iwx_del_task(sc, sc->sc_nswq, &sc->uapsd_task);
+ 	if (ifp->if_flags & IFF_RUNNING) {
+ 		/* Drop the base reference taken by iwx_init() and wait. */
+ 		iwx_refcnt_finalize(sc, "iwxstop");
+@@ -8312,6 +8620,9 @@
+ 	sc->sc_rx_ba_sessions = 0;
+ 	memset(sc->aggqid, 0, sizeof(sc->aggqid));
+ 
++	sc->sc_uapsd.ud_assoc = 0;
++	sc->sc_uapsd.ud_active = 0;
++
+ 	if (ic->ic_state != IEEE80211_S_INIT)
+ 		sc->sc_newstate(ic, IEEE80211_S_INIT, -1);
+ 	sc->ns_nstate = IEEE80211_S_INIT;
+@@ -9091,9 +9402,24 @@
+ 			break;
+ 		}
+ 
+-		case IWX_PSM_UAPSD_AP_MISBEHAVING_NOTIFICATION:
+-			/* U-APSD is not used by this port. */
++		case IWX_PSM_UAPSD_AP_MISBEHAVING_NOTIFICATION: {
++			struct ieee80211_node *ni = sc->sc_ic.ic_bss;
++			struct iwx_uapsd_misbehaving_ap_notif *notif;
++
++			SYNC_RESP_STRUCT(notif, pkt);
++
++			/*
++			 * LISPBSD: as in OpenBSD, stop using U-APSD with this
++			 * AP until the next association.  OpenBSD resends the
++			 * power table from the interrupt handler; here it is
++			 * done from a task serialised with state changes.
++			 */
++			sc->sc_uapsd.ud_misbehaving++;
++			if (ni != NULL && (ni->ni_flags & IEEE80211_NODE_UAPSD))
++				iwx_uapsd_request_off(sc,
++				    IWX_UAPSD_OFF_MISBEHAVING);
+ 			break;
++		}
+ 
+ 		case IWX_WIDE_ID(IWX_MAC_CONF_GROUP,
+ 		    IWX_SESSION_PROTECTION_NOTIF): {
+@@ -10098,6 +10424,16 @@
+ 
+ 	ic->ic_node_alloc = iwx_node_alloc;
+ 
++	/* LISPBSD: U-APSD on all ACs, unlimited SP, as in OpenBSD. */
++	ic->ic_wme.wme_update = iwx_wme_update;
++	ic->ic_uapsd_ac = IEEE80211_WMM_IE_STA_QOSINFO_AC_VO |
++	    IEEE80211_WMM_IE_STA_QOSINFO_AC_VI |
++	    IEEE80211_WMM_IE_STA_QOSINFO_AC_BK |
++	    IEEE80211_WMM_IE_STA_QOSINFO_AC_BE;
++	ic->ic_uapsd_maxsp = IEEE80211_WMM_IE_STA_QOSINFO_SP_ALL;
++	if (iwx_uapsd)
++		iwx_uapsd_caps(sc, 1);
++
+ 	/* Override 802.11 state transition machine. */
+ 	sc->sc_newstate = ic->ic_newstate;
+ 	ic->ic_newstate = iwx_newstate;
+@@ -10589,6 +10925,7 @@
+ 
+ 	iwx_task_set(&sc->init_task, iwx_init_task, sc);
+ 	iwx_task_set(&sc->newstate_task, iwx_newstate_task, sc);
++	iwx_task_set(&sc->uapsd_task, iwx_uapsd_task, sc);
+ 
+ 	for (i = 0; i < nitems(sc->sc_phyctxt); i++) {
+ 		sc->sc_phyctxt[i].id = i;
+@@ -10820,6 +11157,111 @@
+ 	return 0;
+ }
+ 
++/*
++ * LISPBSD: hw.iwx.uapsd.  Setting it makes the next association ask for
++ * U-APSD; clearing it turns U-APSD off in the firmware at once.  Neither
++ * reassociates by itself.
++ */
++static void
++iwx_apply_uapsd(struct iwx_softc *sc)
++{
++	struct ieee80211com *ic = &sc->sc_ic;
++	int s;
++
++	rw_enter(&sc->ioctl_rwl, RW_WRITER);
++	s = splnet();
++	if (ISSET(sc->sc_flags, IWX_FLAG_ATTACHED)) {
++		iwx_uapsd_caps(sc, iwx_uapsd);
++		if (!iwx_uapsd) {
++			if (ic->ic_bss != NULL &&
++			    (ic->ic_bss->ni_flags & IEEE80211_NODE_UAPSD))
++				iwx_uapsd_request_off(sc,
++				    IWX_UAPSD_OFF_SWITCH);
++		} else if (ic->ic_state == IEEE80211_S_RUN && ic->ic_bss &&
++		    (ic->ic_bss->ni_flags & IEEE80211_NODE_UAPSD) == 0)
++			printf("%s: hw.iwx.uapsd=1 takes effect at the next "
++			    "association\n", DEVNAME(sc));
++	}
++	splx(s);
++	rw_exit(&sc->ioctl_rwl);
++}
++
++static int
++iwx_sysctl_uapsd(SYSCTLFN_ARGS)
++{
++	struct sysctlnode node = *rnode;
++	struct iwx_softc *sc;
++	int val = iwx_uapsd, err, i;
++
++	node.sysctl_data = &val;
++	err = sysctl_lookup(SYSCTLFN_CALL(&node));
++	if (err || newp == NULL)
++		return err;
++	if (val != 0 && val != 1)
++		return EINVAL;
++	if (val == iwx_uapsd)
++		return 0;
++	iwx_uapsd = val;
++	for (i = 0; i < iwx_cd.cd_ndevs; i++)
++		if ((sc = device_lookup_private(&iwx_cd, i)) != NULL)
++			iwx_apply_uapsd(sc);
++	return 0;
++}
++
++/*
++ * LISPBSD: hw.iwx.uapsd_status, one line per device.  Timeouts are in
++ * microseconds as sent to the firmware; flags is the MAC power table
++ * flags word (0x0200 = U-APSD, 0x1000 = misbehaving-AP detection).
++ */
++static int
++iwx_sysctl_uapsd_status(SYSCTLFN_ARGS)
++{
++	struct sysctlnode node = *rnode;
++	struct iwx_softc *sc;
++	char buf[1024];
++	size_t off = 0;
++	int i;
++
++	buf[0] = '\0';
++	for (i = 0; i < iwx_cd.cd_ndevs && off < sizeof(buf); i++) {
++		const struct iwx_uapsd_diag *ud;
++		const struct iwx_mac_power_cmd *pm;
++
++		if ((sc = device_lookup_private(&iwx_cd, i)) == NULL)
++			continue;
++		ud = &sc->sc_uapsd;
++		pm = &ud->ud_pm;
++		off += snprintf(buf + off, sizeof(buf) - off,
++		    "%s%s: switch=%d fw=%d assoc=%d ap_wmm=%d ap_uapsd=%d "
++		    "req=0x%02x qos=%d negotiated=%d active=%d "
++		    "assocs=%u uapsd_assocs=%u misbehaving=%u "
++		    "level=%d flags=0x%04x rx_to=%u tx_to=%u "
++		    "rx_to_uapsd=%u tx_to_uapsd=%u qndp_tid=%u "
++		    "ac_flags=0x%02x max_sp=%u skip_dtim=%u keep_alive=%u "
++		    "sta_acs=0x%02x sp_length=%u",
++		    off ? "\n" : "", DEVNAME(sc), iwx_uapsd,
++		    (sc->sc_capaflags &
++		    IWX_UCODE_TLV_FLAGS_UAPSD_SUPPORT) != 0,
++		    ud->ud_assoc, ud->ud_ap_wmm, ud->ud_ap_uapsd, ud->ud_req,
++		    ud->ud_qos, ud->ud_negotiated, ud->ud_active,
++		    ud->ud_assocs, ud->ud_uapsd_assocs, ud->ud_misbehaving,
++		    ud->ud_pslevel, le16toh(pm->flags),
++		    le32toh(pm->rx_data_timeout),
++		    le32toh(pm->tx_data_timeout),
++		    le32toh(pm->rx_data_timeout_uapsd),
++		    le32toh(pm->tx_data_timeout_uapsd),
++		    pm->qndp_tid, pm->uapsd_ac_flags, pm->uapsd_max_sp,
++		    pm->skip_dtim_periods, le16toh(pm->keep_alive_seconds),
++		    ud->ud_sta_acs, ud->ud_sp_length);
++	}
++	if (off >= sizeof(buf))
++		buf[sizeof(buf) - 1] = '\0';
++
++	node.sysctl_data = buf;
++	node.sysctl_size = strlen(buf) + 1;
++	return sysctl_lookup(SYSCTLFN_CALL(&node));
++}
++
+ SYSCTL_SETUP(sysctl_iwx, "sysctl iwx(4) subtree setup")
+ {
+ 	const struct sysctlnode *rnode;
+@@ -10839,6 +11281,21 @@
+ 	    iwx_sysctl_beacon_filter, 0, NULL, 0, CTL_CREATE, CTL_EOL)) != 0)
+ 		goto err;
+ 
++	if ((rc = sysctl_createv(clog, 0, &rnode, &cnode,
++	    CTLFLAG_PERMANENT|CTLFLAG_READWRITE, CTLTYPE_INT,
++	    "uapsd",
++	    SYSCTL_DESCR("Ask for U-APSD (WMM power save) at the next "
++	    "association (0/1)"),
++	    iwx_sysctl_uapsd, 0, NULL, 0, CTL_CREATE, CTL_EOL)) != 0)
++		goto err;
++
++	if ((rc = sysctl_createv(clog, 0, &rnode, &cnode,
++	    CTLFLAG_PERMANENT|CTLFLAG_READONLY, CTLTYPE_STRING,
++	    "uapsd_status",
++	    SYSCTL_DESCR("U-APSD negotiation and firmware power table"),
++	    iwx_sysctl_uapsd_status, 0, NULL, 0, CTL_CREATE, CTL_EOL)) != 0)
++		goto err;
++
+ #ifdef IWX_DEBUG
+ 	/* control debugging printfs */
+ 	if ((rc = sysctl_createv(clog, 0, &rnode, &cnode,
+--- a/sys/dev/pci/if_iwxvar.h
++++ b/sys/dev/pci/if_iwxvar.h
+@@ -335,6 +335,29 @@
+ 	uint8_t vht_chan_width;
+ };
+ 
++/*
++ * LISPBSD: U-APSD state for hw.iwx.uapsd_status (what the AP offered,
++ * what was negotiated and the power table last sent to the firmware).
++ */
++struct iwx_uapsd_diag {
++	int		ud_assoc;	/* associated (iwx_run done) */
++	int		ud_ap_wmm;	/* AP's beacon carried a WMM element */
++	int		ud_ap_uapsd;	/* ...advertising U-APSD */
++	uint8_t		ud_req;		/* QoS Info of our assoc request */
++	int		ud_qos;		/* WMM (QoS) association */
++	int		ud_negotiated;	/* IEEE80211_NODE_UAPSD at iwx_run */
++	int		ud_active;	/* last MAC power table had U-APSD */
++	int		ud_pslevel;	/* power level of that table */
++	uint32_t	ud_assocs;	/* associations seen */
++	uint32_t	ud_uapsd_assocs; /* ...of which with U-APSD */
++	uint32_t	ud_misbehaving;	/* misbehaving-AP notifications */
++	int		ud_off_why;	/* uapsd_task: IWX_UAPSD_OFF_* */
++	uint32_t	ud_off_gen;	/* uapsd_task: ud_assocs when queued */
++	uint8_t		ud_sta_acs;	/* ADD_STA/STA_CONFIG uapsd_acs */
++	uint8_t		ud_sp_length;	/* ADD_STA/STA_CONFIG sp_length */
++	struct iwx_mac_power_cmd ud_pm;	/* last MAC power table sent */
++};
++
+ struct iwx_bf_data {
+ 	int bf_enabled;		/* filtering	*/
+ 	int ba_enabled;		/* abort	*/
+@@ -475,6 +498,8 @@
+ 	struct iwx_task		newstate_task;
+ 	enum ieee80211_state	ns_nstate;
+ 	int			ns_arg;
++	struct iwx_task		uapsd_task;	/* LISPBSD: U-APSD fallback */
++	struct iwx_uapsd_diag	sc_uapsd;	/* LISPBSD: U-APSD state */
+ 
+ 	bus_space_tag_t sc_st;
+ 	bus_space_handle_t sc_sh;
+--- a/sys/net80211/ieee80211_crypto_ccmp.c
++++ b/sys/net80211/ieee80211_crypto_ccmp.c
+@@ -66,9 +66,25 @@
+ 
+ #define AES_BLOCK_LEN 16
+ 
++/*
++ * LISPBSD: receive replay counters per TID (802.11-2012 11.4.3.4.4).
++ * The transmitter keeps one PN per key but sends QoS data of different
++ * access categories from different queues, so frames of different TIDs
++ * may arrive out of PN order.  struct ieee80211_key has a single
++ * wk_keyrsc; the per-TID counters live in this private context so that
++ * the key structure (embedded in nodes and in ieee80211com) keeps its
++ * layout.  Non-QoS data uses its own counter (CCMP_NONQOS_TID), which
++ * behaves exactly like the old single counter.  wk_keyrsc still records
++ * the last accepted PN (ioctl key queries report it) and seeds all
++ * counters when a key is set.
++ */
++#define	CCMP_NONQOS_TID	16
++#define	CCMP_NUM_RSC	(CCMP_NONQOS_TID + 1)
++
+ struct ccmp_ctx {
+ 	struct aesenc cc_aes;
+ 	struct ieee80211com *cc_ic;	/* for diagnostics */
++	uint64_t cc_rsc[CCMP_NUM_RSC];	/* rx replay counter per TID */
+ };
+ 
+ static	void *ccmp_attach(struct ieee80211com *, struct ieee80211_key *);
+@@ -127,6 +143,7 @@
+ ccmp_setkey(struct ieee80211_key *k)
+ {
+ 	struct ccmp_ctx *ctx = k->wk_private;
++	int i;
+ 
+ 	if (k->wk_keylen != (128/NBBY)) {
+ 		IEEE80211_DPRINTF(ctx->cc_ic, IEEE80211_MSG_CRYPTO,
+@@ -136,6 +153,8 @@
+ 	}
+ 	if (k->wk_flags & IEEE80211_KEY_SWCRYPT)
+ 		aes_setenckey128(&ctx->cc_aes, k->wk_key);
++	for (i = 0; i < CCMP_NUM_RSC; i++)
++		ctx->cc_rsc[i] = k->wk_keyrsc;
+ 	return 1;
+ }
+ 
+@@ -204,6 +223,7 @@
+ 	struct ieee80211_frame *wh;
+ 	uint8_t *ivp;
+ 	uint64_t pn;
++	int tid;
+ 
+ 	/*
+ 	 * Header should have extended IV and sequence number;
+@@ -222,7 +242,11 @@
+ 		return 0;
+ 	}
+ 	pn = READ_6(ivp[0], ivp[1], ivp[4], ivp[5], ivp[6], ivp[7]);
+-	if (pn <= k->wk_keyrsc) {
++	if (ieee80211_has_qos(wh))
++		tid = ieee80211_get_qos(wh) & IEEE80211_QOS_TID;
++	else
++		tid = CCMP_NONQOS_TID;
++	if (pn <= ctx->cc_rsc[tid]) {
+ 		/*
+ 		 * Replay violation.
+ 		 */
+@@ -252,6 +276,7 @@
+ 	/*
+ 	 * Ok to update rsc now.
+ 	 */
++	ctx->cc_rsc[tid] = pn;
+ 	k->wk_keyrsc = pn;
+ 
+ 	return 1;
+--- a/sys/net80211/ieee80211.h
++++ b/sys/net80211/ieee80211.h
+@@ -223,6 +223,25 @@
+ 	    (IEEE80211_FC0_TYPE_DATA | IEEE80211_FC0_SUBTYPE_QOS))
+ 
+ /*
++ * QoS Info field of the WMM Information/Parameter element (U-APSD).
++ * From OpenBSD (2026-05 U-APSD support); same names as Linux.
++ */
++#define IEEE80211_WMM_IE_AP_QOSINFO_UAPSD	0x80
++
++#define IEEE80211_WMM_IE_STA_QOSINFO_AC_VO	0x01
++#define IEEE80211_WMM_IE_STA_QOSINFO_AC_VI	0x02
++#define IEEE80211_WMM_IE_STA_QOSINFO_AC_BK	0x04
++#define IEEE80211_WMM_IE_STA_QOSINFO_AC_BE	0x08
++#define IEEE80211_WMM_IE_STA_QOSINFO_AC_MASK	0x0f
++
++#define IEEE80211_WMM_IE_STA_QOSINFO_SP_ALL	0x00
++#define IEEE80211_WMM_IE_STA_QOSINFO_SP_2	0x01
++#define IEEE80211_WMM_IE_STA_QOSINFO_SP_4	0x02
++#define IEEE80211_WMM_IE_STA_QOSINFO_SP_6	0x03
++#define IEEE80211_WMM_IE_STA_QOSINFO_SP_MASK	0x03
++#define IEEE80211_WMM_IE_STA_QOSINFO_SP_SHIFT	5
++
++/*
+  * WME/802.11e information element.
+  */
+ struct ieee80211_wme_info {
+--- a/sys/net80211/ieee80211_input.c
++++ b/sys/net80211/ieee80211_input.c
+@@ -317,7 +317,8 @@
+ 	m = ieee80211_decap(m, hdrspace);
+ 	if (m == NULL) {
+ 		/* don't count Null data frames as errors */
+-		if (subtype == IEEE80211_FC0_SUBTYPE_NODATA)
++		if (subtype == IEEE80211_FC0_SUBTYPE_NODATA ||
++		    subtype == IEEE80211_FC0_SUBTYPE_QOS_NULL)
+ 			goto out;
+ 		IEEE80211_DISCARD_MAC(ic, IEEE80211_MSG_INPUT,
+ 		    ni->ni_macaddr, "data", "%s", "decap error");
+@@ -1946,6 +1947,36 @@
+ #undef MS
+ }
+ 
++/*
++ * Decide whether U-APSD is in use with the AP after (re)association.
++ * From OpenBSD; peer_uapsd is the U-APSD bit of the QoS Info in the
++ * (re)association response.  NetBSD adaptation: the request is
++ * configured with IEEE80211_FEXT_UAPSD (OpenBSD: the "uapsd" nwflag),
++ * and U-APSD is only used, with the ACs and max SP, that our request
++ * actually asked for (ni_uapsd_qosinfo, recorded when the request was
++ * built; not recomputed here, so a change of the flag in between cannot
++ * make the two disagree).
++ */
++void
++ieee80211_setup_uapsd(struct ieee80211com *ic, struct ieee80211_node *ni,
++    int peer_uapsd)
++{
++	u_int8_t req = ni->ni_uapsd_qosinfo;
++
++	if (peer_uapsd && (req & IEEE80211_WMM_IE_STA_QOSINFO_AC_MASK) &&
++	    (ni->ni_flags & IEEE80211_NODE_QOS)) {
++		ni->ni_flags |= IEEE80211_NODE_UAPSD;
++		ni->ni_uapsd_ac = req & IEEE80211_WMM_IE_STA_QOSINFO_AC_MASK;
++		ni->ni_uapsd_maxsp = (req >>
++		    IEEE80211_WMM_IE_STA_QOSINFO_SP_SHIFT) &
++		    IEEE80211_WMM_IE_STA_QOSINFO_SP_MASK;
++	} else {
++		ni->ni_flags &= ~IEEE80211_NODE_UAPSD;
++		ni->ni_uapsd_ac = 0;
++		ni->ni_uapsd_maxsp = 0;
++	}
++}
++
+ void
+ ieee80211_saveie(u_int8_t **iep, const u_int8_t *ie)
+ {
+@@ -2773,7 +2804,8 @@
+ 	struct ieee80211_frame *wh;
+ 	u_int8_t *frm, *efrm;
+ 	u_int8_t *rates, *xrates, *wme;
+-	u_int8_t rate;
++	u_int8_t rate, wmm_qosinfo = 0;
++	int has_wmm_qosinfo = 0;
+ 	IEEE80211_DEBUGVAR(char ebuf[3 * ETHER_ADDR_LEN]);
+ 	u_int16_t capinfo, associd;
+ 	u_int16_t status;
+@@ -2836,6 +2868,9 @@
+ 
+ 		frm += frm[1] + 2;
+ 	}
++	if (wme != NULL &&
++	    ieee80211_parse_wmm_qosinfo(wme, &wmm_qosinfo) == 0)
++		has_wmm_qosinfo = 1;
+ 
+ 	IEEE80211_VERIFY_ELEMENT(rates, IEEE80211_RATE_MAXSIZE);
+ 
+@@ -2857,12 +2892,23 @@
+ 
+ 	ni->ni_capinfo = capinfo;
+ 	ni->ni_associd = associd;
++	/*
++	 * LISPBSD: parse the AP's EDCA parameters afresh on every
++	 * (re)association.  ieee80211_parse_wmeparams() skips an element
++	 * whose parameter set count equals the one it saw last, and the
++	 * count starts at 0 on both sides, so the parameters of a fresh
++	 * association were never parsed.
++	 */
++	if (ic->ic_flags & IEEE80211_F_WME)
++		ic->ic_wme.wme_wmeChanParams.cap_info = 0xff;
+ 	if (wme != NULL && ieee80211_parse_wmeparams(ic, wme, wh) >= 0) {
+ 		ni->ni_flags |= IEEE80211_NODE_QOS;
+ 		ieee80211_wme_updateparams(ic);
+ 	} else {
+ 		ni->ni_flags &= ~IEEE80211_NODE_QOS;
+ 	}
++	ieee80211_setup_uapsd(ic, ni, has_wmm_qosinfo &&
++	    (wmm_qosinfo & IEEE80211_WMM_IE_AP_QOSINFO_UAPSD));
+ 
+ 	/*
+ 	 * Configure state now that we are associated.
+@@ -2895,13 +2941,16 @@
+ 	}
+ 
+ 	IEEE80211_DPRINTF(ic, IEEE80211_MSG_ASSOC,
+-	    "[%s] %sassoc success: %s preamble, %s slot time%s%s\n",
++	    "[%s] %sassoc success: %s preamble, %s slot time%s%s%s\n",
+ 	    ether_snprintf(ebuf, sizeof(ebuf), wh->i_addr2),
+ 	    ISREASSOC(subtype) ? "re" : "",
+ 	    ic->ic_flags&IEEE80211_F_SHPREAMBLE ? "short" : "long",
+ 	    ic->ic_flags&IEEE80211_F_SHSLOT ? "short" : "long",
+ 	    ic->ic_flags&IEEE80211_F_USEPROT ? ", protection" : "",
+-	    ni->ni_flags & IEEE80211_NODE_QOS ? ", QoS" : ""
++	    ni->ni_flags & IEEE80211_NODE_QOS ? ", QoS" : "",
++	    (ic->ic_flags_ext & IEEE80211_FEXT_UAPSD) ?
++		((ni->ni_flags & IEEE80211_NODE_UAPSD) ?
++		    ", uAPSD enabled" : ", uAPSD disabled") : ""
+ 	);
+ 
+ 	ieee80211_new_state(ic, IEEE80211_S_RUN, subtype);
+--- a/sys/net80211/ieee80211_node.h
++++ b/sys/net80211/ieee80211_node.h
+@@ -105,6 +105,7 @@
+ /* NB: this must have the same value as IEEE80211_FC1_PWR_MGT */
+ #define	IEEE80211_NODE_PWR_MGT	0x0010		/* power save mode enabled */
+ #define	IEEE80211_NODE_AREF	0x0020		/* authentication ref held */
++#define	IEEE80211_NODE_UAPSD	0x0040		/* U-APSD negotiated */
+ 	u_int16_t		ni_associd;	/* assoc response */
+ 	u_int16_t		ni_txpower;	/* current transmit power */
+ 	u_int16_t		ni_vlan;	/* vlan tag */
+@@ -126,6 +127,18 @@
+ 	u_int8_t		ni_macaddr[IEEE80211_ADDR_LEN];
+ 	u_int8_t		ni_bssid[IEEE80211_ADDR_LEN];
+ 
++	/*
++	 * U-APSD ACs and max SP in use with this node when
++	 * IEEE80211_NODE_UAPSD is set (IEEE80211_WMM_IE_STA_QOSINFO_*),
++	 * and the QoS Info of the WMM element of our last (re)association
++	 * request to it (0: no element or no U-APSD asked for).
++	 * In the alignment hole before ni_tstamp: the layout of
++	 * struct ieee80211_node does not change.
++	 */
++	u_int8_t		ni_uapsd_ac;
++	u_int8_t		ni_uapsd_maxsp;
++	u_int8_t		ni_uapsd_qosinfo;
++
+ 	/* beacon, probe response */
+ 	union {
+ 		u_int8_t	data[8];
+--- a/sys/net80211/ieee80211_output.c
++++ b/sys/net80211/ieee80211_output.c
+@@ -1678,8 +1678,18 @@
+ 		frm = ieee80211_add_ssid(frm, ni->ni_essid, ni->ni_esslen);
+ 		frm = ieee80211_add_rates(frm, &ni->ni_rates);
+ 		frm = ieee80211_add_xrates(frm, &ni->ni_rates);
+-		if ((ic->ic_flags & IEEE80211_F_WME) && ni->ni_wme_ie != NULL)
++		ni->ni_uapsd_qosinfo = 0;
++		if ((ic->ic_flags & IEEE80211_F_WME) && ni->ni_wme_ie != NULL) {
+ 			frm = ieee80211_add_wme_info(frm, &ic->ic_wme);
++			/*
++			 * QoS Info: the U-APSD ACs and max SP we ask for
++			 * (OpenBSD sets it inside ieee80211_add_wme_info()).
++			 * Remembered in the node so that the response is
++			 * judged against what was actually sent.
++			 */
++			ni->ni_uapsd_qosinfo = ieee80211_uapsd_qosinfo(ic, ni);
++			frm[-1] = ni->ni_uapsd_qosinfo;
++		}
+ 		if (ic->ic_opt_ie != NULL) {
+ 			memcpy(frm, ic->ic_opt_ie, ic->ic_opt_ie_len);
+ 			frm += ic->ic_opt_ie_len;
+--- a/sys/net80211/ieee80211_proto.h
++++ b/sys/net80211/ieee80211_proto.h
+@@ -227,6 +227,8 @@
+ void	ieee80211_wme_initparams(struct ieee80211com *);
+ void	ieee80211_wme_updateparams(struct ieee80211com *);
+ void	ieee80211_wme_updateparams_locked(struct ieee80211com *);
++void	ieee80211_setup_uapsd(struct ieee80211com *, struct ieee80211_node *,
++	    int);
+ 
+ #define	ieee80211_new_state(_ic, _nstate, _arg) \
+ 	(((_ic)->ic_newstate)((_ic), (_nstate), (_arg)))
+--- a/sys/net80211/ieee80211_var.h
++++ b/sys/net80211/ieee80211_var.h
+@@ -142,6 +142,14 @@
+ 	u_int16_t		ic_tim_len;	/* ic_tim_bitmap size (bytes) */
+ 	u_int8_t		ic_dtim_period;	/* DTIM period */
+ 	u_int8_t		ic_dtim_count;	/* DTIM count for last bcn */
++	/*
++	 * U-APSD ACs and max SP to request (IEEE80211_WMM_IE_STA_QOSINFO_*),
++	 * set by the driver; used when IEEE80211_FEXT_UAPSD is set.  These
++	 * sit in the alignment hole before ic_media so that the layout of
++	 * struct ieee80211com does not change.
++	 */
++	u_int8_t		ic_uapsd_ac;
++	u_int8_t		ic_uapsd_maxsp;
+ 	struct ifmedia		ic_media;	/* interface media config */
+ 	struct bpf_if *		ic_rawbpf;	/* packet filter structure */
+ 	struct ieee80211_node	*ic_bss;	/* information for this node */
+@@ -256,6 +264,7 @@
+ #define	IEEE80211_FEXT_WDS	0x00000001	/* CONF: 4 addr allowed */
+ /* 0x00000006 reserved */
+ #define	IEEE80211_FEXT_BGSCAN	0x00000008	/* STATUS: enable full bgscan completion */
++#define	IEEE80211_FEXT_UAPSD	0x00000100	/* CONF: request U-APSD */
+ #define	IEEE80211_FEXT_PROBECHAN 0x00020000	/* CONF: probe passive channel*/
+ 
+ /* ic_caps */
+@@ -332,6 +341,52 @@
+ }
+ 
+ /*
++ * U-APSD helpers.  ieee80211_parse_wmm_qosinfo() and
++ * ieee80211_uapsd_qosinfo() come from OpenBSD's ieee80211_input.c and
++ * ieee80211_output.c; here they are inlines so that a driver module
++ * using them does not depend on new kernel symbols.
++ */
++
++/* Extract the QoS Info byte of a WMM Information or Parameter element. */
++static __inline int
++ieee80211_parse_wmm_qosinfo(const u_int8_t *frm, u_int8_t *qosinfo)
++{
++	if (frm[1] < 7)
++		return IEEE80211_REASON_IE_INVALID;
++
++	*qosinfo = frm[8];
++	return 0;
++}
++
++/* Did the node's beacon/probe response WMM element advertise U-APSD? */
++static __inline int
++ieee80211_node_uapsd_capable(const struct ieee80211_node *ni)
++{
++	u_int8_t qosinfo;
++
++	return ni->ni_wme_ie != NULL &&
++	    ieee80211_parse_wmm_qosinfo(ni->ni_wme_ie, &qosinfo) == 0 &&
++	    (qosinfo & IEEE80211_WMM_IE_AP_QOSINFO_UAPSD) != 0;
++}
++
++/*
++ * QoS Info for the WMM Information element of a (re)association request
++ * to the given AP.  Unlike OpenBSD, U-APSD is only requested from an AP
++ * which advertised it (as the WMM specification asks of a station).
++ */
++static __inline u_int8_t
++ieee80211_uapsd_qosinfo(const struct ieee80211com *ic,
++    const struct ieee80211_node *ni)
++{
++	if ((ic->ic_flags_ext & IEEE80211_FEXT_UAPSD) == 0 ||
++	    !ieee80211_node_uapsd_capable(ni))
++		return 0;
++	return (ic->ic_uapsd_ac & IEEE80211_WMM_IE_STA_QOSINFO_AC_MASK) |
++	    ((ic->ic_uapsd_maxsp & IEEE80211_WMM_IE_STA_QOSINFO_SP_MASK) <<
++	    IEEE80211_WMM_IE_STA_QOSINFO_SP_SHIFT);
++}
++
++/*
+  * XXX these need to be here for IEEE80211_F_DATAPAD
+  */
+ 

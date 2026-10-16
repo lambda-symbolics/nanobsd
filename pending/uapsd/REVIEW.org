@@ -1,0 +1,172 @@
+#+TITLE: Review of uapsd.diff (iwx U-APSD + net80211 WMM), before first boot
+#+DATE: 2026-10-17
+
+Read-only review of =/root/lispbsd-work/uapsd/uapsd.diff= against =/root/lispbsd/sys=.
+The diff applied to a fresh copy reproduces =sys/= under the work dir exactly
+(checked with cmp).  Nothing was built or run.  CONFIRMED = verified by reading
+the code paths; PLAUSIBLE = reasoned, not provable without hardware.
+
+* Verdict
+
+- *hw.iwx.uapsd=0 (default): equivalent to kernel 176 for a non-QoS
+  association.*  Every firmware command (ADD_STA, STA_CONFIG, MAC context,
+  MAC_PM_POWER_TABLE) is byte-identical, the (re)association request is
+  identical (no WMM element), and CCMP replay checking of non-QoS frames is
+  identical.  The only observable differences are a stats counter (QoS-Null)
+  and diagnostics.  Safe to boot.
+- *hw.iwx.uapsd=1*: negotiation and firmware layouts look right.  Two things
+  should change before or be watched during the morning test: a teardown race in
+  the fallback/sysctl path (F1) and the first QoS receive path through the
+  iwx header-padding code (F2).
+
+* Switch off (=hw.iwx.uapsd=0=): what runs regardless, and why it is inert
+
+| # | change that runs with the switch off | result | status |
+|---+--------------------------------------+--------+--------|
+| 0.1 | CCMP per-TID counters (=ccmp_decap=) | Non-QoS frames use =cc_rsc[16]=, seeded from =wk_keyrsc= in =ccmp_setkey=; same =<== compare, same update, =wk_keyrsc= still set.  Seeding is ordered correctly: the ioctl sets =wk_keyrsc= (ioctl.c:1666) before =ieee80211_crypto_setkey= -> =ccmp_setkey= (1670), and a rekey with the same cipher keeps the ctx and reseeds.  No other writer of =wk_keyrsc=. | CONFIRMED identical |
+| 0.2 | same, security | Per-TID counters cannot be abused to replay a non-QoS frame as QoS (or move TIDs): AAD keeps FC bit 7 (=fc[0] & 0x8f=) and the QC TID, and the nonce carries the TID, so any rewrite fails the MIC.  Separate non-QoS counter (Linux/OpenBSD share TID 0) is not weaker for the same reason. | CONFIRMED no regression |
+| 0.3 | same, semantics | =wk_keyrsc= becomes "last accepted PN" instead of "max PN" once QoS frames of several TIDs arrive.  Only readers: GETKEY ioctl and the replay-failure event.  Only reachable with QoS frames. | CONFIRMED, harmless |
+| 0.4 | =ccmp_ctx= grows by 136 bytes | private to net80211 (kernel), allocated by =ccmp_attach=; =struct ieee80211_key= unchanged | CONFIRMED |
+| 0.5 | QoS-Null input | Now =goto out= instead of =goto err=: only =if_ierrors= / =is_rx_decap= no longer count QoS-Null frames.  The mbuf is already freed by =m_pullup= in both cases. | CONFIRMED, stats only |
+| 0.6 | assoc response: =ieee80211_parse_wmm_qosinfo= + =ieee80211_setup_uapsd= always | element length already checked by =IEEE80211_VERIFY_LENGTH=, inline reads =frm[8]= only if =frm[1] >= 7=; =ieee80211_uapsd_qosinfo()= returns 0 without =FEXT_UAPSD=, so the node flag/fields are just cleared | CONFIRMED |
+| 0.7 | =cap_info = 0xff= EDCA reparse | gated on =F_WME= | CONFIRMED inert |
+| 0.8 | =ic_wme.wme_update = iwx_wme_update= set at attach | only called from =ieee80211_wme_updateparams=, which is gated on =C_WME= (proto.c:846) | CONFIRMED inert |
+| 0.9 | iwx: =iwx_auth= clears =NODE_UAPSD=; power/ADD_STA/STA_CONFIG gated on =iwx_uapsd_usable()= | flag can only be set by =setup_uapsd= with =FEXT_UAPSD=; fields stay 0, =modify_mask= unchanged | CONFIRMED byte-identical |
+| 0.10 | =iwx_get_edca_params= | uses =iwx_edca_defaults= unless =C_WME= is set; =C_WME= is cleared with the switch | CONFIRMED |
+| 0.11 | misbehaving-AP notification | now a dmamap sync + counter; task only queued if =NODE_UAPSD= | CONFIRMED inert |
+| 0.12 | =iwx_uapsd_note_assoc= in =iwx_run= | reads =ni_wme_ie= of =ic_bss= (not rewritten while in ASSOC/RUN), diag only | CONFIRMED |
+| 0.13 | =iwx_stop= deletes =uapsd_task= before =iwx_refcnt_finalize= | correct order, zeroed task is a no-op | CONFIRMED |
+
+Layout / ABI:
+- =ic_uapsd_ac/maxsp= sit after =ic_tim_bitmap= (ptr) + u16 + u8 + u8, i.e. in
+  the 4-byte hole before =ic_media= (8-aligned).  =ni_uapsd_ac/maxsp= follow
+  u32 + u8 + 6 + 6 bytes before the 8-aligned =ni_tstamp= union: a hole of at
+  least 3 bytes whatever the base alignment.  =0x0040= is unused in =ni_flags=
+  (no wholesale assignments of =ni_flags= anywhere); =FEXT 0x100= is free.
+  CONFIRMED by reading (the VM sizeof/offset probe is consistent).
+- Skew: old module + new kernel = today's behaviour.  New module + old kernel
+  with the switch on = WMM association with the *old single replay counter*
+  (QoS downlink of different ACs dropped as replays) and =req=0x0f= shown
+  although nothing was requested.  Do not mix; switch off it is harmless.
+- *Deployment note:* =iwx*= is in =GENERIC= (and so in =LISPBSD=, =CSTATE=,
+  nanobsd =GENERIC=); the driver also declares =MODULE(..., if_iwx, ...)=, so
+  with a kernel that has iwx built in, the =/etc/modules.conf= =if_iwx= load
+  fails with EEXIST and the built-in copy is the one running.  Check
+  =modstat if_iwx= (builtin vs filesys) to know which copy you are testing;
+  rebuild both from the same tree.
+
+* Switch on: findings
+
+** F1 (medium, PLAUSIBLE) power command racing a state teardown
+=iwx_uapsd_off()= (from =uapsd_task= on =sc_systq=, and from the sysctl) sends
+a synchronous MAC_PM_POWER_TABLE if =IWX_FLAG_MAC_ACTIVE= and
+=ic_state == RUN=.  =iwx_newstate_task= runs on a different kthread
+(=sc_nswq=) and only calls =sc_newstate()= at its end, so for the whole
+RUN->x teardown (=iwx_run_stop=, =iwx_deauth=, several sleeping commands)
+=ic_state= is still RUN and MAC_ACTIVE stays set until the MAC REMOVE completes.
+Both threads hold the kernel lock but interleave at every sleep.
+Scenario: AP misbehaves, then beacons are lost / user reassociates;
+newstate_task sleeps in =iwx_deauth= removing the MAC, the queued uapsd_task
+runs and sends a power table for a MAC id being removed -> firmware error
+(SYSASSERT and NIC reset at worst).  Same window for =sysctl -w hw.iwx.uapsd=0=
+during a reassociation.  Related: a notification for association N handled
+after association N+1 negotiated U-APSD turns it off for N+1 (logged, benign).
+Fix (small): queue =uapsd_task= on =sc->sc_nswq= so it is serialized with
+state changes, and in =iwx_uapsd_off= also require =sc->ns_nstate == IEEE80211_S_RUN=;
+optionally record =ud_assocs= when queueing and ignore the task if it changed.
+(The existing beacon-filter sysctl has the same race; it is pre-existing there.)
+
+*Resolved (2026-10-17):* =uapsd_task= now runs on =sc_nswq= (serialised with
+=iwx_newstate_task=; =iwx_stop= deletes it from there).  Both the misbehaving
+notification and =hw.iwx.uapsd=0= only queue it (=iwx_uapsd_request_off=);
+the task sends the power table only if MAC_ACTIVE, =ic_state= == RUN and
+=ns_nstate= == RUN.  It also records =ud_assocs= when queued and ignores a
+misbehaving notification if a new association happened since (the switch
+case instead re-checks that the switch is still 0).  The beacon-filter
+sysctl race is left as it was.
+
+** F2 (medium watch item, PLAUSIBLE ok) first QoS frames through the RX pad path
+With QoS frames (26-byte header) the firmware sets =IWX_RX_MPDU_MFLG2_PAD=;
+=iwx_rx_mpdu_mq= removes 2 bytes after the header, or after header+8 if the
+status says =SEC_CCM_ENC=.  Non-QoS 24-byte headers never took this path on
+the laptop.  No keys are in the firmware, so status should be NO_ENC and the
+pad sits right after the MAC header; Linux =iwlwifi swcrypto=1= relies on the
+same layout (=crypt_len= 0 when not decrypted), so this is probably fine.
+Symptom if wrong: associates (EAPOL is unencrypted) but every encrypted QoS
+frame fails software CCMP (net80211 =is_rx_ccmpmic=/=is_rx_ccmpreplay= counters, =netstat -i -I iwx0= input errors),
+ping dead right after the reassociation with =qos=1=.  Step 2 of the test plan
+catches it; rollback =hw.iwx.uapsd=0= + reassociate.
+
+** F3 (low, PLAUSIBLE) request/response decided from two snapshots of the switch
+=frm[-1] = ieee80211_uapsd_qosinfo()= at request time and
+=setup_uapsd()= recomputes it at response time from the current =FEXT_UAPSD=.
+A sysctl write between the two gives =NODE_UAPSD= without having asked (firmware
+does U-APSD triggers, AP treats us as legacy PS: stalls until misbehaving
+fallback), or the reverse.  Needs a write inside the few-ms exchange.  Fix:
+store the requested QoS Info in the node when building the request (e.g. in
+=ni_uapsd_ac=) and have =setup_uapsd= test that instead of recomputing.
+
+*Resolved (2026-10-17):* new node byte =ni_uapsd_qosinfo= (offset 299, still in
+the hole before =ni_tstamp=; sizes unchanged) is set when the (re)association
+request is built (0 when no WMM element is sent) and =ieee80211_setup_uapsd()=
+takes the ACs and max SP from it; the switch is no longer re-read.  The
+driver's =req= diagnostic now shows this byte too, so a new module on an old
+kernel shows =req=0x00= instead of a fake 0x0f.
+
+** F4 (low, PLAUSIBLE) ADD_STA =uapsd_acs=0xff= for the AP station
+=uapsd_acs/sp_length= describe the *peer's* U-APSD (used when we buffer for it).
+Linux in client mode sets =STA_MODIFY_UAPSD_ACS= with =uapsd_acs=0=,
+=sp_length=128= for the AP station; OpenBSD (ported) sets 0xff.  README
+already flags it; if anything odd shows only with the switch on, set
+=uapsd_acs=0= there first.
+
+** F5 (low, CONFIRMED) EDCA with the switch on and a non-WMM AP
+=C_WME= makes =iwx_get_edca_params= use =wme_chanParams=; for a non-QoS node
+net80211's "aggressive mode" overwrites BE with =phyParam= (AIFSN 2, ECWmin 4,
+ECWmax 10) instead of the driver default AIFSN 3.  Only switch-on, only BE,
+only non-WMM APs.  Not a reason to block.
+
+*Resolved (2026-10-17):* =iwx_get_edca_params()= uses =ic_wme= only when
+=C_WME= is set *and* =ic_bss= has =NODE_QOS=; otherwise the driver defaults,
+so a non-WMM association is identical with the switch on or off.
+
+** Checked and correct
+- Firmware layouts vs =if_iwxreg.h=: =iwx_mac_power_cmd= field order
+  (=rx/tx_data_timeout_uapsd= u32 in usec, =qndp_tid=, =uapsd_ac_flags=,
+  =uapsd_max_sp= u8); flags =ADVANCE_PM= bit 9, =UAPSD_MISBEHAVING= bit 12;
+  50 ms = 50000 us as Linux; =IWX_STA_MODIFY_UAPSD_ACS= = bit 2 (= Linux
+  =STA_MODIFY_UAPSD_ACS=); ADD_STA =sp_length/uapsd_acs= u8, STA_CONFIG u32
+  with =htole32=; trigger nibble + delivery nibble with =IWX_AC_BK=0, BE=1,
+  VI=2, VO=3= (as Linux); =sp_length= 2/4/6/128 = Linux =max_sp*2= or 128;
+  =qndp_tid= 6/5/0/1 by AC priority skipping ACM = Linux; =uapsd_ac_flags=
+  takes QoS Info bits per the API comment (Linux's =BIT(IEEE80211_AC_*)= is
+  actually the odd one out for BE/BK; all give 0x0f here).
+- QoS Info: =wme_info= is the 9th byte of =ieee80211_add_wme_info=, so
+  =frm[-1]= is right; both ASSOC_REQ and REASSOC_REQ share the case.
+- Negotiation: requested only if the AP's beacon WMM element advertises
+  U-APSD, flag set only with =NODE_QOS= and the AP bit in the response;
+  =ni_wme_ie= is saved regardless of =F_WME= (node.c:1338), so =ap_wmm=/
+  =ap_uapsd= are valid with the switch off (test step 1 works).
+- Ordering in =iwx_run=: ADD_STA update and power table are sent after the
+  assoc response set the flag; =iwx_auth= clears a stale flag before the
+  station is added; RUN->ASSOC reassociations re-decide in =setup_uapsd=.
+- TX of QoS frames: =iwx_tx= pads 26-byte headers (=IWX_TX_CMD_OFFLD_PAD=);
+  classification uses =M_WME_AC_*= = =M_LINK1|M_LINK2= (shift 13 matches);
+  same single queue as OpenBSD non-agg.  Software CCMP AAD/nonce handle QoS.
+- Sysctl: mirrors =hw.iwx.beacon_filter= (EINVAL for !0/1, no-op if unchanged,
+  =ioctl_rwl= writer + splnet, kernel lock since not MPSAFE, sleeping at
+  splnet as the rest of the driver); applies at attach if set earlier
+  (=wme_update= is assigned before =iwx_uapsd_caps=, which calls
+  =ieee80211_wme_initparams= -> =wme_update=).  Status string: 1 KB stack
+  buffer, truncation handled.  No deadlock with =iwx_stop= (task takes no rwlock).
+- Locking of =ni_flags= RMW: task, softint and sysctl all run kernel-locked at
+  splnet: fine on this driver's model.
+
+* Test plan / script notes
+- =uapsd-ab.sh= does =wpa_cli reassociate= at every mode switch (5 times for
+  =6 2=), and reassociate scans.  Start it at the laptop, never over ssh/wg
+  (standing rule: no remote scans).
+- Add to step 2: =netstat -i -I iwx0= input errors (and net80211 stats if a tool exposes them)
+  before/after the reassociation, to catch F2 quickly.
+- With the switch off at step 1, =qos=1= means the AP sent a WMM element
+  unsolicited (pre-existing net80211 behaviour, now with per-TID counters).
