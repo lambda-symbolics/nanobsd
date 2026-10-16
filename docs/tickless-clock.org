@@ -182,6 +182,12 @@ wrap; the VM's 2.92 GHz TSC got shift 5).  Quality 2900, so it is chosen
 only by =sysctl kern.timecounter.hardware=TSC-low= (a counter switch wakes
 the primary, 176).  VM: wall clock exact on it.
 
+** DIAGNOSTIC + LOCKDEBUG run
+The same VM test on a GENERIC + DIAGNOSTIC + LOCKDEBUG build of 177:
+no assertion or lock-debug report, ticks 91.9-92.0 s per CPU in 90.3 s
+real (as without), the cache survives a =kern.callout_deferrable= 0/1
+flip (25.9 M hits, 412 scans), and the wg up/down test passes.
+
 ** Not done: batching the hardclock replay
 cidle replays one =hardclock()= per skipped tick.  A batched catch-up
 (cp_time, sched ticks, one windup, the wheel advanced bucket by bucket under
