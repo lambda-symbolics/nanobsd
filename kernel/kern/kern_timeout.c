@@ -185,6 +185,21 @@ struct callout_cpu {
 	char		cc_name1[12];
 	char		cc_name2[12];
 	struct cpu_info	*cc_cpu;
+	/*
+	 * LISPBSD: the earliest wheel expiry the tickless idle must honour
+	 * (non-deferrable callouts), cached so callout_next_ticks() does not
+	 * walk all BUCKETS on every idle entry.  Kept EXACT OR EARLY: the only
+	 * insertion into the wheel (callout_softclock) lowers it; removals and
+	 * firings can leave it early, which wakes the CPU once, finds the time
+	 * passed and rescans.  Valid for one generation of the deferrable
+	 * policy.  Under cc_lock.
+	 */
+	u_int		cc_next_gen;	/* callout_next_gen when computed; 0 = never */
+	bool		cc_next_none;	/* no honoured callout in the wheel */
+	int		cc_next_time;	/* absolute ticks of the earliest */
+	uint64_t	cc_next_hits;	/* idle entries answered from the cache */
+	uint64_t	cc_next_scans;	/* full wheel walks */
+	uint64_t	cc_deferred_skips; /* deferrable callouts passed over */
 };
 
 #ifdef DDB
@@ -903,7 +918,68 @@ int callout_next_ticks(void);
  * late.  0: every callout counts, for A/B measurement.
  */
 int callout_deferrable_enabled = 1;
-static uint64_t callout_deferred_skips;	/* deferrable callouts passed over */
+/* Bumped when the deferrable policy changes: every CPU's cache is stale. */
+static volatile u_int callout_next_gen = 1;
+
+static int
+sysctl_kern_callout_deferrable(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	int t = callout_deferrable_enabled, error;
+
+	node.sysctl_data = &t;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error || newp == NULL)
+		return error;
+	callout_deferrable_enabled = (t != 0);
+	/* The policy is visible before the generation that names it. */
+	membar_release();
+	/* Skip 0, the "never computed" value. */
+	if (atomic_inc_uint_nv(&callout_next_gen) == 0)
+		atomic_inc_uint(&callout_next_gen);
+	return 0;
+}
+
+/* Sum a per-CPU uint64_t counter of struct callout_cpu (field offset). */
+static uint64_t
+callout_cpu_sum(size_t off)
+{
+	CPU_INFO_ITERATOR cii;
+	struct cpu_info *ci;
+	uint64_t sum = 0;
+
+	for (CPU_INFO_FOREACH(cii, ci)) {
+		struct callout_cpu *cc = ci->ci_data.cpu_callout;
+		if (cc != NULL)
+			sum += *(volatile uint64_t *)((char *)cc + off);
+	}
+	return sum;
+}
+
+static int
+sysctl_kern_callout_deferred(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	uint64_t v = callout_cpu_sum(offsetof(struct callout_cpu,
+	    cc_deferred_skips));
+
+	node.sysctl_data = &v;
+	return sysctl_lookup(SYSCTLFN_CALL(&node));
+}
+
+static int
+sysctl_kern_callout_nextcache(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	char buf[64];
+
+	snprintf(buf, sizeof(buf), "hits=%" PRIu64 " scans=%" PRIu64,
+	    callout_cpu_sum(offsetof(struct callout_cpu, cc_next_hits)),
+	    callout_cpu_sum(offsetof(struct callout_cpu, cc_next_scans)));
+	node.sysctl_data = buf;
+	node.sysctl_size = strlen(buf) + 1;
+	return sysctl_lookup(SYSCTLFN_CALL(&node));
+}
 
 SYSCTL_SETUP(sysctl_kern_callout_setup, "kern.callout_deferrable")
 {
@@ -911,13 +987,19 @@ SYSCTL_SETUP(sysctl_kern_callout_setup, "kern.callout_deferrable")
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
 	    "callout_deferrable",
 	    SYSCTL_DESCR("Deferrable callouts do not wake an idle CPU (1) or do (0)"),
-	    NULL, 0, &callout_deferrable_enabled, 0,
+	    sysctl_kern_callout_deferrable, 0, NULL, 0,
 	    CTL_KERN, CTL_CREATE, CTL_EOL);
 	sysctl_createv(clog, 0, NULL, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_QUAD,
 	    "callout_deferred",
 	    SYSCTL_DESCR("Deferrable callouts passed over by the idle path"),
-	    NULL, 0, &callout_deferred_skips, 0,
+	    sysctl_kern_callout_deferred, 0, NULL, 0,
+	    CTL_KERN, CTL_CREATE, CTL_EOL);
+	sysctl_createv(clog, 0, NULL, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING,
+	    "callout_nextcache",
+	    SYSCTL_DESCR("Idle next-deadline cache: answered from cache / full scans"),
+	    sysctl_kern_callout_nextcache, 0, NULL, 0,
 	    CTL_KERN, CTL_CREATE, CTL_EOL);
 }
 
@@ -938,9 +1020,38 @@ callout_setdeferrable(callout_t *cs, bool deferrable)
 	lock = callout_lock(c);
 	if (deferrable)
 		c->c_flags |= CALLOUT_DEFERRABLE;
-	else
+	else {
 		c->c_flags &= ~CALLOUT_DEFERRABLE;
+		/* It now counts: let its CPU's cache see it. */
+		c->c_cpu->cc_next_gen = 0;
+	}
 	mutex_spin_exit(lock);
+}
+
+/* Is callout C one the tickless idle must wake for? */
+static inline bool
+callout_next_honoured(const callout_impl_t *c)
+{
+
+	return !callout_deferrable_enabled ||
+	    (c->c_flags & CALLOUT_DEFERRABLE) == 0;
+}
+
+/*
+ * A callout went into CC's wheel: keep the cached earliest exact-or-early.
+ * Called with cc_lock held.
+ */
+static inline void
+callout_next_note(struct callout_cpu *cc, const callout_impl_t *c)
+{
+
+	if (cc->cc_next_gen != callout_next_gen || !callout_next_honoured(c))
+		return;
+	if (cc->cc_next_none ||
+	    (int)((unsigned)c->c_time - (unsigned)cc->cc_next_time) < 0) {
+		cc->cc_next_none = false;
+		cc->cc_next_time = c->c_time;
+	}
 }
 
 int
@@ -950,27 +1061,59 @@ callout_next_ticks(void)
 	struct callout_circq *b, *p;
 	callout_impl_t *c;
 	int i, delta, best = CALLOUT_NO_NEXT;
+	bool none = true;
+	int earliest = 0;
+	u_int gen;
+	uint64_t skipped = 0;
 
 	mutex_spin_enter(cc->cc_lock);
+	/*
+	 * Read the generation before the policy: a scan that races a
+	 * policy change records the older generation and is redone.
+	 */
+	gen = callout_next_gen;
+	membar_acquire();
 	if (!CIRCQ_EMPTY(&cc->cc_todo)) {
 		best = 0;
-	} else {
-		for (i = 0; i < BUCKETS; i++) {
-			b = &cc->cc_wheel[i];
-			for (p = b->cq_next_l; p != b; p = p->cq_next_l) {
-				c = (callout_impl_t *)p;
-				if (callout_deferrable_enabled &&
-				    (c->c_flags & CALLOUT_DEFERRABLE) != 0) {
-					atomic_inc_64(&callout_deferred_skips);
-					continue;
-				}
-				delta = (int)((unsigned)c->c_time -
-				    (unsigned)cc->cc_ticks);
-				if (delta < best)
-					best = delta;
+		goto out;
+	}
+	if (cc->cc_next_gen == gen) {
+		if (cc->cc_next_none) {
+			cc->cc_next_hits++;
+			goto out;
+		}
+		delta = (int)((unsigned)cc->cc_next_time -
+		    (unsigned)cc->cc_ticks);
+		if (delta > 0) {
+			cc->cc_next_hits++;
+			best = delta;
+			goto out;
+		}
+		/* The cached one has run or was early: look again. */
+	}
+	cc->cc_next_scans++;
+	for (i = 0; i < BUCKETS; i++) {
+		b = &cc->cc_wheel[i];
+		for (p = b->cq_next_l; p != b; p = p->cq_next_l) {
+			c = (callout_impl_t *)p;
+			if (!callout_next_honoured(c)) {
+				skipped++;
+				continue;
+			}
+			delta = (int)((unsigned)c->c_time -
+			    (unsigned)cc->cc_ticks);
+			if (none || delta < best) {
+				best = delta;
+				earliest = c->c_time;
+				none = false;
 			}
 		}
 	}
+	cc->cc_deferred_skips += skipped;
+	cc->cc_next_gen = gen;
+	cc->cc_next_none = none;
+	cc->cc_next_time = earliest;
+out:
 	mutex_spin_exit(cc->cc_lock);
 	if (best < 0)
 		best = 0;
@@ -1014,6 +1157,7 @@ callout_softclock(void *v)
 		delta = (int)((unsigned)c->c_time - (unsigned)ticks);
 		if (delta > 0) {
 			CIRCQ_INSERT(&c->c_list, BUCKET(cc, delta, c->c_time));
+			callout_next_note(cc, c);
 			continue;
 		}
 		if (delta < 0)
