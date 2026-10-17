@@ -50,4 +50,6 @@ until a reboot.  Also: =crash -N <kernel>= cannot name module functions
 * Still to do
 - Panel-off energy window on battery after 10 min uptime (battery was at 5 %
   on 10-17 morning).
-- Lid s2idle cycle with the radio parked, then an inquiry (needs the lid).
+- Lid s2idle cycle with the radio parked (done 2026-10-17 15:43, kernel 180):
+  clean resume, one reconcile, no failures, inquiry OK after resume, num_cmd 2,
+  radio re-parked.
