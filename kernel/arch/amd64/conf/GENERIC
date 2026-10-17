@@ -203,6 +203,7 @@ options 	DKWEDGE_METHOD_APPLE	# Support Apple partitions as wedges
 
 # File systems
 include "conf/filesystems.config"
+file-system	GEFS		# LISPBSD: gefs+ (fs/gefs from lambda-symbolics/gefs-netbsd), built in for a gefs root
 
 # File system options
 # ffs

@@ -34,6 +34,9 @@
 #ifdef SUPPORT_EXT2FS
 #include <lib/libsa/ext2fs.h>
 #endif
+#ifdef SUPPORT_GEFS
+#include <lib/libsa/gefs.h>
+#endif
 #ifdef SUPPORT_MINIXFS3
 #include <lib/libsa/minixfs3.h>
 #endif
@@ -87,6 +90,9 @@ struct fs_ops file_system[] = {
 #ifdef SUPPORT_DOSFS
 	FS_OPS(null),
 #endif
+#ifdef SUPPORT_GEFS
+	FS_OPS(null),
+#endif
 };
 int nfsys = __arraycount(file_system);
 
@@ -104,6 +110,9 @@ struct fs_ops file_system_disk[] = {
 #endif
 #ifdef SUPPORT_DOSFS
 	FS_OPS(dosfs),
+#endif
+#ifdef SUPPORT_GEFS
+	FS_OPS(gefs),
 #endif
 };
 __CTASSERT(__arraycount(file_system) == __arraycount(file_system_disk));

@@ -71,6 +71,7 @@ SUBDIR+=	ffs
 SUBDIR+=	filecore
 SUBDIR+=	flash
 SUBDIR+=	fss
+SUBDIR+=	gefs
 SUBDIR+=	gpio
 SUBDIR+=	gpioiic
 SUBDIR+=	gpioow
