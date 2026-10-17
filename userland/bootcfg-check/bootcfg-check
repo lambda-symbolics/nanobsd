@@ -1,0 +1,27 @@
+#!/bin/sh
+# bootcfg-check FILE: lint a NetBSD boot.cfg for the EFI loader before installing it.
+# - menu=<title>:<commands>: the title ends at the FIRST ':' (sys/lib/libsa/bootcfg.c),
+#   so a ':' in the title turns the rest of the title into an unknown command;
+# - a '#' ANYWHERE in a line starts a comment and cuts the rest, commands included;
+# - every command must exist in efiboot's command table (efiboot/boot.c).
+# Exit status: number of problems.
+f=${1:-/boot.cfg}
+[ -r "$f" ] || { echo "bootcfg-check: cannot read $f" >&2; exit 1; }
+cmds=" help ? quit boot pkboot consdev root dev devpath efivar fs gop load ls memmap menu modules multiboot reloc rndseed splash text userconf version prompt "
+awk -v cmds="$cmds" '
+/^[ \t]*#/ || /^[ \t]*$/ { next }
+{
+	line = $0
+	if (index(line, "#")) { printf "line %d: \"#\" starts a comment here, the rest of the line is ignored: %s\n", NR, line; bad++; line = substr(line, 1, index(line, "#") - 1) }
+	if (line !~ /^menu=/) next
+	v = substr(line, 6); c = index(v, ":")
+	if (!c) { printf "line %d: menu entry without \":\" (no commands): %s\n", NR, line; bad++; next }
+	title = substr(v, 1, c - 1); rest = substr(v, c + 1)
+	n = split(rest, cmd, ";")
+	for (i = 1; i <= n; i++) {
+		w = cmd[i]; sub(/^[ \t]+/, "", w); split(w, t, /[ \t]/)
+		if (t[1] == "") continue
+		if (index(cmds, " " t[1] " ") == 0) { printf "line %d: unknown loader command \"%s\" (title \"%s\" - a \":\" in a title ends it early)\n", NR, t[1], title; bad++ }
+	}
+}
+END { if (!bad) print "ok: " FILENAME; exit bad }' "$f"
