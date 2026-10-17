@@ -1,0 +1,1374 @@
+--- dev/usb/xhcivar.h	2026-10-15 20:44:14.000000000 +0200
++++ dev/usb/xhcivar.h	2026-10-17 01:48:16.278341035 +0200
+@@ -36,6 +36,7 @@
+ #include <sys/mutex.h>
+ #include <sys/pmf.h>
+ #include <sys/pool.h>
++#include <sys/queue.h>
+ 
+ #include <sys/callout.h>
+ #include <dev/usb/usbdi.h>
+@@ -102,6 +103,25 @@
+ 	uint32_t xs_dbpending;		/* doorbells to ring after the resume, bit per dci */
+ 	int xs_rt_want;			/* 1: suspend, 2: resume (for xs_rt_task) */
+ 	struct usb_task xs_rt_task;
++
++	/*
++	 * Deadlines (sc_intr_lock).  At most one is armed per slot.  The idle
++	 * deadline is xs_lastbusy + hw.usbpm.autosuspend, re-read when the
++	 * controller callout fires (activity only moves xs_lastbusy).  The
++	 * retry deadline re-runs a failed transition: xs_retry_want 2 (a
++	 * resume/unpark that still owes deferred I/O: never abandoned) or 1
++	 * (a suspend: backoff, then a slow re-check at the cap).
++	 * A dormant slot was refused for a reason that only an eligibility
++	 * event (pipe open/close, port change, sysctl write, resume) changes.
++	 */
++	bool xs_idle_armed;
++	bool xs_retry_armed;
++	bool xs_dormant;
++	int xs_retry_want;
++	int xs_retry_due;		/* getticks() */
++	u_int xs_rt_gen;		/* eligibility events (see xhci_rt_event_locked) */
++	u_int xs_res_fails;		/* consecutive failed resumes/unparks */
++	u_int xs_susp_fails;		/* consecutive failed suspends */
+ };
+ 
+ struct xhci_softc {
+@@ -168,12 +188,26 @@
+ 	bool sc_state_lost;		/* cold recovery required until successful */
+ 
+ 	/* LispBSD USB runtime power management */
+-	callout_t sc_rt_callout;	/* the idle scan, deferrable */
++	callout_t sc_rt_callout;	/* earliest slot deadline; idle when none */
+ 	int sc_rt_bound;		/* device slots bound (populated) */
+ 	bool sc_rt_paused;		/* sc_intr_lock: no new runtime PM tasks */
+ 	u_int sc_rt_openers;		/* sc_intr_lock: synchronous port wakes */
+ 	kcondvar_t sc_rt_cv;		/* drain sc_rt_openers before system suspend */
+ 	uint64_t sc_rt_suspends, sc_rt_resumes, sc_rt_wakes, sc_rt_failed;
++	/* sc_intr_lock: the deadline callout */
++	bool sc_rt_armed;		/* sc_rt_callout is scheduled */
++	bool sc_rt_armed_hard;		/* ... not deferrable (a resume retry) */
++	int sc_rt_armed_at;		/* ... for this getticks() */
++	u_int sc_rt_ndeadlines;		/* slots with an armed deadline */
++	uint64_t sc_rt_callouts;	/* callout invocations */
++	uint64_t sc_rt_scans;		/* slot walks by the callout */
++	uint64_t sc_rt_reconciles;	/* event-driven full walks */
++	uint64_t sc_rt_tasks;		/* runtime PM task runs with work */
++	uint64_t sc_rt_retries;		/* retry deadlines that fired */
++	uint64_t sc_rt_giveups;		/* suspends abandoned after backoff */
++	int sc_rt_maxlate;		/* ticks: worst callout lateness */
++	LIST_ENTRY(xhci_softc) sc_rt_link; /* xhci_rt_list (sysctl) */
++	bool sc_rt_listed;
+ 
+ 	void (*sc_vendor_init)(struct xhci_softc *);
+ 	int (*sc_vendor_port_status)(struct xhci_softc *, uint32_t, int);
+--- dev/usb/xhci.c	2026-10-15 20:44:10.000000000 +0200
++++ dev/usb/xhci.c	2026-10-17 02:21:28.728737395 +0200
+@@ -53,6 +53,8 @@
+ #include <sys/bus.h>
+ #include <sys/cpu.h>
+ #include <sys/sysctl.h>
++#include <sys/atomic.h>
++#include <sys/once.h>
+ 
+ #include <machine/endian.h>
+ 
+@@ -155,7 +157,12 @@
+ static void xhci_rt_doorbell(struct xhci_softc *, struct xhci_slot *, u_int);
+ static void xhci_rt_ring_pending(struct xhci_softc *, struct xhci_slot *);
+ static void xhci_rt_kick(struct xhci_softc *, struct xhci_slot *, int);
+-static void xhci_rt_resume_dev(struct xhci_softc *, struct xhci_slot *);
++static bool xhci_rt_resume_dev(struct xhci_softc *, struct xhci_slot *);
++static void xhci_rt_reconcile(struct xhci_softc *, int);
++#define XHCI_RT_RC_RESET	__BIT(0)	/* reconcile: forget failure history */
++#define XHCI_RT_RC_WAKE		__BIT(1)	/* reconcile: wake idle-suspended slots */
++static void xhci_rt_list_insert(struct xhci_softc *);
++static void xhci_rt_list_remove(struct xhci_softc *);
+ static void xhci_poll(struct usbd_bus *);
+ static struct usbd_xfer *xhci_allocx(struct usbd_bus *, unsigned int);
+ static void xhci_freex(struct usbd_bus *, struct usbd_xfer *);
+@@ -664,11 +671,18 @@
+ 	/* XXX unconfigure/free slots */
+ 
+ 	/*
+-	 * LISPBSD: the runtime PM idle scan reschedules itself; stop it
++	 * LISPBSD: the runtime PM deadline callout re-arms itself; stop it
+ 	 * before the softc goes away (a pending callout in freed memory
+ 	 * took the idle loop down in callout_next_ticks on a drvctl -d).
++	 * Leave the sysctl list first (a hw.usbpm write re-arms every listed
++	 * controller), then refuse arming (sc_dying under sc_intr_lock),
++	 * then wait for a running invocation.
+ 	 */
++	xhci_rt_list_remove(sc);
++	mutex_enter(&sc->sc_intr_lock);
+ 	sc->sc_dying = 1;
++	sc->sc_rt_armed = false;
++	mutex_exit(&sc->sc_intr_lock);
+ 	callout_halt(&sc->sc_rt_callout, NULL);
+ 	callout_destroy(&sc->sc_rt_callout);
+ 
+@@ -982,7 +996,6 @@
+ 		mutex_exit(&sc->sc_intr_lock);
+ 		cv_broadcast(&sc->sc_cmdbusy_cv);
+ 		mutex_exit(&sc->sc_lock);
+-		callout_schedule(&sc->sc_rt_callout, hz * 5);
+ 		for (i = 1; i <= sc->sc_maxslots; i++) {
+ 			struct xhci_slot *xs = &sc->sc_slots[i];
+ 			if (xs->xs_idx != 0 && xs->xs_rt_init &&
+@@ -990,6 +1003,8 @@
+ 			    xs->xs_parked_drv || xs->xs_dbpending != 0))
+ 				xhci_rt_kick(sc, xs, 2);
+ 		}
++		/* Re-arm the deadlines recorded before the pause. */
++		xhci_rt_reconcile(sc, XHCI_RT_RC_RESET);
+ 	}
+ 	return ok;
+ }
+@@ -1467,13 +1482,14 @@
+ 		mutex_enter(&sc->sc_intr_lock);
+ 		sc->sc_rt_paused = false;
+ 		mutex_exit(&sc->sc_intr_lock);
+-		callout_schedule(&sc->sc_rt_callout, hz * 5);
+ 		/* Runtime-parked children were skipped by system PMF suspend. */
+ 		for (i = 1; i <= sc->sc_maxslots; i++) {
+ 			struct xhci_slot *xs = &sc->sc_slots[i];
+ 			if (xs->xs_idx != 0 && xs->xs_rt_init && xs->xs_parked_drv)
+ 				xhci_rt_kick(sc, xs, 2);
+ 		}
++		/* Idle deadlines from the reset xs_lastbusy; old retries re-armed. */
++		xhci_rt_reconcile(sc, XHCI_RT_RC_RESET);
+ 		/* Drain events received while coldres reinitialisation was gated. */
+ 		if (sc->sc_child != NULL)
+ 			usb_schedsoftintr(&sc->sc_bus);
+@@ -1751,11 +1767,10 @@
+ 	xhci_op_write_4(sc, XHCI_USBCMD, XHCI_CMD_INTE|XHCI_CMD_RS);
+ 	aprint_debug_dev(sc->sc_dev, "USBCMD 0x%08"PRIx32"\n",
+ 	    xhci_op_read_4(sc, XHCI_USBCMD));
+-	/* Deferred-start frontends must start the runtime scan here too. */
+-	mutex_enter(&sc->sc_intr_lock);
+-	if (!sc->sc_rt_paused)
+-		callout_schedule(&sc->sc_rt_callout, hz * 5);
+-	mutex_exit(&sc->sc_intr_lock);
++	/*
++	 * LISPBSD: no runtime PM work here: deadlines are armed by slot
++	 * binding and activity, not by a periodic scan.
++	 */
+ }
+ 
+ /*
+@@ -1771,22 +1786,376 @@
+  * so an external keyboard never loses its first key.  Devices behind an
+  * external hub are left alone (v1).  The controller stays in D0; with
+  * every port in U3 or empty the PCH gates the USB PLLs by itself.
++ *
++ * Deadline-driven work (replaces the periodic idle scan of kernels
++ * 156-174).  Every slot carries at most one deadline, under sc_intr_lock:
++ *
++ *  - idle: armed when the slot may become idle-suspendable (bind, pipe
++ *    open/close, a successful runtime or system resume, a port change of a
++ *    dormant slot, a sysctl write).  Its due time is xs_lastbusy +
++ *    autosuspend, re-read when the callout fires, so transfers only store
++ *    xs_lastbusy (no locking or re-arming on the I/O path): a callout that
++ *    finds the slot busy again simply re-arms for the new due time.
++ *  - retry: a failed transition.  Resume/unpark (want 2, the slot owes
++ *    deferred doorbells or a parked driver): backoff XHCI_RT_RETRY_MIN
++ *    doubling to XHCI_RT_RETRY_MAX, never abandoned.  Suspend/park
++ *    (want 1, also a transitional USB3 link state): backoff from the
++ *    autosuspend period doubling to XHCI_RT_SUSPEND_BACKOFF_MAX periods;
++ *    from XHCI_RT_SUSPEND_TRIES consecutive failures on (giveups++) a
++ *    slow deferrable re-check at that cap, never permanent.
++ *
++ * xs_rt_gen counts eligibility events from outside the transition (pipe
++ * open/close, bind, port change, reconcile).  A task samples it when it
++ * takes the slot; a refusal or failure decided before a newer event is
++ * not applied (the slot re-evaluates from an idle deadline).
++ *
++ * A slot refused for a static reason (no ubt to park, HID, no remote
++ * wakeup capability, disabled port) goes dormant: no deadline until an
++ * eligibility event re-arms it.  A slot that is suspended, or whose
++ * transition is owned by the task or an opener, has no idle deadline.
++ *
++ * One callout per controller is armed for the earliest deadline and
++ * stopped when the last deadline is cleared, so with every eligible device
++ * suspended and no failed transition outstanding nothing runs at all.
++ * Idle deadlines use a deferrable callout (it does not wake an idle CPU):
++ * the tickless idle path still wakes every machdep.cidle.maxskip ticks
++ * (hard cap 1400), which is the latest execution time of an idle deadline;
++ * hw.usbpm.deferrable=0 makes it exact.  Resume retries (I/O is waiting)
++ * arm the callout non-deferrable.  The callout only queues the slot's USB
++ * task (want 1 or 2); eligibility checks, PMF parking and port writes run
++ * in that task (USB_TASKQ_HC, KERNEL_LOCK held).
++ *
++ * Ownership is unchanged: xs_rt_owner (the task or a pipe opener) owns a
++ * slot's transition; the callout skips owned slots and slots with a
++ * queued request (xs_rt_want), and the owner re-arms the slot's deadline
++ * when it lets go.  Deferred doorbells (xs_dbpending) are only rung by a
++ * successful resume.
+  */
+ int xhci_autosuspend = 5;	/* seconds; 0: off */
+ int xhci_autosuspend_hid = 0;
+ int xhci_rt_debug = 0;		/* hw.usbpm.debug: say why a park is refused */
++int xhci_rt_deferrable = 1;	/* hw.usbpm.deferrable: idle deadlines may run late */
++u_int xhci_rt_inject_suspend;	/* hw.usbpm.inject_suspend: fail N suspends */
++u_int xhci_rt_inject_resume;	/* hw.usbpm.inject_resume: fail N resumes */
+ #define XHCI_RT_WHY(sc, xs, fmt, ...) do { if (xhci_rt_debug) \
+ 	device_printf((sc)->sc_dev, "port %u: " fmt "\n", (xs)->xs_ctlrport, ##__VA_ARGS__); } while (0)
+ 
++#define XHCI_RT_AUTOSUSPEND_MAX	3600	/* seconds */
++#define XHCI_RT_RETRY_MIN	MAX(1, hz / 5)	/* first resume retry: 200 ms */
++#define XHCI_RT_RETRY_MAX	(10 * hz)	/* resume retry cap */
++#define XHCI_RT_SUSPEND_TRIES	5	/* failed suspends before dormant */
++#define XHCI_RT_SUSPEND_BACKOFF_MAX 8	/* suspend retry cap, in periods */
++
++/* Outcome of an idle-suspend attempt (xhci_rt_suspend_dev). */
++enum xhci_rt_susp {
++	XHCI_RT_SUSP_OK,	/* the port is in U3 */
++	XHCI_RT_SUSP_BUSY,	/* used again: idle deadline from xs_lastbusy */
++	XHCI_RT_SUSP_DORMANT,	/* not eligible until an eligibility event */
++	XHCI_RT_SUSP_FAILED,	/* transition failed: retry with backoff */
++	XHCI_RT_SUSP_NONE,	/* nothing to do (paused, unbound, owned) */
++};
++
+ static void xhci_rt_task(void *);
+ static void xhci_rt_callout(void *);
+ 
++static kmutex_t xhci_rt_list_lock;	/* xhci_rt_list; before sc_intr_lock */
++static LIST_HEAD(, xhci_softc) xhci_rt_list = LIST_HEAD_INITIALIZER(xhci_rt_list);
++static ONCE_DECL(xhci_rt_once);
++
++static int
++xhci_rt_list_init(void)
++{
++	mutex_init(&xhci_rt_list_lock, MUTEX_DEFAULT, IPL_NONE);
++	return 0;
++}
++
++static void
++xhci_rt_list_insert(struct xhci_softc *sc)
++{
++	RUN_ONCE(&xhci_rt_once, xhci_rt_list_init);
++	mutex_enter(&xhci_rt_list_lock);
++	LIST_INSERT_HEAD(&xhci_rt_list, sc, sc_rt_link);
++	sc->sc_rt_listed = true;
++	mutex_exit(&xhci_rt_list_lock);
++}
++
++static void
++xhci_rt_list_remove(struct xhci_softc *sc)
++{
++	if (!sc->sc_rt_listed)
++		return;
++	mutex_enter(&xhci_rt_list_lock);
++	LIST_REMOVE(sc, sc_rt_link);
++	sc->sc_rt_listed = false;
++	mutex_exit(&xhci_rt_list_lock);
++}
++
+ static inline bool
+ xhci_rt_enabled(void)
+ {
+ 	return xhci_autosuspend > 0;
+ }
+ 
++/* a - b for getticks() values, wrap-safe */
++static inline int
++xhci_rt_tdiff(int a, int b)
++{
++	return (int)((unsigned)a - (unsigned)b);
++}
++
++static inline int
++xhci_rt_period(void)
++{
++	return hz * xhci_autosuspend;
++}
++
++/* Consume one injected failure (test hook). */
++static bool
++xhci_rt_inject(volatile u_int *p)
++{
++	u_int v;
++
++	do {
++		v = *p;
++		if (v == 0)
++			return false;
++	} while (atomic_cas_uint(p, v, v - 1) != v);
++	return true;
++}
++
++/* Bump a statistics counter (all of them live under sc_intr_lock). */
++static void
++xhci_rt_count(struct xhci_softc *sc, uint64_t *c)
++{
++	mutex_enter(&sc->sc_intr_lock);
++	(*c)++;
++	mutex_exit(&sc->sc_intr_lock);
++}
++
++/*
++ * Schedule the controller callout for getticks() == at.  hard: not
++ * deferrable.  sc_intr_lock held (the callout lock nests inside it).
++ */
++static void
++xhci_rt_schedule_locked(struct xhci_softc *sc, int at, bool hard)
++{
++	int delta;
++
++	KASSERT(mutex_owned(&sc->sc_intr_lock));
++	if (!xhci_rt_deferrable)
++		hard = true;
++	/*
++	 * A pending callout stays on its CPU, whose tickless sleep was set
++	 * for the old (later or deferrable) time; re-timing it would neither
++	 * wake nor IPI that CPU.  Stopped, it migrates to this (awake) CPU.
++	 */
++	if (sc->sc_rt_armed &&
++	    (hard || xhci_rt_tdiff(at, sc->sc_rt_armed_at) < 0))
++		callout_stop(&sc->sc_rt_callout);
++	if (!sc->sc_rt_armed || hard != sc->sc_rt_armed_hard)
++		callout_setdeferrable(&sc->sc_rt_callout, !hard);
++	delta = MAX(xhci_rt_tdiff(at, getticks()), 1);
++	callout_schedule(&sc->sc_rt_callout, delta);
++	sc->sc_rt_armed = true;
++	sc->sc_rt_armed_hard = hard;
++	/* When it is due to run (an overdue deadline runs on the next tick). */
++	sc->sc_rt_armed_at = getticks() + delta;
++}
++
++/*
++ * A deadline at `due' exists: make sure the callout runs by then.  O(1):
++ * the callout recomputes the earliest deadline when it fires.
++ */
++static void
++xhci_rt_arm_locked(struct xhci_softc *sc, int due, bool hard)
++{
++	KASSERT(mutex_owned(&sc->sc_intr_lock));
++	if (sc->sc_dying || sc->sc_rt_paused)
++		return;		/* xhci_rt_reconcile re-arms after the pause */
++	if (!xhci_rt_deferrable)
++		hard = true;
++	if (sc->sc_rt_armed) {
++		hard = hard || sc->sc_rt_armed_hard;
++		if (xhci_rt_tdiff(sc->sc_rt_armed_at, due) <= 0) {
++			if (hard == sc->sc_rt_armed_hard)
++				return;	/* runs first and rescans */
++			due = sc->sc_rt_armed_at;
++		}
++	}
++	xhci_rt_schedule_locked(sc, due, hard);
++}
++
++static void
++xhci_rt_dl_clear_locked(struct xhci_softc *sc, struct xhci_slot *xs)
++{
++	KASSERT(mutex_owned(&sc->sc_intr_lock));
++	if (!xs->xs_idle_armed && !xs->xs_retry_armed)
++		return;
++	xs->xs_idle_armed = xs->xs_retry_armed = false;
++	KASSERT(sc->sc_rt_ndeadlines > 0);
++	if (--sc->sc_rt_ndeadlines == 0 && sc->sc_rt_armed) {
++		/* The last deadline went away: nothing left to wake up for. */
++		callout_stop(&sc->sc_rt_callout);
++		sc->sc_rt_armed = false;
++	}
++}
++
++static void
++xhci_rt_dl_count_locked(struct xhci_softc *sc, struct xhci_slot *xs)
++{
++	if (!xs->xs_idle_armed && !xs->xs_retry_armed)
++		sc->sc_rt_ndeadlines++;
++}
++
++/*
++ * Eligibility event: (re)arm the idle deadline of an awake root-port slot.
++ * A pending suspend retry keeps its backoff; a slot that is suspended,
++ * waking or owes a resume has no idle deadline.
++ */
++static void
++xhci_rt_idle_arm_locked(struct xhci_softc *sc, struct xhci_slot *xs)
++{
++	KASSERT(mutex_owned(&sc->sc_intr_lock));
++	if (!xs->xs_rt_init || xs->xs_dev == NULL || xs->xs_ctlrport == 0 ||
++	    sc->sc_dying)
++		return;
++	xs->xs_dormant = false;
++	if (xs->xs_retry_armed || xs->xs_suspended || xs->xs_resuming)
++		return;
++	if (!xhci_rt_enabled()) {
++		xhci_rt_dl_clear_locked(sc, xs);
++		return;
++	}
++	xhci_rt_dl_count_locked(sc, xs);
++	xs->xs_idle_armed = true;
++	xhci_rt_arm_locked(sc, xs->xs_lastbusy + xhci_rt_period(), false);
++}
++
++/*
++ * An eligibility event from outside the slot's transition (pipe open or
++ * close, bind, port change): bump the generation, so that a task deciding
++ * with older facts does not override it, and arm the idle deadline.  The
++ * owner's own pipe traffic (ubt reopening its event pipe while being
++ * unparked by the task) is not news to the owner.
++ */
++static void
++xhci_rt_event_locked(struct xhci_softc *sc, struct xhci_slot *xs)
++{
++	KASSERT(mutex_owned(&sc->sc_intr_lock));
++	if (xs->xs_rt_owner != curlwp)
++		xs->xs_rt_gen++;
++	xhci_rt_idle_arm_locked(sc, xs);
++}
++
++static void
++xhci_rt_dormant_locked(struct xhci_softc *sc, struct xhci_slot *xs)
++{
++	KASSERT(mutex_owned(&sc->sc_intr_lock));
++	xhci_rt_dl_clear_locked(sc, xs);
++	xs->xs_dormant = true;
++}
++
++static void
++xhci_rt_retry_locked(struct xhci_softc *sc, struct xhci_slot *xs, int want,
++    int delay)
++{
++	KASSERT(mutex_owned(&sc->sc_intr_lock));
++	if (!xs->xs_rt_init || xs->xs_dev == NULL)
++		return;
++	xhci_rt_dl_count_locked(sc, xs);
++	xs->xs_idle_armed = false;
++	xs->xs_retry_armed = true;
++	xs->xs_retry_want = want;
++	xs->xs_retry_due = getticks() + MAX(delay, 1);
++	xs->xs_dormant = false;
++	xhci_rt_arm_locked(sc, xs->xs_retry_due, want == 2);
++}
++
++/* A resume/unpark failed: the slot stays suspended and owes the retry. */
++static void
++xhci_rt_resume_failed_locked(struct xhci_softc *sc, struct xhci_slot *xs)
++{
++	u_int n;
++	int delay;
++
++	KASSERT(mutex_owned(&sc->sc_intr_lock));
++	n = MIN(xs->xs_res_fails, 16);
++	xs->xs_res_fails++;
++	delay = XHCI_RT_RETRY_MIN;
++	while (n-- > 0 && delay < XHCI_RT_RETRY_MAX)
++		delay *= 2;
++	delay = MIN(delay, XHCI_RT_RETRY_MAX);
++	XHCI_RT_WHY(sc, xs, "resume failed (%u), retry in %d ms",
++	    xs->xs_res_fails, delay * 1000 / hz);
++	xhci_rt_retry_locked(sc, xs, 2, delay);
++}
++
++/*
++ * A suspend/park failed with the slot awake (or the link was in a
++ * transitional state): back off from one period, doubling; from
++ * XHCI_RT_SUSPEND_TRIES on, keep a slow re-check at the cap (deferrable,
++ * XHCI_RT_SUSPEND_BACKOFF_MAX periods) instead of giving up for good.
++ */
++static void
++xhci_rt_suspend_failed_locked(struct xhci_softc *sc, struct xhci_slot *xs)
++{
++	u_int n;
++	int delay, base, cap;
++
++	KASSERT(mutex_owned(&sc->sc_intr_lock));
++	xs->xs_susp_fails++;
++	if (xs->xs_suspended || xs->xs_retry_armed)
++		return;		/* a resume retry is outstanding: it comes first */
++	base = MAX(xhci_rt_period(), XHCI_RT_RETRY_MIN);
++	cap = XHCI_RT_SUSPEND_BACKOFF_MAX * base;
++	if (xs->xs_susp_fails == XHCI_RT_SUSPEND_TRIES) {
++		sc->sc_rt_giveups++;
++		XHCI_RT_WHY(sc, xs, "suspend failed %u times, slow re-check",
++		    xs->xs_susp_fails);
++	}
++	n = MIN(xs->xs_susp_fails - 1, 16);
++	delay = base;
++	while (n-- > 0 && delay < cap)
++		delay *= 2;
++	delay = MIN(delay, cap);
++	XHCI_RT_WHY(sc, xs, "suspend failed (%u), retry in %d ms",
++	    xs->xs_susp_fails, delay * 1000 / hz);
++	xhci_rt_retry_locked(sc, xs, 1, delay);
++}
++
++/* Re-arm the callout for a slot's existing deadline (owner let go). */
++static void
++xhci_rt_slot_rearm_locked(struct xhci_softc *sc, struct xhci_slot *xs)
++{
++	KASSERT(mutex_owned(&sc->sc_intr_lock));
++	if (xs->xs_retry_armed)
++		xhci_rt_arm_locked(sc, xs->xs_retry_due, xs->xs_retry_want == 2);
++	else if (xs->xs_idle_armed)
++		xhci_rt_arm_locked(sc, xs->xs_lastbusy + xhci_rt_period(),
++		    false);
++}
++
++/*
++ * The owner of a slot's transition let go: hand over a request that came
++ * in meanwhile (the task skipped it while owned) and re-arm the deadline.
++ */
++static void
++xhci_rt_release_locked(struct xhci_softc *sc, struct xhci_slot *xs)
++{
++	KASSERT(mutex_owned(&sc->sc_intr_lock));
++	xs->xs_rt_owner = NULL;
++	cv_broadcast(&sc->sc_rt_cv);
++	if (xs->xs_rt_want != 0 && xs->xs_rt_init && xs->xs_dev != NULL &&
++	    !sc->sc_rt_paused && !sc->sc_dying)
++		usb_add_task(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC);
++	/* Invariant: an awake slot has a deadline unless it is dormant. */
++	if (!xs->xs_idle_armed && !xs->xs_retry_armed && !xs->xs_dormant &&
++	    xs->xs_rt_want == 0 && !xs->xs_suspended && !xs->xs_resuming)
++		xhci_rt_idle_arm_locked(sc, xs);
++	else
++		xhci_rt_slot_rearm_locked(sc, xs);
++}
++
+ /* Bind a slot to its device the first time a pipe on it is opened. */
+ /*
+  * LISPBSD: "lispbsd-usb-populated" on the controller's device tells the
+@@ -1797,9 +2166,22 @@
+ static void
+ xhci_populated_update(struct xhci_softc *sc, int delta)
+ {
++	bool populated;
++
++	/*
++	 * No spin lock held: the dictionary takes a sleepable rwlock and may
++	 * allocate.  xhci_rt_list_lock serialises count and property, so two
++	 * explore threads (sc_bus, sc_bus2) cannot publish out of order.
++	 */
++	mutex_enter(&xhci_rt_list_lock);
++	mutex_enter(&sc->sc_intr_lock);
+ 	sc->sc_rt_bound += delta;
++	KASSERT(sc->sc_rt_bound >= 0);
++	populated = sc->sc_rt_bound > 0;
++	mutex_exit(&sc->sc_intr_lock);
+ 	prop_dictionary_set_bool(device_properties(sc->sc_dev),
+-	    "lispbsd-usb-populated", sc->sc_rt_bound > 0);
++	    "lispbsd-usb-populated", populated);
++	mutex_exit(&xhci_rt_list_lock);
+ }
+ 
+ static void
+@@ -1808,6 +2190,9 @@
+ {
+ 	if (xs->xs_rt_init || xs->xs_dev != NULL)
+ 		return;
++	mutex_enter(&sc->sc_intr_lock);
++	xhci_rt_dl_clear_locked(sc, xs);
++	mutex_exit(&sc->sc_intr_lock);
+ 	xs->xs_dev = dev;
+ 	xs->xs_npipes = 0;
+ 	xs->xs_lastbusy = getticks();
+@@ -1817,6 +2202,8 @@
+ 	xs->xs_rt_owner = NULL;
+ 	xs->xs_rt_want = 0;
+ 	xs->xs_dbpending = 0;
++	xs->xs_dormant = false;
++	xs->xs_res_fails = xs->xs_susp_fails = 0;
+ 	xs->xs_ctlrport = 0;
+ 	if (dev->ud_depth == 1 && dev->ud_powersrc != NULL) {
+ 		xs->xs_bus = (dev->ud_bus == &sc->sc_bus2) ? 1 : 0;
+@@ -1825,8 +2212,11 @@
+ 	}
+ 	/* PMF callbacks and the subdevice walk require KERNEL_LOCK. */
+ 	usb_init_task(&xs->xs_rt_task, xhci_rt_task, xs, 0);
+-	xs->xs_rt_init = true;
+ 	xhci_populated_update(sc, 1);
++	mutex_enter(&sc->sc_intr_lock);
++	xs->xs_rt_init = true;
++	xhci_rt_event_locked(sc, xs);
++	mutex_exit(&sc->sc_intr_lock);
+ }
+ 
+ static void
+@@ -1841,8 +2231,9 @@
+ 	}
+ 	/* Close admission before removing a queued rerun and joining the task. */
+ 	xs->xs_rt_init = false;
+-	xhci_populated_update(sc, -1);
++	xhci_rt_dl_clear_locked(sc, xs);
+ 	mutex_exit(&sc->sc_intr_lock);
++	xhci_populated_update(sc, -1);
+ 	if (locked)
+ 		mutex_exit(&sc->sc_lock);
+ 	if (xs->xs_dev != NULL) {
+@@ -1853,6 +2244,8 @@
+ 	mutex_enter(&sc->sc_intr_lock);
+ 	while (xs->xs_rt_owner != NULL)
+ 		cv_wait(&sc->sc_rt_cv, &sc->sc_intr_lock);
++	/* An owner's release may have re-armed it: clear for good. */
++	xhci_rt_dl_clear_locked(sc, xs);
+ 	xs->xs_dev = NULL;
+ 	xs->xs_suspended = xs->xs_resuming = false;
+ 	xs->xs_parked_drv = false;
+@@ -1860,6 +2253,8 @@
+ 	xs->xs_dbpending = 0;
+ 	xs->xs_ctlrport = 0;
+ 	xs->xs_rt_want = 0;
++	xs->xs_dormant = false;
++	xs->xs_res_fails = xs->xs_susp_fails = 0;
+ 	mutex_exit(&sc->sc_intr_lock);
+ 	if (locked)
+ 		mutex_enter(&sc->sc_lock);
+@@ -1880,7 +2275,10 @@
+ 	return false;
+ }
+ 
+-/* Called with neither xHCI lock held, before sc_suspender is installed. */
++/*
++ * Called with neither xHCI lock held, before sc_suspender is installed.
++ * Deadlines stay recorded in the slots; xhci_rt_reconcile re-arms them.
++ */
+ static void
+ xhci_rt_pause(struct xhci_softc *sc)
+ {
+@@ -1888,6 +2286,9 @@
+ 	sc->sc_rt_paused = true;
+ 	mutex_exit(&sc->sc_intr_lock);
+ 	callout_halt(&sc->sc_rt_callout, NULL);
++	mutex_enter(&sc->sc_intr_lock);
++	sc->sc_rt_armed = false;
++	mutex_exit(&sc->sc_intr_lock);
+ 	for (int i = 1; i <= sc->sc_maxslots; i++) {
+ 		struct xhci_slot *xs = &sc->sc_slots[i];
+ 		if (xs->xs_rt_init && xs->xs_dev != NULL) {
+@@ -1918,6 +2319,54 @@
+ }
+ 
+ /*
++ * Bring every bound slot's deadline in line with the current state and
++ * settings: after a pause (system suspend/resume), a failed system
++ * suspend, or a hw.usbpm write.  Not paused: sc_intr_lock held.
++ */
++static void
++xhci_rt_reconcile_locked(struct xhci_softc *sc, int flags)
++{
++	KASSERT(mutex_owned(&sc->sc_intr_lock));
++	if (sc->sc_dying || sc->sc_rt_paused)
++		return;
++	sc->sc_rt_reconciles++;
++	for (int i = 1; i <= sc->sc_maxslots; i++) {
++		struct xhci_slot *xs = &sc->sc_slots[i];
++
++		if (xs->xs_idx == 0 || !xs->xs_rt_init || xs->xs_dev == NULL) {
++			xhci_rt_dl_clear_locked(sc, xs);
++			continue;
++		}
++		xs->xs_rt_gen++;	/* newer than any task in flight */
++		if (flags & XHCI_RT_RC_RESET) {
++			/* Suspend retries restart; a resume retry only if owed. */
++			xs->xs_res_fails = xs->xs_susp_fails = 0;
++			if (xs->xs_retry_armed && (xs->xs_retry_want == 1 ||
++			    !xs->xs_suspended))
++				xhci_rt_dl_clear_locked(sc, xs);
++		}
++		if ((flags & XHCI_RT_RC_WAKE) && xs->xs_ctlrport != 0 &&
++		    (xs->xs_suspended || xs->xs_parked_drv))
++			xs->xs_rt_want = 2;
++		/* A request the pause or an owner left behind. */
++		if (xs->xs_rt_want != 0 && xs->xs_rt_owner == NULL)
++			usb_add_task(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC);
++		if (xs->xs_retry_armed)
++			xhci_rt_slot_rearm_locked(sc, xs);
++		else
++			xhci_rt_idle_arm_locked(sc, xs);
++	}
++}
++
++static void
++xhci_rt_reconcile(struct xhci_softc *sc, int flags)
++{
++	mutex_enter(&sc->sc_intr_lock);
++	xhci_rt_reconcile_locked(sc, flags);
++	mutex_exit(&sc->sc_intr_lock);
++}
++
++/*
+  * Ring a doorbell, or remember it when the port is asleep or waking: the
+  * TRBs are on the ring already; the resume rings it.
+  */
+@@ -2065,15 +2514,18 @@
+ 		xs->xs_parked_ndevs = i + 1;
+ 		mutex_exit(&sc->sc_intr_lock);
+ 		if (!pmf_device_suspend(d, PMF_Q_SELF)) {
+-			sc->sc_rt_failed++;
++			xhci_rt_count(sc, &sc->sc_rt_failed);
+ 			return false;
+ 		}
+ 	}
+ 	return true;
+ }
+ 
+-/* process context, KERNEL_LOCK held by the USB task */
+-static void
++/*
++ * process context, KERNEL_LOCK held by the USB task.  The caller turns the
++ * outcome into the slot's next deadline (xhci_rt_suspend_outcome).
++ */
++static enum xhci_rt_susp
+ xhci_rt_suspend_dev(struct xhci_softc *sc, struct xhci_slot *xs)
+ {
+ 	struct usbd_device *dev = xs->xs_dev;
+@@ -2085,39 +2537,63 @@
+ 	usbd_status err;
+ 
+ 	KASSERT(KERNEL_LOCKED_P());
+-	if (dev == NULL || xs->xs_ctlrport == 0 || sc->sc_dying ||
+-	    !xhci_rt_enabled())
+-		return;
++	if (dev == NULL || xs->xs_ctlrport == 0 || sc->sc_dying)
++		return XHCI_RT_SUSP_NONE;
++	if (!xhci_rt_enabled())
++		return XHCI_RT_SUSP_DORMANT;
+ 	if (!xhci_rt_idle_ok(sc, xs)) {
+ 		XHCI_RT_WHY(sc, xs, "not parkable (%u pipes, driver not ubt)",
+ 		    xs->xs_npipes);
+-		return;
++		return XHCI_RT_SUSP_DORMANT;
+ 	}
+ 	if (!xhci_autosuspend_hid && xhci_rt_has_hid(dev)) {
+ 		XHCI_RT_WHY(sc, xs, "HID interface");
+-		return;
++		return XHCI_RT_SUSP_DORMANT;
+ 	}
+ 	mutex_enter(&sc->sc_intr_lock);
+ 	if (!xs->xs_rt_init || sc->sc_rt_paused ||
+ 	    xs->xs_suspended || xs->xs_resuming ||
+-	    xs->xs_parked_drv ||
+-	    getticks() - xs->xs_lastbusy < hz * xhci_autosuspend) {
++	    xs->xs_parked_drv) {
+ 		XHCI_RT_WHY(sc, xs, "state: init=%d paused=%d susp=%d resuming=%d "
+-		    "parked=%d idle=%d ticks", xs->xs_rt_init, sc->sc_rt_paused,
+-		    xs->xs_suspended, xs->xs_resuming, xs->xs_parked_drv,
+-		    getticks() - xs->xs_lastbusy);
++		    "parked=%d", xs->xs_rt_init, sc->sc_rt_paused,
++		    xs->xs_suspended, xs->xs_resuming, xs->xs_parked_drv);
++		/* Parked but awake: the unpark is owed (old scan: want 2). */
++		if (xs->xs_rt_init && xs->xs_parked_drv && !xs->xs_suspended)
++			xs->xs_rt_want = 2;
+ 		mutex_exit(&sc->sc_intr_lock);
+-		return;
++		return XHCI_RT_SUSP_NONE;
++	}
++	if (xhci_rt_tdiff(getticks(), xs->xs_lastbusy) < xhci_rt_period()) {
++		XHCI_RT_WHY(sc, xs, "busy %d ticks ago",
++		    xhci_rt_tdiff(getticks(), xs->xs_lastbusy));
++		mutex_exit(&sc->sc_intr_lock);
++		return XHCI_RT_SUSP_BUSY;
+ 	}
+ 	park = xs->xs_npipes != 0;
+ 	mutex_exit(&sc->sc_intr_lock);
+ 
+ 	port = XHCI_PORTSC(xs->xs_ctlrport);
+ 	v = xhci_op_read_4(sc, port);
+-	if (v == UINT32_MAX || (v & XHCI_PS_PED) == 0 ||
+-	    XHCI_PS_PLS_GET(v) >= XHCI_PS_PLS_U3) {
+-		XHCI_RT_WHY(sc, xs, "portsc 0x%08x", v);
+-		return;
++	if (v == UINT32_MAX || (v & XHCI_PS_PED) == 0) {
++		/* Disabled or gone: a port status change re-arms the slot. */
++		XHCI_RT_WHY(sc, xs, "portsc 0x%08x: port not enabled", v);
++		return XHCI_RT_SUSP_DORMANT;
++	}
++	if (XHCI_PS_PLS_GET(v) >= XHCI_PS_PLS_U3) {
++		/*
++		 * U3 we did not enter, or a transitional link state (USB3
++		 * Recovery, Polling, Resume ...) that need not raise PLC: no
++		 * event may follow, so re-check later with backoff.
++		 */
++		XHCI_RT_WHY(sc, xs, "portsc 0x%08x: link state %u, re-check",
++		    v, (u_int)XHCI_PS_PLS_GET(v));
++		return XHCI_RT_SUSP_FAILED;
++	}
++
++	if (xhci_rt_inject(&xhci_rt_inject_suspend)) {
++		XHCI_RT_WHY(sc, xs, "injected suspend failure");
++		xhci_rt_count(sc, &sc->sc_rt_failed);
++		return XHCI_RT_SUSP_FAILED;
+ 	}
+ 
+ 	/* An open radio needs unsolicited events to be able to wake the port. */
+@@ -2132,19 +2608,19 @@
+ 		if (park && err != USBD_NORMAL_COMPLETION) {
+ 			XHCI_RT_WHY(sc, xs, "remote wakeup request: %s",
+ 			    usbd_errstr(err));
+-			sc->sc_rt_failed++;
+-			return;
++			xhci_rt_count(sc, &sc->sc_rt_failed);
++			return XHCI_RT_SUSP_FAILED;
+ 		}
+ 	} else if (park) {
+ 		XHCI_RT_WHY(sc, xs, "no remote wakeup capability (bmAttributes 0x%x)",
+ 		    dev->ud_cdesc != NULL ? dev->ud_cdesc->bmAttributes : 0);
+-		return;
++		return XHCI_RT_SUSP_DORMANT;
+ 	}
+ 
+ 	mutex_enter(&sc->sc_intr_lock);
+ 	if (!xs->xs_rt_init || sc->sc_rt_paused) {
+ 		mutex_exit(&sc->sc_intr_lock);
+-		return;
++		return XHCI_RT_SUSP_NONE;
+ 	}
+ 	if (park) {
+ 		/* Defer writes throughout PMF parking, including within one tick. */
+@@ -2154,7 +2630,7 @@
+ 	mutex_exit(&sc->sc_intr_lock);
+ 	if (park && !xhci_rt_park(sc, xs)) {
+ 		xhci_rt_resume_dev(sc, xs);
+-		return;
++		return XHCI_RT_SUSP_FAILED;
+ 	}
+ 
+ 	v = xhci_op_read_4(sc, port);
+@@ -2183,31 +2659,89 @@
+ 		usb_delay_ms(&sc->sc_bus, 1);
+ 	}
+ 	if (v == UINT32_MAX || j == XHCI_WAIT_PLS_U3) {
+-		sc->sc_rt_failed++;
++		xhci_rt_count(sc, &sc->sc_rt_failed);
+ 		/* Restore the link before rearming the driver's inbound pipes. */
+ 		xhci_rt_resume_dev(sc, xs);
+-		return;
++		return XHCI_RT_SUSP_FAILED;
+ 	}
+-	sc->sc_rt_suspends++;
+ 	mutex_enter(&sc->sc_intr_lock);
++	sc->sc_rt_suspends++;
+ 	xs->xs_resuming = false;
++	xs->xs_susp_fails = 0;
+ 	/* Catch a remote wake whose event arrived during the PMF transition. */
+ 	v = xhci_op_read_4(sc, port);
+ 	wake = xs->xs_dbpending != 0 || v == UINT32_MAX ||
+ 	    XHCI_PS_PLS_GET(v) != XHCI_PS_PLS_U3;
++	if (wake) {
++		/* The task runs the resume after this one returns. */
++		xs->xs_resuming = true;
++		xs->xs_rt_want = 2;
++	}
+ 	mutex_exit(&sc->sc_intr_lock);
+ 	aprint_debug_dev(sc->sc_dev, "port %u suspended\n", xs->xs_ctlrport);
+-	if (wake)
+-		xhci_rt_kick(sc, xs, 2);
+-	return;
++	return XHCI_RT_SUSP_OK;
+ 
+ unpark:
++	/* Used again (or the port changed) during the transition. */
+ 	if (park)
+ 		xhci_rt_resume_dev(sc, xs);
++	return XHCI_RT_SUSP_BUSY;
+ }
+ 
+-/* process context */
++/* Turn a suspend attempt's outcome into the slot's next deadline. */
++/*
++ * Turn a suspend attempt's outcome into the slot's next deadline.  gen is
++ * xs_rt_gen when the task took the slot: if a reconcile or an eligibility
++ * event came in while the task slept, the event wins over a refusal or a
++ * failure decided on older facts (re-evaluate from an idle deadline), and
++ * a suspend completed after "autosuspend 0" is undone at once.
++ */
+ static void
++xhci_rt_suspend_outcome(struct xhci_softc *sc, struct xhci_slot *xs,
++    enum xhci_rt_susp r, u_int gen)
++{
++	bool changed;
++
++	mutex_enter(&sc->sc_intr_lock);
++	changed = xs->xs_rt_gen != gen;
++	if (xs->xs_rt_init) {
++		switch (r) {
++		case XHCI_RT_SUSP_OK:
++			xhci_rt_dl_clear_locked(sc, xs);
++			if (!xhci_rt_enabled()) {
++				/* The release requeues the task: wake. */
++				xs->xs_rt_want = 2;
++			}
++			break;
++		case XHCI_RT_SUSP_BUSY:
++			xhci_rt_idle_arm_locked(sc, xs);
++			break;
++		case XHCI_RT_SUSP_DORMANT:
++			if (changed)
++				xhci_rt_idle_arm_locked(sc, xs);
++			else if (!xs->xs_suspended && !xs->xs_retry_armed)
++				xhci_rt_dormant_locked(sc, xs);
++			break;
++		case XHCI_RT_SUSP_FAILED:
++			if (changed && !xs->xs_suspended && !xs->xs_retry_armed) {
++				xs->xs_susp_fails++;
++				xhci_rt_idle_arm_locked(sc, xs);
++			} else
++				xhci_rt_suspend_failed_locked(sc, xs);
++			break;
++		case XHCI_RT_SUSP_NONE:
++			break;
++		}
++	}
++	mutex_exit(&sc->sc_intr_lock);
++}
++
++/*
++ * process context.  Returns true when the port is in U0 with the driver
++ * unparked; on failure the slot stays suspended (I/O deferred) and a
++ * resume retry deadline owns the next attempt.
++ */
++static bool
+ xhci_rt_resume_dev(struct xhci_softc *sc, struct xhci_slot *xs)
+ {
+ 	bus_size_t port = XHCI_PORTSC(xs->xs_ctlrport);
+@@ -2215,11 +2749,16 @@
+ 	int j;
+ 
+ 	if (xs->xs_ctlrport == 0 || sc->sc_dying)
+-		return;
++		return false;
+ 	mutex_enter(&sc->sc_intr_lock);
+ 	xs->xs_resuming = true;
+ 	mutex_exit(&sc->sc_intr_lock);
+ 
++	if (xhci_rt_inject(&xhci_rt_inject_resume)) {
++		XHCI_RT_WHY(sc, xs, "injected resume failure");
++		goto failed;
++	}
++
+ 	v = xhci_op_read_4(sc, port);
+ 	if (v == UINT32_MAX || (v & (XHCI_PS_CCS | XHCI_PS_PED)) !=
+ 	    (XHCI_PS_CCS | XHCI_PS_PED))
+@@ -2263,23 +2802,30 @@
+ 	/* The callback queues inbound reads while all doorbells are deferred. */
+ 	if (xs->xs_parked_drv && !xhci_rt_unpark(sc, xs))
+ 		goto failed;
+-	sc->sc_rt_resumes++;
+ 	mutex_enter(&sc->sc_intr_lock);
++	sc->sc_rt_resumes++;
+ 	xs->xs_suspended = false;
+ 	xs->xs_resuming = false;
+ 	xs->xs_lastbusy = getticks();
+ 	xs->xs_rt_want = 0;
++	xs->xs_res_fails = 0;
++	if (xs->xs_retry_armed && xs->xs_retry_want == 2)
++		xhci_rt_dl_clear_locked(sc, xs);
++	/* Awake again: power down once it has been idle long enough. */
++	xhci_rt_idle_arm_locked(sc, xs);
+ 	mutex_exit(&sc->sc_intr_lock);
+ 	xhci_rt_ring_pending(sc, xs);
+-	return;
++	return true;
+ 
+ failed:
+ 	mutex_enter(&sc->sc_intr_lock);
+ 	xs->xs_suspended = true;
+ 	xs->xs_resuming = false;
+-	xs->xs_rt_want = 2; /* Retry at the next scan, without a busy loop. */
+ 	sc->sc_rt_failed++;
++	/* Retry from the deadline, without a busy loop. */
++	xhci_rt_resume_failed_locked(sc, xs);
+ 	mutex_exit(&sc->sc_intr_lock);
++	return false;
+ }
+ 
+ static void
+@@ -2287,6 +2833,8 @@
+ {
+ 	struct xhci_slot *xs = arg;
+ 	struct xhci_softc *sc;
++	enum xhci_rt_susp r;
++	u_int gen;
+ 	int want;
+ 
+ 	if (xs->xs_dev == NULL)
+@@ -2295,20 +2843,29 @@
+ 	mutex_enter(&sc->sc_intr_lock);
+ 	if (!xs->xs_rt_init || sc->sc_rt_paused || sc->sc_dying ||
+ 	    xs->xs_rt_owner != NULL) {
++		/* An owner hands a pending xs_rt_want back on release. */
+ 		mutex_exit(&sc->sc_intr_lock);
+ 		return;
+ 	}
+ 	xs->xs_rt_owner = curlwp;
++	gen = xs->xs_rt_gen;
+ 	want = xs->xs_rt_want;
+ 	xs->xs_rt_want = 0;
++	/* Nothing to wake (another path already did). */
++	if (want == 2 && !xs->xs_suspended && !xs->xs_resuming &&
++	    !xs->xs_parked_drv)
++		want = 0;
++	if (want != 0 || xs->xs_resuming)
++		sc->sc_rt_tasks++;
+ 	mutex_exit(&sc->sc_intr_lock);
+ 	if (want == 2 || xs->xs_resuming)
+-		xhci_rt_resume_dev(sc, xs);
+-	else if (want == 1)
+-		xhci_rt_suspend_dev(sc, xs);
++		(void)xhci_rt_resume_dev(sc, xs);
++	else if (want == 1) {
++		r = xhci_rt_suspend_dev(sc, xs);
++		xhci_rt_suspend_outcome(sc, xs, r, gen);
++	}
+ 	mutex_enter(&sc->sc_intr_lock);
+-	xs->xs_rt_owner = NULL;
+-	cv_broadcast(&sc->sc_rt_cv);
++	xhci_rt_release_locked(sc, xs);
+ 	mutex_exit(&sc->sc_intr_lock);
+ }
+ 
+@@ -2332,58 +2889,102 @@
+ 	}
+ 	mutex_exit(&sc->sc_intr_lock);
+ 	if (need) {
+-		xhci_rt_resume_dev(sc, xs);
++		(void)xhci_rt_resume_dev(sc, xs);
+ 		mutex_enter(&sc->sc_intr_lock);
+ 		KASSERT(sc->sc_rt_openers != 0);
+ 		sc->sc_rt_openers--;
+-		xs->xs_rt_owner = NULL;
+-		cv_broadcast(&sc->sc_rt_cv);
++		xhci_rt_release_locked(sc, xs);
+ 		mutex_exit(&sc->sc_intr_lock);
+ 	}
+ }
+ 
+-/* softint: the idle scan */
++/*
++ * softint: a deadline is due.  Queue the due slots' tasks, then arm the
++ * callout for the earliest remaining deadline, or leave it idle.
++ */
+ static void
+ xhci_rt_callout(void *arg)
+ {
+ 	struct xhci_softc *sc = arg;
+ 	struct xhci_slot *xs;
+-	int i, idle;
++	int i, now, period, next = 0, late;
++	u_int n = 0;
++	bool any = false, hard = false;
+ 
+ 	mutex_enter(&sc->sc_intr_lock);
++	sc->sc_rt_callouts++;
++	if (sc->sc_rt_armed) {
++		late = xhci_rt_tdiff(getticks(), sc->sc_rt_armed_at);
++		if (late > sc->sc_rt_maxlate)
++			sc->sc_rt_maxlate = late;
++	}
++	sc->sc_rt_armed = false;
+ 	if (sc->sc_dying || sc->sc_rt_paused) {
+ 		mutex_exit(&sc->sc_intr_lock);
+ 		return;
+ 	}
+-	idle = hz * xhci_autosuspend;
++	sc->sc_rt_scans++;
++	now = getticks();
++	period = xhci_rt_period();
+ 	for (i = 1; i <= sc->sc_maxslots; i++) {
+-		int want;
++		int due, want;
+ 
+ 		xs = &sc->sc_slots[i];
+-		if (xs->xs_idx == 0 || !xs->xs_rt_init ||
+-		    xs->xs_dev == NULL || xs->xs_ctlrport == 0 ||
+-		    xs->xs_rt_owner != NULL || xs->xs_resuming)
++		if (!xs->xs_idle_armed && !xs->xs_retry_armed)
+ 			continue;
+-		/* Retry failed unparks and wakes, even with autosuspend disabled. */
+-		if (xs->xs_rt_want == 2 ||
+-		    (xs->xs_parked_drv && !xs->xs_suspended) ||
+-		    (xs->xs_suspended && xs->xs_dbpending != 0))
+-			want = 2;
+-		else if (xhci_rt_enabled() && !xs->xs_suspended &&
+-		    getticks() - xs->xs_lastbusy >= idle)
+-			want = 1; /* Check driver eligibility in process context. */
+-		else
++		if (xs->xs_idx == 0 || !xs->xs_rt_init || xs->xs_dev == NULL ||
++		    xs->xs_ctlrport == 0) {
++			xhci_rt_dl_clear_locked(sc, xs);
+ 			continue;
+-		xs->xs_rt_want = MAX(xs->xs_rt_want, want);
+-		usb_add_task(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC);
++		}
++		n++;
++		/* Owned or queued: the owner re-arms when it lets go. */
++		if (xs->xs_rt_owner != NULL || xs->xs_rt_want != 0 ||
++		    xs->xs_resuming)
++			continue;
++		if (xs->xs_retry_armed) {
++			due = xs->xs_retry_due;
++			want = xs->xs_retry_want;
++			if (xhci_rt_tdiff(now, due) >= 0)
++				sc->sc_rt_retries++;
++		} else {
++			if (!xhci_rt_enabled() || xs->xs_suspended) {
++				xhci_rt_dl_clear_locked(sc, xs);
++				n--;
++				continue;
++			}
++			/* Re-read: transfers since the arming push it out. */
++			due = xs->xs_lastbusy + period;
++			want = 1;
++		}
++		if (xhci_rt_tdiff(now, due) >= 0) {
++			/* Due: the task owns it now (and re-arms it). */
++			xhci_rt_dl_clear_locked(sc, xs);
++			n--;
++			xs->xs_rt_want = MAX(xs->xs_rt_want, want);
++			usb_add_task(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC);
++			continue;
++		}
++		if (!any || xhci_rt_tdiff(due, next) < 0)
++			next = due;
++		any = true;
++		hard = hard || (xs->xs_retry_armed && want == 2);
++	}
++	sc->sc_rt_ndeadlines = n;
++	if (any)
++		xhci_rt_schedule_locked(sc, next, hard);
++	else {
++		/* Possibly re-pended by an arming while we waited. */
++		callout_stop(&sc->sc_rt_callout);
++		sc->sc_rt_armed = false;
+ 	}
+-	if (!sc->sc_rt_paused && !sc->sc_dying)
+-		callout_schedule(&sc->sc_rt_callout,
+-		    hz * (xhci_autosuspend > 0 ? xhci_autosuspend : 5));
+ 	mutex_exit(&sc->sc_intr_lock);
+ }
+ 
+-/* A port status change: a remote wakeup of a sleeping device? */
++/*
++ * A port status change: a remote wakeup of a sleeping device, or a new
++ * chance for a dormant one (e.g. a port that was not enabled).
++ */
+ static void
+ xhci_rt_portchange(struct xhci_softc *sc, u_int ctlrport)
+ {
+@@ -2400,16 +3001,26 @@
+ 	for (i = 1; i <= sc->sc_maxslots; i++) {
+ 		xs = &sc->sc_slots[i];
+ 		if (xs->xs_idx == 0 || !xs->xs_rt_init ||
+-		    xs->xs_ctlrport != ctlrport || !xs->xs_suspended ||
+-		    xs->xs_resuming)
++		    xs->xs_ctlrport != ctlrport)
+ 			continue;
++		if (!xs->xs_suspended) {
++			/* Newer than a refusal a task may be deciding now. */
++			mutex_enter(&sc->sc_intr_lock);
++			xs->xs_rt_gen++;
++			if (xs->xs_dormant)
++				xhci_rt_idle_arm_locked(sc, xs);
++			mutex_exit(&sc->sc_intr_lock);
++			return;
++		}
++		if (xs->xs_resuming)
++			return;
+ 		v = xhci_op_read_4(sc, XHCI_PORTSC(ctlrport));
+ 		if (XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_RESUME ||
+ 		    XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_U0) {
+ 			mutex_enter(&sc->sc_intr_lock);
+ 			xs->xs_resuming = true;
+-			mutex_exit(&sc->sc_intr_lock);
+ 			sc->sc_rt_wakes++;
++			mutex_exit(&sc->sc_intr_lock);
+ 			xhci_rt_kick(sc, xs, 2);
+ 		}
+ 		return;
+@@ -2420,31 +3031,104 @@
+ sysctl_hw_usbpm_stats(SYSCTLFN_ARGS)
+ {
+ 	struct sysctlnode node = *rnode;
+-	char buf[128];
+-	device_t dv;
+-	deviter_t di;
+-	uint64_t s = 0, r = 0, w = 0, f = 0;
+-
+-	for (dv = deviter_first(&di, DEVITER_F_LEAVES_FIRST); dv != NULL;
+-	     dv = deviter_next(&di)) {
+-		if (!device_is_a(dv, "xhci"))
+-			continue;
+-		struct xhci_softc *sc = device_private(dv);
++	char buf[384];
++	struct xhci_softc *sc;
++	uint64_t s = 0, r = 0, w = 0, f = 0, co = 0, sn = 0, rc = 0, t = 0,
++	    rt = 0, g = 0;
++	u_int armed = 0, dl = 0, dormant = 0;
++	int maxlate = 0;
++
++	RUN_ONCE(&xhci_rt_once, xhci_rt_list_init);
++	mutex_enter(&xhci_rt_list_lock);
++	LIST_FOREACH(sc, &xhci_rt_list, sc_rt_link) {
++		mutex_enter(&sc->sc_intr_lock);
+ 		s += sc->sc_rt_suspends; r += sc->sc_rt_resumes;
+ 		w += sc->sc_rt_wakes; f += sc->sc_rt_failed;
++		co += sc->sc_rt_callouts; sn += sc->sc_rt_scans;
++		rc += sc->sc_rt_reconciles; t += sc->sc_rt_tasks;
++		rt += sc->sc_rt_retries; g += sc->sc_rt_giveups;
++		armed += sc->sc_rt_armed ? 1 : 0;
++		dl += sc->sc_rt_ndeadlines;
++		maxlate = MAX(maxlate, sc->sc_rt_maxlate);
++		for (int i = 1; i <= sc->sc_maxslots; i++)
++			if (sc->sc_slots[i].xs_rt_init &&
++			    sc->sc_slots[i].xs_dormant)
++				dormant++;
++		mutex_exit(&sc->sc_intr_lock);
+ 	}
+-	deviter_release(&di);
++	mutex_exit(&xhci_rt_list_lock);
+ 	snprintf(buf, sizeof(buf), "suspends=%" PRIu64 " resumes=%" PRIu64
+-	    " wakes=%" PRIu64 " failed=%" PRIu64, s, r, w, f);
++	    " wakes=%" PRIu64 " failed=%" PRIu64 " callouts=%" PRIu64
++	    " scans=%" PRIu64 " reconciles=%" PRIu64 " tasks=%" PRIu64
++	    " retries=%" PRIu64 " giveups=%" PRIu64 " armed=%u deadlines=%u"
++	    " dormant=%u maxlate_ms=%d", s, r, w, f, co, sn, rc, t, rt, g,
++	    armed, dl, dormant, (int)((int64_t)maxlate * 1000 / hz));
+ 	node.sysctl_data = buf;
+ 	node.sysctl_size = strlen(buf) + 1;
+ 	return sysctl_lookup(SYSCTLFN_CALL(&node));
+ }
+ 
++/*
++ * hw.usbpm.{autosuspend,hid,deferrable}: every write (even of the same
++ * value) reconciles all controllers; autosuspend 0 also wakes the devices
++ * that sleep for idleness.
++ */
++static int
++sysctl_hw_usbpm_knob(SYSCTLFN_ARGS)
++{
++	struct sysctlnode node = *rnode;
++	struct xhci_softc *sc;
++	int *knob = rnode->sysctl_data;
++	int val, error, flags;
++
++	val = *knob;
++	node.sysctl_data = &val;
++	error = sysctl_lookup(SYSCTLFN_CALL(&node));
++	if (error || newp == NULL)
++		return error;
++	if (val < 0)
++		return EINVAL;
++	if (knob == &xhci_autosuspend && val > XHCI_RT_AUTOSUSPEND_MAX)
++		return EINVAL;
++	if (knob != &xhci_autosuspend && val > 1)
++		return EINVAL;
++
++	RUN_ONCE(&xhci_rt_once, xhci_rt_list_init);
++	mutex_enter(&xhci_rt_list_lock);
++	*knob = val;
++	flags = XHCI_RT_RC_RESET;
++	if (knob == &xhci_autosuspend && val == 0)
++		flags |= XHCI_RT_RC_WAKE;
++	LIST_FOREACH(sc, &xhci_rt_list, sc_rt_link)
++		xhci_rt_reconcile(sc, flags);
++	mutex_exit(&xhci_rt_list_lock);
++	return 0;
++}
++
++/* hw.usbpm.inject_*: a count, 0..1000000 (a negative value is refused). */
++static int
++sysctl_hw_usbpm_inject(SYSCTLFN_ARGS)
++{
++	struct sysctlnode node = *rnode;
++	u_int *cnt = rnode->sysctl_data;
++	int val, error;
++
++	val = (int)MIN(*cnt, 1000000u);
++	node.sysctl_data = &val;
++	error = sysctl_lookup(SYSCTLFN_CALL(&node));
++	if (error || newp == NULL)
++		return error;
++	if (val < 0 || val > 1000000)
++		return EINVAL;
++	atomic_swap_uint(cnt, (u_int)val);
++	return 0;
++}
++
+ SYSCTL_SETUP(sysctl_hw_usbpm_setup, "hw.usbpm")
+ {
+ 	const struct sysctlnode *node = NULL;
+ 
++	RUN_ONCE(&xhci_rt_once, xhci_rt_list_init);
+ 	sysctl_createv(clog, 0, NULL, &node, CTLFLAG_PERMANENT, CTLTYPE_NODE,
+ 	    "usbpm", SYSCTL_DESCR("USB runtime power management"),
+ 	    NULL, 0, NULL, 0, CTL_HW, CTL_CREATE, CTL_EOL);
+@@ -2452,20 +3136,32 @@
+ 		return;
+ 	sysctl_createv(clog, 0, &node, NULL,
+ 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "autosuspend",
+-	    SYSCTL_DESCR("Seconds a root-port device may be idle before its port sleeps (0: never)"),
+-	    NULL, 0, &xhci_autosuspend, 0, CTL_CREATE, CTL_EOL);
++	    SYSCTL_DESCR("Seconds a root-port device may be idle before its port sleeps (0: never, and wake the sleeping ones)"),
++	    sysctl_hw_usbpm_knob, 0, &xhci_autosuspend, 0, CTL_CREATE, CTL_EOL);
+ 	sysctl_createv(clog, 0, &node, NULL,
+ 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "hid",
+ 	    SYSCTL_DESCR("Also sleep devices with a HID interface (keyboards, mice)"),
+-	    NULL, 0, &xhci_autosuspend_hid, 0, CTL_CREATE, CTL_EOL);
++	    sysctl_hw_usbpm_knob, 0, &xhci_autosuspend_hid, 0, CTL_CREATE, CTL_EOL);
++	sysctl_createv(clog, 0, &node, NULL,
++	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "deferrable",
++	    SYSCTL_DESCR("Idle deadlines may run late, with the next wake-up (1) or exactly (0)"),
++	    sysctl_hw_usbpm_knob, 0, &xhci_rt_deferrable, 0, CTL_CREATE, CTL_EOL);
+ 	sysctl_createv(clog, 0, &node, NULL,
+ 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "debug",
+ 	    SYSCTL_DESCR("Report why a device is not parked"),
+ 	    NULL, 0, &xhci_rt_debug, 0, CTL_CREATE, CTL_EOL);
+ 	sysctl_createv(clog, 0, &node, NULL,
++	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "inject_suspend",
++	    SYSCTL_DESCR("Test: fail the next N runtime suspends (before any port write)"),
++	    sysctl_hw_usbpm_inject, 0, &xhci_rt_inject_suspend, 0, CTL_CREATE, CTL_EOL);
++	sysctl_createv(clog, 0, &node, NULL,
++	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "inject_resume",
++	    SYSCTL_DESCR("Test: fail the next N runtime resumes (before any port write)"),
++	    sysctl_hw_usbpm_inject, 0, &xhci_rt_inject_resume, 0, CTL_CREATE, CTL_EOL);
++	sysctl_createv(clog, 0, &node, NULL,
+ 	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING, "stats",
+-	    SYSCTL_DESCR("suspends, resumes, remote wakes, failures"),
+-	    sysctl_hw_usbpm_stats, 0, NULL, 128, CTL_CREATE, CTL_EOL);
++	    SYSCTL_DESCR("suspends, resumes, remote wakes, failures; deadline callouts, scans, reconciles, tasks, retries, giveups; armed callouts, armed deadlines, dormant slots, worst lateness"),
++	    sysctl_hw_usbpm_stats, 0, NULL, 384, CTL_CREATE, CTL_EOL);
+ }
+ 
+ /*
+@@ -2767,7 +3463,7 @@
+ 	 */
+ 	sc->sc_slots = kmem_zalloc(sizeof(*sc->sc_slots) *
+ 	    (sc->sc_maxslots + 1), KM_SLEEP);
+-	/* LispBSD USB runtime power management: the idle scan */
++	/* LispBSD USB runtime power management: the deadline callout */
+ 	callout_init(&sc->sc_rt_callout, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
+ 	callout_setfunc(&sc->sc_rt_callout, xhci_rt_callout, sc);
+ 	if (sc->sc_slots == NULL) {
+@@ -2794,6 +3490,9 @@
+ 
+ 	xhci_init_hw(sc, false);
+ 
++	/* hw.usbpm writes reconcile every listed controller. */
++	xhci_rt_list_insert(sc);
++
+ 	if ((sc->sc_quirks & XHCI_DEFERRED_START) == 0)
+ 		xhci_start(sc);
+ 
+@@ -3244,6 +3943,8 @@
+ 			mutex_enter(&sc->sc_intr_lock);
+ 			xs->xs_npipes++;
+ 			xs->xs_lastbusy = getticks();
++			/* Eligibility may have changed (e.g. ubt up). */
++			xhci_rt_event_locked(sc, xs);
+ 			mutex_exit(&sc->sc_intr_lock);
+ 		}
+ 		return err;
+@@ -3295,6 +3996,8 @@
+ 		if (xs->xs_npipes > 0)
+ 			xs->xs_npipes--;
+ 		xs->xs_lastbusy = getticks();
++		/* Eligibility may have changed (e.g. a driver let go). */
++		xhci_rt_event_locked(sc, xs);
+ 		mutex_exit(&sc->sc_intr_lock);
+ 	}
+ 

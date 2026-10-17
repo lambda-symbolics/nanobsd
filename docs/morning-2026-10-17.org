@@ -1,0 +1,87 @@
+#+TITLE: Power work prepared overnight 2026-10-16/17: what to install, test and measure
+
+Everything below was built and (where possible) run in VMs; nothing has
+touched the Nano.  Kernel 177 is in kernel/ (HEAD); the agent-built features
+are in pending/<name>/ as diffs against the laptop tree and move into
+kernel/ (stock first, then the change) when deployed.  Order matters: each step is one change on top of the
+last, so a regression has one suspect.  Measure only after 10 min of
+uptime, on battery, hands off (wakecensus-energy flags a touched window).
+
+* 0. Baseline on kernel 176 (before installing anything)
+Normal-use energy baseline the reviews asked for, and the reference for
+every A/B below.  Install =userland/wakecensus/wakecensus-energy= next to
+=wakecensus= (/usr/local/bin) first.  Panel blanked by Mahogany (not the lid), battery:
+: wakecensus-energy 900 k176-blank
+: wakecensus 120 k176-census     # the disturbing census, separately
+Also keep one window with the panel on at the usual brightness.
+
+* 1. Kernel 177: tick accounting, callout cache, TSC-low, wg timer
+nanobsd 6ca5ac1 223d16b 090ec16 fd50a35 435aa40 (docs/tickless-clock.org,
+"Kernel 177 candidates"; docs/wg-keepalive-review.org).
+Binary built in the VM from sources identical to nanobsd HEAD:
+=/root/lispbsd-work/kernel177/{netbsd,cidle.kmod,if_wg.kmod}= (MD5 file
+there).  Or build on the laptop as usual after syncing the five files into
+/usr/src/sys (that also keeps the laptop tree = nanobsd).
+
+Install:
+- =/netbsd.i915.rpm.177=; boot.cfg: a 177 entry first (default), 176 kept
+  as the next entry; nanobsd etc/boot.cfg updated to match.
+- =cidle.kmod= -> /stand/amd64/11.0/modules/cidle/ (keep the old one as
+  =cidle.kmod.176=); it works on 176 too (only safe MSR reads changed).
+- =if_wg.kmod= -> /stand/amd64/11.0/modules/if_wg/ (keep the old one).
+
+Checks after boot (10 min):
+- =sysctl kern.callout_nextcache= : hits >> scans.
+- From the workstation: =userland/wakecensus/clock-check.sh= (wall clock
+  and cpu0 ticks vs real time; 176 lost ticks under interrupt load, 177
+  should track real time within a fraction of a percent).
+- TSC-low: =sysctl -w kern.timecounter.hardware=TSC-low=, then
+  clock-check again, and =wakecensus 120= : the cpu0 timer rate should drop
+  by about 1/s (the primary no longer wakes for the windup).  Energy A/B:
+  =wakecensus-energy 900= on TSC vs TSC-low, twice each (ABAB).  If it
+  holds, put =kern.timecounter.hardware=TSC-low= in /etc/sysctl.conf.
+- wg: =ifconfig wg0 down; ifconfig wg0 up=, the tunnel comes back (the
+  first keepalive fires within a second of up).
+
+Back out: boot the 176 entry; the modules are compatible both ways.
+
+* 2. USB runtime PM by deadlines (no periodic scan)
+=pending/usbpm/= (usbpm.diff, README.org, REVIEW.org,
+usbpm-deadlines.sh; patched files also in /root/lispbsd-work/usbpm/).  Two
+review rounds; DIAGNOSTIC+LOCKDEBUG VM run on emulated xHCI: 22 checks pass,
+controller PMF suspend skipped (stock qemu-xhci storm, README).  Replaces the 5 s rescan with per-slot
+deadlines and one earliest-deadline callout; acceptance: with everything
+parked =hw.usbpm.stats= shows =armed=0 deadlines=0= and its callouts/scans/
+tasks counters stay flat.  Kernel 178 = 177 + these two files (the
+files they patch are already in nanobsd).  Test: =sh usbpm-deadlines.sh= (2.5 min), then a
+panel-off energy window (expect the 174 figures: 1.20 W, PC10 97-98 %),
+a lid s2idle cycle with the radio parked then an inquiry, and
+=drvctl -d xhci0; drvctl -r pci0=.
+
+* 3. Wi-Fi U-APSD (hw.iwx.uapsd, default 0)
+=pending/uapsd/= (README.org, REVIEW.org, uapsd.diff,
+uapsd-ab.sh).  iwx is BUILT INTO GENERIC (the modules.conf load is the
+duplicate), so this needs a kernel build, and kernel and module from the
+same tree.  With the switch at 0 the review found it equivalent to 176
+(byte-identical firmware commands, no WMM element).  Switch on = first WMM
+associations on this stack: do it AT THE LAPTOP (reassociate scans; never
+over ssh/wg).  uapsd-ab.sh runs the A/B detached.  Ping the gateway right
+after the first reassociation: dead ping = the QoS RX padding watch item
+(REVIEW F2), back out with =hw.iwx.uapsd=0= + reassociate.
+
+* 4. SAGV/QGV (hw.drm2.i915_modparams.lispbsd_sagv, default 0)
+=pending/sagv/= (README.org, REVIEW.org, sagv.diff, the two new
+intel_global_state files).  Two review rounds, R2 fixes in.  Mode 0
+reviewed as unchanged (no pcode writes, same watermarks, same bandwidth
+rule); 13 of the 21 files are not yet in nanobsd and get the
+stock-then-change treatment when this is deployed.  First read-only:
+=dmesg | grep 'LISPBSD SAGV'=, =sysctl hw.i915sagv=; =points=1= or
+=not-controlled= = SAGV is off in firmware, stop.  Then A/B/C mode
+0/1/2 with wakecensus-energy and the underrun checks in its README.
+
+* Order and expectations
+| step | change                       | expected                         | risk     |
+| 1    | 177 accounting/cache/TSC-low | ~1 fewer CPU0 wake/s, exact ticks | low      |
+| 2    | USB PM deadlines             | no idle USB timers               | medium   |
+| 3    | U-APSD                       | radio awake 50 ms not 200-300 ms | medium   |
+| 4    | SAGV                         | memory clock drops at idle       | med-high |

@@ -1,0 +1,273 @@
+#+TITLE: Review: usbpm-deadlines (xhci deadline-driven runtime PM)
+#+DATE: 2026-10-17
+
+Scope: =usbpm.diff= against =/root/lispbsd/sys= (=dev/usb/xhci.c=, =xhcivar.h=),
+the patched copies, README.org, the brief and =usbpm-deadlines.sh=.  Read-only;
+nothing on the laptop was touched.
+
+* Mechanical checks
+
+- =patch --dry-run -p0= on a scratch copy of the two files: applies cleanly,
+  no fuzz/offsets.  The result is byte-identical to =xhci.c= / =xhcivar.h= here.
+- The base files in =/root/lispbsd/sys= equal nanobsd =kernel/dev/usb/=.
+- VM: =/build/agent-usbpm/sys/dev/usb/xhci.c= is identical to the patched copy;
+  =GENERIC/netbsd= and =xhci.o= were built after it (-Werror, exit 0).
+- *DIAGNOSTIC is off* in GENERIC (and in nanobsd's LISPBSD/CSTATE configs), so
+  every =KASSERT= in the patch is compiled out, including the
+  =sc_rt_ndeadlines= underflow guard.  README says "GENERIC with DIAGNOSTIC";
+  that is wrong.  See finding 7.
+
+* Verdict
+
+I found no panic, deadlock or use-after-free in the kernel change.  The
+deadline bookkeeping holds up:
+- each counter increment has a matching clear;
+- the callout recount is self-healing;
+- arming is refused under =sc_dying= / =sc_rt_paused=;
+- =callout_halt= is only called without xhci locks;
+- the list is removed before teardown;
+- unbind clears before and after the join.
+
+The owner-release rule covers every path I traced (task, opener, doorbell
+kick, remote wake, system resume, failed system suspend, cold resume), so an
+awake slot always ends up with a deadline, a queued task, or the dormant flag.
+
+The real problems are in the *acceptance test* (two steps will report false
+failures on this machine's 3 PCH devices) and in a few narrow races and
+behaviour changes in the kernel.
+
+* Findings (most severe first)
+
+** 1. Test step 6 (inject_suspend=2) will almost certainly FAIL on the laptop -- CONFIRMED (logic)
+=hw.usbpm.inject_*= is global.  Step 6 sets autosuspend 0, then 5.  The RC_WAKE
+reconcile wakes all three PCH devices (fingerprint ugen, camera uvideo,
+ubt; power-audit: "suspends=3").  The RESET reconcile then gives all three an
+idle deadline at the same tick (lastbusy = time of the wake, about 2 s
+before).
+- t+3 s: device A and device B each use up one injected failure.  Device C
+  parks.
+- The suspend backoff after a first failure is one period (=susp_fails=1=, so
+  n=0 and the delay is P), so A and B both retry at about t+8 s and park.
+- =wait_idle= returns at about 8-9 s (+ at most 1 s deferral each).  The check
+  =[ $el -ge $((2 * AS)) ]= (10 s) fails.  The step's backoff comment assumes
+  a single device.
+
+Fix: let everything park first, set =inject_suspend=2=, then wake *only* the
+radio (=btconfig ubt0 inquiry=).  Expect the re-park at at least 3*AS after
+the inquiry ends (the times between: P after the first failure, 2P after the
+second).  Or drop the elapsed-time check when more than one device was woken.
+
+*Resolved:* step 6 now waits until everything is parked, sets
+=inject_suspend=2=, and wakes only the radio (=btconfig ubt0 inquiry=).  It
+expects a re-park about 4P after the inquiry ends (P idle, then P and 2P of
+backoff) and accepts 3P..4P+6 s.
+
+** 2. Test step 8 (give-up) gives a false FAIL on this machine -- CONFIRMED (logic)
+Five global injections spread over three devices woken at the same time
+(3 + 2).  No device reaches =XHCI_RT_SUSP_TRIES= (5), so it never gives up.
+The script logs this as "inconclusive" but then runs the re-arm check anyway.
+That check is =wait_parked "$b" ...=, which requires =suspends= to grow.
+Everything is already parked, so the sysctl write reconciles nothing into a
+suspend, and the step times out with "FAIL: dormant slot not re-armed".
+
+Fix: the same single-device setup as in finding 1 (park everything, inject 5,
+inquiry).  ubt then takes all five failures, with backoff of
+5+10+20+40 s ≈ 75 s.  Skip the re-arm check when no give-up happened.
+
+*Resolved:* step 8 uses the same radio-only setup with 5 injections.  It
+waits up to about 16P for =giveups= +1 and then checks that the slow
+re-check is armed.  The sysctl re-arm check only runs after a real
+give-up; otherwise the step is logged as inconclusive.
+
+** 3. Reconcile vs an in-flight task: a sysctl write or eligibility event can be overwritten -- PLAUSIBLE (narrow window)
+The task decides with the settings it read at the start.  Its outcome is
+applied after it sleeps (=usbd_do_request= SET_FEATURE, =xhci_rt_park=, the U3
+wait), and those sleeps drop KERNEL_LOCK.  The reconcile runs meanwhile, but
+the outcome overrides it.
+- =hw.usbpm.autosuspend=0= written while a task is between
+  =xhci_rt_enabled()= and the U3 write:
+  - The RC_WAKE pass skips the slot because it is not yet =xs_suspended=.
+  - The task then suspends or parks it.  The OK outcome clears the deadline,
+    and the release does nothing because the slot is suspended.
+  - Result: the device stays in U3 / parked with autosuspend 0, against the
+    "0 wakes everything" contract.  It is harmless functionally, because I/O
+    still wakes it.
+- DORMANT outcome vs a concurrent eligibility event: the task reads PORTSC
+  (PED=0) or decides "not parkable".  An MPSAFE source then calls
+  =xhci_rt_idle_arm_locked=: =xhci_rt_portchange= from the USB softint, or a
+  pipe open/close from a non-KERNEL_LOCK context.  Then
+  =xhci_rt_suspend_outcome(DORMANT)= marks the slot dormant and clears the
+  deadline just armed.  The event is lost.
+  - Result: the device stays awake until the next event (a power regression;
+    for the radio, no PC10 at 1.20 W).
+  - Window: microseconds for the DORMANT paths (no sleep between decision and
+    outcome); tens of ms for the autosuspend=0 case.
+
+Fix: a per-slot eligibility generation, bumped by =xhci_rt_idle_arm_locked=,
+reconcile and portchange.  The task samples it when it takes ownership.  In
+=xhci_rt_suspend_outcome=, if it changed: for DORMANT/FAILED re-arm idle
+instead; for OK with =!xhci_rt_enabled()= set =xs_rt_want = 2= so the release
+requeues a wake.
+
+*Resolved:* there is a per-slot =xs_rt_gen=.  It is bumped by
+=xhci_rt_event_locked= (bind, pipe open/close from a thread other than the
+owner), by port changes and by reconcile.  The task samples it when it
+takes ownership.  In =xhci_rt_suspend_outcome= a DORMANT or FAILED result
+with a changed generation re-arms idle instead.  OK with
+=!xhci_rt_enabled()= sets =xs_rt_want = 2=, so the release requeues a
+wake.  The owner's own pipe events, i.e. ubt reopening its event pipe
+during unpark, do not bump it, so backoff is kept.
+
+** 4. Static "dormant" for transient PORTSC states, and give-up, have no timed recovery -- PLAUSIBLE, low here
+=xhci_rt_suspend_dev= returns DORMANT on =PLS >= U3= or =PED == 0=.
+- PLS 8 (Recovery) is a transient USB3 state that does not set PLC, so no
+  port status change event follows.  A SuperSpeed device caught in Recovery at
+  the deadline is never re-checked: no periodic scan, no event.
+- The old 5 s scan retried it.
+- On this laptop the PCH devices are USB2, so this mostly affects USB-C
+  devices.
+
+Similarly, after 5 failed SET_FEATURE(REMOTE_WAKEUP) attempts the slot is
+dormant until a pipe, port or sysctl event.  For an open radio that means
+no parking (watts) until the user reopens or writes a sysctl.  The old code
+retried forever.  This is a design choice in the README.
+
+Cheap mitigation: treat PLS > U3 other than Disabled as FAILED (backoff)
+rather than DORMANT.  Optionally give dormant-after-give-up a very long
+deferrable recheck (e.g. 8*P), so a stuck radio recovers without user action.
+
+*Resolved:* only =PED == 0= or all-ones (disabled/gone) is DORMANT.
+=PLS >= U3= with the port enabled (Recovery, Polling, Resume, a U3 we did
+not enter) is FAILED, so it goes through the backoff without
+=sc_rt_failed=++.  Give-up is no longer permanent: from the 5th consecutive
+failure (=giveups=++ once) the slot keeps a deferrable re-check at the cap
+of 8P (40 s).  Static refusals (HID, non-ubt open pipes, no remote wakeup)
+stay dormant, so the PCH devices still have nothing armed when they are
+truly idle.
+
+** 5. "Hard" resume retries are not exact when the callout is already pending on another (sleeping) CPU -- PLAUSIBLE, low
+In =callout_schedule_locked=, a PENDING callout stays on its CPU and is only
+re-timed.  Making it non-deferrable or moving it earlier from another CPU
+neither wakes nor IPIs that CPU.  Its tickless sleep was computed with the
+callout deferrable, or later, so it fires at the earlier of the CPU's next
+wake and =maxskip= (1 s).  The same applies to its =cc_ticks= lagging
+=getticks()=.
+
+Effect: a 200 ms resume retry (I/O waiting, e.g. an HCI command on a radio
+whose unpark failed) can take up to about 1.2 s.  This only happens on the
+failure path.
+
+Fix: in =xhci_rt_schedule_locked=, when =hard= or moving earlier, call
+=callout_stop()= before =callout_schedule()=.  A non-pending callout migrates
+to the current, awake CPU.  Both are legal under =sc_intr_lock=.
+
+*Resolved:* =xhci_rt_schedule_locked= calls =callout_stop= before
+=callout_schedule= when the callout is armed and the new arming is hard or
+earlier.  A stopped callout migrates to the arming CPU.
+
+** 6. Unbind still updates the prop dictionary under the spin lock -- CONFIRMED, pre-existing
+The patch moved =xhci_populated_update(sc, 1)= in bind out of =sc_intr_lock=
+("may grow the property dictionary").  =xhci_rt_unbind= still calls
+=xhci_populated_update(sc, -1)= with =sc_intr_lock= (spin, IPL_USB) held.
+=prop_dictionary_set_bool= takes the dictionary's =krwlock_t= (=rw_enter=),
+which is a sleepable lock.  If it is contended (a reader of
+=lispbsd-usb-populated=: the ACPI power manager, =drvctl -p=), this blocks
+with a spin mutex held.
+
+Also: =sc_rt_bound= is now changed with no lock in bind and under
+=sc_intr_lock= in unbind.  Two explore threads (=sc_bus=, =sc_bus2=) can bind
+and unbind on the same controller at once, so an update can be lost.  The
+populated flag then goes wrong, and the cold-off guard depends on it.
+
+Fix while you are in there: in unbind, take the count under =sc_intr_lock=
+and do the =prop_dictionary_set_bool= after =mutex_exit=, in both places.
+
+*Resolved:* =xhci_populated_update= is called from bind and unbind with
+no spin lock held.  Under =xhci_rt_list_lock= it updates =sc_rt_bound=
+(itself under =sc_intr_lock=, with =KASSERT >= 0=) and then writes the
+property after dropping the spin lock, so concurrent bind/unbind can
+neither lose a count nor publish out of order.
+
+** 7. Instrumentation and documentation nits -- CONFIRMED
+- KASSERTs are compiled out (no DIAGNOSTIC).  An =sc_rt_ndeadlines= underflow
+  would silently wrap: =deadlines= in the stats would show 4294967295 and
+  =dl_clear= would stop stopping the callout, until the next callout recount
+  repairs it.  I found no underflow path, but a DIAGNOSTIC (ideally also
+  LOCKDEBUG) VM build plus a short VM boot with qemu-xhci + usb devices would
+  exercise the bookkeeping and locking before the laptop does.
+- These counters are bumped without =sc_intr_lock=, from both the task and
+  opener threads, although the README says they are under it:
+  - =sc_rt_failed= (suspend_dev, park)
+  - =sc_rt_suspends=, =sc_rt_resumes=
+  - =sc_rt_wakes= (portchange)
+  A rare lost increment could fail a "resumes grew" test check.  Cosmetic.
+- README says the list is "removed first thing in =xhci_detach=".  It is
+  removed after the children are detached.  That is fine: unbind closes
+  admission before reconcile could queue anything.
+- With =inject_*= written negative (CTLTYPE_INT over =u_int=), the next ~4e9
+  suspends/resumes fail.  This is test-only.  Clamp it or use a handler.
+
+*Resolved:*
+- All counters are now under =sc_intr_lock= (=xhci_rt_count= or moved into
+  the existing critical sections).
+- README: the detach-order text is fixed and the DIAGNOSTIC claim
+  corrected.
+- =inject_*= has a handler that refuses values outside 0..1000000.
+- Built GENERIC + DIAGNOSTIC + LOCKDEBUG and ran it in a KVM VM with
+  qemu-xhci; see the VM test note at the end.
+
+* Behaviour change vs the old 5 s scan (when everything is idle)
+
+- Intended: with all eligible devices in U3 and no failure pending, there
+  are zero callouts and tasks (old: a deferrable callout every 5 s plus a task
+  for every awake idle slot).
+- Awake-but-ineligible slots (HID, non-ubt open pipes, inactive ubt, no
+  remote wake, port not enabled) are no longer polled.  They depend on an
+  event (findings 3 and 4).  =dormant== in the stats shows them, and any
+  =hw.usbpm.autosuspend= write recovers them.
+- Resume retries are now non-deferrable at 0.2 s..10 s, forever (old:
+  deferrable, every 5 s).  For a permanently failing device this wakes a CPU
+  every 10 s.  That is negligible, but it is not zero.
+- System suspend/resume (s2idle freeze and =usb off/on pch=, which are PMF
+  suspend/resume of xhci1): pause keeps the recorded deadlines; resume
+  reconciles.  A =hw.usbpm= write made while a controller is PMF-suspended
+  (the =usb off= boot state) is a no-op for that controller.  Resume
+  reconciles with RESET but not WAKE, so after "autosuspend=0 while
+  suspended" an unparked U3 device stays in U3 until opened.  Minor.
+- Cold (power-loss) resume: requires no bound slot, so no deadlines exist.
+  Nothing changes.
+- Detach (=drvctl -d=, USB_TCSS_DETACH): ordering is correct.  The callout
+  cannot be re-armed after =sc_dying= and the =callout_halt=.  No sysctl
+  can reach the softc after list removal.
+
+* Morning test: suggested edits before running
+
+1. Steps 6 and 8: inject only with the radio as the single awake device
+   (park all, inject, =btconfig ubt0 inquiry=).  Recompute the expected
+   times.  In step 8, skip the re-arm check when there was no give-up.
+2. Optionally run once with =hw.usbpm.deferrable=0= to see =maxlate_ms= ≈ 0,
+   then with 1 (≤ ~1000 ms expected).
+3. Keep the planned =drvctl -d xhci0= / =usb on usbc= check, and do
+   =sysctl hw.usbpm.stats= right after it (list removal path).
+
+* VM test of the fixed patch (2026-10-17)
+
+GENERIC + DIAGNOSTIC + LOCKDEBUG ran in a KVM VM with qemu-xhci (kbd,
+mouse, usb-storage, usb-serial, usb-ccid).  =vm/vmtest.sh= finished with
+FAILS=0 and the console shows no KASSERT and no LOCKDEBUG report.
+
+It covered:
+- parked => nothing armed, with a quiet window;
+- =hid=1= and =autosuspend= 0/5 reconciles;
+- open/close wake and re-suspend;
+- umass I/O on a dormant slot;
+- injected suspend failures: backoff P, P, 2P = 20 s;
+- injected resume failures;
+- a negative inject value, refused;
+- give-up at 16P, then a slow re-check, then a sysctl re-arm;
+- =deferrable=0= (=maxlate_ms= 20);
+- =drvctl -d xhci0= / =drvctl -r pci0=.
+
+=drvctl -S/-R xhci0= could not be run: the stock 11.0 kernel also panics
+("softints stuck") on qemu-xhci.  Details and the table are in README.org
+under "VM test".
