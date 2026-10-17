@@ -117,6 +117,7 @@ file	external/bsd/drm2/dist/drm/i915/display/intel_fbc.c	i915drmkms
 file	external/bsd/drm2/dist/drm/i915/display/intel_fbdev.c	i915drmkms
 file	external/bsd/drm2/dist/drm/i915/display/intel_fifo_underrun.c	i915drmkms
 file	external/bsd/drm2/dist/drm/i915/display/intel_frontbuffer.c	i915drmkms
+file	external/bsd/drm2/dist/drm/i915/display/intel_global_state.c	i915drmkms
 file	external/bsd/drm2/dist/drm/i915/display/intel_gmbus.c	i915drmkms
 file	external/bsd/drm2/dist/drm/i915/display/intel_hdcp.c	i915drmkms
 file	external/bsd/drm2/dist/drm/i915/display/intel_hdmi.c	i915drmkms

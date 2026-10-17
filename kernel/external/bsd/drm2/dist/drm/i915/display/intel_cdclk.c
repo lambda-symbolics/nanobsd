@@ -2066,7 +2066,7 @@ static int intel_compute_min_cdclk(struct intel_atomic_state *state)
 
 		state->min_cdclk[i] = min_cdclk;
 
-		ret = intel_atomic_lock_global_state(state);
+		ret = _intel_atomic_lock_global_state(state);
 		if (ret)
 			return ret;
 	}
@@ -2116,7 +2116,7 @@ static int bxt_compute_min_voltage_level(struct intel_atomic_state *state)
 
 		state->min_voltage_level[i] = min_voltage_level;
 
-		ret = intel_atomic_lock_global_state(state);
+		ret = _intel_atomic_lock_global_state(state);
 		if (ret)
 			return ret;
 	}
@@ -2372,12 +2372,12 @@ int intel_modeset_calc_cdclk(struct intel_atomic_state *state)
 		 * Also serialize commits across all crtcs
 		 * if the actual hw needs to be poked.
 		 */
-		ret = intel_atomic_serialize_global_state(state);
+		ret = _intel_atomic_serialize_global_state(state);
 		if (ret)
 			return ret;
 	} else if (intel_cdclk_changed(&dev_priv->cdclk.logical,
 				       &state->cdclk.logical)) {
-		ret = intel_atomic_lock_global_state(state);
+		ret = _intel_atomic_lock_global_state(state);
 		if (ret)
 			return ret;
 	} else {

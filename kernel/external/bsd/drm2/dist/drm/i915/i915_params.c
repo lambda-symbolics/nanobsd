@@ -104,6 +104,13 @@ i915_param_named_unsafe(lispbsd_idle_drrs, int, 0600,
 	"Let idleness DRRS drop the eDP panel to its downclock refresh a "
 	"second after the last screen update (0=off, 1=on [default])");
 
+i915_param_named_unsafe(lispbsd_sagv, int, 0600,
+	"Gen12 display SAGV/QGV control, applied at the next display update "
+	"(0=stock: never touch SAGV, plain watermarks [default], "
+	"1=upstream TGL SAGV: allow the QGV points with enough bandwidth and "
+	"use the SAGV watermarks, 2=managed but SAGV off: pin the highest "
+	"bandwidth QGV point); see hw.i915sagv");
+
 i915_param_named_unsafe(force_probe, charp, 0400,
 	"Force probe the driver for specified devices. "
 	"See CONFIG_DRM_I915_FORCE_PROBE for details.");

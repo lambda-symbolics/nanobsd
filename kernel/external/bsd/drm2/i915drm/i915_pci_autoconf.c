@@ -34,6 +34,7 @@ __KERNEL_RCSID(0, "$NetBSD: i915_pci_autoconf.c,v 1.14 2022/10/15 15:20:06 riast
 
 #include <sys/types.h>
 #include <sys/atomic.h>
+#include <sys/kmem.h>
 #include <sys/queue.h>
 #include <sys/systm.h>
 #include <sys/queue.h>
@@ -49,6 +50,7 @@ __KERNEL_RCSID(0, "$NetBSD: i915_pci_autoconf.c,v 1.14 2022/10/15 15:20:06 riast
 #include "i915_drv.h"
 #include "i915_pci.h"
 #include "gt/intel_rps.h"
+#include "display/intel_bw.h"
 
 struct drm_device;
 
@@ -168,6 +170,42 @@ i915drmkms_sysctl_pmstate(SYSCTLFN_ARGS)
 	node.sysctl_data = buf;
 	node.sysctl_size = strlen(buf) + 1;
 	return sysctl_lookup(SYSCTLFN_CALL(&node));
+}
+
+/*
+ * LISPBSD: display SAGV/QGV report, hw.i915sagv: what the firmware allows,
+ * what the driver last did (hw.drm2.i915_modparams.lispbsd_sagv), and the
+ * live memory clock registers unless hw.i915rpm has the device suspended.
+ */
+static int
+i915drmkms_sysctl_sagv(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	struct i915drmkms_softc *sc = lispbsd_i915_sc;
+	struct drm_i915_private *i915;
+	intel_wakeref_t wakeref = 0;
+	const size_t len = 1024;
+	char *buf;
+	bool live;
+	int error;
+
+	if (sc == NULL || sc->sc_drm_dev == NULL)
+		return ENXIO;
+	i915 = to_i915(sc->sc_drm_dev);
+	buf = kmem_zalloc(len, KM_SLEEP);
+	live = lispbsd_i915rpm == 0;
+	if (live) {
+		wakeref = intel_runtime_pm_get_if_in_use(&i915->runtime_pm);
+		live = wakeref != 0;
+	}
+	intel_bw_lispbsd_sagv_report(i915, buf, len, live);
+	if (wakeref)
+		intel_runtime_pm_put(&i915->runtime_pm, wakeref);
+	node.sysctl_data = buf;
+	node.sysctl_size = strlen(buf) + 1;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	kmem_free(buf, len);
+	return error;
 }
 
 /*
@@ -483,6 +521,12 @@ i915drmkms_attach_real(device_t self)
 	    CTLFLAG_READONLY, CTLTYPE_STRING, "i915pmstate",
 	    SYSCTL_DESCR("i915 software wakeref snapshot without waking the GPU"),
 	    i915drmkms_sysctl_pmstate, 0, NULL, 0,
+	    CTL_HW, CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(NULL, 0, NULL, NULL,
+	    CTLFLAG_READONLY, CTLTYPE_STRING, "i915sagv",
+	    SYSCTL_DESCR("LISPBSD display SAGV/QGV state; switch: hw.drm2.i915_modparams.lispbsd_sagv"),
+	    i915drmkms_sysctl_sagv, 0, NULL, 0,
 	    CTL_HW, CTL_CREATE, CTL_EOL);
 	i915drmkms_sysctl_rps_init();
 

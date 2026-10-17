@@ -359,7 +359,7 @@ static inline int gen6_check_mailbox_status(u32 mbox)
 	}
 }
 
-static inline int gen7_check_mailbox_status(u32 mbox)
+static inline int gen7_check_mailbox_status(u32 mbox, u32 cmd)
 {
 	switch (mbox & GEN6_PCODE_ERROR_MASK) {
 	case GEN6_PCODE_SUCCESS:
@@ -373,6 +373,23 @@ static inline int gen7_check_mailbox_status(u32 mbox)
 	case GEN7_PCODE_MIN_FREQ_TABLE_GT_RATIO_OUT_OF_RANGE:
 		return -EOVERFLOW;
 	default:
+		/*
+		 * LISPBSD: the gen11 status codes (upstream f22fd334890e,
+		 * f136c58a0de9) are errors only for the QGV restriction
+		 * request the SAGV port adds; every other pcode caller keeps
+		 * the old handling of an unknown status (warn, success).
+		 */
+		if ((cmd & GEN6_PCODE_ERROR_MASK) ==
+		    ICL_PCODE_SAGV_DE_MEM_SS_CONFIG) {
+			switch (mbox & GEN6_PCODE_ERROR_MASK) {
+			case GEN11_PCODE_ILLEGAL_SUBCOMMAND:
+				return -ENXIO;
+			case GEN11_PCODE_LOCKED:
+				return -EBUSY;
+			case GEN11_PCODE_REJECTED:
+				return -EACCES;
+			}
+		}
 		MISSING_CASE(mbox & GEN6_PCODE_ERROR_MASK);
 		return 0;
 	}
@@ -385,6 +402,7 @@ static int __sandybridge_pcode_rw(struct drm_i915_private *i915,
 				  bool is_read)
 {
 	struct intel_uncore *uncore = &i915->uncore;
+	const u32 cmd = mbox;	/* LISPBSD: mbox is reused for the reply */
 
 	lockdep_assert_held(&i915->sb_lock);
 
@@ -416,7 +434,7 @@ static int __sandybridge_pcode_rw(struct drm_i915_private *i915,
 		*val1 = intel_uncore_read_fw(uncore, GEN6_PCODE_DATA1);
 
 	if (INTEL_GEN(i915) > 6)
-		return gen7_check_mailbox_status(mbox);
+		return gen7_check_mailbox_status(mbox, cmd);
 	else
 		return gen6_check_mailbox_status(mbox);
 }

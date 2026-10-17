@@ -48,6 +48,7 @@
 #include "i915_drv.h"
 
 struct drm_printer;
+struct __intel_global_objs_state;
 
 /*
  * Display related stuff
@@ -461,6 +462,9 @@ struct intel_atomic_state {
 
 	intel_wakeref_t wakeref;
 
+	struct __intel_global_objs_state *global_objs;
+	int num_global_objs;
+
 	struct {
 		/*
 		 * Logical state of cdclk (used for all scaling, watermark,
@@ -673,12 +677,15 @@ struct skl_plane_wm {
 	struct skl_wm_level wm[8];
 	struct skl_wm_level uv_wm[8];
 	struct skl_wm_level trans_wm;
+	struct skl_wm_level sagv_wm0;
+	struct skl_wm_level sagv_trans_wm;	/* LISPBSD: later upstream */
 	bool is_planar;
 };
 
 struct skl_pipe_wm {
 	struct skl_plane_wm planes[I915_MAX_PLANES];
 	u32 linetime;
+	bool use_sagv_wm;
 };
 
 enum vlv_wm_level {

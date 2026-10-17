@@ -129,6 +129,7 @@ SRCS+=	intel_fbc.c
 SRCS+=	intel_fbdev.c
 SRCS+=	intel_fifo_underrun.c
 SRCS+=	intel_frontbuffer.c
+SRCS+=	intel_global_state.c
 SRCS+=	intel_gmbus.c
 SRCS+=	intel_hdcp.c
 SRCS+=	intel_hdmi.c

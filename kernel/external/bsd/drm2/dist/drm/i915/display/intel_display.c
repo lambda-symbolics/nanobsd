@@ -13821,7 +13821,9 @@ static void verify_wm_state(struct intel_crtc *crtc,
 		/* Watermarks */
 		for (level = 0; level <= max_level; level++) {
 			if (skl_wm_level_equals(&hw_plane_wm->wm[level],
-						&sw_plane_wm->wm[level]))
+						&sw_plane_wm->wm[level]) ||
+			    (level == 0 && skl_wm_level_equals(&hw_plane_wm->wm[level],
+							       &sw_plane_wm->sagv_wm0)))
 				continue;
 
 			DRM_ERROR("mismatch in WM pipe %c plane %d level %d (expected e=%d b=%u l=%u, got e=%d b=%u l=%u)\n",
@@ -13835,7 +13837,10 @@ static void verify_wm_state(struct intel_crtc *crtc,
 		}
 
 		if (!skl_wm_level_equals(&hw_plane_wm->trans_wm,
-					 &sw_plane_wm->trans_wm)) {
+					 &sw_plane_wm->trans_wm) &&
+		    /* LISPBSD: or the SAGV one, like wm0 above */
+		    !skl_wm_level_equals(&hw_plane_wm->trans_wm,
+					 &sw_plane_wm->sagv_trans_wm)) {
 			DRM_ERROR("mismatch in trans WM pipe %c plane %d (expected e=%d b=%u l=%u, got e=%d b=%u l=%u)\n",
 				  pipe_name(pipe), plane + 1,
 				  sw_plane_wm->trans_wm.plane_en,
@@ -13873,7 +13878,9 @@ static void verify_wm_state(struct intel_crtc *crtc,
 		/* Watermarks */
 		for (level = 0; level <= max_level; level++) {
 			if (skl_wm_level_equals(&hw_plane_wm->wm[level],
-						&sw_plane_wm->wm[level]))
+						&sw_plane_wm->wm[level]) ||
+			    (level == 0 && skl_wm_level_equals(&hw_plane_wm->wm[level],
+							       &sw_plane_wm->sagv_wm0)))
 				continue;
 
 			DRM_ERROR("mismatch in WM pipe %c cursor level %d (expected e=%d b=%u l=%u, got e=%d b=%u l=%u)\n",
@@ -13887,7 +13894,10 @@ static void verify_wm_state(struct intel_crtc *crtc,
 		}
 
 		if (!skl_wm_level_equals(&hw_plane_wm->trans_wm,
-					 &sw_plane_wm->trans_wm)) {
+					 &sw_plane_wm->trans_wm) &&
+		    /* LISPBSD: or the SAGV one, like wm0 above */
+		    !skl_wm_level_equals(&hw_plane_wm->trans_wm,
+					 &sw_plane_wm->sagv_trans_wm)) {
 			DRM_ERROR("mismatch in trans WM pipe %c cursor (expected e=%d b=%u l=%u, got e=%d b=%u l=%u)\n",
 				  pipe_name(pipe),
 				  sw_plane_wm->trans_wm.plane_en,
@@ -14311,35 +14321,41 @@ static int hsw_mode_set_planes_workaround(struct intel_atomic_state *state)
 	return 0;
 }
 
+u8 intel_calc_active_pipes(struct intel_atomic_state *state,
+			   u8 active_pipes)
+{
+	const struct intel_crtc_state *crtc_state;
+	struct intel_crtc *crtc;
+	int i;
+
+	for_each_new_intel_crtc_in_state(state, crtc, crtc_state, i) {
+		if (crtc_state->hw.active)
+			active_pipes |= BIT(crtc->pipe);
+		else
+			active_pipes &= ~BIT(crtc->pipe);
+	}
+
+	return active_pipes;
+}
+
 static int intel_modeset_checks(struct intel_atomic_state *state)
 {
 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
-	struct intel_crtc_state *old_crtc_state, *new_crtc_state;
-	struct intel_crtc *crtc;
-	int ret, i;
+	int ret;
 
 	/* keep the current setting */
 	if (!state->cdclk.force_min_cdclk_changed)
 		state->cdclk.force_min_cdclk = dev_priv->cdclk.force_min_cdclk;
 
 	state->modeset = true;
-	state->active_pipes = dev_priv->active_pipes;
+	state->active_pipes = intel_calc_active_pipes(state, dev_priv->active_pipes);
 	state->cdclk.logical = dev_priv->cdclk.logical;
 	state->cdclk.actual = dev_priv->cdclk.actual;
 
-	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
-					    new_crtc_state, i) {
-		if (new_crtc_state->hw.active)
-			state->active_pipes |= BIT(crtc->pipe);
-		else
-			state->active_pipes &= ~BIT(crtc->pipe);
-
-		if (old_crtc_state->hw.active != new_crtc_state->hw.active)
-			state->active_pipe_changes |= BIT(crtc->pipe);
-	}
+	state->active_pipe_changes = state->active_pipes ^ dev_priv->active_pipes;
 
 	if (state->active_pipe_changes) {
-		ret = intel_atomic_lock_global_state(state);
+		ret = _intel_atomic_lock_global_state(state);
 		if (ret)
 			return ret;
 	}
@@ -15426,15 +15442,10 @@ static void intel_atomic_commit_tail(struct intel_atomic_state *state)
 						 &dev_priv->cdclk.actual,
 						 state->cdclk.pipe);
 
-		/*
-		 * SKL workaround: bspec recommends we disable the SAGV when we
-		 * have more then one pipe enabled
-		 */
-		if (!intel_can_enable_sagv(state))
-			intel_disable_sagv(dev_priv);
-
 		intel_modeset_verify_disabled(dev_priv, state);
 	}
+
+	intel_sagv_pre_plane_update(state);
 
 	/* Complete the events for pipes that have now been disabled */
 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
@@ -15526,8 +15537,7 @@ static void intel_atomic_commit_tail(struct intel_atomic_state *state)
 	if (state->modeset)
 		intel_verify_planes(state);
 
-	if (state->modeset && intel_can_enable_sagv(state))
-		intel_enable_sagv(dev_priv);
+	intel_sagv_post_plane_update(state);
 
 	drm_atomic_helper_commit_hw_done(&state->base);
 
@@ -15661,6 +15671,8 @@ static int intel_atomic_commit(struct drm_device *dev,
 	ret = drm_atomic_helper_setup_commit(&state->base, nonblock);
 	if (!ret)
 		ret = drm_atomic_helper_swap_state(&state->base, true);
+	if (!ret)
+		intel_atomic_swap_global_state(state);
 
 	if (ret) {
 		i915_sw_fence_commit(&state->commit_ready);
@@ -17140,17 +17152,6 @@ intel_user_framebuffer_create(struct drm_device *dev,
 	return fb;
 }
 
-static void intel_atomic_state_free(struct drm_atomic_state *state)
-{
-	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
-
-	drm_atomic_state_default_release(state);
-
-	i915_sw_fence_fini(&intel_state->commit_ready);
-
-	kfree(state);
-}
-
 static enum drm_mode_status
 intel_mode_valid(struct drm_device *dev,
 		 const struct drm_display_mode *mode)
@@ -17592,6 +17593,7 @@ static void intel_mode_config_init(struct drm_i915_private *i915)
 	struct drm_mode_config *mode_config = &i915->drm.mode_config;
 
 	drm_mode_config_init(&i915->drm);
+	INIT_LIST_HEAD(&i915->global_obj_list);
 
 	mode_config->min_width = 0;
 	mode_config->min_height = 0;
@@ -17631,6 +17633,12 @@ static void intel_mode_config_init(struct drm_i915_private *i915)
 		mode_config->cursor_width = 256;
 		mode_config->cursor_height = 256;
 	}
+}
+
+static void intel_mode_config_cleanup(struct drm_i915_private *i915)
+{
+	intel_atomic_global_obj_cleanup(i915);
+	drm_mode_config_cleanup(&i915->drm);
 }
 
 int intel_modeset_init(struct drm_i915_private *i915)
@@ -17677,7 +17685,7 @@ int intel_modeset_init(struct drm_i915_private *i915)
 		for_each_pipe(i915, pipe) {
 			ret = intel_crtc_init(i915, pipe);
 			if (ret) {
-				drm_mode_config_cleanup(dev);
+				intel_mode_config_cleanup(i915);
 				return ret;
 			}
 		}
@@ -18630,7 +18638,7 @@ void intel_modeset_driver_remove(struct drm_i915_private *i915)
 
 	intel_hdcp_component_fini(i915);
 
-	drm_mode_config_cleanup(&i915->drm);
+	intel_mode_config_cleanup(i915);
 
 	intel_overlay_cleanup(i915);
 
@@ -18639,8 +18647,6 @@ void intel_modeset_driver_remove(struct drm_i915_private *i915)
 	intel_gmbus_teardown(i915);
 
 	intel_fbc_cleanup(i915);
-
-	intel_bw_cleanup(i915);
 
 	DRM_DESTROY_WAITQUEUE(&i915->atomic_commit_wq);
 	spin_lock_destroy(&i915->atomic_commit_lock);

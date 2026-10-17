@@ -74,6 +74,7 @@
 #include "display/intel_dpll_mgr.h"
 #include "display/intel_dsb.h"
 #include "display/intel_frontbuffer.h"
+#include "display/intel_global_state.h"
 #include "display/intel_gmbus.h"
 #include "display/intel_opregion.h"
 
@@ -1100,6 +1101,8 @@ struct drm_i915_private {
 	struct intel_shared_dpll shared_dplls[I915_NUM_PLLS];
 	const struct intel_dpll_mgr *dpll_mgr;
 
+	struct list_head global_obj_list;
+
 	/*
 	 * dpll_lock serializes intel_{prepare,enable,disable}_shared_dpll.
 	 * Must be global rather than per dpll, because on some platforms
@@ -1192,6 +1195,31 @@ struct drm_i915_private {
 
 	u32 sagv_block_time_us;
 
+	/*
+	 * LISPBSD: what the firmware reported about SAGV/QGV and what the
+	 * driver last did with it, for hw.i915sagv (read-only snapshot,
+	 * filled at init and in the commit tail).
+	 */
+	struct {
+		int global_ret;		/* pcode MEM_SS global info read */
+		u32 global_raw;
+		int block_time_ret;	/* pcode SAGV block time read */
+		u8 num_points;
+		u8 num_channels;
+		u8 t_bl;
+		u8 dram_type;		/* enum intel_dram_type */
+		u32 qgv_raw[I915_NUM_QGV_POINTS][2];	/* pcode val, val2 */
+		int qgv_ret[I915_NUM_QGV_POINTS];
+		u8 mode;		/* lispbsd_sagv of the committed state */
+		bool sagv_allowed;	/* intel_can_enable_sagv() of it */
+		u8 qgv_points_mask;	/* its QGV restriction mask */
+		bool mask_written;	/* did we ever send a QGV mask */
+		bool pinned;		/* a highest-point pin succeeded */
+		u8 last_mask;		/* last mask sent to the pcode */
+		int last_ret;		/* and its result */
+		unsigned int writes, errors, commits;
+	} lispbsd_sagv;
+
 	struct {
 		/*
 		 * Raw watermark latency values:
@@ -1259,7 +1287,7 @@ struct drm_i915_private {
 		u8 num_planes;
 	} max_bw[6];
 
-	struct drm_private_obj bw_obj;
+	struct intel_global_obj bw_obj;
 
 	struct intel_runtime_pm runtime_pm;
 
