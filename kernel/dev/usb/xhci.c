@@ -5986,7 +5986,29 @@ xhci_roothub_ctrl_locked(struct usbd_bus *bus, usb_device_request_t *req,
 			xhci_op_write_4(sc, port, v & ~XHCI_PS_PED);
 			break;
 		case UHF_PORT_SUSPEND:
-			return -1;
+			/*
+			 * LISPBSD: resume a suspended link, USB 2 with resume
+			 * signalling first (as xhci_rt_resume_dev).
+			 */
+			if (XHCI_PS_PLS_GET(v) != XHCI_PS_PLS_U3)
+				break;
+			v &= ~XHCI_PS_PLS_MASK;
+			if (bn == 1) {
+				xhci_op_write_4(sc, port, v | XHCI_PS_LWS |
+				    XHCI_PS_PLS_SET(XHCI_PS_PLS_SETRESUME));
+				usb_delay_ms(&sc->sc_bus, 20);
+				v = xhci_op_read_4(sc, port) &
+				    ~(XHCI_PS_CLEAR | XHCI_PS_PLS_MASK);
+			}
+			xhci_op_write_4(sc, port, v | XHCI_PS_LWS |
+			    XHCI_PS_PLS_SET(XHCI_PS_PLS_SETU0));
+			for (i = 0; i < 20; i++) {
+				v = xhci_op_read_4(sc, port);
+				if (XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_U0)
+					break;
+				usb_delay_ms(&sc->sc_bus, 1);
+			}
+			break;
 		case UHF_PORT_POWER:
 			xhci_op_write_4(sc, port, v & ~XHCI_PS_PP);
 			break;
@@ -6122,7 +6144,16 @@ xhci_roothub_ctrl_locked(struct usbd_bus *bus, usb_device_request_t *req,
 			xhci_op_write_4(sc, port, v | XHCI_PS_PED);
 			break;
 		case UHF_PORT_SUSPEND:
-			/* XXX suspend */
+			/* LISPBSD: link to U3 (the device must be idle). */
+			v &= ~XHCI_PS_PLS_MASK;
+			xhci_op_write_4(sc, port, v | XHCI_PS_LWS |
+			    XHCI_PS_PLS_SET(XHCI_PS_PLS_SETU3));
+			for (i = 0; i < 20; i++) {
+				v = xhci_op_read_4(sc, port);
+				if (XHCI_PS_PLS_GET(v) == XHCI_PS_PLS_U3)
+					break;
+				usb_delay_ms(&sc->sc_bus, 1);
+			}
 			break;
 		case UHF_PORT_RESET:
 			xhci_op_write_4(sc, port, v | XHCI_PS_PR);

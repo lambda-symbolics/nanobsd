@@ -149,6 +149,7 @@ __KERNEL_RCSID(0, "$NetBSD: umass.c,v 1.189 2022/09/22 14:27:52 riastradh Exp $"
 #include <dev/usb/usbdevs.h>
 #include <dev/usb/usbhist.h>
 
+#include <dev/usb/usbdivar.h>	/* LISPBSD: ud_powersrc for the port cycle */
 #include <dev/usb/umassvar.h>
 #include <dev/usb/umass_quirks.h>
 #include <dev/usb/umass_scsipi.h>
@@ -614,6 +615,27 @@ umass_attach(device_t parent, device_t self, void *aux)
 	 * works.  A Bulk-Only Mass Storage Reset plus clearing both bulk halts
 	 * is the class's reset recovery (BOT 5.3.4), allowed at any time.
 	 */
+	/*
+	 * LISPBSD: the Verbatim Portable SSD (18a5:0422) answers no command
+	 * after a boot-time bus reset until its link has been suspended and
+	 * resumed (or it is power cycled); a hot plug works.  Cycle its port
+	 * through U3 before the first command.
+	 */
+	if (uiaa->uiaa_vendor == 0x18a5 && uiaa->uiaa_product == 0x0422 &&
+	    sc->sc_udev->ud_powersrc != NULL &&
+	    sc->sc_udev->ud_powersrc->up_parent != NULL) {
+		struct usbd_device *hub = sc->sc_udev->ud_powersrc->up_parent;
+		int portno = sc->sc_udev->ud_powersrc->up_portno;
+		usbd_status e1, e2;
+
+		e1 = usbd_set_port_feature(hub, portno, UHF_PORT_SUSPEND);
+		usbd_delay_ms(sc->sc_udev, 100);
+		e2 = usbd_clear_port_feature(hub, portno, UHF_PORT_SUSPEND);
+		usbd_delay_ms(sc->sc_udev, 50);
+		aprint_normal_dev(self, "port %d suspend/resume at attach: "
+		    "%s / %s\n", portno, usbd_errstr(e1), usbd_errstr(e2));
+	}
+
 	if (sc->sc_wire == UMASS_WPROTO_BBB) {
 		usb_device_request_t req;
 		usbd_status rerr;
