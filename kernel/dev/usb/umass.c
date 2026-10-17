@@ -1107,11 +1107,24 @@ umass_reset(struct umass_softc *sc, transfer_cb_f cb, void *priv)
  * Bulk protocol specific functions
  */
 
+/*
+ * LISPBSD: the Verbatim Portable SSD fails its first SCSI probe at boot
+ * ("generic HBA error") but attaches on a later rescan.  Log the first
+ * transport errors and reset recoveries of every umass device to see where.
+ */
+static int umass_lispbsd_log;
+#define	UMASS_LOGMAX	64
+
 Static void
 umass_bbb_reset(struct umass_softc *sc, int status)
 {
 	UMASSHIST_FUNC(); UMASSHIST_CALLED();
 	SDT_PROBE2(usb, umass, bbb, reset,  sc, status);
+	if (umass_lispbsd_log < UMASS_LOGMAX) {
+		umass_lispbsd_log++;
+		device_printf(sc->sc_dev, "bbb reset recovery (state %d, "
+		    "status %d)\n", sc->transfer_state, status);
+	}
 	KASSERTMSG(sc->sc_wire & UMASS_WPROTO_BBB,
 		   "sc->sc_wire == 0x%02x wrong for umass_bbb_reset\n",
 		   sc->sc_wire);
@@ -1288,6 +1301,12 @@ umass_bbb_state(struct usbd_xfer *xfer, void *priv,
 	int residue;
 
 	SDT_PROBE3(usb, umass, bbb, state,  sc, xfer, err);
+	if (err != USBD_NORMAL_COMPLETION &&
+	    umass_lispbsd_log < UMASS_LOGMAX) {
+		umass_lispbsd_log++;
+		device_printf(sc->sc_dev, "bbb state %d: %s\n",
+		    sc->transfer_state, usbd_errstr(err));
+	}
 
 	KASSERTMSG(sc->sc_wire & UMASS_WPROTO_BBB,
 		   "sc->sc_wire == 0x%02x wrong for umass_bbb_state\n",

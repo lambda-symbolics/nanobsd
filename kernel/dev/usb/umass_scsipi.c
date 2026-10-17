@@ -468,6 +468,9 @@ umass_scsipi_cb(struct umass_softc *sc, void *priv, int residue, int status)
 		return;
 
 	case STATUS_WIRE_FAILED:
+		/* LISPBSD: boot-time probe failures (umass.c) */
+		printf("%s: cmd 0x%02x: transport failed, will reset\n",
+		    device_xname(sc->sc_dev), xs->cmd->opcode);
 		xs->error = XS_RESET;
 		break;
 
@@ -515,6 +518,9 @@ umass_scsipi_sense_cb(struct umass_softc *sc, void *priv, int residue,
 	default:
 		DPRINTFM(UDMASS_SCSI, "sc %#jx: Autosense failed, status %jd",
 		    (uintptr_t)sc, status, 0, 0);
+		/* LISPBSD: this is the "generic HBA error" path */
+		printf("%s: cmd 0x%02x: request sense failed (status %d)\n",
+		    device_xname(sc->sc_dev), xs->cmd->opcode, status);
 		xs->error = XS_DRIVER_STUFFUP;
 		break;
 	}
