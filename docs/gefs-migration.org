@@ -18,6 +18,21 @@ is a wash with APST on (measured 2026-09-28, docs/power-levers.org).
    loader on the internal ESP, boot entries switched.  Swap/dump (dk2)
    untouched; the old FFS loader stays on the ESP under another name.
 
+* Booting from the USB-C SSD (phases 1 and 2)
+- The firmware loads the loader and kernel through its own USB stack, and the
+  kernel attaches xhci0 and the SSD during autoconfiguration, before root is
+  mounted: booting needs nothing special.
+- But =/etc/rc.local= runs =usb off= (all controllers), which would power the
+  USB-C controller off under the mounted root.  On every copy that boots from
+  the SSD, rc.local must say =usb off pch= (internal Bluetooth, camera and
+  fingerprint reader still powered down; USB-C stays on).  The kernel's
+  populated-controller guard (lispbsd-usb-populated) would refuse the power
+  cut anyway; do not rely on it.  Back to =usb off= on the internal gefs root
+  in phase 3.
+- Lid suspend with a USB root is harder than the final setup: s2idle suspends
+  and resumes xhci0 under the root disk.  Test it in phase 2, but a failure
+  there is about USB, not gefs; skip it on the SSD rather than block phase 3.
+
 * Preconditions
 | what                                   | state                                    |
 |----------------------------------------+------------------------------------------|
