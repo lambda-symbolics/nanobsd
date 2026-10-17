@@ -1,0 +1,24 @@
+#+TITLE: Wi-Fi U-APSD on the Nano (kernel 180)
+
+Port and reviews: pending/uapsd/ (README.org, REVIEW.org); in kernel/ since
+770dc4f.  Switch hw.iwx.uapsd (default 0, effective at the next association),
+status hw.iwx.uapsd_status.
+
+* Functional (2026-10-17, home AP Zyxel_7B79_5G, ch 36)
+First WMM associations on this net80211: U-APSD negotiated on all 4
+(=qos=1 negotiated=1 active=1 flags=0x1203 ac_flags=0x0f=), firmware never
+flagged the AP as misbehaving, 0 % ping loss, ssh over wg survived the
+reassociations (QoS RX padding fine, per-TID CCMP fine).
+
+* Energy and latency (=pending/uapsd/uapsd-ab.sh 6 2=, battery, Firefox idle)
+| window | W     | iwx irq/s | gateway ping avg / max |
+| off    | 1.80* | 1.31      | 4.4 / 8.5 ms           |
+| on     | 1.50  | 1.36      | 53 / 103 ms            |
+| off    | 1.20  | 1.57      | 4.0 / 5.3 ms           |
+| on     | 1.40  | 1.23      | 61 / 110 ms            |
+*panel still on for part of the first window (Mahogany blanks after 5 min).
+No measurable saving (battery counter 0.1 W per 6 min window); the latency
+cost is ~50 ms.  Beacon filtering + PS level 2 already keep the radio asleep;
+U-APSD only shortens the 200/300 ms awake tail after bursts.  Kept at 0.
+Revisit under heavier background traffic (chat, sync) where bursts are
+frequent, with longer windows.
