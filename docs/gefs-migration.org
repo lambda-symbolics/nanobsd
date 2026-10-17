@@ -70,3 +70,14 @@ Makefile.efiboot, GENERIC.  Previous versions on the laptop: =*.180=.
 
 - /usr/INSTALL (NetBSD 11.0 install sets) deleted too: the sets are on
   cdn.netbsd.org, and the user is present for the whole migration.
+- 2026-10-17 22:00-23:05, phase 1 on the Verbatim Portable SSD (476 GB; it
+  attaches on the PCH USB 2 bus, uhub3 port 5: the USB-C controller's USB 3
+  path does not come up after the TCSS power cycle, a separate issue):
+  GPT ssdesp (dk3, 256 MB FAT32) / ffsbackup (dk4, 150 GB FFSv2ea) /
+  gefstrial (dk5, 150 GB, gefs type) / 175 GB free.  dump|restore was
+  abandoned: the fss snapshot of the WAPBL root missed a block of /var
+  inodes ("not found on tape"), and a /tmp backing store fills tmpfs.  Copy
+  = =pax -rw -pe -X . /mnt/ffsbackup= from / (53 min, USB 2): 1,303,560
+  entries on both sides, spot checks identical.  Copy's fstab root
+  NAME=ffsbackup, rc.local without usb off, boot.cfg kernel 181 then 180,
+  gefs efiboot as EFI/BOOT/BOOTX64.EFI on ssdesp, bootme on ffsbackup.
