@@ -85,3 +85,19 @@ stock-then-change treatment when this is deployed.  First read-only:
 | 2    | USB PM deadlines             | no idle USB timers               | medium   |
 | 3    | U-APSD                       | radio awake 50 ms not 200-300 ms | medium   |
 | 4    | SAGV                         | memory clock drops at idle       | med-high |
+
+* Status 2026-10-17 10:20
+- 177 deployed and verified (docs/tickless-clock.org "Kernel 177 deployed").
+- 178 (USB PM deadlines) deployed; the acceptance test exposed a pre-existing
+  ubt bug (lost event per wake), fixed in 179; usbpm-deadlines.sh 13/13 on
+  179 (docs/usbpm-deadlines.org).
+- 180 = 179 + U-APSD + SAGV (both 0) booted.  Read-only checks:
+  - SAGV: pcode global info 0x443: LPDDR4, 4 channels, 4 QGV points
+    (DCLK 2134 / 3201 / 4268 / 4268 MHz; 13.3 / 18.5 / 23.0 / 23.0 GB/s for
+    one plane), status=enabled, block time 11 us; mode 0 wrote nothing
+    (written=0), 13 commits, no underrun or WM mismatch.  SA_PERF_STATUS
+    read 0x1a000020 at boot and 0x0c000020 later: the firmware may already
+    move the memory clock by itself (mode 1 may then add little).
+  - U-APSD: fw=1, the current AP has WMM and U-APSD (ap_wmm=1 ap_uapsd=1);
+    switch still 0 (needs a reassociation = scan, at the laptop).
+- Energy A/B TSC vs TSC-low (energy-ab.sh 600 1) running on battery.
