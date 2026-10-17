@@ -1,0 +1,357 @@
+#+TITLE: Review of sagv.diff (TGL SAGV/QGV backport, lispbsd_sagv)
+#+DATE: 2026-10-17
+
+Read-only review of /root/lispbsd-work/sagv/sagv.diff and the patched copies in
+sys/.  Nothing was built or run.  =diff -u= of the patched copies against
+/root/lispbsd/sys gives the same diff (1328 changed lines).  The i915 files in
+the nanobsd kernel overlay that the patch touches are byte-identical to the
+base.
+
+* Verdict
+
+- *Mode 0 (default): display behaviour is unchanged.*  With the switch at 0,
+  no pcode write is sent, every plane gets the same wm0, and the Gen12
+  bandwidth check gives the same accept/reject result as before.  What
+  changes is bookkeeping and locking, plus a pcode status-code change that
+  affects every pcode caller (M0-2).  I found no NULL dereference, no
+  use-after-free, and no new deadlock class.
+- *Mode 1* matches upstream 5.8 plus the listed fixes.  It lacks two later
+  upstream refinements: the SAGV transition watermark (M1-1) and the 2-bit
+  QGV reply mask (M1-2).  Neither should block a supervised test.
+- *Process:* the patch is not in the nanobsd tree yet (P-1).
+
+* Mode 0: checked and OK (verified by reading the code)
+
+- *No pcode writes.*  =intel_has_sagv()= is now true on TGL when there is
+  more than one QGV point.  The only callers that write are:
+  - =intel_enable/disable_sagv()=, now reachable only for gen < 11;
+  - =icl_pcode_restrict_qgv_points()=, reached only from the pre/post plane
+    hooks.  Those hooks return before any write when the old and new bw
+    states are both =STOCK= (=intel_sagv_stock()=, intel_pm.c ~3865/3937).
+  =grep= finds no other caller.
+- *Same watermarks.*  =use_sagv_wm = gen>=12 && intel_can_enable_sagv()=,
+  and that is false whenever =lispbsd_sagv != AUTO=.  So
+  =skl_plane_wm_level()= returns =wm[0]=.  Readout leaves =use_sagv_wm= at 0
+  and sets =sagv_wm0 = wm[0]=.
+- *Same bandwidth decision.*  Old rule: reject if =data_rate= is above the
+  smallest bandwidth over all QGV points.  New rule in mode 0: reject unless
+  =allowed_points == mask=.  These are equivalent.
+  - The check still runs only when a pipe's data rate or plane count changes:
+    both =intel_can_enable_sagv()= results are false and the modes are equal,
+    so =changed= stays false otherwise.
+  - The 0-point case (pcode read failed) still accepts everything.
+  - =max(1, num_planes)= changes nothing, because 0 planes means a data rate
+    of 0.
+- *Global state.*
+  - Init order is correct: =INIT_LIST_HEAD(global_obj_list)= runs in
+    =intel_mode_config_init()= before =intel_bw_init()=.
+  - The refcounted swap, clear and free match upstream f8c86ffa2800.
+  - =intel_atomic_state_clear()= drops the global states on every EDEADLK
+    backoff (=drm_atomic_state_clear=) and before free.
+  - Commit tails keep their own references to the old and new states, so a
+    nonblocking commit cannot have them freed underneath it.
+  - The pre/post hooks and =intel_compute_sagv_mask()= dereference the old bw
+    state only after the new one is known to be non-NULL.  The two are always
+    added together.
+  - NetBSD =krealloc=/=kfree= are pairwise compatible (linux_malloc header).
+  - =drm_modeset_lock_assert_held= is a =KDASSERT=, so it is a no-op in
+    GENERIC.  The "not read locked" check is only a WARN.
+- *Locking and ww_mutex.*  =intel_atomic_lock_global_state()= takes every
+  crtc mutex through the commit's acquire ctx and passes =-EDEADLK= up
+  (=intel_atomic_check= returns it untouched).
+  - This is the same pattern =_intel_atomic_lock_global_state()= already
+    uses for cdclk, so the ww_mutex emulation sees no new kind of locking.
+  - The commit tails take no modeset locks, so nothing waits on a lock across
+    a commit tail.
+- *Build paths.*  The laptop boots GENERIC with =i915drmkms* at pci?= built
+  in; /etc/modules.conf does not load i915.  The new
+  =intel_global_state.c= is listed in both =files.i915drmkms= (kernel) and
+  =modules/i915drmkms/Makefile= (module).  No other build list exists.
+- *Seamless 60/30 Hz and slow watermarks.*  The patch touches none of the
+  LISPBSD code (pixel_rate, M/N fastset, the =PIPE_WM_LINETIME= write in
+  the =update_m_n= branch of the commit path).
+  - The 30 Hz watermark change still reaches the registers: since
+    23baedd217ef, =skl_wm_add_affected_planes()= compares the final
+    (post-DDB) watermarks.  That is stricter than the old pre/post-DDB
+    comparison, and DDB changes are still caught by
+    =skl_ddb_add_affected_planes()=.
+  - =dirty_pipes= (linetime) still compares =linetime=.
+- *RPS / hw.i915rps:* not touched.
+
+* Findings
+
+** M0-1  Mode 0 now locks every crtc, and sometimes serializes commits  — CONFIRMED, low
+Cost of the global-state rework when the switch is at 0:
+- =intel_compute_sagv_mask()= adds the bw state to every commit that has a
+  crtc.
+- It takes *all* crtc locks when =pipe_sagv_reject= or =active_pipes=
+  changes.  =pipe_sagv_reject= is computed even in mode 0, for example when
+  the cursor's SAGV wm0 fits or stops fitting.
+- =intel_bw_atomic_check()= takes all crtc locks on any data-rate change.
+  Before, it took only the bw private-object lock.
+- Mode 0 still stores =qgv_points_mask = ~BIT(max)=, so the first
+  data-rate change after boot serializes once.  It adds every crtc to the
+  commit; this happens in the boot-time blocking commits.
+
+Failure scenario: with two active outputs, a nonblocking commit that
+serializes stalls on, or returns =-EBUSY= because of, the other pipe's
+pending flip (=stall_checks=).  This is the upstream behaviour.  With the eDP
+panel alone, disabled crtcs complete =flip_done= at once, so there is no
+effect.
+
+** M0-2  The pcode status map changed for *all* pcode callers  — CONFIRMED (code), effect PLAUSIBLE, low
+=gen7_check_mailbox_status()= now returns:
+| status | was                    | now      |
+|--------+------------------------+----------|
+| 0x4    | 0 (success), with a =MISSING_CASE= WARN | =-ENXIO=  |
+| 0x6    | 0 (success), with a =MISSING_CASE= WARN | =-EBUSY=  |
+| 0x11   | 0 (success), with a =MISSING_CASE= WARN | =-EACCES= |
+
+If any existing pcode call on this machine gets one of these replies (cdclk
+change, DC states, the LispBSD RPS/RC6 paths), it now fails instead of
+"succeeding with a WARN".
+
+Check before boot: =grep -i 'missing case' /var/log/messages*= on the laptop
+(read only).  If it finds nothing, there is no behaviour change.
+
+** M0-3  New reads at boot  — CONFIRMED, low
+- Pcode =GEN12_PCODE_READ_SAGV_BLOCK_TIME_US= (0x23).  The HACK used to
+  prevent this read.
+- MCHBAR mirror reads at 0x145e00, 0x145e04 and 0x145918 in
+  =intel_bw_init_hw()= and in =hw.i915sagv=.
+- If 0x145918 or 0x145e00 is not claimed on TGL, expect at most a one-time
+  "Unclaimed access detected" message after a modeset.  It is harmless.
+
+** M1-0  Switching 1 or 2 back to 0 can make every commit fail  — PLAUSIBLE, low here
+- Once the mode is 0 again, the stock rule applies: every QGV point must carry
+  the configuration.  A configuration that mode 1 or 2 accepted because only
+  the highest point carried it (an external high-bandwidth display) then
+  fails *every* later commit with =-EINVAL=.  The compositor freezes until
+  the sysctl goes back to 1 or 2.
+- With the eDP panel alone (about 0.7 GB/s) every point carries the
+  configuration, so this does not happen.
+- Fix: in =intel_bw_atomic_check()=, use the stock "all points" rule only
+  while =!dev_priv->lispbsd_sagv.mask_written= (firmware untouched).  After
+  any pin, memory stays at the highest point, so checking against
+  =max_bw_point= is correct.
+
+** M1-1  No SAGV transition watermark  — CONFIRMED divergence from later upstream, effect PLAUSIBLE, medium for mode 1
+- =skl_compute_transition_wm()= derives =trans_wm= from the plain =wm[0]=.
+  IPC is enabled on TGL, so =trans_wm= is programmed.
+- Upstream later added =sagv.trans_wm=, computed from the SAGV wm0 (see
+  v6.1 =skl_watermark.c=):
+  - =skl_plane_trans_wm()= returns =sagv.trans_wm= when =use_sagv_wm= is set;
+  - =skl_check_wm_level()= disables =sagv.wm0= and =sagv.trans_wm= when they
+    do not fit the DDB.
+- Here, with SAGV wm0 in use, =PLANE_WM_TRANS= can sit *below* the
+  programmed wm0.
+- Failure scenario: a FIFO underrun or flicker during IPC transitions while
+  SAGV is active.  Watch for =FIFO underrun= in mode 1.  Porting the field
+  takes about 30 lines.
+
+** M1-2  QGV reply mask is 0x1; later upstream uses 0x3  — CONFIRMED divergence, low
+- Later upstream: =ICL_PCODE_REP_QGV_MASK= is =GENMASK(1,0)=, with SAFE=0,
+  POLL=1, REJECTED=2.
+- The 5.8 values here (mask 0x1, expected reply 0) treat a reply of 2
+  (rejected) as success.
+- Failure scenario: a refused pin shows =last_ret=0=, and the driver believes
+  SAGV is off while the firmware still roams the points.  In mode 1 that
+  means plain wm0 under SAGV, i.e. the same exposure as stock.
+- Fix: use mask 0x3 and expected reply 0.
+
+** D-1  The boot log and hw.i915sagv mislabel DCLK  — CONFIRMED, diagnostic
+- The pcode returns the DCLK of each QGV point as a multiple of 16.667 MHz.
+  v6.1 converts it:
+  =sp->dclk = DIV_ROUND_UP(16667*dclk + (ver>11 ? 500 : 0), 1000)=.
+- The 5.6 =icl_calc_bw()= also treats it as a multiple ("multiples of
+  16.666MHz").
+- The new lines print the raw value as "DCLK=… MHz" (for example 128 instead
+  of about 2133).  Read it as ×16.667 MHz, and correct the README test plan
+  step that compares =qclk_mhz= with the "max-point DCLK".
+
+** D-2  =mask= is non-zero in mode 0  — CONFIRMED, cosmetic
+In mode 0, =hw.i915sagv mask= shows =~BIT(max)= (for example 0xe) even though
+nothing was sent.  =written=0= is the field to trust.
+
+** L-1  num_points == 0 counts as "SAGV enabled"  — PLAUSIBLE, low (pre-existing)
+- =icl_get_bw_info()= sets =I915_SAGV_ENABLED= whenever =num_points != 1=,
+  including 0.  (The same code then divides by =num_channels=, which may
+  also be 0.)
+- Consequence: mode 1 would then send a mask of 0 on the 0->1 transition.
+- Fix: treat =num_points < 2= as =NOT_CONTROLLED=.
+
+** L-2  The pcode may reset after S3 or firmware resume  — PLAUSIBLE, low
+- The GENERIC_S3 config exists.  After S3, firmware can reset the QGV mask to
+  "all allowed" while the driver's state still says "pinned" (mode 1 with
+  SAGV not fitting, or mode 2).
+- The result is SAGV under plain wm0, which is the same exposure as stock.
+  The README already says to re-check after a lid cycle.
+- s2idle does not reset the PCU in principle.
+
+** P-1  nanobsd sync  — CONFIRMED, process
+- Only 8 of the 21 touched files exist in /root/nanobsd/kernel.  The rest
+  (intel_pm.[ch], i915_drv.h, intel_bw.[ch], intel_global_state.[ch],
+  intel_sideband.c, i915_reg.h, intel_audio.c, intel_atomic.h,
+  intel_display.h, the module Makefile) are stock and absent.
+- A kernel built "the usual way from the nanobsd tree" will not contain the
+  patch until all of these are copied into the overlay, including the two
+  new files and files.i915drmkms.
+
+* Mode 1 vs upstream (verified line by line)
+
+- Plane updates: pre-plane masks (=old|new=), post-plane unmasks (=new=);
+  both are placed exactly as in 5.8, and the unmask comes after
+  =wait_for_flip_done=.
+- Bandwidth check: =intel_bw_atomic_check()= matches 5.8 plus 6b728595ffa5.
+  =intel_compute_sagv_mask()= matches 5.8 plus 8dd8ffb824ca (=use_sagv_wm=
+  set after serialization).  The plane-wm fix 2871b2fde449 is present
+  (=skl_plane_selected_wm_equals=; both write paths use
+  =skl_plane_wm_level=).
+- SAGV wm0 latency = =skl_latency[0] + sagv_block_time_us=, the same as
+  upstream.  A bad block time (-1, read failure) is guarded.
+- Pcode protocol: =skl_pcode_request(0xe, mask, 0x1, 0x0, 1)= is the 5.8
+  form (see M1-2).
+- Mode transitions: the LispBSD 0<->1/2 design (pin the highest point first,
+  unmask in post only when going to 1) is correctly ordered.  Every mode
+  change serializes, so concurrent nonblocking commit tails cannot reorder
+  the pcode writes.
+
+* Suggested checks on first boot (mode 0)
+
+- =dmesg | grep -i 'missing case\|unclaimed\|LISPBSD SAGV\|underrun\|mismatch in WM'=
+- =hw.i915sagv= should show =written=0 writes=0=.  If it shows =commits=
+  growing and no warnings, mode 0 is behaving.
+
+* Resolutions (2026-10-17, author of the patch)
+
+- M0-1 :: Accepted as upstream behaviour, not changed (no effect with the eDP
+  panel alone).  Noted in README Risks.
+- M0-2 :: Resolved.  =gen7_check_mailbox_status()= takes the original command.
+  The gen11 statuses 0x4/0x6/0x11 map to -ENXIO/-EBUSY/-EACCES *only* for
+  =ICL_PCODE_SAGV_DE_MEM_SS_CONFIG= (0xe, the QGV request this port adds).
+  All other pcode callers fall through to the old =MISSING_CASE=, success
+  path, so they behave exactly as before (intel_sideband.c).
+- M0-3 :: Accepted (read-only).  README test step 6 now also greps for
+  =missing case= and =unclaimed=.
+- M1-0 :: Resolved as suggested.  The stock "every point" rule applies only
+  while =!lispbsd_sagv.mask_written=.  After any mask the upstream
+  max-point rule applies (intel_bw.c).
+- M1-1 :: Resolved by porting.  New =skl_plane_wm.sagv_trans_wm=, computed by
+  =skl_compute_transition_wm()= (now from a given wm0 into a given level)
+  from =sagv_wm0=.  It is programmed through =skl_plane_trans_wm()= (SAGV
+  trans when =use_sagv_wm=) in the plane and cursor writers and compared in
+  =skl_plane_selected_wm_equals()=.  On hardware readout it is set to
+  =trans_wm=.  =verify_wm_state()= accepts either one.
+  In =skl_allocate_pipe_ddb()=, =sagv_wm0= (=min_ddb_alloc > total=) and
+  =sagv_trans_wm= (=res_b >= total=, the 5.6 trans rule) are zeroed when they
+  do not fit.  =tgl_crtc_can_enable_sagv()= skips disabled planes and refuses
+  SAGV unless =sagv_wm0= is still enabled and fits the plane's DDB.
+- M1-2 :: Resolved.  =ICL_PCODE_POINTS_RESTRICTED_MASK= is now 0x3 (expected
+  reply 0), so a rejected (2) request times out, returns an error and is
+  counted in =errors=.
+- D-1 :: Resolved.  The boot log and =hw.i915sagv= print DCLK in MHz,
+  converted as upstream does (=DIV_ROUND_UP(16667*raw + 500, 1000)= on gen12).
+  The boot log also shows the raw value.  The README diagnostics section and
+  test steps 1 and 3 are corrected.
+- D-2 :: Resolved.  =hw.i915sagv= prints =mask=none= while the committed mode
+  is 0.
+- L-1 :: Resolved.  =num_points < 2= means not-controlled.  =num_channels == 0=
+  is now treated as a failed read (no limit, not-controlled), which also
+  removes the division by zero.
+- L-2 :: Accepted, noted in README Risks.
+- P-1 :: Nothing was written to /root/nanobsd.  README "Import list" names
+  the 2 new files, the 8 modified files already in the overlay and the 11
+  modified files not yet in it.
+- Rebuild :: GENERIC rebuilt from scratch in /build/agent-sagv (-Werror).
+  =sagv.diff= was regenerated and checked: =patch -p1= on a copy of
+  /root/lispbsd reproduces all 21 files.
+
+* Round 2 re-review (2026-10-17, reviewer)
+
+Scope: the delta in intel_sideband.c, i915_reg.h, intel_pm.c, intel_bw.c,
+intel_display.c and intel_display_types.h, checked against /root/lispbsd/sys
+by reading the code.
+
+** Mode 0: watermarks programmed are bit-identical to stock — CONFIRMED
+- =skl_write_plane_wm()= and =skl_write_cursor_wm()= choose the level through
+  =skl_plane_wm_level()= and =skl_plane_trans_wm()=.  Both return the plain
+  =wm[level]= and =trans_wm= while =use_sagv_wm= is false.  It is false in
+  mode 0 and after hardware readout.
+- =trans_wm= comes from the same =skl_compute_transition_wm()= code, now
+  called with =&wm->wm[0]=.  The early returns are the same (gen <= 9, no
+  IPC), and so is the drop rule in =skl_allocate_pipe_ddb()=.
+- The new =sagv_wm0= and =sagv_trans_wm= fields are written only to
+  themselves.  They take no part in the DDB sizing: the new block in
+  =skl_allocate_pipe_ddb()= only clears these two fields.
+
+** Mode 0: no new checker warnings, no extra plane reprogramming — CONFIRMED
+- In mode 0, =skl_plane_selected_wm_equals()= compares =wm[0..7]= and
+  =trans_wm=, the same as stock =skl_plane_wm_equals()= minus =uv_wm=.  The
+  hardware never uses =uv_wm=, so the new code can only add *fewer* planes.
+- =skl_pipe_wm_equals()= (linetime, =dirty_pipes=) does not look at the SAGV
+  fields.
+- =verify_wm_state()= now accepts *either* value (plain or SAGV) for wm0 and
+  the transition watermark.  It can only warn less than before.  The one
+  downside: in mode 0 it would no longer flag hardware that wrongly holds the
+  SAGV value.
+- The SAGV fields therefore cannot cause plane writes in the 30 Hz seamless /
+  slow-watermark commits.
+- Still true from M0-1: =pipe_sagv_reject= is computed in mode 0.  If a
+  60<->30 Hz switch makes a plane's SAGV wm0 fit or stop fitting, that commit
+  takes every crtc lock.  This is locking only; no registers are written.
+
+** M0-2 fix: every non-QGV pcode caller behaves as before — CONFIRMED
+- The outer switch in =gen7_check_mailbox_status()= is back to the stock
+  cases.
+- The gen11 codes are mapped only when the command's low byte is 0xe, which
+  is =ICL_PCODE_SAGV_DE_MEM_SS_CONFIG=.  =cmd= is captured before =mbox=
+  is overwritten by the reply.
+- No other pcode command in this tree has low byte 0xe (checked i915_reg.h
+  and every caller).
+- Mode 0 never sends 0xe.
+
+** R2-1  A rejected QGV request now stalls about 51 ms with preemption off — CONFIRMED (code path), mode 1/2 only, low
+- With the 0x3 reply mask, a reply of 2 ("rejected") never matches, so
+  =skl_pcode_request()= polls for 1 ms, then spins with
+  =wait_for_atomic(…, 50)= under =preempt_disable=, and returns
+  =-ETIMEDOUT=.
+- This is the same as later upstream, and it is now counted in =errors=.
+- Failure scenario: if the firmware keeps rejecting (for example it locks
+  QGV), every mask change costs about 51 ms in the commit tail before the
+  plane update.  That shows as a visible hitch at each SAGV toggle.  If
+  =errors= grows, use mode 2 or 0.
+
+** R2-2  =mask_written= is set even when the write failed — PLAUSIBLE, low
+- The M1-0 fix relaxes the mode 0 rule after any write
+  (=!mask_written=), and =icl_pcode_restrict_qgv_points()= sets
+  =mask_written= before it checks =ret=.
+- Failure scenario: the 1->0 pin fails, the firmware keeps roaming, and the
+  relaxed max-point rule then accepts a configuration that a low point cannot
+  carry.  This needs a high-bandwidth external display, so it cannot happen
+  on the eDP panel alone.
+- Fix: set a separate =pinned= flag only when =ret == 0=.
+
+** Mode 1 sanity — OK
+- =tgl_crtc_can_enable_sagv()= skips planes with =!wm[0].plane_en= and
+  requires =sagv_wm0.plane_en=, which matches later upstream.
+- =sagv_wm0= and =sagv_trans_wm= are cleared when they do not fit the DDB.
+- The checker accepts the SAGV values, and readout copies the plain
+  watermarks into the SAGV fields.
+- A rejected =sagv_wm0= (=plane_res_b= 0) makes the u16 =wm0_sel_res_b=
+  wrap when the SAGV transition watermark is computed, so it can come out
+  small and enabled.  It is never programmed, because SAGV is then refused
+  for that crtc.  Stock =trans_wm= has the same wrap.
+
+Verdict: mode 0 is safe to boot.  The two new items affect only modes 1 and 2
+and are minor.
+
+** Resolved (author, 2026-10-17)
+- R2-2 :: Resolved.  New =lispbsd_sagv.pinned=, set only when the
+  highest-point pin on a stock<->managed transition returns 0 from the pcode.
+  The mode-0 "every point" rule in =intel_bw_atomic_check()= now keys on
+  =!pinned= instead of =!mask_written=, so a failed pin keeps the firmware
+  rule.  =hw.i915sagv= shows =pinned==.  Incremental -Werror rebuild in
+  /build/agent-sagv: exit 0, 0 warnings.  =sagv.diff= was regenerated and
+  reproduces all 21 files.
+- R2-1 :: Accepted as upstream behaviour.  README test plan: if =errors=
+  grows, use mode 2 or 0.

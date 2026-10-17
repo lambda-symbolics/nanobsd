@@ -1,0 +1,2534 @@
+--- a/sys/external/bsd/drm2/dist/drm/i915/display/intel_atomic.c
++++ b/sys/external/bsd/drm2/dist/drm/i915/display/intel_atomic.c
+@@ -41,6 +41,7 @@
+ 
+ #include "intel_atomic.h"
+ #include "intel_display_types.h"
++#include "intel_global_state.h"
+ #include "intel_hdcp.h"
+ #include "intel_psr.h"
+ #include "intel_sprite.h"
+@@ -502,10 +503,23 @@
+ 	return &state->base;
+ }
+ 
++void intel_atomic_state_free(struct drm_atomic_state *_state)
++{
++	struct intel_atomic_state *state = to_intel_atomic_state(_state);
++
++	drm_atomic_state_default_release(&state->base);
++	kfree(state->global_objs);
++
++	i915_sw_fence_fini(&state->commit_ready);
++
++	kfree(state);
++}
++
+ void intel_atomic_state_clear(struct drm_atomic_state *s)
+ {
+ 	struct intel_atomic_state *state = to_intel_atomic_state(s);
+ 	drm_atomic_state_default_clear(&state->base);
++	intel_atomic_clear_global_state(state);
+ 	state->dpll_set = state->modeset = false;
+ 	state->global_state_changed = false;
+ 	state->active_pipes = 0;
+@@ -528,7 +542,7 @@
+ 	return to_intel_crtc_state(crtc_state);
+ }
+ 
+-int intel_atomic_lock_global_state(struct intel_atomic_state *state)
++int _intel_atomic_lock_global_state(struct intel_atomic_state *state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
+ 	struct intel_crtc *crtc;
+@@ -547,7 +561,7 @@
+ 	return 0;
+ }
+ 
+-int intel_atomic_serialize_global_state(struct intel_atomic_state *state)
++int _intel_atomic_serialize_global_state(struct intel_atomic_state *state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
+ 	struct intel_crtc *crtc;
+--- a/sys/external/bsd/drm2/dist/drm/i915/display/intel_atomic.h
++++ b/sys/external/bsd/drm2/dist/drm/i915/display/intel_atomic.h
+@@ -47,6 +47,7 @@
+ void intel_crtc_free_hw_state(struct intel_crtc_state *crtc_state);
+ void intel_crtc_copy_color_blobs(struct intel_crtc_state *crtc_state);
+ struct drm_atomic_state *intel_atomic_state_alloc(struct drm_device *dev);
++void intel_atomic_state_free(struct drm_atomic_state *state);
+ void intel_atomic_state_clear(struct drm_atomic_state *state);
+ 
+ struct intel_crtc_state *
+@@ -57,9 +58,9 @@
+ 			       struct intel_crtc *intel_crtc,
+ 			       struct intel_crtc_state *crtc_state);
+ 
+-int intel_atomic_lock_global_state(struct intel_atomic_state *state);
++int _intel_atomic_lock_global_state(struct intel_atomic_state *state);
+ 
+-int intel_atomic_serialize_global_state(struct intel_atomic_state *state);
++int _intel_atomic_serialize_global_state(struct intel_atomic_state *state);
+ 
+ #include "i915_sw_fence.h"
+ int __i915_sw_fence_call
+--- a/sys/external/bsd/drm2/dist/drm/i915/display/intel_audio.c
++++ b/sys/external/bsd/drm2/dist/drm/i915/display/intel_audio.c
+@@ -827,7 +827,7 @@
+ 		enable ? 2 * 96000 : 0;
+ 
+ 	/* Protects dev_priv->cdclk.force_min_cdclk */
+-	ret = intel_atomic_lock_global_state(to_intel_atomic_state(state));
++	ret = _intel_atomic_lock_global_state(to_intel_atomic_state(state));
+ 	if (!ret)
+ 		ret = drm_atomic_commit(state);
+ 
+--- a/sys/external/bsd/drm2/dist/drm/i915/display/intel_bw.c
++++ b/sys/external/bsd/drm2/dist/drm/i915/display/intel_bw.c
+@@ -13,6 +13,9 @@
+ #include "intel_bw.h"
+ #include "intel_display_types.h"
+ #include "intel_sideband.h"
++#include "intel_atomic.h"
++#include "intel_pm.h"
++
+ 
+ /* Parameters for Qclk Geyserville (QGV) */
+ struct intel_qgv_point {
+@@ -37,6 +40,8 @@
+ 				     ICL_PCODE_MEM_SUBSYSYSTEM_INFO |
+ 				     ICL_PCODE_MEM_SS_READ_GLOBAL_INFO,
+ 				     &val, NULL);
++	dev_priv->lispbsd_sagv.global_ret = ret;
++	dev_priv->lispbsd_sagv.global_raw = val;
+ 	if (ret)
+ 		return ret;
+ 
+@@ -103,6 +108,11 @@
+ 				     ICL_PCODE_MEM_SUBSYSYSTEM_INFO |
+ 				     ICL_PCODE_MEM_SS_READ_QGV_POINT_INFO(point),
+ 				     &val, &val2);
++	if (point < I915_NUM_QGV_POINTS) {
++		dev_priv->lispbsd_sagv.qgv_ret[point] = ret;
++		dev_priv->lispbsd_sagv.qgv_raw[point][0] = val;
++		dev_priv->lispbsd_sagv.qgv_raw[point][1] = val2;
++	}
+ 	if (ret)
+ 		return ret;
+ 
+@@ -118,6 +128,35 @@
+ 	return 0;
+ }
+ 
++int icl_pcode_restrict_qgv_points(struct drm_i915_private *dev_priv,
++				  u32 points_mask)
++{
++	int ret;
++
++	/* bspec says to keep retrying for at least 1 ms */
++	ret = skl_pcode_request(dev_priv, ICL_PCODE_SAGV_DE_MEM_SS_CONFIG,
++				points_mask,
++				ICL_PCODE_POINTS_RESTRICTED_MASK,
++				ICL_PCODE_POINTS_RESTRICTED,
++				1);
++
++	/* LISPBSD: hw.i915sagv */
++	dev_priv->lispbsd_sagv.mask_written = true;
++	dev_priv->lispbsd_sagv.last_mask = points_mask;
++	dev_priv->lispbsd_sagv.last_ret = ret;
++	dev_priv->lispbsd_sagv.writes++;
++	if (ret < 0)
++		dev_priv->lispbsd_sagv.errors++;
++	DRM_DEBUG_KMS("LISPBSD SAGV: QGV mask 0x%x -> %d\n", points_mask, ret);
++
++	if (ret < 0) {
++		drm_err(&dev_priv->drm, "Failed to disable qgv points (%d)\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
+ static int icl_get_qgv_points(struct drm_i915_private *dev_priv,
+ 			      struct intel_qgv_info *qi)
+ {
+@@ -191,11 +230,26 @@
+ 	int i, ret;
+ 
+ 	ret = icl_get_qgv_points(dev_priv, &qi);
++	dev_priv->lispbsd_sagv.num_points = qi.num_points;
++	dev_priv->lispbsd_sagv.num_channels = qi.num_channels;
++	dev_priv->lispbsd_sagv.t_bl = qi.t_bl;
++	dev_priv->lispbsd_sagv.dram_type = qi.dram_type;
+ 	if (ret) {
+ 		DRM_DEBUG_KMS("Failed to get memory subsystem information, ignoring bandwidth limits");
++		/*
++		 * LISPBSD: no QGV points to restrict or to check against;
++		 * never send SAGV/QGV requests then.
++		 */
++		dev_priv->sagv_status = I915_SAGV_NOT_CONTROLLED;
+ 		return ret;
+ 	}
+ 	num_channels = qi.num_channels;
++	/* LISPBSD: the divisions below need channels (pre-existing hole) */
++	if (num_channels == 0) {
++		DRM_DEBUG_KMS("No memory channels reported, ignoring bandwidth limits\n");
++		dev_priv->sagv_status = I915_SAGV_NOT_CONTROLLED;
++		return -EINVAL;
++	}
+ 
+ 	deinterleave = DIV_ROUND_UP(num_channels, is_y_tile ? 4 : 2);
+ 	dclk_max = icl_sagv_max_dclk(&qi);
+@@ -241,6 +295,16 @@
+ 			break;
+ 	}
+ 
++	/*
++	 * In case if SAGV is disabled in BIOS, we always get 1
++	 * SAGV point, but we can't send PCode commands to restrict it
++	 * as it will fail and pointless anyway.
++	 */
++	if (qi.num_points < 2)	/* LISPBSD: also 0 points (upstream: == 1) */
++		dev_priv->sagv_status = I915_SAGV_NOT_CONTROLLED;
++	else
++		dev_priv->sagv_status = I915_SAGV_ENABLED;
++
+ 	return 0;
+ }
+ 
+@@ -249,6 +313,11 @@
+ {
+ 	int i;
+ 
++	/*
++	 * Let's return max bw for 0 planes
++	 */
++	num_planes = max(1, num_planes);
++
+ 	for (i = 0; i < ARRAY_SIZE(dev_priv->max_bw); i++) {
+ 		const struct intel_bw_info *bi =
+ 			&dev_priv->max_bw[i];
+@@ -267,8 +336,133 @@
+ 	return 0;
+ }
+ 
++/*
++ * LISPBSD: memory clock registers in the MCHBAR mirror.  MC_BIOS_REQ/DATA
++ * are the SKL+ "BIOS request" pair (the low bits hold the requested QCLK
++ * ratio); SA_PERF_STATUS is the current system agent operating point, laid
++ * out as on DG1 (a TGL derivative): bits 9:2 QCLK ratio, bit 10 reference
++ * (0 = 133.33 MHz, 1 = 100 MHz).  Only the raw values are certain on TGL.
++ */
++#define LISPBSD_MC_BIOS_REQ	_MMIO(MCHBAR_MIRROR_BASE_SNB + 0x5e00)
++#define LISPBSD_MC_BIOS_DATA	_MMIO(MCHBAR_MIRROR_BASE_SNB + 0x5e04)
++#define LISPBSD_SA_PERF_STATUS	_MMIO(MCHBAR_MIRROR_BASE_SNB + 0x5918)
++
++/*
++ * LISPBSD: the pcode gives a QGV point's DCLK in multiples of 16.667 MHz
++ * (icl_calc_bw() works on the raw value); later upstream converts it with
++ * DIV_ROUND_UP(16667 * dclk + (gen > 11 ? 500 : 0), 1000).
++ */
++static unsigned int lispbsd_dclk_mhz(struct drm_i915_private *dev_priv,
++				     u32 raw)
++{
++	return DIV_ROUND_UP(16667 * (raw & 0xffff) +
++			    (INTEL_GEN(dev_priv) > 11 ? 500 : 0), 1000);
++}
++
++static unsigned int lispbsd_qclk_mhz(u32 sa_perf)
++{
++	unsigned int ratio = (sa_perf >> 2) & 0xff;
++
++	return (sa_perf & (1 << 10)) ? ratio * 100 : ratio * 13333 / 100;
++}
++
++static const char *lispbsd_sagv_status_str(int status)
++{
++	switch (status) {
++	case I915_SAGV_UNKNOWN:		return "unknown";
++	case I915_SAGV_DISABLED:	return "disabled";
++	case I915_SAGV_ENABLED:		return "enabled";
++	case I915_SAGV_NOT_CONTROLLED:	return "not-controlled";
++	default:			return "?";
++	}
++}
++
++static const char *lispbsd_dram_str(int type)
++{
++	switch (type) {
++	case INTEL_DRAM_DDR3:	return "DDR3";
++	case INTEL_DRAM_DDR4:	return "DDR4";
++	case INTEL_DRAM_LPDDR3:	return "LPDDR3";
++	case INTEL_DRAM_LPDDR4:	return "LPDDR4";
++	default:		return "unknown";
++	}
++}
++
++/*
++ * LISPBSD: the text behind hw.i915sagv.  Everything but the live memory
++ * clock registers is a snapshot taken at init or in the commit tail; @live
++ * is false when the caller knows the device must not be touched.
++ */
++int intel_bw_lispbsd_sagv_report(struct drm_i915_private *dev_priv,
++				 char *buf, size_t len, bool live)
++{
++	const struct intel_bw_info *bi = &dev_priv->max_bw[0];
++	size_t off = 0;
++	int i;
++
++#define LISPBSD_P(...) do {						\
++	if (off < len)							\
++		off += snprintf(buf + off, len - off, __VA_ARGS__);	\
++} while (0)
++
++	LISPBSD_P("mode=%d applied=%u sagv_allowed=%d status=%s block_us=%d"
++	    " block_ret=%d",
++	    i915_modparams.lispbsd_sagv, dev_priv->lispbsd_sagv.mode,
++	    dev_priv->lispbsd_sagv.sagv_allowed,
++	    lispbsd_sagv_status_str(dev_priv->sagv_status),
++	    (int)dev_priv->sagv_block_time_us,
++	    dev_priv->lispbsd_sagv.block_time_ret);
++	/* LISPBSD: the stock mode computes a mask but never sends it */
++	if (dev_priv->lispbsd_sagv.mode == LISPBSD_SAGV_STOCK)
++		LISPBSD_P(" mask=none");
++	else
++		LISPBSD_P(" mask=0x%x", dev_priv->lispbsd_sagv.qgv_points_mask);
++	LISPBSD_P(" written=%d pinned=%d last=0x%x last_ret=%d writes=%u"
++	    " errors=%u commits=%u",
++	    dev_priv->lispbsd_sagv.mask_written,
++	    dev_priv->lispbsd_sagv.pinned,
++	    dev_priv->lispbsd_sagv.last_mask, dev_priv->lispbsd_sagv.last_ret,
++	    dev_priv->lispbsd_sagv.writes, dev_priv->lispbsd_sagv.errors,
++	    dev_priv->lispbsd_sagv.commits);
++	LISPBSD_P(" global=0x%x/%d dram=%s ch=%u tbl=%u points=%u",
++	    dev_priv->lispbsd_sagv.global_raw, dev_priv->lispbsd_sagv.global_ret,
++	    lispbsd_dram_str(dev_priv->lispbsd_sagv.dram_type),
++	    dev_priv->lispbsd_sagv.num_channels, dev_priv->lispbsd_sagv.t_bl,
++	    dev_priv->lispbsd_sagv.num_points);
++	for (i = 0; i < dev_priv->lispbsd_sagv.num_points &&
++		 i < I915_NUM_QGV_POINTS; i++) {
++		u32 val = dev_priv->lispbsd_sagv.qgv_raw[i][0];
++		u32 val2 = dev_priv->lispbsd_sagv.qgv_raw[i][1];
++
++		/* DCLK MHz, tRP tRCD tRDPRE tRAS, then MB/s for one plane */
++		LISPBSD_P(" qgv%d=%u/%u/%u/%u/%u/%u", i,
++		    lispbsd_dclk_mhz(dev_priv, val),
++		    (val >> 16) & 0xff, (val >> 24) & 0xff,
++		    val2 & 0xff, (val2 >> 8) & 0xff,
++		    i < bi->num_qgv_points ? icl_max_bw(dev_priv, 1, i) : 0);
++	}
++	LISPBSD_P(" wm_us=");
++	for (i = 0; i < ARRAY_SIZE(dev_priv->wm.skl_latency); i++)
++		LISPBSD_P("%s%u", i ? "," : "", dev_priv->wm.skl_latency[i]);
++	if (live) {
++		u32 req = I915_READ(LISPBSD_MC_BIOS_REQ);
++		u32 data = I915_READ(LISPBSD_MC_BIOS_DATA);
++		u32 sa = I915_READ(LISPBSD_SA_PERF_STATUS);
++
++		LISPBSD_P(" mc_req=0x%08x mc_data=0x%08x sa_perf=0x%08x"
++		    " qclk_mhz=%u", req, data, sa, lispbsd_qclk_mhz(sa));
++	} else {
++		LISPBSD_P(" live=off");
++	}
++#undef LISPBSD_P
++
++	return 0;
++}
++
+ void intel_bw_init_hw(struct drm_i915_private *dev_priv)
+ {
++	int i;
++
+ 	if (!HAS_DISPLAY(dev_priv))
+ 		return;
+ 
+@@ -276,33 +470,43 @@
+ 		icl_get_bw_info(dev_priv, &tgl_sa_info);
+ 	else if (IS_GEN(dev_priv, 11))
+ 		icl_get_bw_info(dev_priv, &icl_sa_info);
+-}
+-
+-static unsigned int intel_max_data_rate(struct drm_i915_private *dev_priv,
+-					int num_planes)
+-{
+-	if (INTEL_GEN(dev_priv) >= 11) {
+-		/*
+-		 * Any bw group has same amount of QGV points
+-		 */
+-		const struct intel_bw_info *bi =
+-			&dev_priv->max_bw[0];
+-		unsigned int min_bw = UINT_MAX;
+-		int i;
+-
+-		/*
+-		 * FIXME with SAGV disabled maybe we can assume
+-		 * point 1 will always be used? Seems to match
+-		 * the behaviour observed in the wild.
+-		 */
+-		for (i = 0; i < bi->num_qgv_points; i++) {
+-			unsigned int bw = icl_max_bw(dev_priv, num_planes, i);
++	else
++		return;
+ 
+-			min_bw = min(bw, min_bw);
+-		}
+-		return min_bw;
+-	} else {
+-		return UINT_MAX;
++	/*
++	 * LISPBSD: say what the firmware allows before the driver touches
++	 * anything (the SAGV switch is read at the first display updates).
++	 */
++	DRM_INFO("LISPBSD SAGV: pcode global info 0x%x (ret %d): %s, %u channels,"
++	    " %u QGV points, sagv_status %s\n",
++	    dev_priv->lispbsd_sagv.global_raw, dev_priv->lispbsd_sagv.global_ret,
++	    lispbsd_dram_str(dev_priv->lispbsd_sagv.dram_type),
++	    dev_priv->lispbsd_sagv.num_channels,
++	    dev_priv->lispbsd_sagv.num_points,
++	    lispbsd_sagv_status_str(dev_priv->sagv_status));
++	for (i = 0; i < dev_priv->lispbsd_sagv.num_points &&
++		 i < I915_NUM_QGV_POINTS; i++) {
++		u32 val = dev_priv->lispbsd_sagv.qgv_raw[i][0];
++		u32 val2 = dev_priv->lispbsd_sagv.qgv_raw[i][1];
++
++		DRM_INFO("LISPBSD SAGV: QGV %d: DCLK=%u MHz (raw %u x 16.667)"
++		    " tRP=%u tRCD=%u tRDPRE=%u tRAS=%u, %u MB/s for 1 plane"
++		    " (ret %d)\n", i,
++		    lispbsd_dclk_mhz(dev_priv, val), val & 0xffff,
++		    (val >> 16) & 0xff, (val >> 24) & 0xff,
++		    val2 & 0xff, (val2 >> 8) & 0xff,
++		    i < dev_priv->max_bw[0].num_qgv_points ?
++		    icl_max_bw(dev_priv, 1, i) : 0,
++		    dev_priv->lispbsd_sagv.qgv_ret[i]);
++	}
++	{
++		u32 req = I915_READ(LISPBSD_MC_BIOS_REQ);
++		u32 data = I915_READ(LISPBSD_MC_BIOS_DATA);
++		u32 sa = I915_READ(LISPBSD_SA_PERF_STATUS);
++
++		DRM_INFO("LISPBSD SAGV: MC_BIOS_REQ 0x%08x MC_BIOS_DATA 0x%08x"
++		    " SA_PERF_STATUS 0x%08x (QCLK %u MHz if DG1 layout)\n",
++		    req, data, sa, lispbsd_qclk_mhz(sa));
+ 	}
+ }
+ 
+@@ -375,14 +579,35 @@
+ 	return data_rate;
+ }
+ 
+-static struct intel_bw_state *
++struct intel_bw_state *
++intel_atomic_get_old_bw_state(struct intel_atomic_state *state)
++{
++	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++	struct intel_global_state *bw_state;
++
++	bw_state = intel_atomic_get_old_global_obj_state(state, &dev_priv->bw_obj);
++
++	return to_intel_bw_state(bw_state);
++}
++
++struct intel_bw_state *
++intel_atomic_get_new_bw_state(struct intel_atomic_state *state)
++{
++	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++	struct intel_global_state *bw_state;
++
++	bw_state = intel_atomic_get_new_global_obj_state(state, &dev_priv->bw_obj);
++
++	return to_intel_bw_state(bw_state);
++}
++
++struct intel_bw_state *
+ intel_atomic_get_bw_state(struct intel_atomic_state *state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
+-	struct drm_private_state *bw_state;
++	struct intel_global_state *bw_state;
+ 
+-	bw_state = drm_atomic_get_private_obj_state(&state->base,
+-						    &dev_priv->bw_obj);
++	bw_state = intel_atomic_get_global_obj_state(state, &dev_priv->bw_obj);
+ 	if (IS_ERR(bw_state))
+ 		return ERR_CAST(bw_state);
+ 
+@@ -393,16 +618,31 @@
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
+ 	struct intel_crtc_state *new_crtc_state, *old_crtc_state;
+-	struct intel_bw_state *bw_state = NULL;
+-	unsigned int data_rate, max_data_rate;
++	struct intel_bw_state *new_bw_state = NULL;
++	const struct intel_bw_state *old_bw_state = NULL;
++	unsigned int data_rate;
+ 	unsigned int num_active_planes;
+ 	struct intel_crtc *crtc;
+-	int i;
++	int i, ret;
++	u32 allowed_points = 0;
++	unsigned int max_bw_point = 0, max_bw = 0;
++	unsigned int num_qgv_points = dev_priv->max_bw[0].num_qgv_points;
++	u32 mask = (1 << num_qgv_points) - 1;
++	bool changed = false;
+ 
+ 	/* FIXME earlier gens need some checks too */
+ 	if (INTEL_GEN(dev_priv) < 11)
+ 		return 0;
+ 
++	/*
++	 * LISPBSD: without QGV information from the pcode (the read failed
++	 * at init) there is nothing to check against or to restrict; the
++	 * code before the SAGV series did not limit the bandwidth then
++	 * either, where this would reject every configuration.
++	 */
++	if (num_qgv_points == 0)
++		return 0;
++
+ 	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
+ 					    new_crtc_state, i) {
+ 		unsigned int old_data_rate =
+@@ -422,39 +662,135 @@
+ 		    old_active_planes == new_active_planes)
+ 			continue;
+ 
+-		bw_state  = intel_atomic_get_bw_state(state);
+-		if (IS_ERR(bw_state))
+-			return PTR_ERR(bw_state);
++		new_bw_state = intel_atomic_get_bw_state(state);
++		if (IS_ERR(new_bw_state))
++			return PTR_ERR(new_bw_state);
+ 
+-		bw_state->data_rate[crtc->pipe] = new_data_rate;
+-		bw_state->num_active_planes[crtc->pipe] = new_active_planes;
++		new_bw_state->data_rate[crtc->pipe] = new_data_rate;
++		new_bw_state->num_active_planes[crtc->pipe] = new_active_planes;
++
++		changed = true;
+ 
+ 		DRM_DEBUG_KMS("pipe %c data rate %u num active planes %u\n",
+ 			      pipe_name(crtc->pipe),
+-			      bw_state->data_rate[crtc->pipe],
+-			      bw_state->num_active_planes[crtc->pipe]);
++			      new_bw_state->data_rate[crtc->pipe],
++			      new_bw_state->num_active_planes[crtc->pipe]);
+ 	}
+ 
+-	if (!bw_state)
+-		return 0;
++	old_bw_state = intel_atomic_get_old_bw_state(state);
++	new_bw_state = intel_atomic_get_new_bw_state(state);
++
++	if (new_bw_state &&
++	    (intel_can_enable_sagv(dev_priv, old_bw_state) !=
++	     intel_can_enable_sagv(dev_priv, new_bw_state) ||
++	     /* LISPBSD: the SAGV switch changed */
++	     old_bw_state->lispbsd_sagv != new_bw_state->lispbsd_sagv))
++		changed = true;
+ 
+-	data_rate = intel_bw_data_rate(dev_priv, bw_state);
+-	num_active_planes = intel_bw_num_active_planes(dev_priv, bw_state);
++	/*
++	 * If none of our inputs (data rates, number of active
++	 * planes, SAGV yes/no) changed then nothing to do here.
++	 */
++	if (!changed)
++		return 0;
+ 
+-	max_data_rate = intel_max_data_rate(dev_priv, num_active_planes);
++	ret = intel_atomic_lock_global_state(&new_bw_state->base);
++	if (ret)
++		return ret;
+ 
++	data_rate = intel_bw_data_rate(dev_priv, new_bw_state);
+ 	data_rate = DIV_ROUND_UP(data_rate, 1000);
+ 
+-	if (data_rate > max_data_rate) {
+-		DRM_DEBUG_KMS("Bandwidth %u MB/s exceeds max available %d MB/s (%d active planes)\n",
+-			      data_rate, max_data_rate, num_active_planes);
++	num_active_planes = intel_bw_num_active_planes(dev_priv, new_bw_state);
++
++	for (i = 0; i < num_qgv_points; i++) {
++		unsigned int max_data_rate;
++
++		max_data_rate = icl_max_bw(dev_priv, num_active_planes, i);
++		/*
++		 * We need to know which qgv point gives us
++		 * maximum bandwidth in order to disable SAGV
++		 * if we find that we exceed SAGV block time
++		 * with watermarks. By that moment we already
++		 * have those, as it is calculated earlier in
++		 * intel_atomic_check,
++		 */
++		if (max_data_rate > max_bw) {
++			max_bw_point = i;
++			max_bw = max_data_rate;
++		}
++		if (max_data_rate >= data_rate)
++			allowed_points |= BIT(i);
++		drm_dbg_kms(&dev_priv->drm, "QGV point %d: max bw %d required %d\n",
++			    i, max_data_rate, data_rate);
++	}
++
++	/*
++	 * BSpec states that we always should have at least one allowed point
++	 * left, so if we couldn't - simply reject the configuration for obvious
++	 * reasons.
++	 */
++	if (allowed_points == 0) {
++		drm_dbg_kms(&dev_priv->drm, "No QGV points provide sufficient memory"
++			    " bandwidth %d for display configuration(%d active planes).\n",
++			    data_rate, num_active_planes);
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * LISPBSD: in the stock mode the driver restricts no QGV point and,
++	 * unless a pin to the highest bandwidth point succeeded, the
++	 * firmware may run the memory at any of them, so every point has
++	 * to carry the configuration (the check before the SAGV series).
++	 * After a successful pin (mode 1 or 2 was used and left for stock)
++	 * the upstream rule below is the right one; the stock rule would
++	 * make every commit fail on a configuration only that point carries.
++	 * A failed pin leaves the firmware in charge: keep the stock rule.
++	 */
++	if (INTEL_GEN(dev_priv) >= 12 &&
++	    new_bw_state->lispbsd_sagv == LISPBSD_SAGV_STOCK &&
++	    !READ_ONCE(dev_priv->lispbsd_sagv.pinned) &&
++	    allowed_points != mask) {
++		drm_dbg_kms(&dev_priv->drm, "Bandwidth %u MB/s exceeds max available"
++			    " on QGV points 0x%x (%d active planes)\n",
++			    data_rate, ~allowed_points & mask, num_active_planes);
++		return -EINVAL;
++	}
++
++	/* LISPBSD: what "SAGV off" means for this configuration */
++	new_bw_state->lispbsd_sagv_off_mask = ~BIT(max_bw_point) & mask;
++
++	/*
++	 * Leave only single point with highest bandwidth, if
++	 * we can't enable SAGV due to the increased memory latency it may
++	 * cause.
++	 */
++	if (!intel_can_enable_sagv(dev_priv, new_bw_state)) {
++		allowed_points = BIT(max_bw_point);
++		drm_dbg_kms(&dev_priv->drm, "No SAGV, using single QGV point %d\n",
++			    max_bw_point);
++	}
++	/*
++	 * We store the ones which need to be masked as that is what PCode
++	 * actually accepts as a parameter.
++	 */
++	new_bw_state->qgv_points_mask = ~allowed_points & mask;
++
++	/*
++	 * If the actual mask had changed we need to make sure that
++	 * the commits are serialized(in case this is a nomodeset, nonblocking)
++	 */
++	if (new_bw_state->qgv_points_mask != old_bw_state->qgv_points_mask) {
++		ret = intel_atomic_serialize_global_state(&new_bw_state->base);
++		if (ret)
++			return ret;
++	}
++
+ 	return 0;
+ }
+ 
+-static struct drm_private_state *intel_bw_duplicate_state(struct drm_private_obj *obj)
++static struct intel_global_state *
++intel_bw_duplicate_state(struct intel_global_obj *obj)
+ {
+ 	struct intel_bw_state *state;
+ 
+@@ -462,18 +798,16 @@
+ 	if (!state)
+ 		return NULL;
+ 
+-	__drm_atomic_helper_private_obj_duplicate_state(obj, &state->base);
+-
+ 	return &state->base;
+ }
+ 
+-static void intel_bw_destroy_state(struct drm_private_obj *obj,
+-				   struct drm_private_state *state)
++static void intel_bw_destroy_state(struct intel_global_obj *obj,
++				   struct intel_global_state *state)
+ {
+ 	kfree(state);
+ }
+ 
+-static const struct drm_private_state_funcs intel_bw_funcs = {
++static const struct intel_global_state_funcs intel_bw_funcs = {
+ 	.atomic_duplicate_state = intel_bw_duplicate_state,
+ 	.atomic_destroy_state = intel_bw_destroy_state,
+ };
+@@ -486,13 +820,8 @@
+ 	if (!state)
+ 		return -ENOMEM;
+ 
+-	drm_atomic_private_obj_init(&dev_priv->drm, &dev_priv->bw_obj,
+-				    &state->base, &intel_bw_funcs);
++	intel_atomic_global_obj_init(dev_priv, &dev_priv->bw_obj,
++				     &state->base, &intel_bw_funcs);
+ 
+ 	return 0;
+ }
+-
+-void intel_bw_cleanup(struct drm_i915_private *dev_priv)
+-{
+-	drm_atomic_private_obj_fini(&dev_priv->bw_obj);
+-}
+--- a/sys/external/bsd/drm2/dist/drm/i915/display/intel_bw.h
++++ b/sys/external/bsd/drm2/dist/drm/i915/display/intel_bw.h
+@@ -11,25 +11,67 @@
+ #include <drm/drm_atomic.h>
+ 
+ #include "intel_display.h"
++#include "intel_global_state.h"
+ 
+ struct drm_i915_private;
+ struct intel_atomic_state;
+ struct intel_crtc_state;
+ 
+ struct intel_bw_state {
+-	struct drm_private_state base;
++	struct intel_global_state base;
++
++	/*
++	 * Contains a bit mask, used to determine, whether correspondent
++	 * pipe allows SAGV or not.
++	 */
++	u8 pipe_sagv_reject;
++
++	/*
++	 * Current QGV points mask, which restricts
++	 * some particular SAGV states, not to confuse
++	 * with pipe_sagv_mask.
++	 */
++	u8 qgv_points_mask;
+ 
+ 	unsigned int data_rate[I915_MAX_PIPES];
+ 	u8 num_active_planes[I915_MAX_PIPES];
++
++	/* bitmask of active pipes */
++	u8 active_pipes;
++
++	/*
++	 * LISPBSD: hw.drm2.i915_modparams.lispbsd_sagv as sampled by
++	 * intel_compute_sagv_mask() for this state (gen12 only), and the
++	 * QGV mask that leaves only the highest bandwidth point.
++	 */
++	u8 lispbsd_sagv;
++	u8 lispbsd_sagv_off_mask;
+ };
+ 
++/* LISPBSD: values of lispbsd_sagv */
++#define LISPBSD_SAGV_STOCK	0	/* never touch SAGV/QGV, plain wm0 */
++#define LISPBSD_SAGV_AUTO	1	/* upstream TGL SAGV handling */
++#define LISPBSD_SAGV_OFF	2	/* managed, highest bandwidth point only */
++
+ #define to_intel_bw_state(x) container_of((x), struct intel_bw_state, base)
+ 
++struct intel_bw_state *
++intel_atomic_get_old_bw_state(struct intel_atomic_state *state);
++
++struct intel_bw_state *
++intel_atomic_get_new_bw_state(struct intel_atomic_state *state);
++
++struct intel_bw_state *
++intel_atomic_get_bw_state(struct intel_atomic_state *state);
++
+ void intel_bw_init_hw(struct drm_i915_private *dev_priv);
+ int intel_bw_init(struct drm_i915_private *dev_priv);
+-void intel_bw_cleanup(struct drm_i915_private *dev_priv);
+ int intel_bw_atomic_check(struct intel_atomic_state *state);
+ void intel_bw_crtc_update(struct intel_bw_state *bw_state,
+ 			  const struct intel_crtc_state *crtc_state);
++int icl_pcode_restrict_qgv_points(struct drm_i915_private *dev_priv,
++				  u32 points_mask);
++int intel_bw_lispbsd_sagv_report(struct drm_i915_private *dev_priv,
++				 char *buf, size_t len, bool live);
+ 
+ #endif /* __INTEL_BW_H__ */
+--- a/sys/external/bsd/drm2/dist/drm/i915/display/intel_cdclk.c
++++ b/sys/external/bsd/drm2/dist/drm/i915/display/intel_cdclk.c
+@@ -2066,7 +2066,7 @@
+ 
+ 		state->min_cdclk[i] = min_cdclk;
+ 
+-		ret = intel_atomic_lock_global_state(state);
++		ret = _intel_atomic_lock_global_state(state);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -2116,7 +2116,7 @@
+ 
+ 		state->min_voltage_level[i] = min_voltage_level;
+ 
+-		ret = intel_atomic_lock_global_state(state);
++		ret = _intel_atomic_lock_global_state(state);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -2372,12 +2372,12 @@
+ 		 * Also serialize commits across all crtcs
+ 		 * if the actual hw needs to be poked.
+ 		 */
+-		ret = intel_atomic_serialize_global_state(state);
++		ret = _intel_atomic_serialize_global_state(state);
+ 		if (ret)
+ 			return ret;
+ 	} else if (intel_cdclk_changed(&dev_priv->cdclk.logical,
+ 				       &state->cdclk.logical)) {
+-		ret = intel_atomic_lock_global_state(state);
++		ret = _intel_atomic_lock_global_state(state);
+ 		if (ret)
+ 			return ret;
+ 	} else {
+--- a/sys/external/bsd/drm2/dist/drm/i915/display/intel_display.c
++++ b/sys/external/bsd/drm2/dist/drm/i915/display/intel_display.c
+@@ -13821,7 +13821,9 @@
+ 		/* Watermarks */
+ 		for (level = 0; level <= max_level; level++) {
+ 			if (skl_wm_level_equals(&hw_plane_wm->wm[level],
+-						&sw_plane_wm->wm[level]))
++						&sw_plane_wm->wm[level]) ||
++			    (level == 0 && skl_wm_level_equals(&hw_plane_wm->wm[level],
++							       &sw_plane_wm->sagv_wm0)))
+ 				continue;
+ 
+ 			DRM_ERROR("mismatch in WM pipe %c plane %d level %d (expected e=%d b=%u l=%u, got e=%d b=%u l=%u)\n",
+@@ -13835,7 +13837,10 @@
+ 		}
+ 
+ 		if (!skl_wm_level_equals(&hw_plane_wm->trans_wm,
+-					 &sw_plane_wm->trans_wm)) {
++					 &sw_plane_wm->trans_wm) &&
++		    /* LISPBSD: or the SAGV one, like wm0 above */
++		    !skl_wm_level_equals(&hw_plane_wm->trans_wm,
++					 &sw_plane_wm->sagv_trans_wm)) {
+ 			DRM_ERROR("mismatch in trans WM pipe %c plane %d (expected e=%d b=%u l=%u, got e=%d b=%u l=%u)\n",
+ 				  pipe_name(pipe), plane + 1,
+ 				  sw_plane_wm->trans_wm.plane_en,
+@@ -13873,7 +13878,9 @@
+ 		/* Watermarks */
+ 		for (level = 0; level <= max_level; level++) {
+ 			if (skl_wm_level_equals(&hw_plane_wm->wm[level],
+-						&sw_plane_wm->wm[level]))
++						&sw_plane_wm->wm[level]) ||
++			    (level == 0 && skl_wm_level_equals(&hw_plane_wm->wm[level],
++							       &sw_plane_wm->sagv_wm0)))
+ 				continue;
+ 
+ 			DRM_ERROR("mismatch in WM pipe %c cursor level %d (expected e=%d b=%u l=%u, got e=%d b=%u l=%u)\n",
+@@ -13887,7 +13894,10 @@
+ 		}
+ 
+ 		if (!skl_wm_level_equals(&hw_plane_wm->trans_wm,
+-					 &sw_plane_wm->trans_wm)) {
++					 &sw_plane_wm->trans_wm) &&
++		    /* LISPBSD: or the SAGV one, like wm0 above */
++		    !skl_wm_level_equals(&hw_plane_wm->trans_wm,
++					 &sw_plane_wm->sagv_trans_wm)) {
+ 			DRM_ERROR("mismatch in trans WM pipe %c cursor (expected e=%d b=%u l=%u, got e=%d b=%u l=%u)\n",
+ 				  pipe_name(pipe),
+ 				  sw_plane_wm->trans_wm.plane_en,
+@@ -14311,35 +14321,41 @@
+ 	return 0;
+ }
+ 
++u8 intel_calc_active_pipes(struct intel_atomic_state *state,
++			   u8 active_pipes)
++{
++	const struct intel_crtc_state *crtc_state;
++	struct intel_crtc *crtc;
++	int i;
++
++	for_each_new_intel_crtc_in_state(state, crtc, crtc_state, i) {
++		if (crtc_state->hw.active)
++			active_pipes |= BIT(crtc->pipe);
++		else
++			active_pipes &= ~BIT(crtc->pipe);
++	}
++
++	return active_pipes;
++}
++
+ static int intel_modeset_checks(struct intel_atomic_state *state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
+-	struct intel_crtc_state *old_crtc_state, *new_crtc_state;
+-	struct intel_crtc *crtc;
+-	int ret, i;
++	int ret;
+ 
+ 	/* keep the current setting */
+ 	if (!state->cdclk.force_min_cdclk_changed)
+ 		state->cdclk.force_min_cdclk = dev_priv->cdclk.force_min_cdclk;
+ 
+ 	state->modeset = true;
+-	state->active_pipes = dev_priv->active_pipes;
++	state->active_pipes = intel_calc_active_pipes(state, dev_priv->active_pipes);
+ 	state->cdclk.logical = dev_priv->cdclk.logical;
+ 	state->cdclk.actual = dev_priv->cdclk.actual;
+ 
+-	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
+-					    new_crtc_state, i) {
+-		if (new_crtc_state->hw.active)
+-			state->active_pipes |= BIT(crtc->pipe);
+-		else
+-			state->active_pipes &= ~BIT(crtc->pipe);
+-
+-		if (old_crtc_state->hw.active != new_crtc_state->hw.active)
+-			state->active_pipe_changes |= BIT(crtc->pipe);
+-	}
++	state->active_pipe_changes = state->active_pipes ^ dev_priv->active_pipes;
+ 
+ 	if (state->active_pipe_changes) {
+-		ret = intel_atomic_lock_global_state(state);
++		ret = _intel_atomic_lock_global_state(state);
+ 		if (ret)
+ 			return ret;
+ 	}
+@@ -15426,16 +15442,11 @@
+ 						 &dev_priv->cdclk.actual,
+ 						 state->cdclk.pipe);
+ 
+-		/*
+-		 * SKL workaround: bspec recommends we disable the SAGV when we
+-		 * have more then one pipe enabled
+-		 */
+-		if (!intel_can_enable_sagv(state))
+-			intel_disable_sagv(dev_priv);
+-
+ 		intel_modeset_verify_disabled(dev_priv, state);
+ 	}
+ 
++	intel_sagv_pre_plane_update(state);
++
+ 	/* Complete the events for pipes that have now been disabled */
+ 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
+ 		bool modeset = needs_modeset(new_crtc_state);
+@@ -15526,8 +15537,7 @@
+ 	if (state->modeset)
+ 		intel_verify_planes(state);
+ 
+-	if (state->modeset && intel_can_enable_sagv(state))
+-		intel_enable_sagv(dev_priv);
++	intel_sagv_post_plane_update(state);
+ 
+ 	drm_atomic_helper_commit_hw_done(&state->base);
+ 
+@@ -15661,6 +15671,8 @@
+ 	ret = drm_atomic_helper_setup_commit(&state->base, nonblock);
+ 	if (!ret)
+ 		ret = drm_atomic_helper_swap_state(&state->base, true);
++	if (!ret)
++		intel_atomic_swap_global_state(state);
+ 
+ 	if (ret) {
+ 		i915_sw_fence_commit(&state->commit_ready);
+@@ -17140,17 +17152,6 @@
+ 	return fb;
+ }
+ 
+-static void intel_atomic_state_free(struct drm_atomic_state *state)
+-{
+-	struct intel_atomic_state *intel_state = to_intel_atomic_state(state);
+-
+-	drm_atomic_state_default_release(state);
+-
+-	i915_sw_fence_fini(&intel_state->commit_ready);
+-
+-	kfree(state);
+-}
+-
+ static enum drm_mode_status
+ intel_mode_valid(struct drm_device *dev,
+ 		 const struct drm_display_mode *mode)
+@@ -17592,6 +17593,7 @@
+ 	struct drm_mode_config *mode_config = &i915->drm.mode_config;
+ 
+ 	drm_mode_config_init(&i915->drm);
++	INIT_LIST_HEAD(&i915->global_obj_list);
+ 
+ 	mode_config->min_width = 0;
+ 	mode_config->min_height = 0;
+@@ -17633,6 +17635,12 @@
+ 	}
+ }
+ 
++static void intel_mode_config_cleanup(struct drm_i915_private *i915)
++{
++	intel_atomic_global_obj_cleanup(i915);
++	drm_mode_config_cleanup(&i915->drm);
++}
++
+ int intel_modeset_init(struct drm_i915_private *i915)
+ {
+ 	struct drm_device *dev = &i915->drm;
+@@ -17677,7 +17685,7 @@
+ 		for_each_pipe(i915, pipe) {
+ 			ret = intel_crtc_init(i915, pipe);
+ 			if (ret) {
+-				drm_mode_config_cleanup(dev);
++				intel_mode_config_cleanup(i915);
+ 				return ret;
+ 			}
+ 		}
+@@ -18630,7 +18638,7 @@
+ 
+ 	intel_hdcp_component_fini(i915);
+ 
+-	drm_mode_config_cleanup(&i915->drm);
++	intel_mode_config_cleanup(i915);
+ 
+ 	intel_overlay_cleanup(i915);
+ 
+@@ -18640,8 +18648,6 @@
+ 
+ 	intel_fbc_cleanup(i915);
+ 
+-	intel_bw_cleanup(i915);
+-
+ 	DRM_DESTROY_WAITQUEUE(&i915->atomic_commit_wq);
+ 	spin_lock_destroy(&i915->atomic_commit_lock);
+ 
+--- a/sys/external/bsd/drm2/dist/drm/i915/display/intel_display.h
++++ b/sys/external/bsd/drm2/dist/drm/i915/display/intel_display.h
+@@ -66,6 +66,7 @@
+ struct drm_plane;
+ struct drm_plane_state;
+ struct i915_ggtt_view;
++struct intel_atomic_state;
+ struct intel_crtc;
+ struct intel_crtc_state;
+ struct intel_digital_port;
+@@ -491,6 +492,8 @@
+ 			     ((connector) = to_intel_connector((__state)->base.connectors[__i].ptr), \
+ 			     (new_connector_state) = to_intel_digital_connector_state((__state)->base.connectors[__i].new_state), 1))
+ 
++u8 intel_calc_active_pipes(struct intel_atomic_state *state,
++			   u8 active_pipes);
+ void intel_link_compute_m_n(u16 bpp, int nlanes,
+ 			    int pixel_clock, int link_clock,
+ 			    struct intel_link_m_n *m_n,
+--- a/sys/external/bsd/drm2/dist/drm/i915/display/intel_display_types.h
++++ b/sys/external/bsd/drm2/dist/drm/i915/display/intel_display_types.h
+@@ -48,6 +48,7 @@
+ #include "i915_drv.h"
+ 
+ struct drm_printer;
++struct __intel_global_objs_state;
+ 
+ /*
+  * Display related stuff
+@@ -461,6 +462,9 @@
+ 
+ 	intel_wakeref_t wakeref;
+ 
++	struct __intel_global_objs_state *global_objs;
++	int num_global_objs;
++
+ 	struct {
+ 		/*
+ 		 * Logical state of cdclk (used for all scaling, watermark,
+@@ -673,12 +677,15 @@
+ 	struct skl_wm_level wm[8];
+ 	struct skl_wm_level uv_wm[8];
+ 	struct skl_wm_level trans_wm;
++	struct skl_wm_level sagv_wm0;
++	struct skl_wm_level sagv_trans_wm;	/* LISPBSD: later upstream */
+ 	bool is_planar;
+ };
+ 
+ struct skl_pipe_wm {
+ 	struct skl_plane_wm planes[I915_MAX_PLANES];
+ 	u32 linetime;
++	bool use_sagv_wm;
+ };
+ 
+ enum vlv_wm_level {
+--- a/sys/external/bsd/drm2/dist/drm/i915/display/intel_global_state.c
++++ b/sys/external/bsd/drm2/dist/drm/i915/display/intel_global_state.c
+@@ -0,0 +1,261 @@
++/*	$NetBSD$	*/
++
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright © 2020 Intel Corporation
++ */
++
++#include <sys/cdefs.h>
++__KERNEL_RCSID(0, "$NetBSD$");
++
++#include <linux/string.h>
++
++#include "i915_drv.h"
++#include "intel_atomic.h"
++#include "intel_display_types.h"
++#include "intel_global_state.h"
++
++static void __intel_atomic_global_state_free(struct kref *kref)
++{
++	struct intel_global_state *obj_state =
++		container_of(kref, struct intel_global_state, ref);
++	struct intel_global_obj *obj = obj_state->obj;
++
++	obj->funcs->atomic_destroy_state(obj, obj_state);
++}
++
++static void intel_atomic_global_state_put(struct intel_global_state *obj_state)
++{
++	kref_put(&obj_state->ref, __intel_atomic_global_state_free);
++}
++
++static struct intel_global_state *
++intel_atomic_global_state_get(struct intel_global_state *obj_state)
++{
++	kref_get(&obj_state->ref);
++
++	return obj_state;
++}
++
++void intel_atomic_global_obj_init(struct drm_i915_private *dev_priv,
++				  struct intel_global_obj *obj,
++				  struct intel_global_state *state,
++				  const struct intel_global_state_funcs *funcs)
++{
++	memset(obj, 0, sizeof(*obj));
++
++	state->obj = obj;
++
++	kref_init(&state->ref);
++
++	obj->state = state;
++	obj->funcs = funcs;
++	list_add_tail(&obj->head, &dev_priv->global_obj_list);
++}
++
++void intel_atomic_global_obj_cleanup(struct drm_i915_private *dev_priv)
++{
++	struct intel_global_obj *obj, *next;
++
++	list_for_each_entry_safe(obj, next, &dev_priv->global_obj_list, head) {
++		list_del(&obj->head);
++
++		WARN_ON(kref_read(&obj->state->ref) != 1);
++		intel_atomic_global_state_put(obj->state);
++	}
++}
++
++static void assert_global_state_write_locked(struct drm_i915_private *dev_priv)
++{
++	struct intel_crtc *crtc;
++
++	for_each_intel_crtc(&dev_priv->drm, crtc)
++		drm_modeset_lock_assert_held(&crtc->base.mutex);
++}
++
++static bool modeset_lock_is_held(struct drm_modeset_acquire_ctx *ctx,
++				 struct drm_modeset_lock *lock)
++{
++	struct drm_modeset_lock *l;
++
++	list_for_each_entry(l, &ctx->locked, head) {
++		if (lock == l)
++			return true;
++	}
++
++	return false;
++}
++
++static void assert_global_state_read_locked(struct intel_atomic_state *state)
++{
++	struct drm_modeset_acquire_ctx *ctx = state->base.acquire_ctx;
++	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++	struct intel_crtc *crtc;
++
++	for_each_intel_crtc(&dev_priv->drm, crtc) {
++		if (modeset_lock_is_held(ctx, &crtc->base.mutex))
++			return;
++	}
++
++	WARN(1, "Global state not read locked\n");
++}
++
++struct intel_global_state *
++intel_atomic_get_global_obj_state(struct intel_atomic_state *state,
++				  struct intel_global_obj *obj)
++{
++	int index, num_objs, i;
++	size_t size;
++	struct __intel_global_objs_state *arr;
++	struct intel_global_state *obj_state;
++
++	for (i = 0; i < state->num_global_objs; i++)
++		if (obj == state->global_objs[i].ptr)
++			return state->global_objs[i].state;
++
++	assert_global_state_read_locked(state);
++
++	num_objs = state->num_global_objs + 1;
++	size = sizeof(*state->global_objs) * num_objs;
++	arr = krealloc(state->global_objs, size, GFP_KERNEL);
++	if (!arr)
++		return ERR_PTR(-ENOMEM);
++
++	state->global_objs = arr;
++	index = state->num_global_objs;
++	memset(&state->global_objs[index], 0, sizeof(*state->global_objs));
++
++	obj_state = obj->funcs->atomic_duplicate_state(obj);
++	if (!obj_state)
++		return ERR_PTR(-ENOMEM);
++
++	obj_state->obj = obj;
++	obj_state->changed = false;
++
++	kref_init(&obj_state->ref);
++
++	state->global_objs[index].state = obj_state;
++	state->global_objs[index].old_state =
++		intel_atomic_global_state_get(obj->state);
++	state->global_objs[index].new_state = obj_state;
++	state->global_objs[index].ptr = obj;
++	obj_state->state = state;
++
++	state->num_global_objs = num_objs;
++
++	DRM_DEBUG_ATOMIC("Added new global object %p state %p to %p\n",
++			 obj, obj_state, state);
++
++	return obj_state;
++}
++
++struct intel_global_state *
++intel_atomic_get_old_global_obj_state(struct intel_atomic_state *state,
++				      struct intel_global_obj *obj)
++{
++	int i;
++
++	for (i = 0; i < state->num_global_objs; i++)
++		if (obj == state->global_objs[i].ptr)
++			return state->global_objs[i].old_state;
++
++	return NULL;
++}
++
++struct intel_global_state *
++intel_atomic_get_new_global_obj_state(struct intel_atomic_state *state,
++				      struct intel_global_obj *obj)
++{
++	int i;
++
++	for (i = 0; i < state->num_global_objs; i++)
++		if (obj == state->global_objs[i].ptr)
++			return state->global_objs[i].new_state;
++
++	return NULL;
++}
++
++void intel_atomic_swap_global_state(struct intel_atomic_state *state)
++{
++	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++	struct intel_global_state *old_obj_state, *new_obj_state;
++	struct intel_global_obj *obj;
++	int i;
++
++	for_each_oldnew_global_obj_in_state(state, obj, old_obj_state,
++					    new_obj_state, i) {
++		WARN_ON(obj->state != old_obj_state);
++
++		/*
++		 * If the new state wasn't modified (and properly
++		 * locked for write access) we throw it away.
++		 */
++		if (!new_obj_state->changed)
++			continue;
++
++		assert_global_state_write_locked(dev_priv);
++
++		old_obj_state->state = state;
++		new_obj_state->state = NULL;
++
++		state->global_objs[i].state = old_obj_state;
++
++		intel_atomic_global_state_put(obj->state);
++		obj->state = intel_atomic_global_state_get(new_obj_state);
++	}
++}
++
++void intel_atomic_clear_global_state(struct intel_atomic_state *state)
++{
++	int i;
++
++	for (i = 0; i < state->num_global_objs; i++) {
++		intel_atomic_global_state_put(state->global_objs[i].old_state);
++		intel_atomic_global_state_put(state->global_objs[i].new_state);
++
++		state->global_objs[i].ptr = NULL;
++		state->global_objs[i].state = NULL;
++		state->global_objs[i].old_state = NULL;
++		state->global_objs[i].new_state = NULL;
++	}
++	state->num_global_objs = 0;
++}
++
++int intel_atomic_lock_global_state(struct intel_global_state *obj_state)
++{
++	struct intel_atomic_state *state = obj_state->state;
++	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++	struct intel_crtc *crtc;
++
++	for_each_intel_crtc(&dev_priv->drm, crtc) {
++		int ret;
++
++		ret = drm_modeset_lock(&crtc->base.mutex,
++				       state->base.acquire_ctx);
++		if (ret)
++			return ret;
++	}
++
++	obj_state->changed = true;
++
++	return 0;
++}
++
++int intel_atomic_serialize_global_state(struct intel_global_state *obj_state)
++{
++	struct intel_atomic_state *state = obj_state->state;
++	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++	struct intel_crtc *crtc;
++
++	for_each_intel_crtc(&dev_priv->drm, crtc) {
++		struct intel_crtc_state *crtc_state;
++
++		crtc_state = intel_atomic_get_crtc_state(&state->base, crtc);
++		if (IS_ERR(crtc_state))
++			return PTR_ERR(crtc_state);
++	}
++
++	obj_state->changed = true;
++
++	return 0;
++}
+--- a/sys/external/bsd/drm2/dist/drm/i915/display/intel_global_state.h
++++ b/sys/external/bsd/drm2/dist/drm/i915/display/intel_global_state.h
+@@ -0,0 +1,92 @@
++/*	$NetBSD$	*/
++
++/* SPDX-License-Identifier: MIT */
++/*
++ * Copyright © 2020 Intel Corporation
++ */
++
++#ifndef __INTEL_GLOBAL_STATE_H__
++#define __INTEL_GLOBAL_STATE_H__
++
++#include <linux/kref.h>
++#include <linux/list.h>
++
++struct drm_i915_private;
++struct intel_atomic_state;
++struct intel_global_obj;
++struct intel_global_state;
++
++struct intel_global_state_funcs {
++	struct intel_global_state *(*atomic_duplicate_state)(struct intel_global_obj *obj);
++	void (*atomic_destroy_state)(struct intel_global_obj *obj,
++				     struct intel_global_state *state);
++};
++
++struct intel_global_obj {
++	struct list_head head;
++	struct intel_global_state *state;
++	const struct intel_global_state_funcs *funcs;
++};
++
++#define intel_for_each_global_obj(obj, dev_priv) \
++	list_for_each_entry(obj, &(dev_priv)->global_obj_list, head)
++
++#define for_each_new_global_obj_in_state(__state, obj, new_obj_state, __i) \
++	for ((__i) = 0; \
++	     (__i) < (__state)->num_global_objs && \
++		     ((obj) = (__state)->global_objs[__i].ptr, \
++		      (new_obj_state) = (__state)->global_objs[__i].new_state, 1); \
++	     (__i)++) \
++		for_each_if(obj)
++
++#define for_each_old_global_obj_in_state(__state, obj, new_obj_state, __i) \
++	for ((__i) = 0; \
++	     (__i) < (__state)->num_global_objs && \
++		     ((obj) = (__state)->global_objs[__i].ptr, \
++		      (new_obj_state) = (__state)->global_objs[__i].old_state, 1); \
++	     (__i)++) \
++		for_each_if(obj)
++
++#define for_each_oldnew_global_obj_in_state(__state, obj, old_obj_state, new_obj_state, __i) \
++	for ((__i) = 0; \
++	     (__i) < (__state)->num_global_objs && \
++		     ((obj) = (__state)->global_objs[__i].ptr, \
++		      (old_obj_state) = (__state)->global_objs[__i].old_state, \
++		      (new_obj_state) = (__state)->global_objs[__i].new_state, 1); \
++	     (__i)++) \
++		for_each_if(obj)
++
++struct intel_global_state {
++	struct intel_global_obj *obj;
++	struct intel_atomic_state *state;
++	struct kref ref;
++	bool changed;
++};
++
++struct __intel_global_objs_state {
++	struct intel_global_obj *ptr;
++	struct intel_global_state *state, *old_state, *new_state;
++};
++
++void intel_atomic_global_obj_init(struct drm_i915_private *dev_priv,
++				  struct intel_global_obj *obj,
++				  struct intel_global_state *state,
++				  const struct intel_global_state_funcs *funcs);
++void intel_atomic_global_obj_cleanup(struct drm_i915_private *dev_priv);
++
++struct intel_global_state *
++intel_atomic_get_global_obj_state(struct intel_atomic_state *state,
++				  struct intel_global_obj *obj);
++struct intel_global_state *
++intel_atomic_get_old_global_obj_state(struct intel_atomic_state *state,
++				      struct intel_global_obj *obj);
++struct intel_global_state *
++intel_atomic_get_new_global_obj_state(struct intel_atomic_state *state,
++				      struct intel_global_obj *obj);
++
++void intel_atomic_swap_global_state(struct intel_atomic_state *state);
++void intel_atomic_clear_global_state(struct intel_atomic_state *state);
++int intel_atomic_lock_global_state(struct intel_global_state *obj_state);
++int intel_atomic_serialize_global_state(struct intel_global_state *obj_state);
++
++#endif
+--- a/sys/external/bsd/drm2/dist/drm/i915/intel_pm.c
++++ b/sys/external/bsd/drm2/dist/drm/i915/intel_pm.c
+@@ -47,6 +47,7 @@
+ #include "i915_drv.h"
+ #include "i915_irq.h"
+ #include "i915_trace.h"
++#include "display/intel_bw.h"
+ #include "intel_pm.h"
+ #include "intel_sideband.h"
+ #ifndef __NetBSD__
+@@ -3687,10 +3688,6 @@
+ static bool
+ intel_has_sagv(struct drm_i915_private *dev_priv)
+ {
+-	/* HACK! */
+-	if (IS_GEN(dev_priv, 12))
+-		return false;
+-
+ 	return (IS_GEN9_BC(dev_priv) || INTEL_GEN(dev_priv) >= 10) &&
+ 		dev_priv->sagv_status != I915_SAGV_NOT_CONTROLLED;
+ }
+@@ -3705,6 +3702,10 @@
+ 		ret = sandybridge_pcode_read(dev_priv,
+ 					     GEN12_PCODE_READ_SAGV_BLOCK_TIME_US,
+ 					     &val, NULL);
++		/* LISPBSD: hw.i915sagv and the boot log */
++		dev_priv->lispbsd_sagv.block_time_ret = ret;
++		DRM_INFO("LISPBSD SAGV: block time %u us (pcode ret %d)\n",
++			 val, ret);
+ 		if (!ret) {
+ 			dev_priv->sagv_block_time_us = val;
+ 			return;
+@@ -3807,42 +3808,185 @@
+ 	return 0;
+ }
+ 
+-bool intel_can_enable_sagv(struct intel_atomic_state *state)
++/*
++ * LISPBSD: gen12 SAGV/QGV control is behind hw.drm2.i915_modparams.lispbsd_sagv
++ * (LISPBSD_SAGV_*), sampled into the bw state by intel_compute_sagv_mask().
++ * The stock mode sends no pcode request at all, as the driver did with the
++ * upstream gen12 "HACK" in intel_has_sagv().  When the mode changes to or
++ * from stock the QGV mask in the pcode is not the one the old state
++ * recorded (it is the firmware's, or the stock mode leaves it alone), so
++ * the commit first restricts the memory to the highest bandwidth point,
++ * which carries any configuration that passed intel_bw_atomic_check(), and
++ * only then unmasks what the new state allows.
++ */
++static bool intel_sagv_stock(const struct drm_i915_private *dev_priv,
++			     const struct intel_bw_state *bw_state)
+ {
+-	struct drm_device *dev = state->base.dev;
+-	struct drm_i915_private *dev_priv = to_i915(dev);
+-	struct intel_crtc *crtc;
+-	struct intel_plane *plane;
+-	struct intel_crtc_state *crtc_state;
+-	enum pipe pipe;
+-	int level, latency;
++	return INTEL_GEN(dev_priv) >= 12 &&
++		bw_state->lispbsd_sagv == LISPBSD_SAGV_STOCK;
++}
++
++static bool intel_sagv_stock_changed(const struct drm_i915_private *dev_priv,
++				     const struct intel_bw_state *old_bw_state,
++				     const struct intel_bw_state *new_bw_state)
++{
++	return intel_sagv_stock(dev_priv, old_bw_state) !=
++		intel_sagv_stock(dev_priv, new_bw_state);
++}
++
++void intel_sagv_pre_plane_update(struct intel_atomic_state *state)
++{
++	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++	const struct intel_bw_state *new_bw_state;
++	const struct intel_bw_state *old_bw_state;
++	u32 new_mask = 0;
+ 
++	/*
++	 * Just return if we can't control SAGV or don't have it.
++	 * This is different from situation when we have SAGV but just can't
++	 * afford it due to DBuf limitation - in case if SAGV is completely
++	 * disabled in a BIOS, we are not even allowed to send a PCode request,
++	 * as it will throw an error. So have to check it here.
++	 */
+ 	if (!intel_has_sagv(dev_priv))
+-		return false;
++		return;
++
++	new_bw_state = intel_atomic_get_new_bw_state(state);
++	if (!new_bw_state)
++		return;
++
++	if (INTEL_GEN(dev_priv) < 11 && !intel_can_enable_sagv(dev_priv, new_bw_state)) {
++		intel_disable_sagv(dev_priv);
++		return;
++	}
++
++	old_bw_state = intel_atomic_get_old_bw_state(state);
++
++	/* LISPBSD: see intel_sagv_stock() */
++	if (intel_sagv_stock_changed(dev_priv, old_bw_state, new_bw_state)) {
++		/*
++		 * Only a pin the pcode accepted takes the memory off the
++		 * firmware's QGV points (intel_bw_atomic_check() keys the
++		 * stock bandwidth rule on it).
++		 */
++		if (icl_pcode_restrict_qgv_points(dev_priv,
++				new_bw_state->lispbsd_sagv_off_mask) == 0)
++			WRITE_ONCE(dev_priv->lispbsd_sagv.pinned, true);
++		return;
++	}
++	if (intel_sagv_stock(dev_priv, new_bw_state))
++		return;
+ 
+ 	/*
+-	 * If there are no active CRTCs, no additional checks need be performed
++	 * Nothing to mask
+ 	 */
+-	if (hweight8(state->active_pipes) == 0)
+-		return true;
++	if (new_bw_state->qgv_points_mask == old_bw_state->qgv_points_mask)
++		return;
++
++	new_mask = old_bw_state->qgv_points_mask | new_bw_state->qgv_points_mask;
++
++	/*
++	 * If new mask is zero - means there is nothing to mask,
++	 * we can only unmask, which should be done in unmask.
++	 */
++	if (!new_mask)
++		return;
++
++	/*
++	 * Restrict required qgv points before updating the configuration.
++	 * According to BSpec we can't mask and unmask qgv points at the same
++	 * time. Also masking should be done before updating the configuration
++	 * and unmasking afterwards.
++	 */
++	icl_pcode_restrict_qgv_points(dev_priv, new_mask);
++}
++
++void intel_sagv_post_plane_update(struct intel_atomic_state *state)
++{
++	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++	const struct intel_bw_state *new_bw_state;
++	const struct intel_bw_state *old_bw_state;
++	u32 new_mask = 0;
++
++	new_bw_state = intel_atomic_get_new_bw_state(state);
++
++	/* LISPBSD: snapshot for hw.i915sagv */
++	if (new_bw_state) {
++		dev_priv->lispbsd_sagv.mode = new_bw_state->lispbsd_sagv;
++		dev_priv->lispbsd_sagv.sagv_allowed =
++			intel_can_enable_sagv(dev_priv, new_bw_state);
++		dev_priv->lispbsd_sagv.qgv_points_mask =
++			new_bw_state->qgv_points_mask;
++		dev_priv->lispbsd_sagv.commits++;
++	}
++
++	/*
++	 * Just return if we can't control SAGV or don't have it.
++	 * This is different from situation when we have SAGV but just can't
++	 * afford it due to DBuf limitation - in case if SAGV is completely
++	 * disabled in a BIOS, we are not even allowed to send a PCode request,
++	 * as it will throw an error. So have to check it here.
++	 */
++	if (!intel_has_sagv(dev_priv))
++		return;
++
++	if (!new_bw_state)
++		return;
++
++	if (INTEL_GEN(dev_priv) < 11 && intel_can_enable_sagv(dev_priv, new_bw_state)) {
++		intel_enable_sagv(dev_priv);
++		return;
++	}
++
++	old_bw_state = intel_atomic_get_old_bw_state(state);
++
++	/* LISPBSD: see intel_sagv_stock() */
++	if (intel_sagv_stock(dev_priv, new_bw_state))
++		return;
++	if (intel_sagv_stock_changed(dev_priv, old_bw_state, new_bw_state)) {
++		if (new_bw_state->qgv_points_mask !=
++		    new_bw_state->lispbsd_sagv_off_mask)
++			icl_pcode_restrict_qgv_points(dev_priv,
++						      new_bw_state->qgv_points_mask);
++		return;
++	}
++
++	/*
++	 * Nothing to unmask
++	 */
++	if (new_bw_state->qgv_points_mask == old_bw_state->qgv_points_mask)
++		return;
++
++	new_mask = new_bw_state->qgv_points_mask;
+ 
+ 	/*
+-	 * SKL+ workaround: bspec recommends we disable SAGV when we have
+-	 * more then one pipe enabled
++	 * Allow required qgv points after updating the configuration.
++	 * According to BSpec we can't mask and unmask qgv points at the same
++	 * time. Also masking should be done before updating the configuration
++	 * and unmasking afterwards.
+ 	 */
+-	if (hweight8(state->active_pipes) > 1)
++	icl_pcode_restrict_qgv_points(dev_priv, new_mask);
++}
++
++static bool skl_crtc_can_enable_sagv(const struct intel_crtc_state *crtc_state)
++{
++	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
++	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
++	struct intel_plane *plane;
++	const struct intel_plane_state *plane_state;
++	int level, latency;
++
++	if (!intel_has_sagv(dev_priv))
+ 		return false;
+ 
+-	/* Since we're now guaranteed to only have one active CRTC... */
+-	pipe = ffs(state->active_pipes) - 1;
+-	crtc = intel_get_crtc_for_pipe(dev_priv, pipe);
+-	crtc_state = to_intel_crtc_state(crtc->base.state);
++	if (!crtc_state->hw.active)
++		return true;
+ 
+ 	if (crtc_state->hw.adjusted_mode.flags & DRM_MODE_FLAG_INTERLACE)
+ 		return false;
+ 
+-	for_each_intel_plane_on_crtc(dev, crtc, plane) {
+-		struct skl_plane_wm *wm =
++	intel_atomic_crtc_state_for_each_plane_state(plane, plane_state, crtc_state) {
++		const struct skl_plane_wm *wm =
+ 			&crtc_state->wm.skl.optimal.planes[plane->id];
+ 
+ 		/* Skip this plane if it's not enabled */
+@@ -3857,7 +4001,7 @@
+ 		latency = dev_priv->wm.skl_latency[level];
+ 
+ 		if (skl_needs_memory_bw_wa(dev_priv) &&
+-		    plane->base.state->fb->modifier ==
++		    plane_state->uapi.fb->modifier ==
+ 		    I915_FORMAT_MOD_X_TILED)
+ 			latency += 15;
+ 
+@@ -3992,6 +4136,7 @@
+ 				 int color_plane);
+ static void skl_compute_plane_wm(const struct intel_crtc_state *crtc_state,
+ 				 int level,
++				 unsigned int latency,
+ 				 const struct skl_wm_params *wp,
+ 				 const struct skl_wm_level *result_prev,
+ 				 struct skl_wm_level *result /* out */);
+@@ -4014,7 +4159,9 @@
+ 	WARN_ON(ret);
+ 
+ 	for (level = 0; level <= max_level; level++) {
+-		skl_compute_plane_wm(crtc_state, level, &wp, &wm, &wm);
++		unsigned int latency = dev_priv->wm.skl_latency[level];
++
++		skl_compute_plane_wm(crtc_state, level, latency, &wp, &wm, &wm);
+ 		if (wm.min_ddb_alloc == U16_MAX)
+ 			break;
+ 
+@@ -4106,6 +4253,158 @@
+ 	ddb->enabled_slices = intel_enabled_dbuf_slices_num(dev_priv);
+ }
+ 
++static bool tgl_crtc_can_enable_sagv(const struct intel_crtc_state *crtc_state)
++{
++	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
++	enum plane_id plane_id;
++
++	if (!crtc_state->hw.active)
++		return true;
++
++	for_each_plane_id_on_crtc(crtc, plane_id) {
++		const struct skl_ddb_entry *plane_alloc =
++			&crtc_state->wm.skl.plane_ddb_y[plane_id];
++		const struct skl_plane_wm *wm =
++			&crtc_state->wm.skl.optimal.planes[plane_id];
++
++		/* LISPBSD: skip disabled planes, as later upstream */
++		if (!wm->wm[0].plane_en)
++			continue;
++
++		/*
++		 * LISPBSD: the SAGV wm0 must still be enabled after the DDB
++		 * allocation (later upstream) and fit the plane's DDB.
++		 */
++		if (!wm->sagv_wm0.plane_en ||
++		    skl_ddb_entry_size(plane_alloc) < wm->sagv_wm0.min_ddb_alloc)
++			return false;
++	}
++
++	return true;
++}
++
++static bool intel_crtc_can_enable_sagv(const struct intel_crtc_state *crtc_state)
++{
++	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
++	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
++
++	if (INTEL_GEN(dev_priv) >= 12)
++		return tgl_crtc_can_enable_sagv(crtc_state);
++	else
++		return skl_crtc_can_enable_sagv(crtc_state);
++}
++
++/*
++ * LISPBSD: a SAGV block time the SAGV watermark can use; 0 means no SAGV,
++ * and a failed pcode read leaves -1.
++ */
++static bool lispbsd_sagv_block_time_ok(const struct drm_i915_private *dev_priv)
++{
++	return dev_priv->sagv_block_time_us > 0 &&
++		dev_priv->sagv_block_time_us <= 1000;
++}
++
++bool intel_can_enable_sagv(struct drm_i915_private *dev_priv,
++			   const struct intel_bw_state *bw_state)
++{
++	/*
++	 * LISPBSD: on gen12 SAGV is only ever allowed in the
++	 * LISPBSD_SAGV_AUTO mode, and only when the pcode lets us control
++	 * it and gave a usable block time.
++	 */
++	if (INTEL_GEN(dev_priv) >= 12 &&
++	    (bw_state->lispbsd_sagv != LISPBSD_SAGV_AUTO ||
++	     !intel_has_sagv(dev_priv) ||
++	     !lispbsd_sagv_block_time_ok(dev_priv)))
++		return false;
++
++	if (INTEL_GEN(dev_priv) < 11 &&
++	    bw_state->active_pipes && !is_power_of_2(bw_state->active_pipes))
++		return false;
++
++	return bw_state->pipe_sagv_reject == 0;
++}
++
++static int intel_compute_sagv_mask(struct intel_atomic_state *state)
++{
++	struct drm_i915_private *dev_priv = to_i915(state->base.dev);
++	int ret;
++	struct intel_crtc *crtc;
++	struct intel_crtc_state *new_crtc_state;
++	struct intel_bw_state *new_bw_state = NULL;
++	const struct intel_bw_state *old_bw_state = NULL;
++	int i;
++	/* LISPBSD: one value of the switch for the whole commit */
++	u8 mode = clamp(READ_ONCE(i915_modparams.lispbsd_sagv),
++			LISPBSD_SAGV_STOCK, LISPBSD_SAGV_OFF);
++
++	for_each_new_intel_crtc_in_state(state, crtc,
++					 new_crtc_state, i) {
++		new_bw_state = intel_atomic_get_bw_state(state);
++		if (IS_ERR(new_bw_state))
++			return PTR_ERR(new_bw_state);
++
++		old_bw_state = intel_atomic_get_old_bw_state(state);
++
++		new_bw_state->lispbsd_sagv = mode;
++
++		if (intel_crtc_can_enable_sagv(new_crtc_state))
++			new_bw_state->pipe_sagv_reject &= ~BIT(crtc->pipe);
++		else
++			new_bw_state->pipe_sagv_reject |= BIT(crtc->pipe);
++	}
++
++	if (!new_bw_state)
++		return 0;
++
++	new_bw_state->active_pipes =
++		intel_calc_active_pipes(state, old_bw_state->active_pipes);
++
++	if (new_bw_state->active_pipes != old_bw_state->active_pipes) {
++		ret = intel_atomic_lock_global_state(&new_bw_state->base);
++		if (ret)
++			return ret;
++	}
++
++	/*
++	 * LISPBSD: a new SAGV mode is committed in order with the other
++	 * commits, and every pipe recomputes use_sagv_wm below.
++	 */
++	if (INTEL_GEN(dev_priv) >= 12 &&
++	    new_bw_state->lispbsd_sagv != old_bw_state->lispbsd_sagv) {
++		ret = intel_atomic_serialize_global_state(&new_bw_state->base);
++		if (ret)
++			return ret;
++	}
++
++	if (intel_can_enable_sagv(dev_priv, new_bw_state) !=
++	    intel_can_enable_sagv(dev_priv, old_bw_state)) {
++		ret = intel_atomic_serialize_global_state(&new_bw_state->base);
++		if (ret)
++			return ret;
++	} else if (new_bw_state->pipe_sagv_reject != old_bw_state->pipe_sagv_reject) {
++		ret = intel_atomic_lock_global_state(&new_bw_state->base);
++		if (ret)
++			return ret;
++	}
++
++	for_each_new_intel_crtc_in_state(state, crtc,
++					 new_crtc_state, i) {
++		struct skl_pipe_wm *pipe_wm = &new_crtc_state->wm.skl.optimal;
++
++		/*
++		 * We store use_sagv_wm in the crtc state rather than relying on
++		 * that bw state since we have no convenient way to get at the
++		 * latter from the plane commit hooks (especially in the legacy
++		 * cursor case)
++		 */
++		pipe_wm->use_sagv_wm = INTEL_GEN(dev_priv) >= 12 &&
++				       intel_can_enable_sagv(dev_priv, new_bw_state);
++	}
++
++	return 0;
++}
++
+ /*
+  * Determines the downscale amount of a plane for the purposes of watermark calculations.
+  * The bspec defines downscale amount as:
+@@ -4495,6 +4794,19 @@
+ 
+ 		if (wm->trans_wm.plane_res_b >= total[plane_id])
+ 			memset(&wm->trans_wm, 0, sizeof(wm->trans_wm));
++
++		/*
++		 * LISPBSD (later upstream skl_check_wm_level() on sagv.wm0
++		 * and sagv.trans_wm): drop the SAGV watermarks that do not
++		 * fit, tgl_crtc_can_enable_sagv() then refuses SAGV.
++		 */
++		if (INTEL_GEN(dev_priv) >= 12) {
++			if (wm->sagv_wm0.min_ddb_alloc > total[plane_id])
++				memset(&wm->sagv_wm0, 0, sizeof(wm->sagv_wm0));
++			if (wm->sagv_trans_wm.plane_res_b >= total[plane_id])
++				memset(&wm->sagv_trans_wm, 0,
++				       sizeof(wm->sagv_trans_wm));
++		}
+ 	}
+ 
+ 	return 0;
+@@ -4585,6 +4897,32 @@
+ 					    downscale_amount);
+ }
+ 
++static const struct skl_wm_level *
++skl_plane_wm_level(const struct skl_pipe_wm *pipe_wm,
++		   enum plane_id plane_id,
++		   int level)
++{
++	const struct skl_plane_wm *wm = &pipe_wm->planes[plane_id];
++
++	if (level == 0 && pipe_wm->use_sagv_wm)
++		return &wm->sagv_wm0;
++
++	return &wm->wm[level];
++}
++
++/* LISPBSD: the transition watermark to program (later upstream) */
++static const struct skl_wm_level *
++skl_plane_trans_wm(const struct skl_pipe_wm *pipe_wm,
++		   enum plane_id plane_id)
++{
++	const struct skl_plane_wm *wm = &pipe_wm->planes[plane_id];
++
++	if (pipe_wm->use_sagv_wm)
++		return &wm->sagv_trans_wm;
++
++	return &wm->trans_wm;
++}
++
+ static int
+ skl_compute_wm_params(const struct intel_crtc_state *crtc_state,
+ 		      int width, const struct drm_format_info *format,
+@@ -4711,12 +5049,12 @@
+ 
+ static void skl_compute_plane_wm(const struct intel_crtc_state *crtc_state,
+ 				 int level,
++				 unsigned int latency,
+ 				 const struct skl_wm_params *wp,
+ 				 const struct skl_wm_level *result_prev,
+ 				 struct skl_wm_level *result /* out */)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(crtc_state->uapi.crtc->dev);
+-	u32 latency = dev_priv->wm.skl_latency[level];
+ 	uint_fixed_16_16_t method1, method2;
+ 	uint_fixed_16_16_t selected_result;
+ 	u32 res_blocks, res_lines, min_ddb_alloc = 0;
+@@ -4845,9 +5183,10 @@
+ 
+ 	for (level = 0; level <= max_level; level++) {
+ 		struct skl_wm_level *result = &levels[level];
++		unsigned int latency = dev_priv->wm.skl_latency[level];
+ 
+-		skl_compute_plane_wm(crtc_state, level, wm_params,
+-				     result_prev, result);
++		skl_compute_plane_wm(crtc_state, level, latency,
++				     wm_params, result_prev, result);
+ 
+ 		result_prev = result;
+ 	}
+@@ -4871,9 +5210,38 @@
+ 	return linetime_wm;
+ }
+ 
++static void tgl_compute_sagv_wm(const struct intel_crtc_state *crtc_state,
++				const struct skl_wm_params *wm_params,
++				struct skl_plane_wm *plane_wm)
++{
++	struct drm_i915_private *dev_priv = to_i915(crtc_state->uapi.crtc->dev);
++	struct skl_wm_level *sagv_wm = &plane_wm->sagv_wm0;
++	struct skl_wm_level *levels = plane_wm->wm;
++	unsigned int latency = dev_priv->wm.skl_latency[0] + dev_priv->sagv_block_time_us;
++
++	/*
++	 * LISPBSD: no usable block time (the pcode read failed and left
++	 * -1, which would wrap the latency): SAGV stays off anyway, see
++	 * intel_can_enable_sagv(), so keep the plain wm0.
++	 */
++	if (!lispbsd_sagv_block_time_ok(dev_priv)) {
++		*sagv_wm = levels[0];
++		return;
++	}
++
++	skl_compute_plane_wm(crtc_state, 0, latency,
++			     wm_params, &levels[0],
++			     sagv_wm);
++}
++
++/*
++ * LISPBSD: computes @trans_wm from @wm0, so that TGL can also derive a SAGV
++ * transition watermark from the SAGV wm0 (later upstream sagv.trans_wm).
++ */
+ static void skl_compute_transition_wm(const struct intel_crtc_state *crtc_state,
+ 				      const struct skl_wm_params *wp,
+-				      struct skl_plane_wm *wm)
++				      const struct skl_wm_level *wm0,
++				      struct skl_wm_level *trans_wm)
+ {
+ 	struct drm_device *dev = crtc_state->uapi.crtc->dev;
+ 	const struct drm_i915_private *dev_priv = to_i915(dev);
+@@ -4905,7 +5273,7 @@
+ 	 * Result Blocks is Result Blocks minus 1 and it should work for the
+ 	 * current platforms.
+ 	 */
+-	wm0_sel_res_b = wm->wm[0].plane_res_b - 1;
++	wm0_sel_res_b = wm0->plane_res_b - 1;
+ 
+ 	if (wp->y_tiled) {
+ 		trans_y_tile_min =
+@@ -4926,14 +5294,16 @@
+ 	 * computing the DDB we'll come back and disable it if that
+ 	 * assumption turns out to be false.
+ 	 */
+-	wm->trans_wm.plane_res_b = res_blocks + 1;
+-	wm->trans_wm.plane_en = true;
++	trans_wm->plane_res_b = res_blocks + 1;
++	trans_wm->plane_en = true;
+ }
+ 
+ static int skl_build_plane_wm_single(struct intel_crtc_state *crtc_state,
+ 				     const struct intel_plane_state *plane_state,
+ 				     enum plane_id plane_id, int color_plane)
+ {
++	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
++	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ 	struct skl_plane_wm *wm = &crtc_state->wm.skl.optimal.planes[plane_id];
+ 	struct skl_wm_params wm_params;
+ 	int ret;
+@@ -4944,7 +5314,17 @@
+ 		return ret;
+ 
+ 	skl_compute_wm_levels(crtc_state, &wm_params, wm->wm);
+-	skl_compute_transition_wm(crtc_state, &wm_params, wm);
++
++	skl_compute_transition_wm(crtc_state, &wm_params,
++				  &wm->wm[0], &wm->trans_wm);
++
++	if (INTEL_GEN(dev_priv) >= 12) {
++		tgl_compute_sagv_wm(crtc_state, &wm_params, wm);
++
++		/* LISPBSD: SAGV transition watermark, as later upstream */
++		skl_compute_transition_wm(crtc_state, &wm_params,
++					  &wm->sagv_wm0, &wm->sagv_trans_wm);
++	}
+ 
+ 	return 0;
+ }
+@@ -5096,19 +5476,19 @@
+ 	int level, max_level = ilk_wm_max_level(dev_priv);
+ 	enum plane_id plane_id = plane->id;
+ 	enum pipe pipe = plane->pipe;
+-	const struct skl_plane_wm *wm =
+-		&crtc_state->wm.skl.optimal.planes[plane_id];
++	const struct skl_pipe_wm *pipe_wm = &crtc_state->wm.skl.optimal;
++	const struct skl_plane_wm *wm = &pipe_wm->planes[plane_id];
+ 	const struct skl_ddb_entry *ddb_y =
+ 		&crtc_state->wm.skl.plane_ddb_y[plane_id];
+ 	const struct skl_ddb_entry *ddb_uv =
+ 		&crtc_state->wm.skl.plane_ddb_uv[plane_id];
+ 
+-	for (level = 0; level <= max_level; level++) {
++	for (level = 0; level <= max_level; level++)
+ 		skl_write_wm_level(dev_priv, PLANE_WM(pipe, plane_id, level),
+-				   &wm->wm[level]);
+-	}
++				   skl_plane_wm_level(pipe_wm, plane_id, level));
++
+ 	skl_write_wm_level(dev_priv, PLANE_WM_TRANS(pipe, plane_id),
+-			   &wm->trans_wm);
++			   skl_plane_trans_wm(pipe_wm, plane_id));
+ 
+ 	if (INTEL_GEN(dev_priv) >= 11) {
+ 		skl_ddb_entry_write(dev_priv,
+@@ -5132,16 +5512,16 @@
+ 	int level, max_level = ilk_wm_max_level(dev_priv);
+ 	enum plane_id plane_id = plane->id;
+ 	enum pipe pipe = plane->pipe;
+-	const struct skl_plane_wm *wm =
+-		&crtc_state->wm.skl.optimal.planes[plane_id];
++	const struct skl_pipe_wm *pipe_wm = &crtc_state->wm.skl.optimal;
+ 	const struct skl_ddb_entry *ddb =
+ 		&crtc_state->wm.skl.plane_ddb_y[plane_id];
+ 
+-	for (level = 0; level <= max_level; level++) {
++	for (level = 0; level <= max_level; level++)
+ 		skl_write_wm_level(dev_priv, CUR_WM(pipe, level),
+-				   &wm->wm[level]);
+-	}
+-	skl_write_wm_level(dev_priv, CUR_WM_TRANS(pipe), &wm->trans_wm);
++				   skl_plane_wm_level(pipe_wm, plane_id, level));
++
++	skl_write_wm_level(dev_priv, CUR_WM_TRANS(pipe),
++			   skl_plane_trans_wm(pipe_wm, plane_id));
+ 
+ 	skl_ddb_entry_write(dev_priv, CUR_BUF_CFG(pipe), ddb);
+ }
+@@ -5162,8 +5542,12 @@
+ 	int level, max_level = ilk_wm_max_level(dev_priv);
+ 
+ 	for (level = 0; level <= max_level; level++) {
+-		if (!skl_wm_level_equals(&wm1->wm[level], &wm2->wm[level]) ||
+-		    !skl_wm_level_equals(&wm1->uv_wm[level], &wm2->uv_wm[level]))
++		/*
++		 * We don't check uv_wm as the hardware doesn't actually
++		 * use it. It only gets used for calculating the required
++		 * ddb allocation.
++		 */
++		if (!skl_wm_level_equals(&wm1->wm[level], &wm2->wm[level]))
+ 			return false;
+ 	}
+ 
+@@ -5317,23 +5701,25 @@
+ 				continue;
+ 
+ 			drm_dbg_kms(&dev_priv->drm,
+-				    "[PLANE:%d:%s]   level %cwm0,%cwm1,%cwm2,%cwm3,%cwm4,%cwm5,%cwm6,%cwm7,%ctwm"
+-				    " -> %cwm0,%cwm1,%cwm2,%cwm3,%cwm4,%cwm5,%cwm6,%cwm7,%ctwm\n",
++				    "[PLANE:%d:%s]   level %cwm0,%cwm1,%cwm2,%cwm3,%cwm4,%cwm5,%cwm6,%cwm7,%ctwm,%cswm"
++				    " -> %cwm0,%cwm1,%cwm2,%cwm3,%cwm4,%cwm5,%cwm6,%cwm7,%ctwm,%cswm\n",
+ 				    plane->base.base.id, plane->base.name,
+ 				    enast(old_wm->wm[0].plane_en), enast(old_wm->wm[1].plane_en),
+ 				    enast(old_wm->wm[2].plane_en), enast(old_wm->wm[3].plane_en),
+ 				    enast(old_wm->wm[4].plane_en), enast(old_wm->wm[5].plane_en),
+ 				    enast(old_wm->wm[6].plane_en), enast(old_wm->wm[7].plane_en),
+ 				    enast(old_wm->trans_wm.plane_en),
++				    enast(old_wm->sagv_wm0.plane_en),
+ 				    enast(new_wm->wm[0].plane_en), enast(new_wm->wm[1].plane_en),
+ 				    enast(new_wm->wm[2].plane_en), enast(new_wm->wm[3].plane_en),
+ 				    enast(new_wm->wm[4].plane_en), enast(new_wm->wm[5].plane_en),
+ 				    enast(new_wm->wm[6].plane_en), enast(new_wm->wm[7].plane_en),
+-				    enast(new_wm->trans_wm.plane_en));
++				    enast(new_wm->trans_wm.plane_en),
++				    enast(new_wm->sagv_wm0.plane_en));
+ 
+ 			drm_dbg_kms(&dev_priv->drm,
+-				    "[PLANE:%d:%s]   lines %c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d"
+-				      " -> %c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d\n",
++				    "[PLANE:%d:%s]   lines %c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d"
++				      " -> %c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d,%c%3d\n",
+ 				    plane->base.base.id, plane->base.name,
+ 				    enast(old_wm->wm[0].ignore_lines), old_wm->wm[0].plane_res_l,
+ 				    enast(old_wm->wm[1].ignore_lines), old_wm->wm[1].plane_res_l,
+@@ -5344,6 +5730,7 @@
+ 				    enast(old_wm->wm[6].ignore_lines), old_wm->wm[6].plane_res_l,
+ 				    enast(old_wm->wm[7].ignore_lines), old_wm->wm[7].plane_res_l,
+ 				    enast(old_wm->trans_wm.ignore_lines), old_wm->trans_wm.plane_res_l,
++				    enast(old_wm->sagv_wm0.ignore_lines), old_wm->sagv_wm0.plane_res_l,
+ 
+ 				    enast(new_wm->wm[0].ignore_lines), new_wm->wm[0].plane_res_l,
+ 				    enast(new_wm->wm[1].ignore_lines), new_wm->wm[1].plane_res_l,
+@@ -5353,37 +5740,42 @@
+ 				    enast(new_wm->wm[5].ignore_lines), new_wm->wm[5].plane_res_l,
+ 				    enast(new_wm->wm[6].ignore_lines), new_wm->wm[6].plane_res_l,
+ 				    enast(new_wm->wm[7].ignore_lines), new_wm->wm[7].plane_res_l,
+-				    enast(new_wm->trans_wm.ignore_lines), new_wm->trans_wm.plane_res_l);
++				    enast(new_wm->trans_wm.ignore_lines), new_wm->trans_wm.plane_res_l,
++				    enast(new_wm->sagv_wm0.ignore_lines), new_wm->sagv_wm0.plane_res_l);
+ 
+ 			drm_dbg_kms(&dev_priv->drm,
+-				    "[PLANE:%d:%s]  blocks %4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d"
+-				    " -> %4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d\n",
++				    "[PLANE:%d:%s]  blocks %4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d"
++				    " -> %4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d\n",
+ 				    plane->base.base.id, plane->base.name,
+ 				    old_wm->wm[0].plane_res_b, old_wm->wm[1].plane_res_b,
+ 				    old_wm->wm[2].plane_res_b, old_wm->wm[3].plane_res_b,
+ 				    old_wm->wm[4].plane_res_b, old_wm->wm[5].plane_res_b,
+ 				    old_wm->wm[6].plane_res_b, old_wm->wm[7].plane_res_b,
+ 				    old_wm->trans_wm.plane_res_b,
++				    old_wm->sagv_wm0.plane_res_b,
+ 				    new_wm->wm[0].plane_res_b, new_wm->wm[1].plane_res_b,
+ 				    new_wm->wm[2].plane_res_b, new_wm->wm[3].plane_res_b,
+ 				    new_wm->wm[4].plane_res_b, new_wm->wm[5].plane_res_b,
+ 				    new_wm->wm[6].plane_res_b, new_wm->wm[7].plane_res_b,
+-				    new_wm->trans_wm.plane_res_b);
++				    new_wm->trans_wm.plane_res_b,
++				    new_wm->sagv_wm0.plane_res_b);
+ 
+ 			drm_dbg_kms(&dev_priv->drm,
+-				    "[PLANE:%d:%s] min_ddb %4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d"
+-				    " -> %4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d\n",
++				    "[PLANE:%d:%s] min_ddb %4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d"
++				    " -> %4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d,%4d\n",
+ 				    plane->base.base.id, plane->base.name,
+ 				    old_wm->wm[0].min_ddb_alloc, old_wm->wm[1].min_ddb_alloc,
+ 				    old_wm->wm[2].min_ddb_alloc, old_wm->wm[3].min_ddb_alloc,
+ 				    old_wm->wm[4].min_ddb_alloc, old_wm->wm[5].min_ddb_alloc,
+ 				    old_wm->wm[6].min_ddb_alloc, old_wm->wm[7].min_ddb_alloc,
+ 				    old_wm->trans_wm.min_ddb_alloc,
++				    old_wm->sagv_wm0.min_ddb_alloc,
+ 				    new_wm->wm[0].min_ddb_alloc, new_wm->wm[1].min_ddb_alloc,
+ 				    new_wm->wm[2].min_ddb_alloc, new_wm->wm[3].min_ddb_alloc,
+ 				    new_wm->wm[4].min_ddb_alloc, new_wm->wm[5].min_ddb_alloc,
+ 				    new_wm->wm[6].min_ddb_alloc, new_wm->wm[7].min_ddb_alloc,
+-				    new_wm->trans_wm.min_ddb_alloc);
++				    new_wm->trans_wm.min_ddb_alloc,
++				    new_wm->sagv_wm0.min_ddb_alloc);
+ 		}
+ 	}
+ }
+@@ -5458,6 +5850,28 @@
+ 	return 0;
+ }
+ 
++static bool skl_plane_selected_wm_equals(struct intel_plane *plane,
++					 const struct skl_pipe_wm *old_pipe_wm,
++					 const struct skl_pipe_wm *new_pipe_wm)
++{
++	struct drm_i915_private *i915 = to_i915(plane->base.dev);
++	int level, max_level = ilk_wm_max_level(i915);
++
++	for (level = 0; level <= max_level; level++) {
++		/*
++		 * We don't check uv_wm as the hardware doesn't actually
++		 * use it. It only gets used for calculating the required
++		 * ddb allocation.
++		 */
++		if (!skl_wm_level_equals(skl_plane_wm_level(old_pipe_wm, plane->id, level),
++					 skl_plane_wm_level(new_pipe_wm, plane->id, level)))
++			return false;
++	}
++
++	return skl_wm_level_equals(skl_plane_trans_wm(old_pipe_wm, plane->id),
++				   skl_plane_trans_wm(new_pipe_wm, plane->id));
++}
++
+ /*
+  * To make sure the cursor watermark registers are always consistent
+  * with our computed state the following scenario needs special
+@@ -5503,9 +5917,9 @@
+ 		 * with the software state.
+ 		 */
+ 		if (!drm_atomic_crtc_needs_modeset(&new_crtc_state->uapi) &&
+-		    skl_plane_wm_equals(dev_priv,
+-					&old_crtc_state->wm.skl.optimal.planes[plane_id],
+-					&new_crtc_state->wm.skl.optimal.planes[plane_id]))
++		    skl_plane_selected_wm_equals(plane,
++						 &old_crtc_state->wm.skl.optimal,
++						 &new_crtc_state->wm.skl.optimal))
+ 			continue;
+ 
+ 		plane_state = intel_atomic_get_plane_state(state, plane);
+@@ -5545,7 +5959,23 @@
+ 		ret = skl_build_pipe_wm(new_crtc_state);
+ 		if (ret)
+ 			return ret;
++	}
+ 
++	ret = skl_compute_ddb(state);
++	if (ret)
++		return ret;
++
++	ret = intel_compute_sagv_mask(state);
++	if (ret)
++		return ret;
++
++	/*
++	 * skl_compute_ddb() will have adjusted the final watermarks
++	 * based on how much ddb is available. Now we can actually
++	 * check if the final watermarks changed.
++	 */
++	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
++					    new_crtc_state, i) {
+ 		ret = skl_wm_add_affected_planes(state, crtc);
+ 		if (ret)
+ 			return ret;
+@@ -5556,10 +5986,6 @@
+ 			results->dirty_pipes |= BIT(crtc->pipe);
+ 	}
+ 
+-	ret = skl_compute_ddb(state);
+-	if (ret)
+-		return ret;
+-
+ 	skl_print_wm_changes(state);
+ 
+ 	return 0;
+@@ -5711,12 +6137,19 @@
+ 			skl_wm_level_from_reg_val(val, &wm->wm[level]);
+ 		}
+ 
++		if (INTEL_GEN(dev_priv) >= 12)
++			wm->sagv_wm0 = wm->wm[0];
++
+ 		if (plane_id != PLANE_CURSOR)
+ 			val = I915_READ(PLANE_WM_TRANS(pipe, plane_id));
+ 		else
+ 			val = I915_READ(CUR_WM_TRANS(pipe));
+ 
+ 		skl_wm_level_from_reg_val(val, &wm->trans_wm);
++
++		/* LISPBSD: as later upstream */
++		if (INTEL_GEN(dev_priv) >= 12)
++			wm->sagv_trans_wm = wm->trans_wm;
+ 	}
+ 
+ 	if (!crtc->active)
+--- a/sys/external/bsd/drm2/dist/drm/i915/intel_pm.h
++++ b/sys/external/bsd/drm2/dist/drm/i915/intel_pm.h
+@@ -11,6 +11,7 @@
+ #include <linux/types.h>
+ 
+ #include "i915_reg.h"
++#include "display/intel_bw.h"
+ 
+ struct drm_device;
+ struct drm_i915_private;
+@@ -44,9 +45,12 @@
+ 			      struct skl_pipe_wm *out);
+ void g4x_wm_sanitize(struct drm_i915_private *dev_priv);
+ void vlv_wm_sanitize(struct drm_i915_private *dev_priv);
+-bool intel_can_enable_sagv(struct intel_atomic_state *state);
++bool intel_can_enable_sagv(struct drm_i915_private *dev_priv,
++			   const struct intel_bw_state *bw_state);
+ int intel_enable_sagv(struct drm_i915_private *dev_priv);
+ int intel_disable_sagv(struct drm_i915_private *dev_priv);
++void intel_sagv_pre_plane_update(struct intel_atomic_state *state);
++void intel_sagv_post_plane_update(struct intel_atomic_state *state);
+ bool skl_wm_level_equals(const struct skl_wm_level *l1,
+ 			 const struct skl_wm_level *l2);
+ bool skl_ddb_allocation_overlaps(const struct skl_ddb_entry *ddb,
+--- a/sys/external/bsd/drm2/dist/drm/i915/intel_sideband.c
++++ b/sys/external/bsd/drm2/dist/drm/i915/intel_sideband.c
+@@ -359,7 +359,7 @@
+ 	}
+ }
+ 
+-static inline int gen7_check_mailbox_status(u32 mbox)
++static inline int gen7_check_mailbox_status(u32 mbox, u32 cmd)
+ {
+ 	switch (mbox & GEN6_PCODE_ERROR_MASK) {
+ 	case GEN6_PCODE_SUCCESS:
+@@ -373,6 +373,23 @@
+ 	case GEN7_PCODE_MIN_FREQ_TABLE_GT_RATIO_OUT_OF_RANGE:
+ 		return -EOVERFLOW;
+ 	default:
++		/*
++		 * LISPBSD: the gen11 status codes (upstream f22fd334890e,
++		 * f136c58a0de9) are errors only for the QGV restriction
++		 * request the SAGV port adds; every other pcode caller keeps
++		 * the old handling of an unknown status (warn, success).
++		 */
++		if ((cmd & GEN6_PCODE_ERROR_MASK) ==
++		    ICL_PCODE_SAGV_DE_MEM_SS_CONFIG) {
++			switch (mbox & GEN6_PCODE_ERROR_MASK) {
++			case GEN11_PCODE_ILLEGAL_SUBCOMMAND:
++				return -ENXIO;
++			case GEN11_PCODE_LOCKED:
++				return -EBUSY;
++			case GEN11_PCODE_REJECTED:
++				return -EACCES;
++			}
++		}
+ 		MISSING_CASE(mbox & GEN6_PCODE_ERROR_MASK);
+ 		return 0;
+ 	}
+@@ -385,6 +402,7 @@
+ 				  bool is_read)
+ {
+ 	struct intel_uncore *uncore = &i915->uncore;
++	const u32 cmd = mbox;	/* LISPBSD: mbox is reused for the reply */
+ 
+ 	lockdep_assert_held(&i915->sb_lock);
+ 
+@@ -416,7 +434,7 @@
+ 		*val1 = intel_uncore_read_fw(uncore, GEN6_PCODE_DATA1);
+ 
+ 	if (INTEL_GEN(i915) > 6)
+-		return gen7_check_mailbox_status(mbox);
++		return gen7_check_mailbox_status(mbox, cmd);
+ 	else
+ 		return gen6_check_mailbox_status(mbox);
+ }
+--- a/sys/external/bsd/drm2/dist/drm/i915/i915_drv.h
++++ b/sys/external/bsd/drm2/dist/drm/i915/i915_drv.h
+@@ -74,6 +74,7 @@
+ #include "display/intel_dpll_mgr.h"
+ #include "display/intel_dsb.h"
+ #include "display/intel_frontbuffer.h"
++#include "display/intel_global_state.h"
+ #include "display/intel_gmbus.h"
+ #include "display/intel_opregion.h"
+ 
+@@ -1100,6 +1101,8 @@
+ 	struct intel_shared_dpll shared_dplls[I915_NUM_PLLS];
+ 	const struct intel_dpll_mgr *dpll_mgr;
+ 
++	struct list_head global_obj_list;
++
+ 	/*
+ 	 * dpll_lock serializes intel_{prepare,enable,disable}_shared_dpll.
+ 	 * Must be global rather than per dpll, because on some platforms
+@@ -1192,6 +1195,31 @@
+ 
+ 	u32 sagv_block_time_us;
+ 
++	/*
++	 * LISPBSD: what the firmware reported about SAGV/QGV and what the
++	 * driver last did with it, for hw.i915sagv (read-only snapshot,
++	 * filled at init and in the commit tail).
++	 */
++	struct {
++		int global_ret;		/* pcode MEM_SS global info read */
++		u32 global_raw;
++		int block_time_ret;	/* pcode SAGV block time read */
++		u8 num_points;
++		u8 num_channels;
++		u8 t_bl;
++		u8 dram_type;		/* enum intel_dram_type */
++		u32 qgv_raw[I915_NUM_QGV_POINTS][2];	/* pcode val, val2 */
++		int qgv_ret[I915_NUM_QGV_POINTS];
++		u8 mode;		/* lispbsd_sagv of the committed state */
++		bool sagv_allowed;	/* intel_can_enable_sagv() of it */
++		u8 qgv_points_mask;	/* its QGV restriction mask */
++		bool mask_written;	/* did we ever send a QGV mask */
++		bool pinned;		/* a highest-point pin succeeded */
++		u8 last_mask;		/* last mask sent to the pcode */
++		int last_ret;		/* and its result */
++		unsigned int writes, errors, commits;
++	} lispbsd_sagv;
++
+ 	struct {
+ 		/*
+ 		 * Raw watermark latency values:
+@@ -1259,7 +1287,7 @@
+ 		u8 num_planes;
+ 	} max_bw[6];
+ 
+-	struct drm_private_obj bw_obj;
++	struct intel_global_obj bw_obj;
+ 
+ 	struct intel_runtime_pm runtime_pm;
+ 
+--- a/sys/external/bsd/drm2/dist/drm/i915/i915_params.c
++++ b/sys/external/bsd/drm2/dist/drm/i915/i915_params.c
+@@ -104,6 +104,13 @@
+ 	"Let idleness DRRS drop the eDP panel to its downclock refresh a "
+ 	"second after the last screen update (0=off, 1=on [default])");
+ 
++i915_param_named_unsafe(lispbsd_sagv, int, 0600,
++	"Gen12 display SAGV/QGV control, applied at the next display update "
++	"(0=stock: never touch SAGV, plain watermarks [default], "
++	"1=upstream TGL SAGV: allow the QGV points with enough bandwidth and "
++	"use the SAGV watermarks, 2=managed but SAGV off: pin the highest "
++	"bandwidth QGV point); see hw.i915sagv");
++
+ i915_param_named_unsafe(force_probe, charp, 0400,
+ 	"Force probe the driver for specified devices. "
+ 	"See CONFIG_DRM_I915_FORCE_PROBE for details.");
+--- a/sys/external/bsd/drm2/dist/drm/i915/i915_params.h
++++ b/sys/external/bsd/drm2/dist/drm/i915/i915_params.h
+@@ -55,6 +55,7 @@
+ 	param(int, enable_psr, -1) \
+ 	param(int, lispbsd_seamless_rr, 1) \
+ 	param(int, lispbsd_idle_drrs, 1) \
++	param(int, lispbsd_sagv, 0) \
+ 	param(int, disable_power_well, -1) \
+ 	param(int, enable_ips, 1) \
+ 	param(int, invert_brightness, 0) \
+--- a/sys/external/bsd/drm2/dist/drm/i915/i915_reg.h
++++ b/sys/external/bsd/drm2/dist/drm/i915/i915_reg.h
+@@ -8993,6 +8993,9 @@
+ #define     GEN6_PCODE_UNIMPLEMENTED_CMD	0xFF
+ #define     GEN7_PCODE_TIMEOUT			0x2
+ #define     GEN7_PCODE_ILLEGAL_DATA		0x3
++#define     GEN11_PCODE_ILLEGAL_SUBCOMMAND	0x4
++#define     GEN11_PCODE_LOCKED			0x6
++#define     GEN11_PCODE_REJECTED		0x11
+ #define     GEN7_PCODE_MIN_FREQ_TABLE_GT_RATIO_OUT_OF_RANGE 0x10
+ #define   GEN6_PCODE_WRITE_RC6VIDS		0x4
+ #define   GEN6_PCODE_READ_RC6VIDS		0x5
+@@ -9014,6 +9017,13 @@
+ #define   ICL_PCODE_MEM_SUBSYSYSTEM_INFO	0xd
+ #define     ICL_PCODE_MEM_SS_READ_GLOBAL_INFO	(0x0 << 8)
+ #define     ICL_PCODE_MEM_SS_READ_QGV_POINT_INFO(point)	(((point) << 16) | (0x1 << 8))
++#define   ICL_PCODE_SAGV_DE_MEM_SS_CONFIG	0xe
++#define     ICL_PCODE_POINTS_RESTRICTED		0x0
++/*
++ * LISPBSD: 2-bit reply as later upstream (ICL_PCODE_REP_QGV_MASK,
++ * 0 safe, 1 poll, 2 rejected); 5.8 used 0x1, which read "rejected" as done.
++ */
++#define     ICL_PCODE_POINTS_RESTRICTED_MASK	0x3
+ #define   GEN6_PCODE_READ_D_COMP		0x10
+ #define   GEN6_PCODE_WRITE_D_COMP		0x11
+ #define   HSW_PCODE_DE_WRITE_FREQ_REQ		0x17
+--- a/sys/external/bsd/drm2/i915drm/files.i915drmkms
++++ b/sys/external/bsd/drm2/i915drm/files.i915drmkms
+@@ -117,6 +117,7 @@
+ file	external/bsd/drm2/dist/drm/i915/display/intel_fbdev.c	i915drmkms
+ file	external/bsd/drm2/dist/drm/i915/display/intel_fifo_underrun.c	i915drmkms
+ file	external/bsd/drm2/dist/drm/i915/display/intel_frontbuffer.c	i915drmkms
++file	external/bsd/drm2/dist/drm/i915/display/intel_global_state.c	i915drmkms
+ file	external/bsd/drm2/dist/drm/i915/display/intel_gmbus.c	i915drmkms
+ file	external/bsd/drm2/dist/drm/i915/display/intel_hdcp.c	i915drmkms
+ file	external/bsd/drm2/dist/drm/i915/display/intel_hdmi.c	i915drmkms
+--- a/sys/external/bsd/drm2/i915drm/i915_pci_autoconf.c
++++ b/sys/external/bsd/drm2/i915drm/i915_pci_autoconf.c
+@@ -34,6 +34,7 @@
+ 
+ #include <sys/types.h>
+ #include <sys/atomic.h>
++#include <sys/kmem.h>
+ #include <sys/queue.h>
+ #include <sys/systm.h>
+ #include <sys/queue.h>
+@@ -49,6 +50,7 @@
+ #include "i915_drv.h"
+ #include "i915_pci.h"
+ #include "gt/intel_rps.h"
++#include "display/intel_bw.h"
+ 
+ struct drm_device;
+ 
+@@ -171,6 +173,42 @@
+ }
+ 
+ /*
++ * LISPBSD: display SAGV/QGV report, hw.i915sagv: what the firmware allows,
++ * what the driver last did (hw.drm2.i915_modparams.lispbsd_sagv), and the
++ * live memory clock registers unless hw.i915rpm has the device suspended.
++ */
++static int
++i915drmkms_sysctl_sagv(SYSCTLFN_ARGS)
++{
++	struct sysctlnode node = *rnode;
++	struct i915drmkms_softc *sc = lispbsd_i915_sc;
++	struct drm_i915_private *i915;
++	intel_wakeref_t wakeref = 0;
++	const size_t len = 1024;
++	char *buf;
++	bool live;
++	int error;
++
++	if (sc == NULL || sc->sc_drm_dev == NULL)
++		return ENXIO;
++	i915 = to_i915(sc->sc_drm_dev);
++	buf = kmem_zalloc(len, KM_SLEEP);
++	live = lispbsd_i915rpm == 0;
++	if (live) {
++		wakeref = intel_runtime_pm_get_if_in_use(&i915->runtime_pm);
++		live = wakeref != 0;
++	}
++	intel_bw_lispbsd_sagv_report(i915, buf, len, live);
++	if (wakeref)
++		intel_runtime_pm_put(&i915->runtime_pm, wakeref);
++	node.sysctl_data = buf;
++	node.sysctl_size = strlen(buf) + 1;
++	error = sysctl_lookup(SYSCTLFN_CALL(&node));
++	kmem_free(buf, len);
++	return error;
++}
++
++/*
+  * LISPBSD: GPU frequency scaling (RPS) state and limits, hw.i915rps.*.
+  * Frequencies are MHz.  max_mhz also caps boost_mhz, so it is a hard cap
+  * (rps_work ignores the soft limit for a wait-boost); min_mhz and boost_mhz
+@@ -484,6 +522,12 @@
+ 	    SYSCTL_DESCR("i915 software wakeref snapshot without waking the GPU"),
+ 	    i915drmkms_sysctl_pmstate, 0, NULL, 0,
+ 	    CTL_HW, CTL_CREATE, CTL_EOL);
++
++	(void)sysctl_createv(NULL, 0, NULL, NULL,
++	    CTLFLAG_READONLY, CTLTYPE_STRING, "i915sagv",
++	    SYSCTL_DESCR("LISPBSD display SAGV/QGV state; switch: hw.drm2.i915_modparams.lispbsd_sagv"),
++	    i915drmkms_sysctl_sagv, 0, NULL, 0,
++	    CTL_HW, CTL_CREATE, CTL_EOL);
+ 	i915drmkms_sysctl_rps_init();
+ 
+ 	/*
+--- a/sys/modules/i915drmkms/Makefile
++++ b/sys/modules/i915drmkms/Makefile
+@@ -129,6 +129,7 @@
+ SRCS+=	intel_fbdev.c
+ SRCS+=	intel_fifo_underrun.c
+ SRCS+=	intel_frontbuffer.c
++SRCS+=	intel_global_state.c
+ SRCS+=	intel_gmbus.c
+ SRCS+=	intel_hdcp.c
+ SRCS+=	intel_hdmi.c

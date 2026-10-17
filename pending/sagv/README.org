@@ -1,0 +1,302 @@
+#+TITLE: LispBSD i915: TGL display SAGV/QGV control (opt-in)
+#+DATE: 2026-10-17
+
+* What this is
+
+The NetBSD drm2 i915 (Linux ~5.6 import) never controls SAGV on Gen12:
+=intel_has_sagv()= carries the upstream "HACK" that returns false on TGL, so
+the driver sends no SAGV/QGV pcode request and always programs the plain
+(non-SAGV) level-0 watermark.  Whatever QGV (memory frequency) points the
+firmware left allowed at boot stay allowed or restricted for the whole uptime.
+
+This port brings in the upstream TGL SAGV series (Linux 5.8) the way the Ubuntu
+kernel team backported it to their 5.6 OEM kernel in August 2020
+(kernel-team, "[PATCH 00/31][SRU][OEM-5.6] Add TGL+ SAGV display support",
+LP: #1891451), plus the later upstream fixes for it, and puts the whole
+behaviour behind a runtime switch that defaults to the old behaviour.
+
+- Switch: =hw.drm2.i915_modparams.lispbsd_sagv= (int, default *0*)
+  - =0= stock: no SAGV/QGV pcode request ever, plain wm0, and the bandwidth
+    check of the old code (every QGV point must carry the configuration).
+    Same as the current kernel, apart from two extra pcode/MMIO *reads* at
+    boot (SAGV block time, memory clock registers) and the diagnostics.
+  - =1= upstream TGL SAGV: allow every QGV point with enough bandwidth when the
+    SAGV watermark (wm0 latency + SAGV block time) fits the DDB, else pin the
+    highest bandwidth point.  This is the power lever.
+  - =2= managed but SAGV off: always pin the highest bandwidth QGV point
+    (upstream =i915.enable_sagv=0=).  Useful as the third A/B arm: it tells
+    whether the firmware ran with SAGV on or off at boot.
+  - The value is sampled once per atomic commit; it takes effect at the *next
+    display update* (move the mouse, type a key).  No rebuild, no reboot.
+- Diagnostic: =sysctl hw.i915sagv= (read-only string) and =LISPBSD SAGV:=
+  lines in dmesg at boot.  Works with the switch at 0.
+
+* Files (relative to sys/, based on /root/lispbsd/sys)
+
+| file                                                | what                                              |
+|-----------------------------------------------------+---------------------------------------------------|
+| external/bsd/drm2/dist/drm/i915/display/intel_global_state.[ch] | new: upstream global state objects (+ refcount fix, NetBSD RCS headers) |
+| external/bsd/drm2/dist/drm/i915/display/intel_bw.[ch]           | bw state as global state, QGV restriction, SAGV mode fields, diagnostics, boot log |
+| external/bsd/drm2/dist/drm/i915/intel_pm.[ch]                   | SAGV evaluation per crtc, TGL SAGV wm0, pre/post plane update, mode logic |
+| external/bsd/drm2/dist/drm/i915/display/intel_display.[ch]      | commit tail hooks, global state swap, intel_calc_active_pipes, wm verify |
+| external/bsd/drm2/dist/drm/i915/display/intel_atomic.[ch]       | state free/clear for global objs, old lock helpers renamed =_intel_*= |
+| external/bsd/drm2/dist/drm/i915/display/intel_cdclk.c, intel_audio.c | renamed lock helpers only                     |
+| external/bsd/drm2/dist/drm/i915/display/intel_display_types.h   | =global_objs=, =sagv_wm0=, =sagv_trans_wm=, =use_sagv_wm= |
+| external/bsd/drm2/dist/drm/i915/i915_drv.h                      | =global_obj_list=, =bw_obj= type, =lispbsd_sagv= diagnostic snapshot |
+| external/bsd/drm2/dist/drm/i915/i915_reg.h, intel_sideband.c    | QGV pcode command, 2-bit reply mask, gen11 status codes (QGV request only) |
+| external/bsd/drm2/dist/drm/i915/i915_params.[ch]                | =lispbsd_sagv= parameter                          |
+| external/bsd/drm2/i915drm/i915_pci_autoconf.c                   | =hw.i915sagv= sysctl                              |
+| external/bsd/drm2/i915drm/files.i915drmkms, modules/i915drmkms/Makefile | build =intel_global_state.c=              |
+
+=sagv.diff= is the unified diff of all of them against /root/lispbsd/sys
+(=diff -uN= per file, new files included); applied with =patch -p1= in a copy
+of /root/lispbsd it reproduces the files in sys/ byte for byte.
+
+** Import list (nothing was written to /root/nanobsd)
+
+New (2):
+- sys/external/bsd/drm2/dist/drm/i915/display/intel_global_state.c
+- sys/external/bsd/drm2/dist/drm/i915/display/intel_global_state.h
+
+Modified, already in the nanobsd kernel overlay (8; the copies here are the
+overlay version plus this patch, the overlay files were byte-identical to
+/root/lispbsd/sys):
+- sys/external/bsd/drm2/dist/drm/i915/display/intel_atomic.c
+- sys/external/bsd/drm2/dist/drm/i915/display/intel_cdclk.c
+- sys/external/bsd/drm2/dist/drm/i915/display/intel_display.c
+- sys/external/bsd/drm2/dist/drm/i915/display/intel_display_types.h
+- sys/external/bsd/drm2/dist/drm/i915/i915_params.c
+- sys/external/bsd/drm2/dist/drm/i915/i915_params.h
+- sys/external/bsd/drm2/i915drm/files.i915drmkms
+- sys/external/bsd/drm2/i915drm/i915_pci_autoconf.c
+
+Modified, stock NetBSD 11 so far (not yet in the overlay) (11):
+- sys/external/bsd/drm2/dist/drm/i915/display/intel_atomic.h
+- sys/external/bsd/drm2/dist/drm/i915/display/intel_audio.c
+- sys/external/bsd/drm2/dist/drm/i915/display/intel_bw.c
+- sys/external/bsd/drm2/dist/drm/i915/display/intel_bw.h
+- sys/external/bsd/drm2/dist/drm/i915/display/intel_display.h
+- sys/external/bsd/drm2/dist/drm/i915/intel_pm.c
+- sys/external/bsd/drm2/dist/drm/i915/intel_pm.h
+- sys/external/bsd/drm2/dist/drm/i915/intel_sideband.c
+- sys/external/bsd/drm2/dist/drm/i915/i915_drv.h
+- sys/external/bsd/drm2/dist/drm/i915/i915_reg.h
+- sys/modules/i915drmkms/Makefile
+
+All 21 must be in the overlay before a nanobsd-built kernel contains the
+patch.  In the overlay files the hunks are outside the LispBSD code; the
+cdclk seamless-refresh code is untouched apart from the helper rename.
+
+* Upstream mapping
+
+Ubuntu OEM-5.6 series (patch number, upstream commit, used?):
+
+| #  | upstream     | title                                                        | here |
+|----+--------------+--------------------------------------------------------------+------|
+| 01-08 | 54f09d2342b0 .. ed645eee131c | cdclk state refactors (move/collect/rename/swap cdclk state) | *no*: unrelated refactor; only needed as patch context upstream.  The 3 hunks of #10/#12 that depended on them were adapted by hand |
+| 09 | 5f34299384cb | Move intel_atomic_state_free() into intel_atomic.c            | yes |
+| 10 | 0ef1905ecf2e | Introduce better global state handling                       | yes, adapted (state_clear, cdclk lock renames, struct field placement) |
+| 11 | fd1a9bba73fa | Convert bandwidth state to global state                      | yes; the NetBSD-only =intel_bw_cleanup()= call is dropped, =intel_mode_config_cleanup()= frees global objs |
+| 12 | aac978718bb4 | Introduce intel_calc_active_pipes()                          | yes, adapted by hand (our intel_modeset_checks differs) |
+| 13 | e7f54e6c1981 | Don't check uv_wm in skl_plane_wm_equals()                   | yes |
+| 14 | 23baedd217ef | Don't check for wm changes until we've compute the wms fully | yes, adapted: our skl_compute_wm still has =dirty_pipes=; that comparison moved with the plane check after skl_compute_ddb() |
+| 15 | a7f1e8e45f21 | Enable transition watermarks for glk                         | *no* (glk only, no effect on TGL) |
+| 16 | c834d03cca61 | Implement display w/a 1140 for glk/cnl                       | *no* (glk/cnl only) |
+| 17 | 7b994759ad3c | Start passing latency as parameter                           | yes |
+| 18 | a389c49fac55 | Prepare to extract gen specific functions from intel_can_enable_sagv | yes |
+| 19 | 680e1af713d9 | Add pre/post plane updates for SAGV                          | yes |
+| 20 | 442e7ee834e8 | Add intel_atomic_get_bw_*_state helpers                      | yes |
+| 21 | 9728889f42b9 | Use bw state for per crtc SAGV evaluation                    | yes; the =intel_compute_sagv_mask()= call landed in the wrong function with fuzz and was put back in skl_compute_wm() |
+| 22 | ecab0f3d055d | Track active_pipes in bw_state                               | yes (same fuzz repair) |
+| 23 | 9ff79708c54d | Rename bw_state to new_bw_state                              | yes |
+| 24 | d9162348db12 | Introduce skl_plane_wm_level accessor                        | yes |
+| 25 | 1d0a6c8486aa | Extract skl SAGV checking                                    | yes |
+| 26 | d8d5afe35e3f | Make active_pipes check skl specific                         | yes |
+| 27 | f22fd334890e | gen11: Add additional pcode status values                    | yes |
+| 28 | f136c58a0de9 | Added required new PCode commands                            | yes |
+| 29 | 7241c57d3140 | Add TGL+ SAGV support                                        | yes (struct hunk re-applied by hand: our skl_pipe_wm has =linetime=) |
+| 30 | 20f505f22531 | Restrict qgv points which don't have enough bandwidth        | yes |
+| 31 | 8ca6d0237d16 | Enable SAGV support for Gen12 (drop the HACK)                | yes, but gated by =lispbsd_sagv= (below) |
+
+Later upstream fixes of this code, also ported (all Fixes: one of the above):
+
+| upstream     | title                                                         | why it matters here |
+|--------------+---------------------------------------------------------------+---------------------|
+| f8c86ffa2800 | Fix global state use-after-frees with a refcount (5.8, stable 5.5+) | the commit tail reads old/new bw state; nonblocking commits (Mahogany) could free them underneath |
+| 2871b2fde449 + 93fe86281259 | Fix TGL+ plane SAGV watermark programming (+ transposed args fix) | without it switching SAGV on/off does not reprogram the plane wm0 registers -> SAGV runs on the tight non-SAGV wm0 -> underruns |
+| 8dd8ffb824ca | Correctly populate use_sagv_wm for all pipes                  | same class of underrun |
+| 6b728595ffa5 | Fix bw atomic check when switching between SAGV vs. no SAGV   | otherwise the QGV mask is not recomputed when only SAGV yes/no changes |
+| 9299cde973d7 | Disable SAGV on bw init, to force QGV point recalculation (2024) | implemented differently: see "stock <-> managed transitions" |
+| (later, e.g. v6.1 skl_watermark.c) | SAGV transition watermark (=sagv.trans_wm=), =skl_check_wm_level()= on the SAGV levels, =tgl_crtc_can_enable_sagv()= on =sagv.wm0.enable= | IPC is on for TGL: with only wm0 swapped, PLANE_WM_TRANS could sit below the programmed SAGV wm0.  Ported as =sagv_trans_wm= (computed from =sagv_wm0= by the same transition-wm code), programmed via =skl_plane_trans_wm()= when =use_sagv_wm=, read back and accepted by the wm checker; both SAGV levels are dropped when they do not fit the plane's DDB, and SAGV is then refused (review M1-1) |
+| (later) ICL_PCODE_REP_QGV_MASK | QGV reply is 2 bits: 0 safe, 1 poll, 2 rejected | 5.8's mask 0x1 read "rejected" as success; mask is 0x3 now, a refusal times out and is counted in =errors= (review M1-2) |
+
+Not ported: PSF GV points / ADL+ / MTL pmdemand code, DG2, the enable_sagv
+modparam itself (our switch does its job), debugfs.
+
+* LispBSD adaptations (all marked =LISPBSD=)
+
+- *Mode switch.*  =intel_compute_sagv_mask()= samples
+  =i915_modparams.lispbsd_sagv= once per commit into the bw state
+  (=lispbsd_sagv=).  =intel_can_enable_sagv()= returns false on Gen12 unless the
+  committed mode is 1, the pcode exposes >1 QGV point and the SAGV block time is
+  sane (1..1000 us).  A mode change serializes the commit against all crtcs
+  (like a cdclk change), which also recomputes =use_sagv_wm= for every pipe and,
+  via the plane-wm fix, reprograms the plane watermarks.
+- *Stock mode sends nothing.*  =intel_sagv_pre/post_plane_update()= return
+  before any pcode request while the old and new state are both mode 0, and the
+  bandwidth check keeps the old rule (reject unless *every* QGV point carries
+  the configuration), because the firmware may be roaming all points.  That
+  rule applies only while the driver has never sent a mask; after 1/2 -> 0 the
+  memory is pinned at the highest point and the upstream rule applies, so a
+  configuration only that point carries cannot make every commit fail
+  (review M1-0).
+- *pcode status codes.*  Upstream f22fd334890e/f136c58a0de9 turn the gen11
+  mailbox statuses 0x4/0x6/0x11 into errors for every pcode caller.  Here they
+  are errors only for the QGV restriction request (command 0xe); all other
+  callers keep the old "MISSING_CASE warning, success" handling, so mode 0
+  behaves exactly as before (review M0-2).
+- *stock <-> managed transitions.*  The pcode's QGV mask is unknown when leaving
+  stock (the firmware's) and the stock mode must not be left with SAGV active
+  under non-SAGV watermarks.  So on 0->1/2 and 1/2->0 the commit first restricts
+  to the highest bandwidth point (always valid: it is in every allowed set),
+  updates the planes, then (only into 1) unmasks what the new state allows.
+  Same idea as upstream 9299cde973d7, done at the switch instead of at init.
+  Consequence: 1/2 -> 0 leaves the memory pinned at the highest point; only a
+  reboot gives back the untouched firmware state.
+- *QGV read failure.*  If the pcode memory-subsystem read fails, the old code
+  had no bandwidth limit; the new check would reject every configuration
+  (0 points).  Now: no limit, =sagv_status= not-controlled, no pcode writes.
+  0 QGV points (upstream: only exactly 1) and 0 memory channels (a division
+  by zero in the old code) are treated the same way.
+- *Bad block time.*  A failed block-time read leaves -1, which wrapped the
+  SAGV wm0 latency; =tgl_compute_sagv_wm()= then copies wm0, SAGV stays off.
+- 5.6 differences handled by hand: no =drm_WARN_ON= (WARN_ON), our tree still
+  has =wm_results.dirty_pipes= and =skl_pipe_wm.linetime=, NetBSD's own
+  =intel_bw_cleanup()=, NetBSD RCS headers on the new files.
+
+* Diagnostics
+
+Boot (dmesg, before the driver touches anything):
+: [drm] LISPBSD SAGV: pcode global info 0x... (ret 0): LPDDR4, N channels, K QGV points, sagv_status enabled
+: [drm] LISPBSD SAGV: QGV i: DCLK=... MHz (raw N x 16.667) tRP=.. tRCD=.. tRDPRE=.. tRAS=.., ... MB/s for 1 plane (ret 0)
+
+The pcode gives DCLK in multiples of 16.667 MHz; the MHz shown is converted as
+later upstream does (=DIV_ROUND_UP(16667*raw + 500, 1000)= on gen12), e.g.
+raw 128 -> 2134 MHz (LPDDR4x-4267).
+: [drm] LISPBSD SAGV: MC_BIOS_REQ 0x... MC_BIOS_DATA 0x... SA_PERF_STATUS 0x... (QCLK ... MHz if DG1 layout)
+: [drm] LISPBSD SAGV: block time NN us (pcode ret 0)
+
+=sysctl hw.i915sagv= (one line, key=value):
+- =mode= the switch now, =applied= the mode of the last committed state,
+  =sagv_allowed= whether that state allows SAGV, =status= driver sagv_status
+  (=not-controlled= = one QGV point = SAGV off in BIOS: nothing to gain),
+  =block_us=/=block_ret= SAGV block time from pcode.
+- =mask= QGV restriction mask of the committed state (bit set = point
+  forbidden); =mask=none= in mode 0, which computes a mask but never sends
+  it.  =pinned= whether a pin to the highest point was accepted by the pcode
+  (after that, mode 0 uses the upstream bandwidth rule).  =written= whether any mask was ever sent, =last=/=last_ret= the
+  last mask sent and the pcode result (0 ok; NetBSD errno: -13 rejected,
+  -16 locked, -60 timeout), =writes=/=errors=/=commits= counters.
+- =global= raw pcode global info/ret, =dram=, =ch=, =tbl=, =points=, then
+  =qgvI=DCLK/tRP/tRCD/tRDPRE/tRAS/MBps= per point (DCLK in MHz, converted;
+  MB/s for one plane).
+- =wm_us= the eight watermark latencies.
+- =mc_req=, =mc_data=, =sa_perf= live MCHBAR registers, =qclk_mhz= decoded from
+  SA_PERF_STATUS bits 9:2 x (bit 10 ? 100 : 133.33) MHz.  The layout is DG1's
+  (TGL-derived) and not verified on TGL: trust the raw value changing more
+  than the decode.  =live=off= when hw.i915rpm has the GPU suspended.
+
+* Risks
+
+- Underruns / flicker / black flashes if the SAGV latency is wrong or the
+  watermarks are not reprogrammed: memory stalls for =block_us= on every SAGV
+  transition and the display FIFO must cover it.  The ported fixes address the
+  known upstream cases.  dmesg shows =CPU pipe A FIFO underrun= (reported once
+  per pipe, then masked until the next modeset) and =mismatch in WM= from the
+  state checker.  Mode 2 or 0 stops SAGV at the next display update.
+- Global-state rework touches every atomic commit, also in mode 0: the bw state
+  is now a refcounted global object, cdclk/audio use the renamed
+  =_intel_atomic_*_global_state= helpers.  Compile-tested only.
+- Interaction with seamless 30/60 Hz (=lispbsd_seamless_rr=3=, slow
+  watermarks): the SAGV wm0 is computed by the same =skl_compute_plane_wm()=
+  from the same crtc state, so it follows the mode in use; but a 30->60 Hz
+  switch that does not recompute watermarks would also keep a 30 Hz-sized
+  SAGV wm0.  Watch underruns right after the refresh switches.
+- s2idle/lid: the driver keeps its QGV mask across suspend; if the firmware
+  resets it, SAGV state after resume may differ from =hw.i915sagv=.  Re-check
+  after a lid cycle; toggling 2 -> 1 re-sends the masks.
+- pcode requests run in the commit tail (=skl_pcode_request= retries up to ~1 ms+)
+  and only when the mask changes.
+- Default is 0: a kernel with this patch and no sysctl change behaves as today
+  except the extra boot-time reads and the global-state bookkeeping (which
+  takes all crtc locks on bandwidth/SAGV-input changes and serializes once
+  after boot; no effect with the eDP panel alone, review M0-1).
+- After S3 (GENERIC_S3) the firmware may reset the QGV mask while the driver
+  still believes it is pinned (review L-2); s2idle should not.
+
+* Morning test plan
+
+Preconditions: new kernel installed per nanobsd rules, booted on *battery*
+(=envstat -d acpiacad0= connected FALSE), Mahogany session as usual, nothing
+running but the usual idle desktop, brightness fixed at one level for all arms (and
+idle dim kept from kicking in during the measurement), *wait 10 min after boot* before any measurement (TCSS / PC10
+settle, see tcss-d3cold.org).
+
+1. Read first (mode 0, nothing sent yet):
+   : dmesg | grep 'LISPBSD SAGV'
+   : sysctl hw.i915sagv hw.drm2.i915_modparams.lispbsd_sagv
+   - =points=1= or =status=not-controlled=: BIOS has SAGV disabled; stop,
+     nothing to gain (record the values).
+   - Note the QGV DCLKs (MHz, converted from the pcode's 16.667 MHz units),
+     =block_us=, and =sa_perf=/=qclk_mhz= at idle.  =qclk_mhz= should be
+     close to one of the DCLKs; if it is not, the SA_PERF decode is wrong and
+     only the raw =sa_perf= changes count.
+     Read =hw.i915sagv= a few times over a minute: if =sa_perf= already moves
+     between values in mode 0, the firmware is roaming QGV points already
+     (SAGV on at boot) and mode 1 may save little.
+2. Arm A, mode 0 (stock): battery Wh at t0 and t0+5 min (or 10 min), screen
+   on, idle, same brightness:
+   : envstat -d acpibat0     # "charge" in Wh; log value and time
+   Use the Wh delta x 12 for watts; repeat once.
+3. Arm B, mode 1:
+   : sysctl -w hw.drm2.i915_modparams.lispbsd_sagv=1
+   then move the mouse once and check
+   : sysctl hw.i915sagv
+   expect =applied=1 sagv_allowed=1 mask=0x0 written=1 pinned=1 last_ret=0 errors=0=.
+   If =errors= grows, the pcode rejects the QGV request; each rejection costs
+   a ~51 ms display commit hitch (upstream retry behaviour), so use mode 2
+   or 0
+   (=sagv_allowed=0= means the SAGV watermark does not fit: mask pins the max
+   point, no saving; note =block_us= and wm_us).  Check =qclk_mhz=/=sa_perf=
+   at idle: expect it to drop below the highest QGV DCLK (in MHz).  Wait 1 min, then
+   measure 5+ min as in arm A.
+4. Arm C, mode 2 (pinned max point): =sysctl -w ...lispbsd_sagv=2=, move the
+   mouse, =hw.i915sagv= shows =applied=2 sagv_allowed=0 mask=<all but one>=;
+   measure 5+ min.  A ~= C means the firmware booted with SAGV off (the saving
+   is real); A ~= B means it already ran SAGV.
+5. Back to 1 and measure again (ABA, to see drift).
+6. Display checks in mode 1, each followed by =dmesg | tail=:
+   - =dmesg | grep -i 'underrun\|mismatch in WM\|qgv\|SAGV\|missing case\|unclaimed'=
+     (expect only the LISPBSD lines and no "Failed to disable qgv points")
+   - Firefox scrolling a long page, window moves, a 1440p60 mpv clip with
+     vaapi, the 30<->60 Hz seamless switch (still screen 10 s, then motion),
+     cursor-only motion over a still screen: look for black flashes/stripes.
+   - lid close/open (s2idle) once, then =hw.i915sagv= and underruns again.
+7. Leave it in the mode that won; to keep it, add
+   =hw.drm2.i915_modparams.lispbsd_sagv=1= to /etc/sysctl.conf.  To back out
+   without a reboot: =...=2= (safe pinned) or =...=0=; the untouched firmware
+   state comes back only with a reboot.
+
+* Build
+
+Compile-tested 2026-10-17 in the NetBSD 11 VM on a copy of the laptop tree
+(VM: /build/agent-sagv/sys, symlink /build/agent-sagv-sys; =config GENERIC=,
+=make depend=, =make -j4=, -Werror, log /build/agent-sagv-build.log; rebuilt
+from scratch after the review fixes): exit 0, no new
+warnings (the only 5 are the usual dev/ic/ath.c -Wenum-conversion ones, same
+as /build/lisp-kbuild.log).  =intel_global_state.o= is linked;
+=hw.i915sagv='s handler uses 256 bytes of stack (the 1 KB buffer is
+kmem-allocated).  The result is
+/build/agent-sagv/sys/arch/amd64/compile/GENERIC/netbsd in the VM.  The
+laptop kernel is built the usual way once the 21 files above are imported
+into nanobsd (not done here).  Not run on hardware (the VM has no i915).
