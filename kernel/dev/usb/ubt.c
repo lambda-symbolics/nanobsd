@@ -736,14 +736,26 @@ ubt_resume(device_t self, const pmf_qual_t *qual)
 	if (!sc->sc_enabled || !sc->sc_parked || sc->sc_dying)
 		return true;
 	s = splusb();
+	/*
+	 * Re-arm the event pipe in place.  A close and reopen would reset the
+	 * host's data toggle but not the controller's, and the next event,
+	 * the reply to the command that woke the port, would be discarded:
+	 * one HCI command credit lost per wake (num_cmd 0 = dead radio).
+	 * Fall back to a reopen only if the pipe is gone.
+	 */
 	if (sc->sc_evt_pipe != NULL) {
-		usbd_close_pipe(sc->sc_evt_pipe);
-		sc->sc_evt_pipe = NULL;
-	}
-	/* A failed reopen leaves the pipe NULL and sc_parked set for retry. */
-	err = usbd_open_pipe_intr(sc->sc_iface0, sc->sc_evt_addr,
-	    USBD_SHORT_XFER_OK, &sc->sc_evt_pipe, sc, sc->sc_evt_buf,
-	    UBT_BUFSIZ_EVENT, ubt_recv_event, USBD_DEFAULT_INTERVAL);
+		err = usbd_restart_pipe_intr(sc->sc_evt_pipe);
+		if (err != USBD_NORMAL_COMPLETION) {
+			/* The retry reopens it (resynchronising the toggle is
+			 * then left to luck, as before). */
+			usbd_close_pipe(sc->sc_evt_pipe);
+			sc->sc_evt_pipe = NULL;
+		}
+	} else
+		err = usbd_open_pipe_intr(sc->sc_iface0, sc->sc_evt_addr,
+		    USBD_SHORT_XFER_OK, &sc->sc_evt_pipe, sc, sc->sc_evt_buf,
+		    UBT_BUFSIZ_EVENT, ubt_recv_event, USBD_DEFAULT_INTERVAL);
+	/* A failed restart or reopen leaves sc_parked set for retry. */
 	if (err != USBD_NORMAL_COMPLETION) {
 		sc->sc_evt_pipe = NULL; /* open_pipe_intr may publish then free it */
 		splx(s);

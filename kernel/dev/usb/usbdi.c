@@ -836,6 +836,43 @@ usbd_resume_pipe(struct usbd_pipe *pipe)
 	usbd_unlock_pipe(pipe);
 }
 
+/*
+ * LISPBSD: re-arm an interrupt pipe's repeating transfer after
+ * usbd_abort_pipe(), keeping the pipe open.  Closing and reopening it
+ * instead reconfigures the endpoint, which resets the host controller's
+ * data toggle but not the device's: the device's next packet is then
+ * taken for a retransmission and discarded (ubt lost the event answering
+ * the command that woke a runtime-suspended radio, and with it the HCI
+ * command credit).
+ */
+usbd_status
+usbd_restart_pipe_intr(struct usbd_pipe *pipe)
+{
+	struct usbd_xfer *xfer = pipe->up_intrxfer;
+	usbd_status err;
+
+	if (xfer == NULL)
+		return USBD_INVAL;
+	usbd_lock_pipe(pipe);
+	if (pipe->up_aborting || !SIMPLEQ_EMPTY(&pipe->up_queue)) {
+		usbd_unlock_pipe(pipe);
+		return USBD_IN_USE;
+	}
+	pipe->up_repeat = 1;
+	usbd_unlock_pipe(pipe);
+	usbd_setup_xfer(xfer, xfer->ux_priv, xfer->ux_buffer,
+	    xfer->ux_length, xfer->ux_flags, USBD_NO_TIMEOUT,
+	    xfer->ux_callback);
+	err = usbd_transfer(xfer);
+	if (err != USBD_IN_PROGRESS) {
+		usbd_lock_pipe(pipe);
+		pipe->up_repeat = 0;
+		usbd_unlock_pipe(pipe);
+		return err;
+	}
+	return USBD_NORMAL_COMPLETION;
+}
+
 usbd_status
 usbd_clear_endpoint_stall(struct usbd_pipe *pipe)
 {

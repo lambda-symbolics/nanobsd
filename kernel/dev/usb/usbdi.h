@@ -129,6 +129,7 @@ void usbd_suspend_pipe(struct usbd_pipe *);
 void usbd_resume_pipe(struct usbd_pipe *);
 
 usbd_status usbd_clear_endpoint_stall(struct usbd_pipe *);
+usbd_status usbd_restart_pipe_intr(struct usbd_pipe *);	/* LISPBSD */
 void usbd_clear_endpoint_stall_async(struct usbd_pipe *);
 
 void usbd_clear_endpoint_toggle(struct usbd_pipe *);
