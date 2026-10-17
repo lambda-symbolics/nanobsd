@@ -116,3 +116,9 @@ So the migration went through a rescue root instead:
 Fallbacks: menu entry "Rescue root"; or the SSD's loader (F12) and dk2 at the
 root-device prompt.  Retire the rescue root (back to swap, label "swap",
 fstab) once gefs+ has run for a while.
+- 2026-10-18 01:30: booted gefs+ from the internal disk (kernel 181,
+  /dev/dk1 on / type gefs).  Mahogany failed: wlroots "Found 0 GPUs".  Cause:
+  gefs readdir reported device nodes as DT_REG (the kind lives in the Xrdev
+  attribute, not the directory entry), so libudev skipped /dev/dri/card0.
+  Fixed in gefs-netbsd 11788c4 (lookup after the scan; VM-tested with 3000
+  device nodes across a remount); kernel 185 = 184 + the fix.
