@@ -341,3 +341,16 @@ its first wake), TGL SAGV on (=lispbsd_sagv=1=, -0.8 W under video; never set
 it back to 0 without a reboot), Wi-Fi U-APSD built in but off for good
 (+50 ms latency, no saving), wg keepalive timer stops on ifconfig down.
 Panel off on battery: ~1.05 W.  Never run =usbdevs= while =usb off=.
+
+* Update 2026-10-17 evening — cleanup before the gefs+ migration
+Root 78 GB -> 42 GB.  Removed from the laptop: 117 old kernels (kept
+=netbsd=, 176, 177, 179, 180, 181), the CSTATE/GENERIC_S3/GENERIC_S3_NOGPU/
+LISPBSD compile directories, all crash dumps, pkgsrc work directories except
+Firefox's (kept with the distfiles), VA-API build trees (tarballs and patches
+kept), old traces/logs/captures, the niri and xwayland-satellite builds and
+binaries.  The X session is gone from this machine: StumpWM, rofi, dunst,
+xterm (and libnotify, luit, startup-notification, xcb-util-xrm), ~/.xinitrc,
+~/.stumpwmrc, ~/.stumpwm.d, ~/.Xresources, startx-safe and the switch-to
+scripts.  Mahogany is the only session; the text console is the fallback.
+The StumpWM dotfiles and docs stay in nanobsd as an option for other
+installs.  Xorg (base set) and /etc/X11/xorg.conf remain.
