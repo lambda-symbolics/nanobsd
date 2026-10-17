@@ -87,3 +87,32 @@ Makefile.efiboot, GENERIC.  Previous versions on the laptop: =*.180=.
   power-state residency, vfs.gefs commits/skipped/flushes) in idle windows,
   FFS side on the rescue root; expected a few to a few tens of mW.  The
   battery counter cannot resolve it.
+
+* Plan B, executed 2026-10-18 00:20-01:25 (USB root boot did not work)
+Booting from the SSD failed at the kernel: the Verbatim's first SCSI probe
+fails after a boot-time bus reset (INQUIRY data phase stalls after ~7 s,
+twice, "generic HBA error"), on kernels 177, 180-183 alike, i.e. not our
+USB PM code; a Bulk-Only reset at attach (183) did not help; suspend/resume
+of its controller or a re-plug does.  Kernel 184 adds root-hub port
+suspend/resume and a Verbatim port cycle at attach: untested.  Open issue.
+So the migration went through a rescue root instead:
+1. Partition 3 (swap, 16 GB) -> FFS, label "rescue": a trimmed clone of the
+   system (no /home, pkgsrc, src, var/tmp; 8.2 GB), fstab NAME=rescue, kernel
+   181.  Swap and the dump device are off while it exists.
+2. Booted the rescue root from the internal disk (SSD unplugged).
+3. SSD ffsbackup checked (fsck -n -f: clean apart from the usual alternate
+   superblock note) and mounted read-only; the 13 files changed on dk1 after
+   the SSD copy saved to the rescue root (kernels 182-184, bootcfg-check,
+   umass/xhci sources, histories).
+4. Partition 2 -> gefs type, label "gefsroot", =gefs ream= (461 GiB, retain
+   60@m 24@h 14@d), pax copy from the SSD (36 min, no errors): 1,303,562
+   entries on both sides, checksums, device nodes, hard links, sticky dirs
+   verified; the 13 files restored on top.
+5. gefs root: fstab NAME=gefsroot / gefs rw 0 0, swap line commented, rc.local
+   usb off again, sysctl freeze_fsbarrier=2, boot.cfg kernel 181 plus a
+   "Rescue root" entry (boot NAME=rescue:...).
+6. Internal ESP: efi/boot/bootx64.efi = gefs efiboot (3be1aac7), stock loader
+   kept as bootx64-ffs.efi (8.3 name bootx6~1.efi); bootme on gefsroot.
+Fallbacks: menu entry "Rescue root"; or the SSD's loader (F12) and dk2 at the
+root-device prompt.  Retire the rescue root (back to swap, label "swap",
+fstab) once gefs+ has run for a while.
