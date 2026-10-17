@@ -1,0 +1,27 @@
+#+TITLE: TGL SAGV/QGV on the Nano (kernel 180)
+
+Backport and reviews: pending/sagv/ (README.org, REVIEW.org); in kernel/
+since 9e35b2b.  Switch: hw.drm2.i915_modparams.lispbsd_sagv (0 stock, 1
+driver-managed SAGV, 2 pinned at the top point), now 1 in /etc/sysctl.conf.
+
+* Firmware facts (boot log)
+pcode global info 0x443: LPDDR4, 4 channels, 4 QGV points, DCLK 2134 / 3201
+/ 4268 / 4268 MHz (13.3 / 18.5 / 23.0 / 23.0 GB/s for one plane), SAGV block
+time 11 us.  SA_PERF_STATUS low byte: 0x20 = lowest point, 0x40 = top
+(confirmed by pinning: mode 2 reads 0x40 throughout).
+
+* Behaviour (2026-10-17)
+- Fresh boot, mode 0: 0x20 at idle (load not sampled).
+- Mode 1: low at idle and through a looping video; briefly top during heavy
+  scrolling.  2876+ commits with no underrun or WM mismatch; Firefox scroll,
+  video and the seamless 60/30 Hz switch visually clean (user).
+- Leaving 1/2 for 0 keeps the top point pinned (by design) until reboot.
+
+* Energy, video looping on battery (=userland/wakecensus/sagv-ab.sh 300=)
+| mode | rate sensor | Wh counter | memory |
+| 1    | 6.45 W      | 6.24 W     | low    |
+| 2    | 7.26 W      | 7.20 W     | top    |
+| 2    | 7.43 W      | 7.44 W     | top    |
+| 1    | 6.57 W      | 6.84 W     | low    |
+Pinned top costs ~0.8 W (12 %) under video.  Open: whether the firmware's
+own mode-0 behaviour stays low under load (then part of this is not new).
