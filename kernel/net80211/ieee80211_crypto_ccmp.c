@@ -66,9 +66,25 @@ __KERNEL_RCSID(0, "$NetBSD: ieee80211_crypto_ccmp.c,v 1.20 2023/06/24 05:12:03 m
 
 #define AES_BLOCK_LEN 16
 
+/*
+ * LISPBSD: receive replay counters per TID (802.11-2012 11.4.3.4.4).
+ * The transmitter keeps one PN per key but sends QoS data of different
+ * access categories from different queues, so frames of different TIDs
+ * may arrive out of PN order.  struct ieee80211_key has a single
+ * wk_keyrsc; the per-TID counters live in this private context so that
+ * the key structure (embedded in nodes and in ieee80211com) keeps its
+ * layout.  Non-QoS data uses its own counter (CCMP_NONQOS_TID), which
+ * behaves exactly like the old single counter.  wk_keyrsc still records
+ * the last accepted PN (ioctl key queries report it) and seeds all
+ * counters when a key is set.
+ */
+#define	CCMP_NONQOS_TID	16
+#define	CCMP_NUM_RSC	(CCMP_NONQOS_TID + 1)
+
 struct ccmp_ctx {
 	struct aesenc cc_aes;
 	struct ieee80211com *cc_ic;	/* for diagnostics */
+	uint64_t cc_rsc[CCMP_NUM_RSC];	/* rx replay counter per TID */
 };
 
 static	void *ccmp_attach(struct ieee80211com *, struct ieee80211_key *);
@@ -127,6 +143,7 @@ static int
 ccmp_setkey(struct ieee80211_key *k)
 {
 	struct ccmp_ctx *ctx = k->wk_private;
+	int i;
 
 	if (k->wk_keylen != (128/NBBY)) {
 		IEEE80211_DPRINTF(ctx->cc_ic, IEEE80211_MSG_CRYPTO,
@@ -136,6 +153,8 @@ ccmp_setkey(struct ieee80211_key *k)
 	}
 	if (k->wk_flags & IEEE80211_KEY_SWCRYPT)
 		aes_setenckey128(&ctx->cc_aes, k->wk_key);
+	for (i = 0; i < CCMP_NUM_RSC; i++)
+		ctx->cc_rsc[i] = k->wk_keyrsc;
 	return 1;
 }
 
@@ -204,6 +223,7 @@ ccmp_decap(struct ieee80211_key *k, struct mbuf *m, int hdrlen)
 	struct ieee80211_frame *wh;
 	uint8_t *ivp;
 	uint64_t pn;
+	int tid;
 
 	/*
 	 * Header should have extended IV and sequence number;
@@ -222,7 +242,11 @@ ccmp_decap(struct ieee80211_key *k, struct mbuf *m, int hdrlen)
 		return 0;
 	}
 	pn = READ_6(ivp[0], ivp[1], ivp[4], ivp[5], ivp[6], ivp[7]);
-	if (pn <= k->wk_keyrsc) {
+	if (ieee80211_has_qos(wh))
+		tid = ieee80211_get_qos(wh) & IEEE80211_QOS_TID;
+	else
+		tid = CCMP_NONQOS_TID;
+	if (pn <= ctx->cc_rsc[tid]) {
 		/*
 		 * Replay violation.
 		 */
@@ -252,6 +276,7 @@ ccmp_decap(struct ieee80211_key *k, struct mbuf *m, int hdrlen)
 	/*
 	 * Ok to update rsc now.
 	 */
+	ctx->cc_rsc[tid] = pn;
 	k->wk_keyrsc = pn;
 
 	return 1;

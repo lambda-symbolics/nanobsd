@@ -335,6 +335,29 @@ struct iwx_phy_ctxt {
 	uint8_t vht_chan_width;
 };
 
+/*
+ * LISPBSD: U-APSD state for hw.iwx.uapsd_status (what the AP offered,
+ * what was negotiated and the power table last sent to the firmware).
+ */
+struct iwx_uapsd_diag {
+	int		ud_assoc;	/* associated (iwx_run done) */
+	int		ud_ap_wmm;	/* AP's beacon carried a WMM element */
+	int		ud_ap_uapsd;	/* ...advertising U-APSD */
+	uint8_t		ud_req;		/* QoS Info of our assoc request */
+	int		ud_qos;		/* WMM (QoS) association */
+	int		ud_negotiated;	/* IEEE80211_NODE_UAPSD at iwx_run */
+	int		ud_active;	/* last MAC power table had U-APSD */
+	int		ud_pslevel;	/* power level of that table */
+	uint32_t	ud_assocs;	/* associations seen */
+	uint32_t	ud_uapsd_assocs; /* ...of which with U-APSD */
+	uint32_t	ud_misbehaving;	/* misbehaving-AP notifications */
+	int		ud_off_why;	/* uapsd_task: IWX_UAPSD_OFF_* */
+	uint32_t	ud_off_gen;	/* uapsd_task: ud_assocs when queued */
+	uint8_t		ud_sta_acs;	/* ADD_STA/STA_CONFIG uapsd_acs */
+	uint8_t		ud_sp_length;	/* ADD_STA/STA_CONFIG sp_length */
+	struct iwx_mac_power_cmd ud_pm;	/* last MAC power table sent */
+};
+
 struct iwx_bf_data {
 	int bf_enabled;		/* filtering	*/
 	int ba_enabled;		/* abort	*/
@@ -475,6 +498,8 @@ struct iwx_softc {
 	struct iwx_task		newstate_task;
 	enum ieee80211_state	ns_nstate;
 	int			ns_arg;
+	struct iwx_task		uapsd_task;	/* LISPBSD: U-APSD fallback */
+	struct iwx_uapsd_diag	sc_uapsd;	/* LISPBSD: U-APSD state */
 
 	bus_space_tag_t sc_st;
 	bus_space_handle_t sc_sh;

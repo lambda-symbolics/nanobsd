@@ -227,6 +227,8 @@ struct ieee80211_wme_state {
 void	ieee80211_wme_initparams(struct ieee80211com *);
 void	ieee80211_wme_updateparams(struct ieee80211com *);
 void	ieee80211_wme_updateparams_locked(struct ieee80211com *);
+void	ieee80211_setup_uapsd(struct ieee80211com *, struct ieee80211_node *,
+	    int);
 
 #define	ieee80211_new_state(_ic, _nstate, _arg) \
 	(((_ic)->ic_newstate)((_ic), (_nstate), (_arg)))

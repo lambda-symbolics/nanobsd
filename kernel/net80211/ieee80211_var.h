@@ -142,6 +142,14 @@ struct ieee80211com {
 	u_int16_t		ic_tim_len;	/* ic_tim_bitmap size (bytes) */
 	u_int8_t		ic_dtim_period;	/* DTIM period */
 	u_int8_t		ic_dtim_count;	/* DTIM count for last bcn */
+	/*
+	 * U-APSD ACs and max SP to request (IEEE80211_WMM_IE_STA_QOSINFO_*),
+	 * set by the driver; used when IEEE80211_FEXT_UAPSD is set.  These
+	 * sit in the alignment hole before ic_media so that the layout of
+	 * struct ieee80211com does not change.
+	 */
+	u_int8_t		ic_uapsd_ac;
+	u_int8_t		ic_uapsd_maxsp;
 	struct ifmedia		ic_media;	/* interface media config */
 	struct bpf_if *		ic_rawbpf;	/* packet filter structure */
 	struct ieee80211_node	*ic_bss;	/* information for this node */
@@ -256,6 +264,7 @@ extern struct ieee80211com_head ieee80211com_head;
 #define	IEEE80211_FEXT_WDS	0x00000001	/* CONF: 4 addr allowed */
 /* 0x00000006 reserved */
 #define	IEEE80211_FEXT_BGSCAN	0x00000008	/* STATUS: enable full bgscan completion */
+#define	IEEE80211_FEXT_UAPSD	0x00000100	/* CONF: request U-APSD */
 #define	IEEE80211_FEXT_PROBECHAN 0x00020000	/* CONF: probe passive channel*/
 
 /* ic_caps */
@@ -329,6 +338,52 @@ static __inline void
 ieee80211_key_update_end(struct ieee80211com *ic)
 {
 	ic->ic_crypto.cs_key_update_end(ic);
+}
+
+/*
+ * U-APSD helpers.  ieee80211_parse_wmm_qosinfo() and
+ * ieee80211_uapsd_qosinfo() come from OpenBSD's ieee80211_input.c and
+ * ieee80211_output.c; here they are inlines so that a driver module
+ * using them does not depend on new kernel symbols.
+ */
+
+/* Extract the QoS Info byte of a WMM Information or Parameter element. */
+static __inline int
+ieee80211_parse_wmm_qosinfo(const u_int8_t *frm, u_int8_t *qosinfo)
+{
+	if (frm[1] < 7)
+		return IEEE80211_REASON_IE_INVALID;
+
+	*qosinfo = frm[8];
+	return 0;
+}
+
+/* Did the node's beacon/probe response WMM element advertise U-APSD? */
+static __inline int
+ieee80211_node_uapsd_capable(const struct ieee80211_node *ni)
+{
+	u_int8_t qosinfo;
+
+	return ni->ni_wme_ie != NULL &&
+	    ieee80211_parse_wmm_qosinfo(ni->ni_wme_ie, &qosinfo) == 0 &&
+	    (qosinfo & IEEE80211_WMM_IE_AP_QOSINFO_UAPSD) != 0;
+}
+
+/*
+ * QoS Info for the WMM Information element of a (re)association request
+ * to the given AP.  Unlike OpenBSD, U-APSD is only requested from an AP
+ * which advertised it (as the WMM specification asks of a station).
+ */
+static __inline u_int8_t
+ieee80211_uapsd_qosinfo(const struct ieee80211com *ic,
+    const struct ieee80211_node *ni)
+{
+	if ((ic->ic_flags_ext & IEEE80211_FEXT_UAPSD) == 0 ||
+	    !ieee80211_node_uapsd_capable(ni))
+		return 0;
+	return (ic->ic_uapsd_ac & IEEE80211_WMM_IE_STA_QOSINFO_AC_MASK) |
+	    ((ic->ic_uapsd_maxsp & IEEE80211_WMM_IE_STA_QOSINFO_SP_MASK) <<
+	    IEEE80211_WMM_IE_STA_QOSINFO_SP_SHIFT);
 }
 
 /*

@@ -1678,8 +1678,18 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 		frm = ieee80211_add_ssid(frm, ni->ni_essid, ni->ni_esslen);
 		frm = ieee80211_add_rates(frm, &ni->ni_rates);
 		frm = ieee80211_add_xrates(frm, &ni->ni_rates);
-		if ((ic->ic_flags & IEEE80211_F_WME) && ni->ni_wme_ie != NULL)
+		ni->ni_uapsd_qosinfo = 0;
+		if ((ic->ic_flags & IEEE80211_F_WME) && ni->ni_wme_ie != NULL) {
 			frm = ieee80211_add_wme_info(frm, &ic->ic_wme);
+			/*
+			 * QoS Info: the U-APSD ACs and max SP we ask for
+			 * (OpenBSD sets it inside ieee80211_add_wme_info()).
+			 * Remembered in the node so that the response is
+			 * judged against what was actually sent.
+			 */
+			ni->ni_uapsd_qosinfo = ieee80211_uapsd_qosinfo(ic, ni);
+			frm[-1] = ni->ni_uapsd_qosinfo;
+		}
 		if (ic->ic_opt_ie != NULL) {
 			memcpy(frm, ic->ic_opt_ie, ic->ic_opt_ie_len);
 			frm += ic->ic_opt_ie_len;

@@ -105,6 +105,7 @@ struct ieee80211_node {
 /* NB: this must have the same value as IEEE80211_FC1_PWR_MGT */
 #define	IEEE80211_NODE_PWR_MGT	0x0010		/* power save mode enabled */
 #define	IEEE80211_NODE_AREF	0x0020		/* authentication ref held */
+#define	IEEE80211_NODE_UAPSD	0x0040		/* U-APSD negotiated */
 	u_int16_t		ni_associd;	/* assoc response */
 	u_int16_t		ni_txpower;	/* current transmit power */
 	u_int16_t		ni_vlan;	/* vlan tag */
@@ -125,6 +126,18 @@ struct ieee80211_node {
 	/* header */
 	u_int8_t		ni_macaddr[IEEE80211_ADDR_LEN];
 	u_int8_t		ni_bssid[IEEE80211_ADDR_LEN];
+
+	/*
+	 * U-APSD ACs and max SP in use with this node when
+	 * IEEE80211_NODE_UAPSD is set (IEEE80211_WMM_IE_STA_QOSINFO_*),
+	 * and the QoS Info of the WMM element of our last (re)association
+	 * request to it (0: no element or no U-APSD asked for).
+	 * In the alignment hole before ni_tstamp: the layout of
+	 * struct ieee80211_node does not change.
+	 */
+	u_int8_t		ni_uapsd_ac;
+	u_int8_t		ni_uapsd_maxsp;
+	u_int8_t		ni_uapsd_qosinfo;
 
 	/* beacon, probe response */
 	union {

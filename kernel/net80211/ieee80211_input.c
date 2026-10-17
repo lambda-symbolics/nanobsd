@@ -317,7 +317,8 @@ ieee80211_input_data(struct ieee80211com *ic, struct mbuf **mp,
 	m = ieee80211_decap(m, hdrspace);
 	if (m == NULL) {
 		/* don't count Null data frames as errors */
-		if (subtype == IEEE80211_FC0_SUBTYPE_NODATA)
+		if (subtype == IEEE80211_FC0_SUBTYPE_NODATA ||
+		    subtype == IEEE80211_FC0_SUBTYPE_QOS_NULL)
 			goto out;
 		IEEE80211_DISCARD_MAC(ic, IEEE80211_MSG_INPUT,
 		    ni->ni_macaddr, "data", "%s", "decap error");
@@ -1946,6 +1947,36 @@ ieee80211_parse_wmeparams(struct ieee80211com *ic, u_int8_t *frm,
 #undef MS
 }
 
+/*
+ * Decide whether U-APSD is in use with the AP after (re)association.
+ * From OpenBSD; peer_uapsd is the U-APSD bit of the QoS Info in the
+ * (re)association response.  NetBSD adaptation: the request is
+ * configured with IEEE80211_FEXT_UAPSD (OpenBSD: the "uapsd" nwflag),
+ * and U-APSD is only used, with the ACs and max SP, that our request
+ * actually asked for (ni_uapsd_qosinfo, recorded when the request was
+ * built; not recomputed here, so a change of the flag in between cannot
+ * make the two disagree).
+ */
+void
+ieee80211_setup_uapsd(struct ieee80211com *ic, struct ieee80211_node *ni,
+    int peer_uapsd)
+{
+	u_int8_t req = ni->ni_uapsd_qosinfo;
+
+	if (peer_uapsd && (req & IEEE80211_WMM_IE_STA_QOSINFO_AC_MASK) &&
+	    (ni->ni_flags & IEEE80211_NODE_QOS)) {
+		ni->ni_flags |= IEEE80211_NODE_UAPSD;
+		ni->ni_uapsd_ac = req & IEEE80211_WMM_IE_STA_QOSINFO_AC_MASK;
+		ni->ni_uapsd_maxsp = (req >>
+		    IEEE80211_WMM_IE_STA_QOSINFO_SP_SHIFT) &
+		    IEEE80211_WMM_IE_STA_QOSINFO_SP_MASK;
+	} else {
+		ni->ni_flags &= ~IEEE80211_NODE_UAPSD;
+		ni->ni_uapsd_ac = 0;
+		ni->ni_uapsd_maxsp = 0;
+	}
+}
+
 void
 ieee80211_saveie(u_int8_t **iep, const u_int8_t *ie)
 {
@@ -2773,7 +2804,8 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 	struct ieee80211_frame *wh;
 	u_int8_t *frm, *efrm;
 	u_int8_t *rates, *xrates, *wme;
-	u_int8_t rate;
+	u_int8_t rate, wmm_qosinfo = 0;
+	int has_wmm_qosinfo = 0;
 	IEEE80211_DEBUGVAR(char ebuf[3 * ETHER_ADDR_LEN]);
 	u_int16_t capinfo, associd;
 	u_int16_t status;
@@ -2836,6 +2868,9 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 
 		frm += frm[1] + 2;
 	}
+	if (wme != NULL &&
+	    ieee80211_parse_wmm_qosinfo(wme, &wmm_qosinfo) == 0)
+		has_wmm_qosinfo = 1;
 
 	IEEE80211_VERIFY_ELEMENT(rates, IEEE80211_RATE_MAXSIZE);
 
@@ -2857,12 +2892,23 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 
 	ni->ni_capinfo = capinfo;
 	ni->ni_associd = associd;
+	/*
+	 * LISPBSD: parse the AP's EDCA parameters afresh on every
+	 * (re)association.  ieee80211_parse_wmeparams() skips an element
+	 * whose parameter set count equals the one it saw last, and the
+	 * count starts at 0 on both sides, so the parameters of a fresh
+	 * association were never parsed.
+	 */
+	if (ic->ic_flags & IEEE80211_F_WME)
+		ic->ic_wme.wme_wmeChanParams.cap_info = 0xff;
 	if (wme != NULL && ieee80211_parse_wmeparams(ic, wme, wh) >= 0) {
 		ni->ni_flags |= IEEE80211_NODE_QOS;
 		ieee80211_wme_updateparams(ic);
 	} else {
 		ni->ni_flags &= ~IEEE80211_NODE_QOS;
 	}
+	ieee80211_setup_uapsd(ic, ni, has_wmm_qosinfo &&
+	    (wmm_qosinfo & IEEE80211_WMM_IE_AP_QOSINFO_UAPSD));
 
 	/*
 	 * Configure state now that we are associated.
@@ -2895,13 +2941,16 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 	}
 
 	IEEE80211_DPRINTF(ic, IEEE80211_MSG_ASSOC,
-	    "[%s] %sassoc success: %s preamble, %s slot time%s%s\n",
+	    "[%s] %sassoc success: %s preamble, %s slot time%s%s%s\n",
 	    ether_snprintf(ebuf, sizeof(ebuf), wh->i_addr2),
 	    ISREASSOC(subtype) ? "re" : "",
 	    ic->ic_flags&IEEE80211_F_SHPREAMBLE ? "short" : "long",
 	    ic->ic_flags&IEEE80211_F_SHSLOT ? "short" : "long",
 	    ic->ic_flags&IEEE80211_F_USEPROT ? ", protection" : "",
-	    ni->ni_flags & IEEE80211_NODE_QOS ? ", QoS" : ""
+	    ni->ni_flags & IEEE80211_NODE_QOS ? ", QoS" : "",
+	    (ic->ic_flags_ext & IEEE80211_FEXT_UAPSD) ?
+		((ni->ni_flags & IEEE80211_NODE_UAPSD) ?
+		    ", uAPSD enabled" : ", uAPSD disabled") : ""
 	);
 
 	ieee80211_new_state(ic, IEEE80211_S_RUN, subtype);
