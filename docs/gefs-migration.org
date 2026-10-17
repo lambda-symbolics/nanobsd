@@ -1,0 +1,50 @@
+#+TITLE: Root on gefs+: the migration (started 2026-10-17)
+
+gefs+ = lambda-symbolics/gefs-netbsd (9front gefs as a NetBSD kernel file
+system, plus group commit, commit policy, the 2026-10-14 review fixes,
+batched deadlist merges, workers parked on suspend).  Still readable by
+9front gefs.  Value here: snapshots and boot environments; power-wise it
+is a wash with APST on (measured 2026-09-28, docs/power-levers.org).
+
+* The procedure (agreed 2026-10-14)
+1. Back up the root to the 512 GB USB-C SSD as FFS and boot from it: proves
+   the copy is complete and that this firmware boots from USB.  Kept
+   afterwards as the rollback image.
+2. gefs+ trial on the same SSD: a second partition, gefs+, the system
+   copied in, the gefs-aware loader on the SSD's ESP.  Boot it and live on
+   it for a day: Mahogany, Wi-Fi, lid suspend/resume, a crash dump, a few
+   snapshots, a =boot @label/netbsd= rollback.  Internal disk untouched.
+3. Only then the internal root wedge (dk1 only) becomes gefs+: copy back,
+   loader on the internal ESP, boot entries switched.  Swap/dump (dk2)
+   untouched; the old FFS loader stays on the ESP under another name.
+
+* Preconditions
+| what                                   | state                                    |
+|----------------------------------------+------------------------------------------|
+| gefs built into the kernel             | kernel 181 = 180 + =file-system GEFS=     |
+| current gefs+ on the laptop            | 18aee6f in /root/gefs/gefs-netbsd (old    |
+|                                        | copy: gefs-netbsd.20260928)              |
+| gefs-aware efiboot                     | patches applied, to build                |
+| gefs tools (gefs, newfs/fsck_gefs,     | to build from sbin/ against /usr/src     |
+| mount_gefs)                            |                                          |
+| GPT type 38417555-670b-4a70-8e7a-bd7ce366f5a1 + bootme | at partitioning       |
+| fstab by name, not dk number           | already (=NAME=<gpt uuid>=); gefs root   |
+|                                        | gets a label (=gefsroot=)                |
+| durable commit before s2idle           | barrier in the kernel (freeze_fsbarrier) |
+|                                        | + gefs suspend handler e22a2ac; set      |
+|                                        | =freeze_fsbarrier=2= for a gefs root     |
+| build trees off the snapshots          | pkgsrc WRKOBJDIR / Firefox work dir on   |
+|                                        | their own label with =retain none=       |
+| USB-C SSD reachable                    | =usb on usbc= (it is cold at boot)       |
+
+* Laptop tree layout
+=/usr/src/sys/fs/gefs=, =/usr/src/sys/modules/gefs=,
+=/usr/src/sys/lib/libsa/gefs.[ch]= are symlinks into
+=/root/gefs/gefs-netbsd= (an archive of the repo; =REVISION= names the
+commit).  The NetBSD-side hooks are in nanobsd kernel/ (8bffbed): conf/files,
+fs/Makefile, modules/Makefile, lib/libsa/Makefile, efiboot conf.c and
+Makefile.efiboot, GENERIC.  Previous versions on the laptop: =*.180=.
+
+* Log
+- 2026-10-17 evening: gefs+ 18aee6f synced; tree hooks applied (nanobsd
+  47704c9, 8bffbed); kernel 181 building.  The user is emptying the SSD.
