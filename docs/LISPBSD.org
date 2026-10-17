@@ -330,3 +330,14 @@ follows =-z=, AB_SILENT 0x40000, not =-q=).  Now:
   text screen at the end, which re-enables console drawing.
 - Still visible: the copyright banner for the moment before genfb
   attaches, and the loader's menu itself.
+
+* Update 2026-10-17 — kernels 177-180, power results
+Default boot kernel: =netbsd.i915.rpm.180= (boot.cfg; 179 and 177 kept as
+fallbacks).  What changed and what it measured: docs/power-levers.org
+"Results (2026-10-17, kernels 177-180)".  In short: TSC-measured tickless
+tick accounting, callout deadline cache, TSC-low timecounter (sysctl.conf),
+USB runtime PM by deadlines, a ubt fix (the parked radio no longer dies after
+its first wake), TGL SAGV on (=lispbsd_sagv=1=, -0.8 W under video; never set
+it back to 0 without a reboot), Wi-Fi U-APSD built in but off for good
+(+50 ms latency, no saving), wg keepalive timer stops on ifconfig down.
+Panel off on battery: ~1.05 W.  Never run =usbdevs= while =usb off=.
