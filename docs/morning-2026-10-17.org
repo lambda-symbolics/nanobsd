@@ -10,7 +10,7 @@ uptime, on battery, hands off (wakecensus-energy flags a touched window).
 * 0. Baseline on kernel 176 (before installing anything)
 Normal-use energy baseline the reviews asked for, and the reference for
 every A/B below.  Install =userland/wakecensus/wakecensus-energy= next to
-=wakecensus= (/usr/local/bin) first.  Panel blanked by Mahogany (not the lid), battery:
+=wakecensus= (/usr/local/sbin) first.  Panel blanked by Mahogany (not the lid), battery:
 : wakecensus-energy 900 k176-blank
 : wakecensus 120 k176-census     # the disturbing census, separately
 Also keep one window with the panel on at the usual brightness.

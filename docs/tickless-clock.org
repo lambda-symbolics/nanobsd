@@ -195,3 +195,20 @@ one lock) is possible but each replayed tick costs ~0.5 us: 300 ticks per
 wake, a wake every few seconds, is ~0.005 % of a CPU.  Not worth the risk to
 =hardclock= now; revisit if replay shows up in a profile, or for the
 interrupt-latency spike (maxskip 1400 replays with interrupts at splclock).
+
+* Kernel 177 deployed (2026-10-17 morning, build #179 on the laptop)
+On AC, battery near empty (energy A/B still owed).  =clock-check= from the
+workstation over wg (real = workstation midpoint, ~0.3 s ssh asymmetry):
+
+| kernel 177                     | real    | date | TSC   | HPET  | cpu0 ticks | PC10   |
+| TSC, maxskip 300               | 122.0 s | 123  | 122.3 | 122.3 | 122.3 s    | 98.9 % |
+| TSC-low, maxskip 300           | 122.8 s | 123  | 123.3 | 123.3 | 123.3 s    | 99.0 % |
+| TSC-low, maxskip 1000          | 121.9 s | 123  | 122.2 | 122.2 | 122.2 s    | 98.9 % |
+| back to TSC, maxskip 100       | 92.4 s  | 93   | 92.7  | 92.7  | 92.7 s     | 98.5 % |
+
+cpu0 ticks equal TSC and HPET in every window.  =kern.callout_nextcache=
+right after boot: 36863 hits, 291 scans.  TSC-low registered with shift 4
+(132 MHz).  CPU 0 timer interrupts, 60 s windows, maxskip 300, ABAB:
+TSC 3.40/s, TSC-low 2.61/s, TSC 2.10/s, TSC-low 0.66/s (the drift is the
+boot settling; each pair drops by about the 1 Hz windup wake).  TSC-low is
+now in /etc/sysctl.conf.

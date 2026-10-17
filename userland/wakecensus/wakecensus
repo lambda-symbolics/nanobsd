@@ -5,11 +5,11 @@
 # package C-state residency shares and the battery's Wh delta.
 export PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/pkg/sbin:/usr/pkg/bin:/usr/local/sbin:/usr/local/bin
 n=${1:-60}; label=${2:-idle}
-K=/$(sysctl -n machdep.booted_kernel)
+# crash without -N: /dev/ksyms also resolves module callouts (with -N they show as __kernel_end)
 T=/tmp/wakecensus.$$; mkdir -p $T
 echo "== wakecensus $label: $n s, $(date), kernel $(sysctl -n machdep.booted_kernel), ac=$(envstat -d acpiacad0 | awk '/connected/{print $2}')"
 echo "-- armed periodic callouts (function: count)"
-timeout 30 sh -c "printf 'show callout\\n' | crash -N $K -M /dev/mem" 2>/dev/null | awk 'NF==4 && $4!="sleepq_timeout" && $1 ~ /^[0-9]+$/ {print $4}' | sort | uniq -c | sort -rn | awk '{printf "  %s: %s\n", $2, $1}'
+timeout 30 sh -c "printf 'show callout\\n' | crash -M /dev/mem" 2>/dev/null | awk 'NF==4 && $4!="sleepq_timeout" && $1 ~ /^[0-9]+$/ {print $4}' | sort | uniq -c | sort -rn | awk '{printf "  %s: %s\n", $2, $1}'
 snap() {
 	vmstat -i | awk 'NF>=3 && $NF ~ /^[0-9]+$/ {n=$(NF-1); $(NF-1)=""; $NF=""; sub(/ +$/,""); print $0 "|" n}' > $T/i$1
 	vmstat -e | awk 'NF>=4 && $NF ~ /^[a-z]+$/ && $(NF-1) ~ /^[0-9]+$/ && $(NF-2) ~ /^[0-9]+$/ {n=$(NF-2); $(NF-2)=""; $(NF-1)=""; $NF=""; sub(/ +$/,""); print $0 "|" n}' > $T/e$1

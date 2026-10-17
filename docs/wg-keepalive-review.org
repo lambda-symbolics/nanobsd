@@ -231,3 +231,7 @@ before the stop can re-arm once; that firing sees the flag and stops.
 VM test (wg0 <-> wg1 over lo0, keepalive 2 s, =crash= =show callout=):
 up 12 s: handshake + keepalives, 1 timer armed; down 12 s: no packet, 0
 armed; up again: keepalives resume, 1 armed; module unloads cleanly.
+On the laptop (kernel 177, keepalive 25 s, =crash -M /dev/mem= so the
+module's callout resolves): up 1 armed; down 3 s and 33 s: 0; up again: 1
+armed, status active.  Note: =crash -N <kernel>= cannot name module
+functions; their callouts show as =__kernel_end= (wakecensus fixed).
