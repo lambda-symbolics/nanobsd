@@ -607,6 +607,30 @@ umass_attach(device_t parent, device_t self, void *aux)
 		return;
 	}
 	/*
+	 * LISPBSD: start from a known Bulk-Only state.  After the firmware has
+	 * used the device (UEFI boot, the F12 menu's disk scan), the Verbatim
+	 * Portable SSD NAKs the first command for ~7 s and then stalls it, so
+	 * the boot-time probe fails ("generic HBA error") while a later rescan
+	 * works.  A Bulk-Only Mass Storage Reset plus clearing both bulk halts
+	 * is the class's reset recovery (BOT 5.3.4), allowed at any time.
+	 */
+	if (sc->sc_wire == UMASS_WPROTO_BBB) {
+		usb_device_request_t req;
+		usbd_status rerr;
+
+		req.bmRequestType = UT_WRITE_CLASS_INTERFACE;
+		req.bRequest = UR_BBB_RESET;
+		USETW(req.wValue, 0);
+		USETW(req.wIndex, sc->sc_ifaceno);
+		USETW(req.wLength, 0);
+		rerr = usbd_do_request(sc->sc_udev, &req, NULL);
+		(void)usbd_clear_endpoint_stall(sc->sc_pipe[UMASS_BULKIN]);
+		(void)usbd_clear_endpoint_stall(sc->sc_pipe[UMASS_BULKOUT]);
+		aprint_normal_dev(self, "Bulk-Only reset at attach: %s\n",
+		    usbd_errstr(rerr));
+	}
+
+	/*
 	 * Open the intr-in pipe if the protocol is CBI with CCI.
 	 * Note: early versions of the Zip drive do have an interrupt pipe, but
 	 * this pipe is unused
