@@ -100,4 +100,8 @@ stock-then-change treatment when this is deployed.  First read-only:
     move the memory clock by itself (mode 1 may then add little).
   - U-APSD: fw=1, the current AP has WMM and U-APSD (ap_wmm=1 ap_uapsd=1);
     switch still 0 (needs a reassociation = scan, at the laptop).
-- Energy A/B TSC vs TSC-low (energy-ab.sh 600 1) running on battery.
+- Energy A/B TSC vs TSC-low: no measurable difference (TSC-low kept).
+- SAGV mode 1: -0.8 W under video vs pinned top; on at boot.
+- U-APSD: works, no saving, +50 ms ping; off for good.
+- Lid s2idle with the parked radio: OK.
+- All results: docs/power-levers.org "Results (2026-10-17, kernels 177-180)".

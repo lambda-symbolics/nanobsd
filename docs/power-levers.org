@@ -257,6 +257,44 @@ drive's state twice a second:
   Candidates if it matters: =/var/run= on tmpfs, and fewer resolvconf
   rewrites.
 
+* Results (2026-10-17, kernels 177-180)
+Prepared overnight (reviews, VM builds, a throwaway KVM guest for boot
+tests), deployed and measured on the laptop the next day.  Details per item
+in docs/tickless-clock.org, docs/usbpm-deadlines.org, docs/sagv.org,
+docs/uapsd.org, docs/wg-keepalive-review.org.
+
+- *Whole machine, panel off, battery, usb off: ~1.05 W* (174: 1.20 W).
+- 13: kernel 176 inferred tickless sleeps from the LAPIC count after an IRR
+  read (double ticks when the timer expired between the reads, and under
+  heavy early-wake load in a VM it lost 64 % of hardclock ticks).  177
+  measures with the TSC; on the laptop cpu0 ticks = TSC = HPET in every
+  clock-check window, PC10 98.5-99 %.
+- 14: =kern.callout_nextcache= (hits/scans); exact-or-early per-CPU cache.
+- 15: the 32-bit TSC counter forced a primary wake each ~1 s for the
+  windup; TSC-low (TSC >> 4, 16 s half wrap) removes ~0.7-1 cpu0 wake/s.
+  10 min battery windows ABBA: TSC 1.02 W, TSC-low 1.08 W = inside the
+  battery counter's resolution.  At 98 % PC10 one wake per second is not
+  visible in watts (as with lpsched packing).  Kept (free, exact).
+- 16: xhci runtime PM by per-slot deadlines; the old 5 s rescan is gone.
+  Its test exposed a pre-existing ubt bug: every wake of the parked radio
+  by a command lost that command's reply (event pipe reopen reset the host
+  data toggle), leaking HCI command credits until Bluetooth was dead; fixed
+  in 179 (=usbd_restart_pipe_intr=).  Lid s2idle with the parked radio OK.
+- 17: TGL SAGV backport; firmware has 4 QGV points (DCLK 2134-4268 MHz).
+  Mode 1 keeps the memory at the low point through a video: 6.5 W vs 7.3 W
+  pinned at the top.  On at boot (=lispbsd_sagv=1=).  Never back to 0
+  without a reboot (leaving 1/2 pins the top point).  Open: whether the
+  firmware alone (fresh boot, mode 0) also stays low under load.
+- 18: U-APSD negotiates and works (4/4 WMM associations, 0 % loss), but no
+  saving was measurable (beacon filtering + PS level 2 already sleep the
+  radio) and gateway pings go from ~4 ms to ~50-60 ms (inherent: the AP
+  holds the reply until the next trigger or beacon).  Off for good.
+- wg(4): the persistent keepalive timer now stops with =ifconfig wg0 down=.
+- Tooling: =wakecensus-energy= (endpoint reads only), =energy-ab.sh=,
+  =sagv-ab.sh=, =usbpm-deadlines.sh=; wakecensus names module callouts
+  (=crash -M /dev/mem=, not =-N <kernel>=).  Never run =usbdevs= while
+  =usb off= (D state on the suspended controller, xhci wedged to reboot).
+
 * Status
 
 | lever                         | state                                              |
@@ -273,6 +311,12 @@ drive's state twice a second:
 | 10 SSD power states (APST)    | done (kernel 131); drive in PS4 98 % when quiet    |
 | 11 root log,noatime           | done                                               |
 | 12 gefs for power             | measured: not a lever with APST on (see above)     |
+| 13 LAPIC tick accounting      | done (177): TSC-measured, exact; 176 lost ticks    |
+| 14 callout next-deadline cache| done (177): idle path no longer walks the wheel    |
+| 15 TSC-low timecounter        | on (177): -1 cpu0 wake/s, energy not measurable    |
+| 16 USB PM by deadlines        | done (178): nothing armed when parked, 13/13       |
+| 17 SAGV / QGV                 | on (180): -0.8 W under video vs pinned top         |
+| 18 Wi-Fi U-APSD               | works, off for good: no saving, +50 ms latency     |
 
 =userland/s0ix= logs the whole-machine power of every suspension of 2 minutes
 or more on battery (=s0ix: resumed after N s on battery: X -> Y Wh, Z W= in

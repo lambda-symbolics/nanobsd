@@ -1,0 +1,9 @@
+#+TITLE: pending/: features built outside the laptop, before deployment
+
+Each directory holds a diff against the laptop tree, the design README, the
+review(s) and the test script, as prepared on 2026-10-16/17.  All three are
+now DEPLOYED (2026-10-17) and live in kernel/ (stock first, then the change):
+- usbpm -> kernel/dev/usb/xhci.c, xhcivar.h (kernel 178); docs/usbpm-deadlines.org
+- uapsd -> kernel/dev/pci/if_iwx*, kernel/net80211/ (kernel 180, off); docs/uapsd.org
+- sagv  -> kernel/external/bsd/drm2/... (kernel 180, on); docs/sagv.org
+The files here are the record of what was reviewed; kernel/ is current.
