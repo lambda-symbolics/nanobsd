@@ -81,3 +81,9 @@ Makefile.efiboot, GENERIC.  Previous versions on the laptop: =*.180=.
   entries on both sides, spot checks identical.  Copy's fstab root
   NAME=ffsbackup, rc.local without usb off, boot.cfg kernel 181 then 180,
   gefs efiboot as EFI/BOOT/BOOTX64.EFI on ssdesp, bootme on ffsbackup.
+
+* Later
+- Power comparison gefs+ vs FFS by event counts (disk ops/min, NVMe deepest
+  power-state residency, vfs.gefs commits/skipped/flushes) in idle windows,
+  FFS side on the rescue root; expected a few to a few tens of mW.  The
+  battery counter cannot resolve it.
