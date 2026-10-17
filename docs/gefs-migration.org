@@ -53,6 +53,5 @@ Makefile.efiboot, GENERIC.  Previous versions on the laptop: =*.180=.
   Autolith's own data (recovery-worktrees, tasks, conversations, checkout
   caches; prune through Autolith), the Firefox pkgsrc work dir, distfiles.
 
-* After the migration
-- Delete =/usr/INSTALL= (NetBSD 11.0 install sets, 271 MB): kept only as
-  offline insurance while the root is being moved.
+- /usr/INSTALL (NetBSD 11.0 install sets) deleted too: the sets are on
+  cdn.netbsd.org, and the user is present for the whole migration.
