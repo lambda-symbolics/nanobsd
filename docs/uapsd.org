@@ -22,3 +22,11 @@ cost is ~50 ms.  Beacon filtering + PS level 2 already keep the radio asleep;
 U-APSD only shortens the 200/300 ms awake tail after bursts.  Kept at 0.
 Revisit under heavier background traffic (chat, sync) where bursts are
 frequent, with longer windows.
+
+* Decision (2026-10-17): off for good
+The latency is inherent, not a port bug: the AP buffers downlink until a
+trigger frame; a ping reply is usually not ready when the request (the
+trigger) opens the service period, so it waits for the next trigger or
+beacon (100 ms beacons -> ~50 ms average).  Linux's iwlwifi also leaves
+U-APSD off for client mode by default.  No saving to buy it with, so
+hw.iwx.uapsd stays 0; the code stays (correct, reviewed, default off).
