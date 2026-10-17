@@ -131,11 +131,17 @@ log "   $(stats)"
 # --- 2: radio up, parks within autosuspend + slack ------------------------
 log "-- 2: btconfig $DEV up"
 s=$(stats); b=$(get suspends "$s"); d0=$(get dormant "$s")
-if ! radio_up; then
+was_up=0
+if radio_up; then
+	was_up=1
+else
 	btconfig $DEV up 2>&1 | tee -a $OUT
 fi
 radio_up || { fail "2: $DEV did not come up (firmware? dmesg)"; restore; exit $FAILS; }
-if wait_parked "$b" "$d0" $((AS + SLACK)); then
+if [ $was_up = 1 ] && [ "$(get armed "$s")" = 0 ] && [ "$(get deadlines "$s")" = 0 ]; then
+	# Already up and parked from an earlier run: nothing left to park.
+	pass "2: radio was already up and parked (nothing armed)"
+elif wait_parked "$b" "$d0" $((AS + SLACK)); then
 	pass "2: radio up+idle parked after ${ELAPSED}s (limit $((AS + SLACK))s)"
 else
 	fail "2: radio not parked within $((AS + SLACK))s (dormant? see dmesg 'port N:' lines)"
@@ -144,7 +150,12 @@ log "   $(stats)"
 
 # --- 3: quiet window: no callout, no scan, no task -----------------------
 log "-- 3: quiet ${QUIET}s"
-s1=$(stats); sleep "$QUIET"; s2=$(stats)
+# A task already running (counted in tasks= when it starts) finishes its
+# suspend (suspends=) a moment later: start the window once the counters
+# have stood still for 3 s.
+s1=$(stats); t=0
+while [ $t -lt 15 ]; do sleep 3; t=$((t+3)); s=$(stats); [ "$s" = "$s1" ] && break; s1=$s; done
+sleep "$QUIET"; s2=$(stats)
 log "   before: $s1"
 log "   after:  $s2"
 ok=1

@@ -1,0 +1,53 @@
+#+TITLE: USB runtime PM by deadlines (kernel 178) and the ubt event-toggle fix (kernel 179)
+
+* What changed (178)
+xhci runtime PM no longer rescans every 5 s.  Each slot carries at most one
+deadline (idle: lastbusy + autosuspend; retry with backoff after a failed
+suspend or resume), one callout per controller is armed for the earliest,
+and a slot with nothing to do has no deadline.  Design, review and VM test:
+pending/usbpm/ (README.org, REVIEW.org).  hw.usbpm.stats gained callouts=
+scans= reconciles= tasks= retries= giveups= armed= deadlines= dormant=
+maxlate_ms=; new knobs hw.usbpm.deferrable and inject_suspend/inject_resume.
+
+* On the laptop (2026-10-17)
+=userland/wakecensus/usbpm-deadlines.sh -f -g= on kernel 179, from the boot
+state (radio down, usb off): all 13 checks pass.  The acceptance check: 60 s
+with everything parked, callouts/scans/tasks/suspends/resumes unchanged and
+=armed=0 deadlines=0= (the old code woke every 5 s).  Injected suspend
+failures back off (radio parked 15 s after the inquiry), injected resume
+failures retry and the inquiry still works, 5 failures give up into the
+40 s slow re-check and a sysctl write re-arms it.
+Script fixes found on the hardware: step 2 accepts a radio already up and
+parked; step 3 starts its window once the counters stood still for 3 s (a
+task already running finishes its suspend a moment later).
+
+* The Bluetooth bug the test exposed (pre-existing; fixed in 179)
+Symptom: after the parked radio was woken by a command, Bluetooth went dead
+(=btconfig ubt0 inquiry= "Operation timed out") until =btconfig ubt0 down;
+up=.  =btconfig -v ubt0= showed =num_cmd = 0=.  hcisniff: the inquiry
+command went out, its Command Status (event 0x0f) never came, only the
+Inquiry Complete 9 s later.  Each wake by a command lost the event answering
+it, i.e. one HCI command credit; with 1-2 credits the radio died after the
+first or second wake.  Identical on kernel 177 (the old 5 s scan), so not
+caused by the deadline rewrite.
+Cause: =ubt_resume()= closed and reopened the event (interrupt IN) pipe.
+=xhci_close_pipe()= drops the endpoint and =xhci_open()= adds it back
+(Configure Endpoint), which resets the host's data toggle; the controller
+kept its toggle, so its next packet - the reply to the waking command - was
+taken for a retransmission and discarded.  Fix: =usbd_restart_pipe_intr()=
+(new, usbdi.c) re-arms the interrupt pipe's repeating transfer without
+closing it; ubt uses it on unpark (reopen only as a fallback).
+Verified: 4 park/inquiry cycles, every Command Status arrives ~110 ms after
+the command (the wake), num_cmd stays 2.
+
+Gotcha found on the way: never run =usbdevs= while =usb off= has the PCH
+controller suspended: it blocks in D state (usbxfer) on the powered-down
+controller; =usb on pch= released it, but the aborted transfer left xhci1
+wedged (=xhci_set_dequeue: endpoint 0x0: timed out=, =drvctl -S= stuck in D)
+until a reboot.  Also: =crash -N <kernel>= cannot name module functions
+(module callouts show as =__kernel_end=); use =crash -M /dev/mem=.
+
+* Still to do
+- Panel-off energy window on battery after 10 min uptime (battery was at 5 %
+  on 10-17 morning).
+- Lid s2idle cycle with the radio parked, then an inquiry (needs the lid).
