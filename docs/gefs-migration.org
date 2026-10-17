@@ -122,3 +122,15 @@ fstab) once gefs+ has run for a while.
   attribute, not the directory entry), so libudev skipped /dev/dri/card0.
   Fixed in gefs-netbsd 11788c4 (lookup after the scan; VM-tested with 3000
   device nodes across a remount); kernel 185 = 184 + the fix.
+- 2026-10-18 01:42: kernel 185 on the gefs+ root: Mahogany up (wlroots found
+  the GPU), snapshots running (minute/hour/day of main), commits skipped
+  when clean, freeze_fsbarrier=2.  MIGRATION DONE.
+
+* Still open
+- Lid s2idle with the gefs root and the required barrier: test it.
+- The rescue root (partition 3, label "rescue", FFS 16 GB): keep as a
+  recovery system or turn back into swap (gpt type swap, label "swap",
+  fstab NAME=swap, swapctl; dump device back) once gefs+ is trusted.
+- Booting from the Verbatim SSD (boot-time probe fails; kernel 184's port
+  cycle quirk untested); the SSD keeps the FFS copy of the old root.
+- Power comparison (see "Later").
