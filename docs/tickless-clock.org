@@ -212,3 +212,18 @@ right after boot: 36863 hits, 291 scans.  TSC-low registered with shift 4
 TSC 3.40/s, TSC-low 2.61/s, TSC 2.10/s, TSC-low 0.66/s (the drift is the
 boot settling; each pair drops by about the 1 Hz windup wake).  TSC-low is
 now in /etc/sysctl.conf.
+
+** Energy A/B on battery (2026-10-17, kernel 180, panel blanked, usb off)
+=userland/wakecensus/energy-ab.sh 600 1= (wakecensus-energy windows, no touch):
+
+| window  | W     | cpu0 timer/s | PC10   |
+| TSC     | 1.080 | 2.69         | 98.2 % |
+| TSC-low | 1.020 | 1.63         | 98.2 % |
+| TSC-low | 1.140 | 1.57         | 98.2 % |
+| TSC     | 0.960 | 2.04         | 98.2 % |
+
+TSC 1.02 W, TSC-low 1.08 W: inside the battery counter's resolution (0.01 Wh
+= 0.06 W per 10 min window; window spread 0.18 W).  TSC-low removes ~0.7-1
+cpu0 wake/s but no measurable energy: at 98 % PC10 one wake per second is
+below what the battery can show (as with lpsched packing).  Kept anyway
+(free, exact).  Whole machine panel-off on 180: ~1.05 W (174: 1.20 W).
