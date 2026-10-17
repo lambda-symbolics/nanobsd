@@ -48,3 +48,11 @@ Makefile.efiboot, GENERIC.  Previous versions on the laptop: =*.180=.
 * Log
 - 2026-10-17 evening: gefs+ 18aee6f synced; tree hooks applied (nanobsd
   47704c9, 8bffbed); kernel 181 building.  The user is emptying the SSD.
+- 2026-10-17 evening: root cleaned 78 -> 28 GB before the copy (see
+  docs/LISPBSD.org "cleanup before the gefs+ migration").  Left on purpose:
+  Autolith's own data (recovery-worktrees, tasks, conversations, checkout
+  caches; prune through Autolith), the Firefox pkgsrc work dir, distfiles.
+
+* After the migration
+- Delete =/usr/INSTALL= (NetBSD 11.0 install sets, 271 MB): kept only as
+  offline insurance while the root is being moved.
