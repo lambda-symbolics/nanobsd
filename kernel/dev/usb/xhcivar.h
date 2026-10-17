@@ -36,6 +36,7 @@
 #include <sys/mutex.h>
 #include <sys/pmf.h>
 #include <sys/pool.h>
+#include <sys/queue.h>
 
 #include <sys/callout.h>
 #include <dev/usb/usbdi.h>
@@ -102,6 +103,25 @@ struct xhci_slot {
 	uint32_t xs_dbpending;		/* doorbells to ring after the resume, bit per dci */
 	int xs_rt_want;			/* 1: suspend, 2: resume (for xs_rt_task) */
 	struct usb_task xs_rt_task;
+
+	/*
+	 * Deadlines (sc_intr_lock).  At most one is armed per slot.  The idle
+	 * deadline is xs_lastbusy + hw.usbpm.autosuspend, re-read when the
+	 * controller callout fires (activity only moves xs_lastbusy).  The
+	 * retry deadline re-runs a failed transition: xs_retry_want 2 (a
+	 * resume/unpark that still owes deferred I/O: never abandoned) or 1
+	 * (a suspend: backoff, then a slow re-check at the cap).
+	 * A dormant slot was refused for a reason that only an eligibility
+	 * event (pipe open/close, port change, sysctl write, resume) changes.
+	 */
+	bool xs_idle_armed;
+	bool xs_retry_armed;
+	bool xs_dormant;
+	int xs_retry_want;
+	int xs_retry_due;		/* getticks() */
+	u_int xs_rt_gen;		/* eligibility events (see xhci_rt_event_locked) */
+	u_int xs_res_fails;		/* consecutive failed resumes/unparks */
+	u_int xs_susp_fails;		/* consecutive failed suspends */
 };
 
 struct xhci_softc {
@@ -168,12 +188,26 @@ struct xhci_softc {
 	bool sc_state_lost;		/* cold recovery required until successful */
 
 	/* LispBSD USB runtime power management */
-	callout_t sc_rt_callout;	/* the idle scan, deferrable */
+	callout_t sc_rt_callout;	/* earliest slot deadline; idle when none */
 	int sc_rt_bound;		/* device slots bound (populated) */
 	bool sc_rt_paused;		/* sc_intr_lock: no new runtime PM tasks */
 	u_int sc_rt_openers;		/* sc_intr_lock: synchronous port wakes */
 	kcondvar_t sc_rt_cv;		/* drain sc_rt_openers before system suspend */
 	uint64_t sc_rt_suspends, sc_rt_resumes, sc_rt_wakes, sc_rt_failed;
+	/* sc_intr_lock: the deadline callout */
+	bool sc_rt_armed;		/* sc_rt_callout is scheduled */
+	bool sc_rt_armed_hard;		/* ... not deferrable (a resume retry) */
+	int sc_rt_armed_at;		/* ... for this getticks() */
+	u_int sc_rt_ndeadlines;		/* slots with an armed deadline */
+	uint64_t sc_rt_callouts;	/* callout invocations */
+	uint64_t sc_rt_scans;		/* slot walks by the callout */
+	uint64_t sc_rt_reconciles;	/* event-driven full walks */
+	uint64_t sc_rt_tasks;		/* runtime PM task runs with work */
+	uint64_t sc_rt_retries;		/* retry deadlines that fired */
+	uint64_t sc_rt_giveups;		/* suspends abandoned after backoff */
+	int sc_rt_maxlate;		/* ticks: worst callout lateness */
+	LIST_ENTRY(xhci_softc) sc_rt_link; /* xhci_rt_list (sysctl) */
+	bool sc_rt_listed;
 
 	void (*sc_vendor_init)(struct xhci_softc *);
 	int (*sc_vendor_port_status)(struct xhci_softc *, uint32_t, int);
