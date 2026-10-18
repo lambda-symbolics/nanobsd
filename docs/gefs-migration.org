@@ -134,3 +134,13 @@ fstab) once gefs+ has run for a while.
 - Booting from the Verbatim SSD (boot-time probe fails; kernel 184's port
   cycle quirk untested); the SSD keeps the FFS copy of the old root.
 - Power comparison (see "Later").
+- 2026-10-18 afternoon: two gefs bugs in use.  git clone failed ("nonexistent
+  object") leaving an undeletable .git/objects/pack, and a download into the
+  empty ~/Desktop was invisible to ls while openable by path.  Cause (found by
+  Astra): readdir reused a finished scan of a once-empty directory, because
+  "." and ".." advance the counter to 2, where that scan had stopped.  Fixed
+  in gefs-netbsd 5201ad1 with three more: rename purges the parent name
+  caches (genfs_rename_cache_purge), unlink/rename report the real link
+  count, statvfs inode counts consistent (df -i was negative).
+  tests/readdir-regress.c fails 5 checks before, 0 after (VM, also after a
+  remount); fsxlite 2x20000 ok.  Kernel 186 = 185 + the fixes.
