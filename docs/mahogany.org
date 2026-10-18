@@ -456,6 +456,40 @@ fullscreen requests run =*fullscreen-change-hook*= to repaint.  Moving the
 fullscreen layer above the top one instead would have hidden layer-shell
 launchers (wmenu) under a fullscreen video.
 
+Fullscreen is a column now, the way Niri does it (10-18, mahogany e60bcb2;
+replaces the 9/28 hiding above).  Before, a fullscreen view sat in a
+panel-sized node at the output origin, outside the strip: focusing a
+neighbour moved focus, input and the focus border to a column hidden under
+it.  Now a fullscreen cell (=cell-fullscreen=) makes its column as wide and
+tall as the whole output, bar rows included, with no border; the column keeps
+its place in the row and scrolls like the others.  Selected, it is lined up
+with the output's left edge; focusing a neighbour slides it aside (focus left
+of it with 1/2 columns: the neighbour on the left half, the fullscreen window
+on the right half from the top edge down, the left half of the bar visible).
+The client stays fullscreen while off focus, so it never resizes back and
+forth.  A fullscreen column shows only that window (the other cells are
+skipped by up/down, cycling and pointer focus).  A new window opens beside
+it without ending fullscreen; moving the column to another group keeps it.
+- The bar is a buffer in heart's *bottom* layer now, under the windows, so a
+  fullscreen window covers exactly the part it spans; layer-shell top and
+  overlay surfaces (wmenu) still draw above everything.
+- No border on a fullscreen window: the view-frame focus method turns the
+  border on, so the strip-cell =:after= method turns it off again for a
+  fullscreen cell, and the layout keeps it off (the old StumpWM top-left
+  border bug, a07e987).  test/strip-tests.lisp covers it (fails 4 checks
+  with that method disabled).
+- heart grants a fullscreen request made before the window mapped (=foot
+  -F=, =mpv --fs=); it used to answer with a plain configure only.
+- Verified with a headless instance next to the real session
+  (WLR_BACKENDS=headless, WLR_RENDERER=pixman, own XDG_RUNTIME_DIR and
+  config with just =(bar-start)=, LD_LIBRARY_PATH=build/heart), foot
+  clients, mahoganyctl and grim screenshots.
+- Build with /usr/local/bin/sbcl (the futex SBCL) first in PATH; with
+  /usr/pkg/bin first the image is built by pkgsrc SBCL 2.6.5 into another
+  asdf-cache.  A fasl compiled in the same second as a source edit is
+  reused (equal timestamps): clear =build/asdf-cache/*/lisp= after
+  experiments.
+
 ** Lid shut at boot
 
 The lid only notifies changes, and the change at boot happens before powerd
