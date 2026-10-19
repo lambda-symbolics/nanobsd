@@ -168,6 +168,17 @@ dma_buf_put(struct dma_buf *dmabuf)
 		return;
 	membar_acquire();
 
+	/*
+	 * LISPBSD: give the exporter its release callback, as Linux does
+	 * when the last reference goes.  For PRIME that is
+	 * drm_gem_dmabuf_release, which drops the GEM object and device
+	 * references drm_gem_dmabuf_export took; without it every buffer
+	 * ever shared as a dma-buf (each Wayland buffer, each VA-API frame)
+	 * stayed allocated with its pages wired until reboot.
+	 */
+	if (dmabuf->ops->release)
+		(*dmabuf->ops->release)(dmabuf);
+
 	dma_resv_poll_fini(&dmabuf->db_resv_poll);
 	mutex_destroy(&dmabuf->db_lock);
 	if (dmabuf->resv == &dmabuf->db_resv_int[0]) {

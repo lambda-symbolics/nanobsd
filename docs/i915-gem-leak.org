@@ -1,0 +1,51 @@
+#+TITLE: Exported GEM buffers never freed (dma-buf release), 2026-10-19
+
+* Symptom
+Firefox crashed every few minutes: "ShmSegmentsWriter failed to allocate
+chunk" (GFX critical notes), then a WebRender abort, the
+has_font(&shared_font_key) assertion in gfx/wr/webrender/src/api_resources.rs
+(both cores in ~mag, the panic text is on the crashing thread's stack).
+
+* Chain of causes
+1. 6.4 GB wired at idle with Firefox closed.  i915 (read from the live
+   kernel with gdb, target kvm /dev/mem, lispbsd_i915_sc):
+   mm.shrink_count 2793 objects, mm.shrink_memory 6.78 GB.  Walking
+   mm.shrink_list: 2671 of 2773 objects have obj->dma_buf set and
+   handle_count 0, so no process has a handle, and only ~50 dma-buf fds
+   are open system-wide.
+2. NetBSD 11.0 never calls a dma-buf's release hook: dma_buf_put
+   (linux_dma_buf.c 1.17) frees the struct when the count reaches 0, and
+   no code anywhere calls dmabuf->ops->release.  For PRIME that hook is
+   drm_gem_dmabuf_release, which drops the GEM object and drm device
+   references drm_gem_dmabuf_export took.  Also
+   drm_gem_object_exported_dma_buf_free (drm_gem.c 1.25) is compiled out
+   under __NetBSD__ although export_and_register_object takes the
+   obj->dma_buf reference: object and dma-buf held each other.  Every
+   buffer ever exported (every Wayland buffer Mesa shares, every VA-API
+   frame) stayed allocated with wired pages until reboot.
+3. tmpfs sizes itself as swap + free + file pages - wired
+   (tmpfs_mem_info).  With swap gone (the rescue root of the gefs+
+   migration took partition 3 on 10-18) and wired > free + file, /tmp and
+   /var/shm reported 0 bytes free while 2.9 GB of RAM was free.  Firefox
+   keeps its shared memory in /var/shm, so every allocation failed.
+
+* Fixes
+- Swap back on partition 3 (10-19, docs/gefs-migration.org): /tmp and
+  /var/shm back to 3.9 GB at once.  Hides the leak only.
+- Kernel 187 (kernel/external/bsd/drm2): dma_buf_put calls
+  ops->release on the last reference; the cycle breaker in drm_gem.c is
+  enabled.  Release now runs synchronously (Linux defers it through
+  fput); on the paths that hold object_name_lock or the prime lock the
+  object's own dma-buf reference keeps the count above zero, so release
+  only runs from the fd close or after the last handle, where it only
+  drops a reference.
+
+* Test
+userland/drm/dmabuf-leak.c: N rounds of create, GTT set-domain (gives the
+object pages; a CPU set-domain returns early on a new object and leaves
+it without), PRIME export, close fd, GEM_CLOSE; prints the wired delta and
+exits 1 when it grew by more than a tenth of what was allocated.
+Kernel 186: 20 x 4 MB rounds, +82 MB wired, shrink_count +21 (the
+no-export control: 0).  A process exiting with handles open frees them
+(drm_close runs, the file list goes 8 -> 9 -> 8); its objects leaked
+only because they had been exported.
