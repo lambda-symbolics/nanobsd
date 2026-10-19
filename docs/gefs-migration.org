@@ -128,9 +128,15 @@ fstab) once gefs+ has run for a while.
 
 * Still open
 - Lid s2idle with the gefs root and the required barrier: test it.
-- The rescue root (partition 3, label "rescue", FFS 16 GB): keep as a
-  recovery system or turn back into swap (gpt type swap, label "swap",
-  fstab NAME=swap, swapctl; dump device back) once gefs+ is trusted.
+- The rescue root: RETIRED 2026-10-19, partition 3 is swap again (gpt type
+  swap, label "swap", fstab NAME=swap sw,dp, swapctl -A: swap and dump on
+  dk2; boot.cfg rescue entry removed).  Running without swap had a cost
+  nobody expected: NetBSD tmpfs counts free space as swap + free + file
+  pages - wired, so with 6.4 GB wired (leaked i915 GEM buffers) /tmp and
+  /var/shm reported 0 bytes free while 2.9 GB of RAM was free, and Firefox
+  crashed on every failed shared-memory allocation (WebRender's
+  has_font(&shared_font_key) assertion after "ShmSegmentsWriter failed to
+  allocate chunk").  Swap only hides the leak; see docs/i915-gem-leak.org.
 - Booting from the Verbatim SSD (boot-time probe fails; kernel 184's port
   cycle quirk untested); the SSD keeps the FFS copy of the old root.
 - Power comparison (see "Later").

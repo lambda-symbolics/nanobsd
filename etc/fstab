@@ -1,8 +1,7 @@
 # NetBSD /etc/fstab
 # See /usr/share/examples/fstab/ for more examples.
 NAME=gefsroot		/	gefs	rw		 0 0
-# rescue root on partition 3 until retired (docs/gefs-migration.org)
-#NAME=5e7b952c-688e-4146-8c4e-0835971d39a9		none	swap	sw,dp		 0 0
+NAME=swap		none	swap	sw,dp		 0 0
 tmpfs		/tmp	tmpfs	rw,-m1777,-sram%25
 kernfs		/kern	kernfs	rw
 ptyfs		/dev/pts	ptyfs	rw
