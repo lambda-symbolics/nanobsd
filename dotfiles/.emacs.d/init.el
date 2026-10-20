@@ -148,10 +148,24 @@
 ;;; Rust
 
 ;; rust-ts-mode when the tree-sitter grammar loads (pkgsrc tree-sitter-rust
-;; puts libtree-sitter-rust.so in /usr/pkg/lib), rust-mode otherwise.
+;; puts libtree-sitter-rust.so in /usr/pkg/lib) and this Emacs can compile
+;; its font-lock queries, rust-mode otherwise.  Stock Emacs 30 writes query
+;; predicates as #match, which tree-sitter 0.26 rejects as a syntax error,
+;; and the first bad query switches font-lock off for the whole buffer
+;; (2026-10-20: Rust had no highlighting at all).  The emacs-pgtk build
+;; carries the fix (nanobsd userland/emacs-pgtk/patch-treesit-predicates.diff).
+(defun mag/treesit-usable-p (lang)
+  "Whether LANG's grammar loads and accepts a query with a predicate."
+  (and (treesit-language-available-p lang)
+       (condition-case nil
+           (progn (treesit-query-compile
+                   lang '(((identifier) @x (:match "x" @x))) t)
+                  t)
+         (error nil))))
+
 (use-package rust-mode
   :init
-  (when (treesit-language-available-p 'rust)
+  (when (mag/treesit-usable-p 'rust)
     (setq rust-mode-treesitter-derive t)))
 
 (defun mag/rust-setup ()

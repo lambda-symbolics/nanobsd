@@ -1,0 +1,29 @@
+--- src/treesit.c.orig	2026-10-20 14:14:13.417176423 +0200
++++ src/treesit.c	2026-10-20 14:14:24.812222650 +0200
+@@ -2948,6 +2948,11 @@
+       Lisp_Object predicate = XCAR (tail);
+       Lisp_Object fn = XCAR (predicate);
+       Lisp_Object args = XCDR (predicate);
++      /* Tree-sitter 0.25 and later only parse predicates ending in
++	 `?' (or `!'), so the query expansion above writes "#match?";
++	 accept both spellings here.  */
++      if (SCHARS (fn) > 1 && SREF (fn, SCHARS (fn) - 1) == '?')
++	fn = Fsubstring (fn, make_fixnum (0), make_fixnum (-1));
+       if (!NILP (Fstring_equal (fn, Vtreesit_str_equal)))
+ 	pass &= treesit_predicate_equal (args, captures, signal_data);
+       else if (!NILP (Fstring_equal (fn, Vtreesit_str_match)))
+@@ -4357,11 +4362,11 @@
+   staticpro (&Vtreesit_str_plus);
+   Vtreesit_str_plus = build_pure_c_string ("+");
+   staticpro (&Vtreesit_str_pound_equal);
+-  Vtreesit_str_pound_equal = build_pure_c_string ("#equal");
++  Vtreesit_str_pound_equal = build_pure_c_string ("#equal?");
+   staticpro (&Vtreesit_str_pound_match);
+-  Vtreesit_str_pound_match = build_pure_c_string ("#match");
++  Vtreesit_str_pound_match = build_pure_c_string ("#match?");
+   staticpro (&Vtreesit_str_pound_pred);
+-  Vtreesit_str_pound_pred = build_pure_c_string ("#pred");
++  Vtreesit_str_pound_pred = build_pure_c_string ("#pred?");
+   staticpro (&Vtreesit_str_open_bracket);
+   Vtreesit_str_open_bracket = build_pure_c_string ("[");
+   staticpro (&Vtreesit_str_close_bracket);
