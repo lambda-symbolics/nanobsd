@@ -11,6 +11,10 @@ patch -p0 < /usr/pkgsrc/editors/emacs30/patches/patch-src_treesit.c && echo "pkg
 # Tree-sitter 0.25+ query predicates (#match? not #match); copy of
 # nanobsd userland/emacs-pgtk/patch-treesit-predicates.diff.
 patch -p0 < /var/tmp/emacs-pgtk/patch-treesit-predicates.diff && echo "predicate patch ok" || exit 1
+# The tarball ships the manuals built; base makeinfo 4.8 cannot rebuild
+# org.texi (@arrow) and leaves a truncated org.info behind, so keep the
+# shipped ones current.
+touch info/*.info
 CPPFLAGS="-I/usr/pkg/include -I/usr/pkg/gcc14/include" \
 LDFLAGS="-L/usr/pkg/lib -Wl,-R/usr/pkg/lib -L/usr/pkg/gcc14/lib -Wl,-R/usr/pkg/gcc14/lib -L/usr/X11R7/lib -Wl,-R/usr/X11R7/lib" \
 ./configure --prefix=/usr/local/emacs-pgtk --localstatedir=/var --with-pgtk --with-native-compilation \
@@ -18,7 +22,7 @@ LDFLAGS="-L/usr/pkg/lib -Wl,-R/usr/pkg/lib -L/usr/pkg/gcc14/lib -Wl,-R/usr/pkg/g
   --without-pop --without-gconf > configure.out 2>&1
 echo "CONFIGURE rc=$?"
 grep -e 'Does Emacs use' -e 'What window system' -e 'native' configure.out | head -40
-nice gmake -j8 > make.out 2>&1; echo "MAKE rc=$?"
+nice gmake -j8 > make.out 2>&1; rc=$?; echo "MAKE rc=$rc"; [ $rc = 0 ] || exit 1
 gmake install > install.out 2>&1; echo "INSTALL rc=$?"
 ls -l /usr/local/emacs-pgtk/bin/
 echo EMACS-BUILD-FINISHED
