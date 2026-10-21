@@ -9,6 +9,17 @@
  *	machdep.hwp.capabilities	(string, RO) decoded IA32_HWP_CAPABILITIES
  *	machdep.hwp.{highest,guaranteed,efficient,lowest} (int, RO)
  *
+ * LISPBSD: and the package power limits (RAPL MSR_PKG_POWER_LIMIT), so a
+ * policy can lower the sustained budget on battery and keep the bursts:
+ *
+ *	machdep.hwp.pl1, machdep.hwp.pl2	(int, RW)  milliwatts
+ *	machdep.hwp.pl1_window			(int, RO)  ms, PL1 time window
+ *	machdep.hwp.pl_locked			(int, RO)  1: firmware locked them
+ *	machdep.hwp.pl1_boot, machdep.hwp.pl2_boot (int, RO) as found at load
+ *
+ * These are the MSR limits only; the firmware may also program the MMIO
+ * copy (MCHBAR), and the lower of the two applies.
+ *
  * Enabling HWP (IA32_PM_ENABLE bit 0) is one-way until reset; unloading the
  * module only removes the sysctl nodes.
  */
@@ -47,6 +58,20 @@ MODULE(MODULE_CLASS_MISC, hwp, NULL);
 
 #define PM_ENABLE_HWP			__BIT(0)
 
+#ifndef MSR_RAPL_POWER_UNIT
+#define MSR_RAPL_POWER_UNIT		0x606
+#endif
+#ifndef MSR_PKG_POWER_LIMIT
+#define MSR_PKG_POWER_LIMIT		0x610
+#endif
+#define PL1_POWER			__BITS(14, 0)
+#define PL1_ENABLE			__BIT(15)
+#define PL1_TIME_Y			__BITS(21, 17)
+#define PL1_TIME_Z			__BITS(23, 22)
+#define PL2_POWER			__BITS(46, 32)
+#define PL2_ENABLE			__BIT(47)
+#define PL_LOCK				__BIT(63)
+
 #define HWP_CAP_HIGHEST(v)		((unsigned)((v) >>  0) & 0xff)
 #define HWP_CAP_GUARANTEED(v)		((unsigned)((v) >>  8) & 0xff)
 #define HWP_CAP_EFFICIENT(v)		((unsigned)((v) >> 16) & 0xff)
@@ -70,6 +95,12 @@ static int		hwp_cap_efficient, hwp_cap_lowest;
 static char		hwp_cap_str[64];
 
 static bool		hwp_has_epp, hwp_has_actwin, hwp_has_plr;
+
+/* RAPL package power limits; hwp_has_rapl when the MSRs read. */
+static bool		hwp_has_rapl;
+static u_int		hwp_rapl_pu;		/* power unit: 1/2^pu W */
+static u_int		hwp_rapl_tu;		/* time unit: 1/2^tu s */
+static int		hwp_pl1_boot, hwp_pl2_boot, hwp_pl1_window, hwp_pl_locked;
 
 /* Filled in by the first CPU (index 0) to run hwp_xc_enable(). */
 static volatile unsigned hwp_ncpus_done;
@@ -152,6 +183,77 @@ out:
 }
 
 static int
+hwp_raw_to_mw(uint64_t raw)
+{
+	return (int)((raw * 1000) >> hwp_rapl_pu);
+}
+
+static uint64_t
+hwp_mw_to_raw(int mw)
+{
+	return (((uint64_t)mw << hwp_rapl_pu) + 500) / 1000;
+}
+
+static void
+hwp_rapl_read(void)
+{
+	uint64_t lim;
+	u_int y, z;
+
+	if (rdmsr_safe(MSR_PKG_POWER_LIMIT, &lim) != 0)
+		return;
+	hwp_pl_locked = (lim & PL_LOCK) != 0;
+	y = __SHIFTOUT(lim, PL1_TIME_Y);
+	z = __SHIFTOUT(lim, PL1_TIME_Z);
+	/* window = 2^y * (1 + z/4) time units */
+	hwp_pl1_window = (int)(((1000ULL << y) * (4 + z) / 4) >> hwp_rapl_tu);
+}
+
+/* machdep.hwp.pl1 / pl2: arg1 selects the field. */
+static int
+hwp_sysctl_pl(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	uint64_t lim, field;
+	int error, val;
+
+	mutex_enter(&hwp_lock);
+	if (rdmsr_safe(MSR_PKG_POWER_LIMIT, &lim) != 0) {
+		error = EIO;
+		goto out;
+	}
+	field = rnode->sysctl_data != NULL ? __SHIFTOUT(lim, PL2_POWER) :
+	    __SHIFTOUT(lim, PL1_POWER);
+	val = hwp_raw_to_mw(field);
+	node.sysctl_data = &val;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (error != 0 || newp == NULL)
+		goto out;
+	if (lim & PL_LOCK) {
+		error = EPERM;
+		goto out;
+	}
+	/* 3 W .. 64 W: below that the package cannot run, above is a typo. */
+	if (val < 3000 || val > 64000) {
+		error = EINVAL;
+		goto out;
+	}
+	field = hwp_mw_to_raw(val);
+	if (rnode->sysctl_data != NULL) {
+		lim &= ~PL2_POWER;
+		lim |= __SHIFTIN(field, PL2_POWER) | PL2_ENABLE;
+	} else {
+		lim &= ~PL1_POWER;
+		lim |= __SHIFTIN(field, PL1_POWER) | PL1_ENABLE;
+	}
+	/* Package scope: any CPU's write applies to the package. */
+	wrmsr(MSR_PKG_POWER_LIMIT, lim);
+out:
+	mutex_exit(&hwp_lock);
+	return error;
+}
+
+static int
 hwp_sysctl_setup(void)
 {
 	const struct sysctlnode *mnode, *hnode;
@@ -214,6 +316,44 @@ hwp_sysctl_setup(void)
 	    CTLFLAG_READONLY, CTLTYPE_INT, "lowest",
 	    SYSCTL_DESCR("Lowest performance level"),
 	    NULL, 0, &hwp_cap_lowest, 0, CTL_CREATE, CTL_EOL);
+	if (error != 0 || !hwp_has_rapl)
+		return error;
+
+	/* sysctl_data NULL: PL1, non-NULL (any marker): PL2. */
+	error = sysctl_createv(&hwp_sysctl_log, 0, &hnode, NULL,
+	    CTLFLAG_READWRITE, CTLTYPE_INT, "pl1",
+	    SYSCTL_DESCR("Package long-term power limit (RAPL PL1), mW"),
+	    hwp_sysctl_pl, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+	if (error != 0)
+		return error;
+	error = sysctl_createv(&hwp_sysctl_log, 0, &hnode, NULL,
+	    CTLFLAG_READWRITE, CTLTYPE_INT, "pl2",
+	    SYSCTL_DESCR("Package short-term power limit (RAPL PL2), mW"),
+	    hwp_sysctl_pl, 0, &hwp_pl2_boot, 0, CTL_CREATE, CTL_EOL);
+	if (error != 0)
+		return error;
+	error = sysctl_createv(&hwp_sysctl_log, 0, &hnode, NULL,
+	    CTLFLAG_READONLY, CTLTYPE_INT, "pl1_window",
+	    SYSCTL_DESCR("PL1 averaging window, ms"),
+	    NULL, 0, &hwp_pl1_window, 0, CTL_CREATE, CTL_EOL);
+	if (error != 0)
+		return error;
+	error = sysctl_createv(&hwp_sysctl_log, 0, &hnode, NULL,
+	    CTLFLAG_READONLY, CTLTYPE_INT, "pl_locked",
+	    SYSCTL_DESCR("The firmware locked the package power limits"),
+	    NULL, 0, &hwp_pl_locked, 0, CTL_CREATE, CTL_EOL);
+	if (error != 0)
+		return error;
+	error = sysctl_createv(&hwp_sysctl_log, 0, &hnode, NULL,
+	    CTLFLAG_READONLY, CTLTYPE_INT, "pl1_boot",
+	    SYSCTL_DESCR("PL1 as found when the module loaded, mW"),
+	    NULL, 0, &hwp_pl1_boot, 0, CTL_CREATE, CTL_EOL);
+	if (error != 0)
+		return error;
+	error = sysctl_createv(&hwp_sysctl_log, 0, &hnode, NULL,
+	    CTLFLAG_READONLY, CTLTYPE_INT, "pl2_boot",
+	    SYSCTL_DESCR("PL2 as found when the module loaded, mW"),
+	    NULL, 0, &hwp_pl2_boot, 0, CTL_CREATE, CTL_EOL);
 	return error;
 }
 
@@ -256,6 +396,20 @@ hwp_init(void)
 	    hwp_cap_efficient, hwp_cap_lowest);
 	hwp_enabled = 1;
 
+	{
+		uint64_t unit, lim;
+
+		if (rdmsr_safe(MSR_RAPL_POWER_UNIT, &unit) == 0 &&
+		    rdmsr_safe(MSR_PKG_POWER_LIMIT, &lim) == 0) {
+			hwp_has_rapl = true;
+			hwp_rapl_pu = unit & 0xf;
+			hwp_rapl_tu = (unit >> 16) & 0xf;
+			hwp_pl1_boot = hwp_raw_to_mw(__SHIFTOUT(lim, PL1_POWER));
+			hwp_pl2_boot = hwp_raw_to_mw(__SHIFTOUT(lim, PL2_POWER));
+			hwp_rapl_read();
+		}
+	}
+
 	error = hwp_sysctl_setup();
 	if (error != 0) {
 		sysctl_teardown(&hwp_sysctl_log);
@@ -268,6 +422,10 @@ hwp_init(void)
 	    hwp_has_epp ? "" : " (EPP unsupported, left 0)",
 	    hwp_has_actwin ? " actwin" : "",
 	    hwp_has_plr ? " pkg" : "");
+	if (hwp_has_rapl)
+		printf("hwp: package power limits PL1 %d mW (window %d ms) "
+		    "PL2 %d mW%s\n", hwp_pl1_boot, hwp_pl1_window,
+		    hwp_pl2_boot, hwp_pl_locked ? ", locked" : "");
 	return 0;
 }
 

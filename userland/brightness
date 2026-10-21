@@ -31,10 +31,17 @@ DEFAULT_BAT=50
 
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="doas"
 
-# Which supply are we on?  envstat is the authority, but the AC hook knows
-# better than envstat does at the moment of a transition, so it passes the
-# answer in explicitly.
+# Which supply are we on?  One source of truth: /var/run/lpsched.ac, which
+# rc.local seeds at boot and powerd's AC hook rewrites before it calls us.
+# envstat lags a transition, so asking it here let two hooks running during
+# the same plug or unplug pick different levels; it is only the fallback
+# for a missing file.
+AC_FILE=/var/run/lpsched.ac
 ac_state() {
+	case "$(cat "$AC_FILE" 2>/dev/null)" in
+	1)	echo ac; return ;;
+	0)	echo bat; return ;;
+	esac
 	case "$(envstat -d acpiacad0 2>/dev/null |
 	    awk '/connected/ { print $2 }')" in
 	TRUE)	echo ac ;;
@@ -59,19 +66,26 @@ apply() {
 }
 
 # The compositor, powerd and the keys can all run this at once; one at a
-# time, and a lock left by a killed run expires after about two seconds.
+# time.  The lock is a symlink naming its owner's pid (created atomically,
+# removable by root and mag alike), and only a lock whose owner is gone is
+# taken over.  It used to be broken after two seconds whatever its owner was
+# still doing, letting two writers interleave.
 lock() {
 	[ -d "$RUN_DIR" ] || return 0
-	_n=0
-	until mkdir "$LOCK" 2>/dev/null; do
-		_n=$((_n + 1))
-		if [ $_n -ge 20 ]; then
+	until ln -s "$$" "$LOCK" 2>/dev/null; do
+		# A directory here is the old lock format, left by a killed run.
+		if [ -d "$LOCK" ] && [ ! -L "$LOCK" ]; then
 			rmdir "$LOCK" 2>/dev/null
-			_n=0
+			continue
 		fi
-		sleep 0.1
+		_o=$(readlink "$LOCK" 2>/dev/null)
+		if [ -n "$_o" ] && ! ps -p "$_o" >/dev/null 2>&1; then
+			rm -f "$LOCK"
+			continue
+		fi
+		sleep 0.05
 	done
-	trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+	trap 'rm -f "$LOCK"' EXIT
 }
 
 cur=$(sysctl -n "$N15" 2>/dev/null); [ -z "$cur" ] && cur=100

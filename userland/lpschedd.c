@@ -8,7 +8,9 @@
  * Inputs
  *   AC state    /var/run/lpsched.ac ("1"/"0"), written by powerd's acadapter
  *               hook; seeded from envstat(8) at startup.
- *   load        1-minute load average.
+ *   busy        CPU utilisation since the previous wakeup (kern.cp_time),
+ *               with a hysteresis band.  The 1-minute load average used
+ *               before followed a change in work a minute late.
  *   idle_ms     machdep.lpsched.idle_ms, ms since the last keyboard/mouse input.
  *   fgpid       "fgpid <pid>" datagrams on /var/run/lpsched.sock from the WM.
  *   input       "input <pid>" datagrams from a compositor (Mahogany) that sees
@@ -19,25 +21,35 @@
  *
  * Outputs
  *   machdep.hwp.epp, machdep.lpsched.{enabled,pack,coalesce_ms,fgpid}
+ *   machdep.hwp.pl1 (RAPL long-term package limit): lowered on battery to
+ *   pl1_bat (-P, mW; 0 leaves it alone), the boot value on AC and at exit.
+ *   Bursts (PL2) are untouched, so short work stays quick and only sustained
+ *   work (a build left running, a busy background page) is capped.  The
+ *   value is re-checked every PL_CHECK_MS, as firmware may reset it at a
+ *   resume or a charger change.
  *
  * Profiles
  *   perf        AC present: EPP perf, no packing, no coalescing.
- *   balanced    battery + input within the interactive window.
- *   load        battery + heavy load + input within the interactive window.
- *   batch       battery + heavy load, no recent input.
- *   powersave   battery + idle.
+ *   balanced    battery + input within the last boost_ms (-b, 1 s): the
+ *               interaction boost.  It used to last the whole 10 s
+ *               interactive window, holding EPP 128 long after the input
+ *               that justified it.
+ *   load        battery + busy + input within the interactive window.
+ *   batch       battery + busy, no recent input.
+ *   powersave   battery, not busy, no input within boost_ms.
  * Heavy load on battery no longer means EPP perf.  Measured on the X1 Nano
  * (docs/epp-load.org): a parallel build at EPP 32 or 128 took 25 s and the
  * most energy; 192 took 12 % longer for 11 % less, 224 took 47 % longer for
  * 27 % less, whole-machine energy over the same window.  EPP 32 was no
  * faster than 128 at all.
  * Upshifts (toward perf) apply immediately; downshifts wait until the
- * condition has held for DOWNSHIFT_SAMPLES polls, load uses a hysteresis band.
+ * condition has held for DOWNSHIFT_MS (elapsed time, not a poll count).
  *
  * Build: cc -O2 -Wall -o lpschedd lpschedd.c -lutil
  */
 
 #include <sys/types.h>
+#include <sys/sched.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -53,6 +65,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 #include <util.h>
 
@@ -60,7 +73,8 @@
 #define	EPP_FILE	"/var/run/lpsched.epp0"	/* EPP found by the first instance */
 #define	SOCK_PATH	"/var/run/lpsched.sock"
 
-#define	DOWNSHIFT_SAMPLES	3	/* polls a lower profile must persist */
+#define	DOWNSHIFT_MS		500	/* how long a lower profile must persist */
+#define	PL_CHECK_MS		30000	/* re-check the battery PL1 this often */
 #define	POLL_ACTIVE_MS		250	/* poll period in perf/balanced */
 #define	POLL_IDLE_MS		500	/* poll period in powersave */
 #define	POLL_SLOW_MS		5000	/* while a compositor reports input */
@@ -80,8 +94,11 @@ static const struct {
 };
 
 static int	 interactive_ms = 10000;	/* -i: input within this = interactive */
-static double	 load_hi = 1.5;			/* -H: above this on battery = load/batch */
-static double	 load_lo = 1.0;			/* -L: below this releases the latch */
+static int	 boost_ms = 1000;		/* -b: EPP 128 this long after input */
+static double	 load_hi = 0.25;		/* -H: CPU busy fraction = load/batch */
+static double	 load_lo = 0.15;		/* -L: below this releases the latch */
+static int	 pl1_bat = 10000;		/* -P: battery PL1, mW (0: leave) */
+static int	 pl1_boot = 0;			/* machdep.hwp.pl1_boot */
 static bool	 debug = false;			/* -d: foreground, log to stderr */
 static bool	 dryrun = false;		/* -n: don't write sysctls */
 static int	 sockfd = -1;
@@ -220,18 +237,73 @@ apply_profile(enum profile p)
 }
 
 static enum profile
-decide(int ac, double load, int idle_ms, bool *load_latched)
+decide(int ac, double busy, int idle_ms, bool *load_latched)
 {
 
 	if (ac != 0)			/* AC, or unknown: do no harm */
 		return P_PERF;
-	if (*load_latched && load < load_lo)
+	if (*load_latched && busy < load_lo)
 		*load_latched = false;
-	else if (!*load_latched && load > load_hi)
+	else if (!*load_latched && busy > load_hi)
 		*load_latched = true;
+	if (idle_ms < boost_ms)
+		return P_BALANCED;
 	if (*load_latched)
 		return idle_ms < interactive_ms ? P_LOAD : P_BATCH;
-	return idle_ms < interactive_ms ? P_BALANCED : P_POWERSAVE;
+	return P_POWERSAVE;
+}
+
+static uint64_t
+now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* Busy fraction of all CPUs since the previous call (0 on the first). */
+static double
+cpu_busy(void)
+{
+	static uint64_t last[CPUSTATES];
+	static bool have;
+	uint64_t cur[CPUSTATES], total = 0, idle;
+	size_t len = sizeof(cur);
+	double busy = 0.0;
+	int i;
+
+	if (sysctlbyname("kern.cp_time", cur, &len, NULL, 0) == -1)
+		return 0.0;
+	if (have) {
+		for (i = 0; i < CPUSTATES; i++)
+			total += cur[i] - last[i];
+		idle = cur[CP_IDLE] - last[CP_IDLE];
+		if (total > 0)
+			busy = 1.0 - (double)idle / (double)total;
+	}
+	memcpy(last, cur, sizeof(last));
+	have = true;
+	return busy;
+}
+
+/* The PL1 for this supply; re-applied when it drifted (resume, firmware). */
+static void
+apply_pl1(int ac)
+{
+	int want, cur;
+
+	if (pl1_bat <= 0 || pl1_boot <= 0)
+		return;
+	want = ac == 0 ? (pl1_bat < pl1_boot ? pl1_bat : pl1_boot) : pl1_boot;
+	if (sysctl_get("machdep.hwp.pl1", &cur) == -1)
+		return;
+	/* The register holds 1/8 W steps: allow for the rounding. */
+	if (cur > want - 125 && cur < want + 125)
+		return;
+	logmsg(LOG_INFO, "package PL1 %d -> %d mW (%s)", cur, want,
+	    ac == 0 ? "battery" : "AC");
+	sysctl_set("machdep.hwp.pl1", want);
 }
 
 static int
@@ -299,12 +371,22 @@ poll_timeout(enum profile cur, int pending, int idle_ms)
 		return cur == P_POWERSAVE ? POLL_IDLE_MS : POLL_ACTIVE_MS;
 	if (pending > 0)
 		return POLL_IDLE_MS;
-	if (cur == P_BALANCED || cur == P_LOAD) {
+	/* Wake when the boost or the interactive window runs out. */
+	if (cur == P_BALANCED) {
+		left = boost_ms - idle_ms + 50;
+		if (left < 50)
+			left = 50;
+		return left < POLL_SLOW_MS ? left : POLL_SLOW_MS;
+	}
+	if (cur == P_LOAD) {
 		left = interactive_ms - idle_ms + 100;
 		if (left < POLL_ACTIVE_MS)
 			left = POLL_ACTIVE_MS;
 		return left < POLL_SLOW_MS ? left : POLL_SLOW_MS;
 	}
+	/* While busy, measure often enough to see the work end. */
+	if (cur == P_BATCH)
+		return POLL_ACTIVE_MS * 4;
 	return POLL_SLOW_MS;
 }
 
@@ -325,6 +407,8 @@ cleanup(void)
 	sysctl_set("machdep.lpsched.coalesce_ms", 0);
 	sysctl_set("machdep.lpsched.fgpid", 0);
 	sysctl_set("machdep.hwp.epp", orig_epp);
+	if (pl1_bat > 0 && pl1_boot > 0)
+		sysctl_set("machdep.hwp.pl1", pl1_boot);
 	if (!dryrun)
 		unlink(EPP_FILE);
 	if (sockfd != -1)
@@ -336,8 +420,8 @@ static void
 usage(void)
 {
 
-	fprintf(stderr, "usage: lpschedd [-dn] [-i interactive_ms] "
-	    "[-H load_hi] [-L load_lo]\n");
+	fprintf(stderr, "usage: lpschedd [-dn] [-b boost_ms] [-i interactive_ms] "
+	    "[-H busy_hi] [-L busy_lo] [-P pl1_bat_mw]\n");
 	exit(1);
 }
 
@@ -347,13 +431,16 @@ main(int argc, char **argv)
 	struct pollfd pfd;
 	enum profile cur = P_COUNT, want;
 	bool load_latched = false;
-	int ac, idle_ms = 0, fgpid = 0, pending = 0, c, timeout;
+	int ac, idle_ms = 0, fgpid = 0, pending = 0, c, timeout, last_ac = -2;
+	uint64_t pending_since = 0, pl_checked = 0;
 	double load;
 
-	while ((c = getopt(argc, argv, "dni:H:L:")) != -1) {
+	while ((c = getopt(argc, argv, "dnb:i:H:L:P:")) != -1) {
 		switch (c) {
 		case 'd': debug = true; break;
 		case 'n': dryrun = true; break;
+		case 'b': boost_ms = atoi(optarg); break;
+		case 'P': pl1_bat = atoi(optarg); break;
 		case 'i': interactive_ms = atoi(optarg); break;
 		case 'H': load_hi = atof(optarg); break;
 		case 'L': load_lo = atof(optarg); break;
@@ -391,9 +478,13 @@ main(int argc, char **argv)
 		if (ac != -1)
 			write_ac_file(ac);
 	}
-	logmsg(LOG_INFO, "started: ac=%d interactive=%dms load_hi=%.2f "
-	    "load_lo=%.2f epp(orig)=%d", ac, interactive_ms, load_hi,
-	    load_lo, orig_epp);
+	if (pl1_bat > 0 && sysctl_get("machdep.hwp.pl1_boot", &pl1_boot) == -1)
+		pl1_boot = 0;		/* hwp without RAPL: leave PL1 alone */
+	logmsg(LOG_INFO, "started: ac=%d boost=%dms interactive=%dms "
+	    "busy_hi=%.2f busy_lo=%.2f epp(orig)=%d pl1 boot=%d bat=%d mW",
+	    ac, boost_ms, interactive_ms, load_hi, load_lo, orig_epp,
+	    pl1_boot, pl1_bat);
+	(void)cpu_busy();
 
 	sockfd = open_socket();
 	sysctl_set("machdep.lpsched.enabled", 1);
@@ -424,10 +515,14 @@ main(int argc, char **argv)
 		c = read_ac_file();
 		if (c != -1)
 			ac = c;
-		if (getloadavg(&load, 1) != 1)
-			load = 0.0;
+		load = cpu_busy();
 		if (sysctl_get("machdep.lpsched.idle_ms", &idle_ms) == -1)
 			idle_ms = 0;
+		if (ac != last_ac || now_ms() - pl_checked >= PL_CHECK_MS) {
+			apply_pl1(ac);
+			last_ac = ac;
+			pl_checked = now_ms();
+		}
 
 		want = decide(ac, load, idle_ms, &load_latched);
 		if (cur == P_COUNT || want < cur) {
@@ -436,7 +531,10 @@ main(int argc, char **argv)
 			pending = 0;
 			apply_profile(cur);
 		} else if (want > cur) {
-			if (++pending >= DOWNSHIFT_SAMPLES) {
+			if (pending == 0) {
+				pending = 1;
+				pending_since = now_ms();
+			} else if (now_ms() - pending_since >= DOWNSHIFT_MS) {
 				cur = want;
 				pending = 0;
 				apply_profile(cur);

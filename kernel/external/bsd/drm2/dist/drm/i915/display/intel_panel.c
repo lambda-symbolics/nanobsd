@@ -720,6 +720,8 @@ void intel_panel_set_backlight_acpi(const struct drm_connector_state *conn_state
 
 	hw_level = clamp_user_to_hw(connector, user_level, user_max);
 	panel->backlight.level = hw_level;
+	if (hw_level > panel->backlight.min)
+		panel->backlight.lispbsd_lastgood = hw_level;
 
 	/*
 	 * Lack of crtc may occur during driver init because
@@ -1202,8 +1204,16 @@ static void __intel_panel_enable_backlight(const struct intel_crtc_state *crtc_s
 
 	WARN_ON(panel->backlight.max == 0);
 
+	/*
+	 * LISPBSD: a level at or below the minimum (the firmware's display-off
+	 * _DSM leaves it there) lights the panel at the last level that was
+	 * really asked for, not at full brightness: that was the flash at
+	 * resume.  Full brightness only when nothing better is known.
+	 */
 	if (panel->backlight.level <= panel->backlight.min) {
-		panel->backlight.level = panel->backlight.max;
+		panel->backlight.level =
+		    panel->backlight.lispbsd_lastgood > panel->backlight.min ?
+		    panel->backlight.lispbsd_lastgood : panel->backlight.max;
 #ifndef __NetBSD__		/* XXX backlight */
 		if (panel->backlight.device)
 			panel->backlight.device->props.brightness =

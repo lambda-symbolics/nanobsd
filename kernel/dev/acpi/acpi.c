@@ -278,7 +278,17 @@ static int		acpi_freeze_keep_net;
 static int		acpi_freeze_fsbarrier = 1;
 static int		acpi_idle_d3;
 static int		acpi_idle_d3_exp;	/* see acpi_adr_power */
-static int		sysctl_hw_acpi_idle_d3(SYSCTLFN_PROTO);
+static int		sysctl_hw_acpi_adr_group(SYSCTLFN_PROTO);
+static int		sysctl_hw_acpi_adr_group_pending(SYSCTLFN_PROTO);
+/* hw.acpi.sleep.idle_d3 / tcss_d3 power groups, see acpi_adr_group_pending */
+struct acpi_adr_pwr;
+struct acpi_adr_group {
+	const char		*ag_what;
+	struct acpi_adr_pwr	*ag_table;
+	unsigned		ag_n;
+	int			*ag_requested;
+};
+static struct acpi_adr_group acpi_idle_group, acpi_tcss_group;
 static int		acpi_freeze_thread_started;
 static void		acpi_freeze_thread(void *);
 
@@ -1865,8 +1875,22 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 
 	(void)sysctl_createv(NULL, 0, &snode, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
-	    "idle_d3", SYSCTL_DESCR("Power down driverless platform IPs while awake"),
-	    sysctl_hw_acpi_idle_d3, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+	    "idle_d3", SYSCTL_DESCR("Power down driverless platform IPs while awake (1 again retries)"),
+	    sysctl_hw_acpi_adr_group, 0, (void *)&acpi_idle_group, 0, CTL_CREATE, CTL_EOL);
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_INT,
+	    "idle_d3_pending", SYSCTL_DESCR("idle_d3 devices requested off that are not off"),
+	    sysctl_hw_acpi_adr_group_pending, 0, (void *)&acpi_idle_group, 0,
+	    CTL_CREATE, CTL_EOL);
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "tcss_d3", SYSCTL_DESCR("Power down the TCSS (USB-C host, Thunderbolt DMA and root ports) while awake (1 again retries)"),
+	    sysctl_hw_acpi_adr_group, 0, (void *)&acpi_tcss_group, 0, CTL_CREATE, CTL_EOL);
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_INT,
+	    "tcss_d3_pending", SYSCTL_DESCR("tcss_d3 devices requested off that are not off"),
+	    sysctl_hw_acpi_adr_group_pending, 0, (void *)&acpi_tcss_group, 0,
+	    CTL_CREATE, CTL_EOL);
 	(void)sysctl_createv(NULL, 0, &snode, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
 	    "idle_d3_exp", SYSCTL_DESCR("idle_d3 experiment bits: 1 run the root ports' _PS3 before cold, 2 no PMCSR D3hot, 4 TCSS xHCI cold under its suspended driver"),
@@ -3205,6 +3229,18 @@ struct acpi_adr_pwr {
 #define ADRPWR_NOPS3		0x04		/* cold without _PS3 (idle_d3_exp bit 0 runs it anyway) */
 	ACPI_HANDLE		ap_changed;	/* set while moved away from D0 */
 	int			ap_previous;
+	/*
+	 * LISPBSD: what the last request did to this entry, so a request can
+	 * be retried (only the entries not yet off) and the policy can report
+	 * what is actually off rather than what was asked for.
+	 */
+	int			ap_state;
+#define ADRPWR_ON		0		/* not requested, or restored */
+#define ADRPWR_APPLIED		1		/* moved off by us (ap_changed) */
+#define ADRPWR_ALREADY		2		/* was already in the target state */
+#define ADRPWR_ABSENT		3		/* not in the namespace */
+#define ADRPWR_SKIPPED		4		/* driver active or device bound */
+#define ADRPWR_FAILED		5		/* power state not read or not set */
 	bool			ap_saved;	/* ap_conf holds the config space */
 	pci_chipset_tag_t	ap_pc;
 	pcitag_t		ap_tag;
@@ -3283,12 +3319,22 @@ acpi_adr_power(struct acpi_softc *sc, const char *what,
 			}
 			ap->ap_changed = NULL;
 		}
+		for (i = 0; i < n; i++)
+			table[i].ap_state = ADRPWR_ON;
 		return;
 	}
 
+	/*
+	 * LISPBSD: a repeated request retries only what is not off yet.  An
+	 * entry already moved keeps its saved configuration and previous
+	 * state (resetting them lost both, and a device skipped while
+	 * populated was never tried again after its device went away).
+	 */
 	for (i = 0; i < n; i++) {
-		table[i].ap_changed = NULL;
+		if (table[i].ap_changed != NULL)
+			continue;
 		table[i].ap_saved = false;
+		table[i].ap_state = ADRPWR_ABSENT;
 	}
 
 	SIMPLEQ_FOREACH(ad, &sc->sc_head, ad_list) {
@@ -3301,6 +3347,19 @@ acpi_adr_power(struct acpi_softc *sc, const char *what,
 				continue;
 			target = (ap->ap_flags & ADRPWR_COLD) ?
 			    ACPI_STATE_D3_COLD : state;
+			if (ap->ap_changed != NULL) {
+				/* Off already; or a failed set to retry as is. */
+				if (ap->ap_state == ADRPWR_FAILED) {
+					ok = acpi_power_set(ap->ap_changed,
+					    target);
+					ap->ap_state = ok ? ADRPWR_APPLIED :
+					    ADRPWR_FAILED;
+					aprint_normal_dev(sc->sc_dev,
+					    "%s: retry adr=0x%x -> %d\n",
+					    what, ap->ap_adr, (int)ok);
+				}
+				break;
+			}
 			if ((ap->ap_flags & ADRPWR_NODRIVER) &&
 			    (acpi_idle_d3_exp & 4) == 0) {
 				device_t gdv = acpi_pcidev_find_dev(ad);
@@ -3323,6 +3382,7 @@ acpi_adr_power(struct acpi_softc *sc, const char *what,
 					    "%s: adr=0x%x %s is %s, skipped\n",
 					    what, ap->ap_adr, device_xname(gdv),
 					    populated ? "populated" : "active");
+					ap->ap_state = ADRPWR_SKIPPED;
 					break;
 				}
 			}
@@ -3333,6 +3393,8 @@ acpi_adr_power(struct acpi_softc *sc, const char *what,
 				aprint_normal_dev(sc->sc_dev,
 				    "%s: ACPI adr=0x%x current=%d skipped\n",
 				    what, ap->ap_adr, old);
+				ap->ap_state = old == target ? ADRPWR_ALREADY :
+				    ADRPWR_FAILED;
 				break;
 			}
 			/*
@@ -3379,6 +3441,7 @@ acpi_adr_power(struct acpi_softc *sc, const char *what,
 			    what, ap->ap_adr, target == ACPI_STATE_D3_COLD ?
 			    3 : target, target == ACPI_STATE_D3_COLD ?
 			    "cold" : "", nops3 ? " (no _PS3)" : "", (int)ok);
+			ap->ap_state = ok ? ADRPWR_APPLIED : ADRPWR_FAILED;
 			break;
 		}
 	}
@@ -3415,52 +3478,84 @@ acpi_s2idle_powerdown(struct acpi_softc *sc, int state)
 
 /*
  * LISPBSD: the platform IPs NetBSD has no driver for stay in D0 with their
- * power resources on while the machine runs.  With the Thunderbolt DMA
- * resources on, an idle package spends about half its time in PC3 instead of
- * PC10 (the same split the s2idle path used to show before its resource
- * power-down).  hw.acpi.sleep.idle_d3 applies that power-down while awake.
- * The Thunderbolt DMA functions share the TCSS D3C resource with the USB-C
- * host (TXHC, 0:13:0): D3C goes _OFF (TCOF: IOM D3cold entry, the package
- * can reach TC10/PC10) only when all three functions have released it.
- * /usr/local/bin/usb suspends and then detaches xhci0 before setting
- * idle_d3 (a merely halted controller leaves the TCSS at PC9 after the
- * cold-off, a suspended one lets the package reach PC10) and rescans pci0
- * after clearing it; the I2C controllers (touchpad) and the PCH xHCI have
- * drivers and are left out.
+ * power resources on while the machine runs.  hw.acpi.sleep.idle_d3 powers
+ * them down while awake; rc.local sets it at boot.
+ *
+ * The TCSS functions are a separate group, hw.acpi.sleep.tcss_d3, driven by
+ * /usr/local/bin/usb: the USB-C host (TXHC, 0:13:0), the Thunderbolt DMA
+ * engines and the Thunderbolt PCIe root ports all hold the TCSS D3C
+ * resource, which goes _OFF (TCOF: IOM D3cold entry, the package can reach
+ * TC10/PC10) only when every one of them has released it.  With the DMA
+ * resources on, an idle package spends about half its time in PC3 instead
+ * of PC10.  usb suspends xhci0 before setting tcss_d3 (a merely halted
+ * controller leaves the TCSS at PC9 after the cold-off, a suspended one lets
+ * the package reach PC10).  The two used to be one switch, so turning USB-C
+ * on also woke the camera, sensor hub, CSME and GNA.
+ *
+ * Writing 1 again retries what is not off yet (a populated TXHC is skipped,
+ * and after its device is unplugged the next write takes it);
+ * <name>_pending counts the entries requested off that are not off.
  */
-static void
-acpi_idle_powerdown(struct acpi_softc *sc, int state)
-{
-	static struct acpi_adr_pwr table[] = {
-		{ .ap_adr = 0x00050000, .ap_flags = ADRPWR_COLD }, /* IPU / image sensor */
-		{ .ap_adr = 0x00120000, .ap_flags = ADRPWR_COLD }, /* ISH (sensor hub) */
-		{ .ap_adr = 0x00160000, .ap_flags = ADRPWR_COLD }, /* HECI / CSME */
-		{ .ap_adr = 0x00080000, .ap_flags = ADRPWR_COLD }, /* GNA */
-		{ .ap_adr = 0x000d0002, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 1 */
-		{ .ap_adr = 0x000d0003, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 2 */
-		{ .ap_adr = 0x000d0000, .ap_flags = ADRPWR_COLD | ADRPWR_NODRIVER }, /* TCSS xHCI */
-		/*
-		 * The Thunderbolt PCIe root ports (TRP0/TRP2, ppb drivers,
-		 * nothing behind them) list D3C and TBT0/TBT1 in _PR0 too;
-		 * D3C only goes _OFF once they have released it as well
-		 * (kernel 159: everything else cold, TXHC still visible).
-		 */
-		{ .ap_adr = 0x00070000, .ap_flags = ADRPWR_COLD | ADRPWR_NOPS3 }, /* Thunderbolt PCIe root port 1 */
-		{ .ap_adr = 0x00070002, .ap_flags = ADRPWR_COLD | ADRPWR_NOPS3 }, /* Thunderbolt PCIe root port 2 */
-	};
+static struct acpi_adr_pwr acpi_idle_table[] = {
+	{ .ap_adr = 0x00050000, .ap_flags = ADRPWR_COLD }, /* IPU / image sensor */
+	{ .ap_adr = 0x00120000, .ap_flags = ADRPWR_COLD }, /* ISH (sensor hub) */
+	{ .ap_adr = 0x00160000, .ap_flags = ADRPWR_COLD }, /* HECI / CSME */
+	{ .ap_adr = 0x00080000, .ap_flags = ADRPWR_COLD }, /* GNA */
+};
 
-	acpi_adr_power(sc, "idle_d3", table, __arraycount(table), state);
+static struct acpi_adr_pwr acpi_tcss_table[] = {
+	{ .ap_adr = 0x000d0002, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 1 */
+	{ .ap_adr = 0x000d0003, .ap_flags = ADRPWR_COLD }, /* Thunderbolt DMA 2 */
+	{ .ap_adr = 0x000d0000, .ap_flags = ADRPWR_COLD | ADRPWR_NODRIVER }, /* TCSS xHCI */
+	/*
+	 * The Thunderbolt PCIe root ports (TRP0/TRP2, ppb drivers, nothing
+	 * behind them) list D3C and TBT0/TBT1 in _PR0 too; D3C only goes _OFF
+	 * once they have released it as well (kernel 159: everything else
+	 * cold, TXHC still visible).
+	 */
+	{ .ap_adr = 0x00070000, .ap_flags = ADRPWR_COLD | ADRPWR_NOPS3 }, /* Thunderbolt PCIe root port 1 */
+	{ .ap_adr = 0x00070002, .ap_flags = ADRPWR_COLD | ADRPWR_NOPS3 }, /* Thunderbolt PCIe root port 2 */
+};
+
+static int acpi_tcss_d3;
+static struct acpi_adr_group acpi_idle_group = {
+	"idle_d3", acpi_idle_table, __arraycount(acpi_idle_table), &acpi_idle_d3
+};
+static struct acpi_adr_group acpi_tcss_group = {
+	"tcss_d3", acpi_tcss_table, __arraycount(acpi_tcss_table), &acpi_tcss_d3
+};
+
+/* Entries requested off that are not off. */
+static int
+acpi_adr_group_pending(const struct acpi_adr_group *ag)
+{
+	unsigned i;
+	int pending = 0;
+
+	if (*ag->ag_requested == 0)
+		return 0;
+	for (i = 0; i < ag->ag_n; i++)
+		switch (ag->ag_table[i].ap_state) {
+		case ADRPWR_APPLIED:
+		case ADRPWR_ALREADY:
+		case ADRPWR_ABSENT:
+			break;
+		default:
+			pending++;
+		}
+	return pending;
 }
 
 static int
-sysctl_hw_acpi_idle_d3(SYSCTLFN_ARGS)
+sysctl_hw_acpi_adr_group(SYSCTLFN_ARGS)
 {
+	struct acpi_adr_group *ag = rnode->sysctl_data;
 	struct sysctlnode node;
 	int err, t;
 
 	if (acpi_softc == NULL)
 		return ENOSYS;
-	t = acpi_idle_d3;
+	t = *ag->ag_requested;
 	node = *rnode;
 	node.sysctl_data = &t;
 	err = sysctl_lookup(SYSCTLFN_CALL(&node));
@@ -3468,13 +3563,28 @@ sysctl_hw_acpi_idle_d3(SYSCTLFN_ARGS)
 		return err;
 	if (t != 0 && t != 1)
 		return EINVAL;
-	if (t == acpi_idle_d3)
+	/* Off again is a retry; on again changes nothing. */
+	if (t == 0 && *ag->ag_requested == 0)
 		return 0;
 	if (acpi_freeze_active)
 		return EBUSY;
-	acpi_idle_d3 = t;
-	acpi_idle_powerdown(acpi_softc, t ? ACPI_STATE_D3 : ACPI_STATE_D0);
+	*ag->ag_requested = t;
+	acpi_adr_power(acpi_softc, ag->ag_what, ag->ag_table, ag->ag_n,
+	    t ? ACPI_STATE_D3 : ACPI_STATE_D0);
 	return 0;
+}
+
+static int
+sysctl_hw_acpi_adr_group_pending(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	int pending;
+
+	if (newp != NULL)
+		return EPERM;
+	pending = acpi_adr_group_pending(rnode->sysctl_data);
+	node.sysctl_data = &pending;
+	return sysctl_lookup(SYSCTLFN_CALL(&node));
 }
 
 void

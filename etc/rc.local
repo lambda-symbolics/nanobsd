@@ -36,6 +36,19 @@ ifconfig iwx0 powersave
 # if the radio is unwanted for a long battery stretch.
 #/usr/local/bin/bluetooth off >/dev/null 2>&1
 
+# The supply in use, for brightness(1) and lpschedd(8); powerd's AC hook
+# keeps it current from here on.
+# The gefs+ commit interval follows it too (see the acadapter hook).
+case "$(envstat -d acpiacad0 2>/dev/null | awk '/connected/ { print $2 }')" in
+TRUE) echo 1 > /var/run/lpsched.ac; sysctl -w vfs.gefs.interval=30 >/dev/null 2>&1 ;;
+*)    echo 0 > /var/run/lpsched.ac; sysctl -w vfs.gefs.interval=90 >/dev/null 2>&1 ;;
+esac
+
+# Power down the platform IPs nothing here drives (camera IPU, sensor hub,
+# CSME, GNA).  Separate from the USB-C/Thunderbolt group, which `usb`
+# controls, so turning USB-C on no longer wakes these.
+sysctl -w hw.acpi.sleep.idle_d3=1 >/dev/null 2>&1
+
 # Disable unused USB data controllers; run `usb on` when needed.
 /usr/local/bin/usb off >/dev/null 2>&1
 # Enable tickless idle; s0ix preserves this policy across suspend.

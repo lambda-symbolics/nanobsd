@@ -207,6 +207,12 @@ struct intel_panel {
 		u32 level;
 		u32 min;
 		u32 max;
+		/*
+		 * LISPBSD: the last level above min that was asked for.
+		 * The firmware's display-off _DSM leaves level at min, and
+		 * enabling a panel at <= min used to jump to max.
+		 */
+		u32 lispbsd_lastgood;
 		bool enabled;
 		bool combination_mode;	/* gen 2/4 only */
 		bool active_low_pwm;

@@ -9,6 +9,13 @@
 # The HWP energy/perf bias is no longer set here: lpschedd(8) owns EPP and
 # reads the AC state we record in /var/run/lpsched.ac.
 PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/bin; export PATH
+# gefs+ background commits: every 30 s on AC, 90 s on battery.  fsync and
+# sync stay durable at once; only the periodic commit of ordinary buffered
+# writes waits longer (fewer NVMe wakeups on battery).
+case "$2" in
+pressed)  sysctl -w vfs.gefs.interval=30 >/dev/null 2>&1 ;;
+released) sysctl -w vfs.gefs.interval=90 >/dev/null 2>&1 ;;
+esac
 case "$2" in
 pressed)
 	echo 1 > /var/run/lpsched.ac

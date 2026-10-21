@@ -7,7 +7,10 @@ user_pref("image.animation_mode", "once");
 user_pref("toolkit.cosmeticAnimations.enabled", false);
 // Background-tab timer throttling (fewer CPU wakeups)
 user_pref("dom.min_background_timeout_value", 10000);
-// Cap content processes (4-core box; less overhead/memory/wakeup surface)
+// Size of the shared web-content process pool.  With Fission (site
+// isolation) this does NOT cap Firefox's content processes: each isolated
+// site gets its own process on top (dom.ipc.processCount.webIsolated per
+// site), so the count grows with the number of sites open.
 user_pref("dom.ipc.processCount", 4);
 // Session store to disk every 60s instead of 15s (fewer NVMe wakeups)
 user_pref("browser.sessionstore.interval", 60000);

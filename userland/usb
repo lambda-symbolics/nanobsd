@@ -6,7 +6,7 @@
 #          off = TCSS D3cold: xhci0 is suspended (ports quiesced, D3hot: a
 #          merely halted controller caps the package at PC9) and the shared
 #          TCSS power resource (D3C, also held by the Thunderbolt DMA engines
-#          and root ports) is switched off through idle_d3; the package then
+#          and root ports) is switched off through tcss_d3; the package then
 #          idles in PC10 (about 1.1 W) instead of a PC3/PC10 split (about
 #          1.9 W).  on = resource back (the kernel tags the function as
 #          power-lost), the driver's resume restarts the empty controller.
@@ -31,7 +31,10 @@ resume_tree(){
 # config-space power state tells a suspended controller from a running one.
 active(){ case $1 in xhci0) d=13 ;; xhci1) d=20 ;; esac
   pcictl pci0 dump -d $d -f 0 2>/dev/null | grep -q 'Power state: D0'; }
-cold(){ [ "$(sysctl -n hw.acpi.sleep.idle_d3 2>/dev/null)" = 1 ]; }
+# Cold = requested and every TCSS function actually off (the kernel skips
+# a populated or active controller and reports it as pending).
+cold(){ [ "$(sysctl -n hw.acpi.sleep.tcss_d3 2>/dev/null)" = 1 ] &&
+  [ "$(sysctl -n hw.acpi.sleep.tcss_d3_pending 2>/dev/null)" = 0 ]; }
 dom=${2:-all}
 case "$dom" in all|pch|usbc) ;; *) echo "usage: usb [on|off|status] [all|pch|usbc]" >&2; exit 1 ;; esac
 pch_off(){
@@ -55,14 +58,13 @@ usbc_off(){
     $SUDO drvctl -d xhci0 2>/dev/null || { echo "usb: xhci0 did not detach" >&2; return 1; }
   fi
   cold && return 0
-  $SUDO sysctl -w hw.acpi.sleep.idle_d3=1 >/dev/null 2>&1 || { echo "usb: TCSS power resources not switched off (idle_d3)" >&2; return 1; }
-  cold || { echo "usb: idle_d3 did not take" >&2; return 1; }
-  # The kernel skips a populated or active controller: say so.
-  [ "$(pcictl pci0 read -d 13 -f 0 0 2>/dev/null | head -1)" = ffffffff ] || echo "usb: TCSS stayed powered (a USB-C device attached? see dmesg idle_d3)" >&2
+  # Writing 1 again retries whatever is still on (unplugged meanwhile).
+  $SUDO sysctl -w hw.acpi.sleep.tcss_d3=1 >/dev/null 2>&1 || { echo "usb: TCSS power resources not switched off (tcss_d3)" >&2; return 1; }
+  cold || { echo "usb: TCSS stayed powered: $(sysctl -n hw.acpi.sleep.tcss_d3_pending) function(s) still on (a USB-C device attached? see dmesg tcss_d3)" >&2; return 1; }
 }
 usbc_on(){
-  if cold; then
-    $SUDO sysctl -w hw.acpi.sleep.idle_d3=0 >/dev/null 2>&1 || { echo "usb: could not restore the TCSS power resources (idle_d3); not touching xhci0" >&2; return 1; }
+  if [ "$(sysctl -n hw.acpi.sleep.tcss_d3 2>/dev/null)" = 1 ]; then
+    $SUDO sysctl -w hw.acpi.sleep.tcss_d3=0 >/dev/null 2>&1 || { echo "usb: could not restore the TCSS power resources (tcss_d3); not touching xhci0" >&2; return 1; }
   fi
   if ! attached xhci0; then
     $SUDO drvctl -r pci0 2>/dev/null
