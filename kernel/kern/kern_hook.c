@@ -195,13 +195,20 @@ shutdownhook_disestablish(void *vhook)
  * Each shutdown hook is removed from the list before it's run, so that
  * it won't be run again.
  */
+/* LISPBSD: shutdown breadcrumbs, kern_reboot.c */
+void	lispbsd_shutdown_mark(const char *, const char *);
+void	lispbsd_shutdown_disarm(void);
+
 void
 doshutdownhooks(void)
 {
 	struct hook_desc *dp;
+	char fn[24];
 
 	while ((dp = LIST_FIRST(&shutdownhook_list)) != NULL) {
 		LIST_REMOVE(dp, hk_list);
+		snprintf(fn, sizeof(fn), "%p", dp->hk_fn);
+		lispbsd_shutdown_mark("shutdown-hook", fn);
 		(*dp->hk_fn)(dp->hk_arg);
 #if 0
 		/*

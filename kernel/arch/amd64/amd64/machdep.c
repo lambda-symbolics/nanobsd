@@ -733,6 +733,10 @@ relock:
 
 struct pcb dumppcb;
 
+/* LISPBSD: shutdown breadcrumbs, kern_reboot.c */
+void	lispbsd_shutdown_mark(const char *, const char *);
+void	lispbsd_shutdown_disarm(void);
+
 void
 cpu_reboot(int howto, char *bootstr)
 {
@@ -769,6 +773,7 @@ cpu_reboot(int howto, char *bootstr)
 			suspendsched();
 	}
 
+	lispbsd_shutdown_mark("pmf-system-shutdown", "");
 	pmf_system_shutdown(boothowto);
 
 	/* Disable interrupts. */
@@ -779,6 +784,7 @@ cpu_reboot(int howto, char *bootstr)
 		dumpsys();
 
 haltsys:
+	lispbsd_shutdown_mark("shutdown-hooks", "");
 	doshutdownhooks();
 
         if ((howto & RB_POWERDOWN) == RB_POWERDOWN) {
@@ -786,6 +792,7 @@ haltsys:
 		if (s != IPL_NONE)
 			splx(s);
 
+		lispbsd_shutdown_mark("acpi-S5", "");
 		acpi_enter_sleep_state(ACPI_STATE_S5);
 #endif
 #ifdef XEN
@@ -796,9 +803,12 @@ haltsys:
 #endif /* XEN */
 	}
 
+	lispbsd_shutdown_mark("halt-other-cpus", "");
 	cpu_broadcast_halt();
 
 	if (howto & RB_HALT) {
+		/* Waits for a key on purpose: not a stuck shutdown. */
+		lispbsd_shutdown_disarm();
 #if NACPICA > 0
 		acpi_disable();
 #endif

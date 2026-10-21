@@ -2397,6 +2397,9 @@ shutdown_next(struct shutdown_state *s)
 	return dv;
 }
 
+/* LISPBSD: shutdown breadcrumbs, kern_reboot.c */
+void	lispbsd_shutdown_mark(const char *, const char *);
+
 bool
 config_detach_all(int how)
 {
@@ -2418,6 +2421,7 @@ config_detach_all(int how)
 	for (curdev = shutdown_first(&s); curdev != NULL;
 	     curdev = shutdown_next(&s)) {
 		aprint_debug(" detaching %s, ", device_xname(curdev));
+		lispbsd_shutdown_mark("detach", device_xname(curdev));
 		if (config_detach(curdev, flags) == 0) {
 			progress = true;
 			aprint_debug("success.");

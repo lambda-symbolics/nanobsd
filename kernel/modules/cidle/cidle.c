@@ -304,7 +304,12 @@ cidle_idle(void)
 
 	KASSERT(ci->ci_ilevel == IPL_NONE);
 
-	if (__predict_false(cidle_tickless)) {
+	/*
+	 * LISPBSD: not while shutting down: every CPU's tick checks the
+	 * shutdown deadline (kern_reboot.c), and a tickless idle CPU can
+	 * sleep for most of two minutes.
+	 */
+	if (__predict_false(cidle_tickless) && !shutting_down) {
 		cidle_idle_tickless(ci);
 		return;
 	}

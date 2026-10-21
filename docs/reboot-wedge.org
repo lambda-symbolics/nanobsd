@@ -43,3 +43,38 @@ with =ddb.onpanic=0= and =ddb.dumpstack=1= the backtrace goes to the message
 buffer, which survives the warm reboot.  After the next wedge, read the end
 of the previous boot in =dmesg=; =/var/tmp/rc.shutdown.final.ran= records the
 last arming.  =wdogctl -x= is the mode that stays armed when wdogctl exits.
+
+* 2026-10-21: why the safety net stayed silent, and its replacement (kernel 192)
+Astra's review of the swwdog arming: =wdogctl -x= forks a tickler (=-e=
+arms and exits); swwdog's callout is not MPSAFE, so a driver callback stuck
+in the shutdown walk with the kernel lock held also holds the watchdog off;
+and a watchdog panic from the callout's LWP waits at kern_reboot's rebooter
+gate instead of rebooting.  The 10-21 wedge (on AC, >20 min dark) proves
+nothing about the watchdog having fired.  A TCO hardware watchdog would be
+independent, but NetBSD's ichsmb only drives the TCO on 100-series PCHs.
+
+Kernel 192 watches the shutdown itself:
+- =lispbsd_shutdown_mark()= (kern_reboot.c) names each step before it
+  runs: kern_reboot, sync, every unmount and forced unmount, every detach,
+  PMF driver and bus shutdown per device, the shutdown hooks one by one
+  (by address), S5, the halt of the other CPUs.  Each mark is printed,
+  recorded, written back to RAM (=wbinvd=: a reset discards dirty cache
+  lines, and without it the newest lines, the ones that matter, were
+  lost), and restarts a no-progress deadline (=kern.lispbsd_shutdown_timeout=,
+  default 60 s, TSC-based so it does not depend on the primary CPU's tick).
+- Every CPU checks the deadline in hardclock (cidle keeps the ticks
+  periodic once =shutting_down= is set); the first to see it pass prints
+  the stuck step and calls =cpu_reset()= directly: no callout, no kernel
+  lock, no panic path.  The message buffer survives the warm reset.
+- Halt (waiting for a key) disarms it.  After =cpu_broadcast_halt()= only
+  the rebooting CPU runs, at splhigh: a hang past that point is not caught.
+- =etc/rc.shutdown.final= arms swwdog with =-e= and records wdogctl's status.
+- Validated 2026-10-21 with =kern.lispbsd_shutdown_test_spin=30= and a 10 s
+  timeout: the next boot's dmesg ends with "shutdown watchdog: no progress
+  for 10 s, stuck in: shutdown-hook 0xffffffff80d43f4e (noticed on cpu4);
+  resetting".
+- Seen on the way: a normal shutdown cannot unmount the gefs+ root and the
+  loop falls through to =force-unmount /= (which succeeds).
+
+After the next wedge: warm reset by the deadline, then
+=dmesg | grep -E 'shutdown:|shutdown watchdog'= names the step.

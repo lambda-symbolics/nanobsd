@@ -345,6 +345,10 @@ pmf_system_suspend(const pmf_qual_t *qual)
 	return true;
 }
 
+/* LISPBSD: shutdown breadcrumbs, kern_reboot.c */
+void	lispbsd_shutdown_mark(const char *, const char *);
+void	lispbsd_shutdown_disarm(void);
+
 static bool
 shutdown_all(int how)
 {
@@ -362,9 +366,13 @@ shutdown_all(int how)
 		else if (!device_pmf_class_shutdown(curdev, how))
 			aprint_debug("failed.");
 #endif
-		else if (!device_pmf_driver_shutdown(curdev, how))
+		else if (lispbsd_shutdown_mark("pmf-driver-shutdown",
+			device_xname(curdev)),
+		    !device_pmf_driver_shutdown(curdev, how))
 			aprint_debug("failed.");
-		else if (!device_pmf_bus_shutdown(curdev, how))
+		else if (lispbsd_shutdown_mark("pmf-bus-shutdown",
+			device_xname(curdev)),
+		    !device_pmf_bus_shutdown(curdev, how))
 			aprint_debug("failed.");
 		else {
 			progress = true;

@@ -1105,6 +1105,9 @@ vfs_unmount_next(uint64_t gen)
 	return nmp;
 }
 
+/* LISPBSD: shutdown breadcrumbs, kern_reboot.c */
+void	lispbsd_shutdown_mark(const char *, const char *);
+
 bool
 vfs_unmount_forceone(struct lwp *l)
 {
@@ -1120,6 +1123,7 @@ vfs_unmount_forceone(struct lwp *l)
 	printf("forcefully unmounting %s (%s)...\n",
 	    mp->mnt_stat.f_mntonname, mp->mnt_stat.f_mntfromname);
 #endif
+	lispbsd_shutdown_mark("force-unmount", mp->mnt_stat.f_mntonname);
 	if ((error = dounmount(mp, MNT_FORCE, l)) == 0) {
 		vfs_unmount_print(mp, "forcefully ");
 		return true;
@@ -1156,6 +1160,8 @@ vfs_unmountall1(struct lwp *l, bool force, bool verbose)
 		    (void *)mp, mp->mnt_stat.f_mntonname,
 		    mp->mnt_stat.f_mntfromname);
 #endif
+		lispbsd_shutdown_mark(force ? "force-unmount" : "unmount",
+		    mp->mnt_stat.f_mntonname);
 		if ((error = dounmount(mp, force ? MNT_FORCE : 0, l)) == 0) {
 			vfs_unmount_print(mp, "");
 			progress = true;
@@ -1196,6 +1202,7 @@ vfs_sync_all(struct lwp *l)
 	/* avoid coming back this way again if we panic. */
 	doing_shutdown = 1;
 
+	lispbsd_shutdown_mark("sync", "");
 	do_sys_sync(l);
 
 	/* Wait for sync to finish. */

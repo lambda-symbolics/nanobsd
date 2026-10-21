@@ -90,6 +90,7 @@ __KERNEL_RCSID(0, "$NetBSD: kern_clock.c,v 1.151 2023/09/02 17:44:59 riastradh E
 #include <sys/time.h>
 #include <sys/timetc.h>
 #include <sys/cpu.h>
+#include <machine/cpu_counter.h>	/* LISPBSD: shutdown deadline */
 #include <sys/atomic.h>
 #include <sys/rndsource.h>
 #include <sys/heartbeat.h>
@@ -309,6 +310,16 @@ hardclock(struct clockframe *frame)
 
 	ci = curcpu();
 	l = ci->ci_onproc;
+
+	/* LISPBSD: the shutdown no-progress deadline (kern_reboot.c). */
+	{
+		extern volatile uint64_t lispbsd_shutdown_deadline;
+		extern void lispbsd_shutdown_tick(void);
+
+		if (__predict_false(lispbsd_shutdown_deadline != 0) &&
+		    cpu_counter() > lispbsd_shutdown_deadline)
+			lispbsd_shutdown_tick();
+	}
 
 	ptimer_tick(l, CLKF_USERMODE(frame));
 
