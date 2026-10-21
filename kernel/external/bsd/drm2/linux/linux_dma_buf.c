@@ -100,7 +100,6 @@ dma_buf_fd(struct dma_buf *dmabuf, int flags)
 {
 	struct file *file;
 	int fd;
-	unsigned refcnt __diagused;
 	int ret;
 
 	/* XXX errno NetBSD->Linux */
@@ -108,8 +107,13 @@ dma_buf_fd(struct dma_buf *dmabuf, int flags)
 	if (ret)
 		goto out0;
 
-	refcnt = atomic_inc_uint_nv(&dmabuf->db_refcnt);
-	KASSERT(refcnt > 1);
+	/*
+	 * LISPBSD: as in Linux, the new file takes over the caller's
+	 * reference; on failure the caller keeps it (and drops it, as
+	 * drm_gem_prime_handle_to_fd does).  This used to take one more,
+	 * which nobody dropped: every export left the dma-buf, and the GEM
+	 * object it holds, allocated for good.
+	 */
 
 	file->f_type = DTYPE_MISC;
 	file->f_flag = 0;	/* XXX DRM code allows only O_CLOEXEC.  */
@@ -168,7 +172,18 @@ dma_buf_put(struct dma_buf *dmabuf)
 		return;
 	membar_acquire();
 
+	/*
+	 * LISPBSD: give the exporter its release callback, as Linux does
+	 * when the last reference goes.  For PRIME that is
+	 * drm_gem_dmabuf_release, which drops the GEM object and device
+	 * references drm_gem_dmabuf_export took.  The last reference goes
+	 * in thread context only (fd close, GEM handle close, PRIME cache
+	 * removal): pending poll callbacks hold none, dma_resv_poll_fini
+	 * takes them off their fence instead.
+	 */
 	dma_resv_poll_fini(&dmabuf->db_resv_poll);
+	if (dmabuf->ops->release)
+		(*dmabuf->ops->release)(dmabuf);
 	mutex_destroy(&dmabuf->db_lock);
 	if (dmabuf->resv == &dmabuf->db_resv_int[0]) {
 		dma_resv_fini(dmabuf->resv);

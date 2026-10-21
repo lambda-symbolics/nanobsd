@@ -59,6 +59,12 @@ struct dma_resv_poll {
 	kmutex_t		rp_lock;
 	struct selinfo		rp_selq;
 	struct dma_fence_cb		rp_fcb;
+	/*
+	 * LISPBSD: the fence rp_fcb was last queued on, referenced, so the
+	 * owner's teardown can take the callback off it (dma_resv_poll_fini)
+	 * instead of freeing rp_fcb while the fence still points at it.
+	 */
+	struct dma_fence		*rp_fence;
 	bool			rp_claimed;
 };
 

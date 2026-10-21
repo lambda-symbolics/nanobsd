@@ -49,3 +49,26 @@ Kernel 186: 20 x 4 MB rounds, +82 MB wired, shrink_count +21 (the
 no-export control: 0).  A process exiting with handles open frees them
 (drm_close runs, the file list goes 8 -> 9 -> 8); its objects leaked
 only because they had been exported.
+
+* Kernel 191 (2026-10-21): the complete fix
+Kernel 187 only added the release call and the cycle breaker.  Astra's
+review found what made it ineffective, and a hazard it would have exposed:
+- dma_buf_fd() took a reference of its own, while its caller
+  (drm_gem_prime_handle_to_fd) expects the new file to take over the one it
+  passes, as in Linux.  One reference per export was never dropped, so the
+  release never ran (187: devref +20 after 20 exports, dmabuf-leak still
+  +82 MB).  191: dma_buf_fd() hands the caller's reference to the file.
+- With releases now happening, a dma-buf can be freed while a poll left its
+  callback (inside the dma-buf) queued on a still-running fence.
+  dma_resv_do_poll now keeps a reference to that fence (rp_fence), and
+  dma_resv_poll_fini, called before the release, takes the callback off the
+  fence.  Callbacks run under the fence lock, as does the removal, so a
+  failed removal means the callback has finished.  The final put then only
+  ever happens in thread context (fd close, handle close, PRIME cache
+  removal), so the synchronous release is safe.
+- Tests on 191: dmabuf-leak 50 x 4 MB: -64 KB wired (186: +82 MB per 20);
+  prime-fuzz 20000 ops, 1453 exports: 0 identity failures, +0 KB wired,
+  device references unchanged (10); dmabuf-poll 3200 rounds, every one
+  tearing the dma-buf down with the callback queued: no panic, nothing in
+  dmesg; three 20 s VA-API videos: devref and GEM memory flat after the
+  first (12, 57 MB).

@@ -247,13 +247,17 @@ static void drm_gem_object_handle_free(struct drm_gem_object *obj)
 
 static void drm_gem_object_exported_dma_buf_free(struct drm_gem_object *obj)
 {
-#ifndef __NetBSD__
+	/*
+	 * LISPBSD: compiled out on NetBSD, although the export takes this
+	 * reference (export_and_register_object), so the object and its
+	 * dma-buf kept each other alive.  dma_buf_put now calls the release
+	 * hook, so drop it as Linux does.
+	 */
 	/* Unbreak the reference cycle if we have an exported dma_buf. */
 	if (obj->dma_buf) {
 		dma_buf_put(obj->dma_buf);
 		obj->dma_buf = NULL;
 	}
-#endif
 }
 
 static void

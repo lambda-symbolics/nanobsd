@@ -1232,6 +1232,7 @@ dma_resv_poll_init(struct dma_resv_poll *rpoll)
 	mutex_init(&rpoll->rp_lock, MUTEX_DEFAULT, IPL_VM);
 	selinit(&rpoll->rp_selq);
 	rpoll->rp_claimed = 0;
+	rpoll->rp_fence = NULL;
 }
 
 /*
@@ -1243,6 +1244,23 @@ void
 dma_resv_poll_fini(struct dma_resv_poll *rpoll)
 {
 
+	/*
+	 * LISPBSD: a poll that returned before its fence signalled leaves
+	 * the callback queued on the fence, inside the memory about to be
+	 * freed (the dma-buf, when its last reference goes).  Take it off.
+	 * Callbacks run with the fence lock held, as does the removal, so
+	 * when the removal finds it gone, it has already run to the end.
+	 */
+	if (rpoll->rp_fence != NULL) {
+		if (dma_fence_remove_callback(rpoll->rp_fence,
+			&rpoll->rp_fcb)) {
+			mutex_enter(&rpoll->rp_lock);
+			rpoll->rp_claimed = 0;
+			mutex_exit(&rpoll->rp_lock);
+		}
+		dma_fence_put(rpoll->rp_fence);
+		rpoll->rp_fence = NULL;
+	}
 	KASSERT(rpoll->rp_claimed == 0);
 	seldestroy(&rpoll->rp_selq);
 	mutex_destroy(&rpoll->rp_lock);
@@ -1374,7 +1392,8 @@ top:	KASSERT(fence == NULL);
 				goto restart;
 			if (!dma_fence_add_callback(fence, &rpoll->rp_fcb,
 				dma_resv_poll_cb)) {
-				dma_fence_put(fence);
+				/* LISPBSD: kept for dma_resv_poll_fini */
+				rpoll->rp_fence = fence;
 				fence = NULL;
 				revents &= ~POLLOUT;
 				callback = true;
@@ -1422,6 +1441,9 @@ top:	KASSERT(fence == NULL);
 		 */
 		if (!dma_fence_add_callback(fence, &rpoll->rp_fcb,
 			dma_resv_poll_cb)) {
+			/* LISPBSD: kept for dma_resv_poll_fini */
+			rpoll->rp_fence = fence;
+			fence = NULL;
 			revents = 0;
 			callback = true;
 			break;
@@ -1455,11 +1477,25 @@ restart:
 record:
 	KASSERT(fence == NULL);
 	rcu_read_unlock();
-	mutex_enter(&rpoll->rp_lock);
-	selrecord(curlwp, &rpoll->rp_selq);
-	if (!rpoll->rp_claimed)
-		claimed = rpoll->rp_claimed = true;
-	mutex_exit(&rpoll->rp_lock);
+	{
+		struct dma_fence *stale = NULL;
+
+		mutex_enter(&rpoll->rp_lock);
+		selrecord(curlwp, &rpoll->rp_selq);
+		if (!rpoll->rp_claimed) {
+			claimed = rpoll->rp_claimed = true;
+			/*
+			 * LISPBSD: the previous callback has run; drop the
+			 * fence it was on (not in the callback: that holds
+			 * the fence lock).
+			 */
+			stale = rpoll->rp_fence;
+			rpoll->rp_fence = NULL;
+		}
+		mutex_exit(&rpoll->rp_lock);
+		if (stale != NULL)
+			dma_fence_put(stale);
+	}
 	recorded = true;
 	goto top;
 }
