@@ -85,7 +85,7 @@ struct hdaudio_codec {
 struct hdaudio_stream {
 	struct hdaudio_softc *st_host;
 	int st_shift, st_num;
-	u_int st_blksize, st_nblk, st_curblk;
+	u_int st_blksize, st_fifos, st_nblk, st_curblk;
 	uint64_t st_blkns, st_lastns;
 };
 
@@ -332,6 +332,7 @@ test_transport(void)
  */
 #define BLK	1920u
 #define BLKNS	10000000ull
+#define FIFOS	192u	/* LPIB trails the DMA fetch by this (measured) */
 
 static struct hdaudio_stream st;
 
@@ -342,17 +343,18 @@ stream_start(void)
 	st.st_host = &sc;
 	st.st_num = 7;
 	st.st_blksize = BLK;
+	st.st_fifos = FIFOS;
 	st.st_nblk = 3;
 	st.st_blkns = BLKNS;
 	st.st_lastns = now_ns = 0;
 	memset(&hdaudio_stats, 0, sizeof(hdaudio_stats));
 }
 
-/* The DMA position at time t, with the controller this far ahead. */
+/* LPIB at time t: the DMA fetch position, less what sits in the FIFO. */
 static uint32_t
 lpib_at(uint64_t t)
 {
-	return (uint32_t)((t * BLK / BLKNS) % (3 * BLK));
+	return (uint32_t)((t * BLK / BLKNS + 3 * BLK - FIFOS) % (3 * BLK));
 }
 
 static u_int
@@ -401,6 +403,15 @@ test_stream(void)
 	n = irq_at(80 * 1000000 + 10000, HDAUDIO_STS_BCIS | HDAUDIO_STS_FIFOE);
 	CHECK(n == 1 && st.st_curblk == 2,
 	    "completion with a FIFO error still counts its block");
+
+	/*
+	 * Two completions merge and the interrupt is serviced 20 us after the
+	 * second boundary, while LPIB still trails it by the FIFO: counting
+	 * from LPIB alone gave 1 here and left the ring a block behind.
+	 */
+	n = irq_at(100 * 1000000 + 20000, HDAUDIO_STS_BCIS);
+	CHECK(n == 2 && st.st_curblk == 1,
+	    "merged completions serviced just past the boundary: 2 (n=%u)", n);
 }
 
 /*
@@ -433,7 +444,7 @@ test_alignment(void)
 
 		head_new = (head_new + irq_at(t, HDAUDIO_STS_BCIS)) % 3;
 		head_old = (head_old + 1) % 3;
-		u_int hw = (lpib_at(t) / BLK) % 3;
+		u_int hw = ((lpib_at(t) + FIFOS) / BLK) % 3;
 		bad_new += head_new != hw;
 		bad_old += head_old != hw;
 	}

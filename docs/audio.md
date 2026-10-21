@@ -130,3 +130,58 @@ all it is a battery-discharge A/B, tens of mW at most.  Firefox's silent
 35 %-CPU content process (stale media tab, seen 10-08 afternoon) died with
 the reboot and was not reproducible on demand; Firefox has the sndio and
 sun cubeb backends built in, backend pref unset.
+
+## 2026-10-21: the audio ring could fall a block behind the DMA (kernel 189)
+
+Astra's review (2026-10-19, kept in /root/audio-bug-review on the workstation,
+reproduced against the old code with mocked hardware) found two defects that
+together fit "playback goes bad and stays bad until the stream restarts":
+
+1. `hdafg_stream_intr` cleared SD_STS without looking at it and called the
+   audio layer's completion callback exactly once per interrupt.  audio(4)
+   advances its hardware ring one block per callback and refills two blocks
+   ahead, so an interrupt serviced more than one 10 ms block late (two
+   completions merged into one) left the ring one block behind the DMA
+   engine for good, refilling the block being played; and a FIFO or
+   descriptor error interrupt counted as a completion.
+2. A codec command spun up to 50 ms for its reply holding `sc_corb_mtx` at
+   IPL_AUDIO (five audio blocks with the stream interrupt held off on that
+   CPU), a timed-out command's late reply was taken by the next command,
+   unsolicited responses were dispatched inside the reply wait (a nested
+   command could take the outer reply) with their tag truncated to the low
+   byte, and a failed pin-sense read (0xffffffff) meant "headphones in,
+   speakers off".
+
+Fixes (kernel/dev/hdaudio, host test userland/hdaudio-test):
+- Completions are counted from the DMA fetch position, not interrupts:
+  (LPIB + FIFOS) / blksize against the last accounted block, plus whole laps
+  from the time since the last interrupt; the callback runs once per
+  completed block, never for an error-only interrupt.  Measured with
+  userland/hdaudio-test/bcis-probe.c: at every BCIS, LPIB is 172-192 bytes
+  short of the boundary and FIFOS is 192, i.e. the interrupt follows the
+  fetch and LPIB trails it by the FIFO.  Using LPIB alone counted every
+  interrupt as "early" and, in the test's late-interrupt simulation, left the
+  ring off the DMA block 903 times in 10000 periods (kernel 188 had that; 189
+  has the FIFOS correction: 0).
+- Commands: stale replies are drained before sending, replies from another
+  codec are dropped, after a timeout the next command waits 1 ms and drops
+  the late reply, and the reply wait is 5 ms.  Unsolicited responses are
+  queued (the interrupt handler only does so if the command lock is free)
+  and run from a soft interrupt with the full response (tag = bits 31:26).
+  A failed pin sense keeps the last routing.
+- The /dev/hdaudioN ioctls and `set_format` hold a runtime PM reference.
+- `sysctl hw.hdaudio.stats`: cmd_timeouts, stale/foreign replies, unsolicited
+  events/drops, stream_irqs, stream_late (blocks beyond one per interrupt),
+  stream_early, stream_laps, FIFO and descriptor errors, spurious.  Late
+  interrupts and stream errors are also logged to dmesg (at most every 10 s).
+
+When the sound goes bad again: note the time, then `sysctl hw.hdaudio.stats`
+and `dmesg | grep hdaudio`.  stream_late/laps growing means the interrupt was
+held off (now recovered automatically); cmd_timeouts means the codec stopped
+answering; neither moving means the fault is elsewhere (codec analog state,
+the application).
+
+Still open (not changed here): audio(4) calls the driver's open with its
+interrupt spin lock held, and `hdafg_open` takes the runtime PM adaptive mutex
+and may resume the controller there (latent since kernel 153; uncontended in
+practice).  A descriptor error stops the DMA and is only logged, not restarted.

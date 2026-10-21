@@ -1782,6 +1782,15 @@ hdaudio_stream_start(struct hdaudio_stream *st, int blksize,
 	hda_write4(sc, HDAUDIO_MMIO_INTCTL, intctl);
 
 	/*
+	 * LispBSD: the FIFO size is known once the format is programmed.
+	 * The completion interrupt comes when the DMA engine fetches a
+	 * block's last byte; LPIB counts bytes sent on the link and trails
+	 * the fetch by this much (measured on the Tiger Lake PCH: LPIB is
+	 * 172-192 bytes short of the boundary at every BCIS, FIFOS 192).
+	 */
+	st->st_fifos = hda_read2(sc, HDAUDIO_SD_FIFOS(snum));
+
+	/*
 	 * Start running the stream
 	 */
 	ctl0 = hda_read1(sc, HDAUDIO_SD_CTL0(snum));
@@ -1824,9 +1833,10 @@ hdaudio_stream_stop(struct hdaudio_stream *st)
  * interrupt serviced late covers every block that finished meanwhile, so the
  * audio layer's ring stays in step with the DMA engine.  The position only
  * gives the count modulo the ring, so whole laps are taken from the time since
- * the last call.  A completion reported just before LPIB crosses into the
- * next block (the controller may raise it when the last byte is fetched)
- * counts as one.  Called from the interrupt handler.
+ * the last call.  LPIB trails the DMA fetch, which the completion refers
+ * to, by the stream FIFO, so the fetch position is LPIB + FIFOS; a
+ * completion seen just before even that crosses the boundary still counts as
+ * one.  Called from the interrupt handler.
  */
 u_int
 hdaudio_stream_elapsed(struct hdaudio_stream *st, uint8_t sts)
@@ -1857,9 +1867,7 @@ hdaudio_stream_elapsed(struct hdaudio_stream *st, uint8_t sts)
 		return 1;
 
 	lpib = hda_read4(sc, HDAUDIO_SD_LPIB(st->st_shift));
-	hwblk = lpib / st->st_blksize;
-	if (hwblk >= nblk)
-		hwblk = nblk - 1;
+	hwblk = ((lpib + st->st_fifos) / st->st_blksize) % nblk;
 	npos = (hwblk + nblk - st->st_curblk) % nblk;
 
 	nanouptime(&ts);

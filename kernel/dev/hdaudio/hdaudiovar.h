@@ -151,6 +151,7 @@ struct hdaudio_stream {
 	 * a completion, left it a block off the DMA engine for good.
 	 */
 	u_int				st_blksize;	/* bytes per BDL entry */
+	u_int				st_fifos;	/* FIFO bytes LPIB trails the fetch by */
 	u_int				st_nblk;	/* BDL entries in the ring */
 	u_int				st_curblk;	/* block the DMA is in, as accounted */
 	uint64_t			st_blkns;	/* playing time of a block */
