@@ -580,7 +580,7 @@ static void	iwx_setup_ht_rates(struct iwx_softc *);
 static uint16_t	iwx_rs_ht_rates(struct iwx_softc *, struct ieee80211_node *,
 		    int);
 static int	iwx_phy_ctxt_update(struct iwx_softc *, struct iwx_phy_ctxt *,
-		    uint8_t, uint8_t);
+		    uint8_t, uint8_t, uint8_t);
 static void	iwx_init_reorder_buffer(struct iwx_rxba_data *, uint16_t,
 		    uint16_t);
 static void	iwx_clear_reorder_buffer(struct iwx_softc *,
@@ -597,6 +597,12 @@ static struct iwx_rxba_data *iwx_find_rxba_data(struct iwx_softc *, uint8_t);
 static void	iwx_sta_rx_agg(struct iwx_softc *, struct ieee80211_node *,
 		    uint8_t, uint16_t, uint16_t, uint32_t, int);
 static void	iwx_ba_task(void *);
+static void	iwx_sta_tx_agg_start(struct iwx_softc *, struct ieee80211_node *,
+		    uint8_t);
+static int	iwx_ampdu_tx_start(struct ieee80211com *,
+		    struct ieee80211_node *, uint8_t);
+static void	iwx_rx_compressed_ba(struct iwx_softc *, struct iwx_rx_packet *);
+static void	iwx_clear_oactive(struct iwx_softc *, struct iwx_tx_ring *);
 static int	iwx_ampdu_rx_start(struct ieee80211com *,
 		    struct ieee80211_node *, uint8_t);
 static void	iwx_ampdu_rx_stop(struct ieee80211com *,
@@ -4365,11 +4371,11 @@ iwx_node_sco(struct iwx_softc *sc, struct ieee80211_node *ni)
 
 static int
 iwx_phy_ctxt_update(struct iwx_softc *sc, struct iwx_phy_ctxt *phyctxt,
-    uint8_t chains, uint8_t sco)
+    uint8_t chains_static, uint8_t chains_dynamic, uint8_t sco)
 {
 	int err;
 
-	err = iwx_phy_ctxt_cmd(sc, phyctxt, chains, chains,
+	err = iwx_phy_ctxt_cmd(sc, phyctxt, chains_static, chains_dynamic,
 	    IWX_FW_CTXT_ACTION_MODIFY, 0, sco, 0);
 	if (err) {
 		printf("%s: could not update PHY context (error %d)\n",
@@ -4380,7 +4386,8 @@ iwx_phy_ctxt_update(struct iwx_softc *sc, struct iwx_phy_ctxt *phyctxt,
 
 	if (iwx_lookup_cmd_ver(sc, IWX_DATA_PATH_GROUP,
 	    IWX_RLC_CONFIG_CMD) == 2)
-		return iwx_phy_send_rlc(sc, phyctxt, chains, chains);
+		return iwx_phy_send_rlc(sc, phyctxt, chains_static,
+		    chains_dynamic);
 	return 0;
 }
 
@@ -4880,6 +4887,16 @@ iwx_ba_task(void *arg)
 			sc->ba_rx.stop_tidmask &= ~(1 << tid);
 			iwx_sta_rx_agg(sc, ni, tid, 0, 0, 0, 0);
 		}
+		if (sc->ba_txreq_tidmask & (1 << tid)) {
+			sc->ba_txreq_tidmask &= ~(1 << tid);
+			if (ni->ni_flags & IEEE80211_NODE_HT)
+				ieee80211_addba_request(ic, ni,
+				    ni->ni_txseqs[tid], tid);
+		}
+		if (sc->ba_tx.start_tidmask & (1 << tid)) {
+			sc->ba_tx.start_tidmask &= ~(1 << tid);
+			iwx_sta_tx_agg_start(sc, ni, tid);
+		}
 	}
 
 	iwx_refcnt_rele_wake(sc);
@@ -4907,6 +4924,117 @@ iwx_ampdu_rx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
 	sc->ba_rx.stop_tidmask &= ~(1 << tid);
 	iwx_add_task(sc, sc->sc_nswq, &sc->ba_task);
 	return EBUSY;
+}
+
+/*
+ * net80211: the AP accepted our ADDBA request.  Enable an aggregation
+ * queue for the TID from the task thread; the firmware does the rest
+ * (OpenBSD: "Firmware handles Tx BA session setup and teardown").
+ */
+static int
+iwx_ampdu_tx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
+    uint8_t tid)
+{
+	struct iwx_softc *sc = IC2IFP(ic)->if_softc;
+
+	/* The agg queue numbers assume the firmware's internal AUX queue. */
+	if (sc->first_data_qid != IWX_DQA_CMD_QUEUE + 1 ||
+	    tid >= IWX_MAX_TID_COUNT)
+		return ENOTSUP;
+	if (sc->ba_tx.start_tidmask & (1 << tid))
+		return EBUSY;
+
+	sc->ba_tx.start_tidmask |= (1 << tid);
+	iwx_add_task(sc, sc->sc_nswq, &sc->ba_task);
+	return EBUSY;
+}
+
+static void
+iwx_sta_tx_agg_start(struct iwx_softc *sc, struct ieee80211_node *ni,
+    uint8_t tid)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	int err, qid;
+
+	if (ni->ni_tx_ba[tid].ba_state != IEEE80211_BA_REQUESTED)
+		return;
+
+	/*
+	 * A TID keeps its queue for the association (the firmware tears
+	 * the session down itself); a new one takes the next queue, which
+	 * is the one the firmware hands out.
+	 */
+	qid = sc->aggqid[tid];
+	if (qid == 0)
+		qid = fls(sc->qenablemsk);
+	if (qid < IWX_FIRST_AGG_TX_QUEUE || qid > IWX_LAST_AGG_TX_QUEUE) {
+		ieee80211_addba_resp_refuse(ic, ni, tid);
+		return;
+	}
+	if ((sc->qenablemsk & (1 << qid)) == 0) {
+		if (!iwx_nic_lock(sc)) {
+			ieee80211_addba_resp_refuse(ic, ni, tid);
+			return;
+		}
+		err = iwx_enable_txq(sc, IWX_STATION_ID, qid, tid,
+		    IWX_TX_RING_COUNT);
+		iwx_nic_unlock(sc);
+		if (err) {
+			printf("%s: could not enable Tx queue %d "
+			    "(error %d)\n", DEVNAME(sc), qid, err);
+			ieee80211_addba_resp_refuse(ic, ni, tid);
+			return;
+		}
+	}
+	sc->aggqid[tid] = qid;
+	sc->sc_ht_stats.hs_tx_agg++;
+	ieee80211_addba_resp_accept(ic, ni, tid);
+}
+
+/* Frames of an aggregation queue were Block Acked: reclaim them. */
+static void
+iwx_rx_compressed_ba(struct iwx_softc *sc, struct iwx_rx_packet *pkt)
+{
+	struct iwx_compressed_ba_notif *ba_res = (void *)pkt->data;
+	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211_node *ni;
+	struct iwx_tx_ring *ring;
+	uint16_t i, tfd_cnt, ra_tid_cnt, idx;
+	int qid;
+
+	if (ic->ic_state != IEEE80211_S_RUN || ic->ic_bss == NULL)
+		return;
+	if (iwx_rx_packet_payload_len(pkt) < sizeof(*ba_res))
+		return;
+	if (ba_res->sta_id != IWX_STATION_ID)
+		return;
+	ni = ic->ic_bss;
+
+	tfd_cnt = le16toh(ba_res->tfd_cnt);
+	ra_tid_cnt = le16toh(ba_res->ra_tid_cnt);
+	if (!tfd_cnt || iwx_rx_packet_payload_len(pkt) < (sizeof(*ba_res) +
+	    sizeof(ba_res->ra_tid[0]) * ra_tid_cnt +
+	    sizeof(ba_res->tfd[0]) * tfd_cnt))
+		return;
+	sc->sc_ht_stats.hs_ba_notif++;
+
+	for (i = 0; i < tfd_cnt; i++) {
+		struct iwx_compressed_ba_tfd *ba_tfd = &ba_res->tfd[i];
+		uint8_t tid = ba_tfd->tid;
+
+		if (tid >= nitems(sc->aggqid))
+			continue;
+		qid = sc->aggqid[tid];
+		if (qid == 0 || qid != le16toh(ba_tfd->q_num))
+			continue;
+		if (ni->ni_tx_ba[tid].ba_state != IEEE80211_BA_AGREED)
+			continue;
+		ring = &sc->txq[qid];
+		idx = le16toh(ba_tfd->tfd_index);
+		sc->sc_tx_timer[qid] = 0;
+		iwx_txq_advance(sc, ring, idx);
+		iwx_clear_oactive(sc, ring);
+	}
 }
 
 /* net80211: an Rx Block Ack agreement ended (DELBA). */
@@ -5919,8 +6047,33 @@ iwx_tx(struct iwx_softc *sc, struct mbuf *m, struct ieee80211_node *ni)
 	else
 		hdrlen = ieee80211_anyhdrsize(wh);
 
-	/* All frames go through the management/data queue (no Tx agg). */
+	/* Frames go through the management/data queue... */
 	qid = sc->first_data_qid;
+
+	/*
+	 * LISPBSD: ...except QoS data of a TID with a Tx Block Ack agreement,
+	 * which goes on its aggregation queue; the firmware aggregates it.
+	 * Other QoS data of an HT association asks for an agreement.
+	 */
+	if (type == IEEE80211_FC0_TYPE_DATA &&
+	    (ni->ni_flags & IEEE80211_NODE_HT) && ieee80211_has_qos(wh) &&
+	    !IEEE80211_IS_MULTICAST(wh->i_addr1) &&
+	    (wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_NODATA) == 0) {
+		uint8_t tid = ((struct ieee80211_qosframe *)wh)->i_qos[0] &
+		    IEEE80211_QOS_TID;
+
+		if (tid < IWX_MAX_TID_COUNT) {
+			if (ni->ni_tx_ba[tid].ba_state == IEEE80211_BA_AGREED &&
+			    sc->aggqid[tid] != 0) {
+				qid = sc->aggqid[tid];
+				sc->sc_ht_stats.hs_tx_agg_frames++;
+			} else if ((sc->ba_txreq_tidmask & (1 << tid)) == 0 &&
+			    ieee80211_tx_ba_due(ic, ni, tid)) {
+				sc->ba_txreq_tidmask |= (1 << tid);
+				iwx_add_task(sc, sc->sc_nswq, &sc->ba_task);
+			}
+		}
+	}
 
 	/*
 	 * net80211 may still hand us management frames (e.g. a DISASSOC on
@@ -8404,6 +8557,16 @@ iwx_auth(struct iwx_softc *sc)
 	IEEE80211_ADDR_COPY(in->in_macaddr, in->in_ni.ni_macaddr);
 
 	/*
+	 * LISPBSD: SM power save for the HT Capabilities element of the
+	 * coming association request.  With power save on, dynamic (as
+	 * Linux does): the firmware listens on one chain and the AP wakes
+	 * the second with an RTS before MIMO frames.  Otherwise disabled.
+	 */
+	ic->ic_htcaps &= ~IEEE80211_HTCAP_SMPS_MASK;
+	ic->ic_htcaps |= ((ic->ic_flags & IEEE80211_F_PMGTON) ? 1 :
+	    IEEE80211_HTCAP_SMPS_DIS) << IEEE80211_HTCAP_SMPS_SHIFT;
+
+	/*
 	 * LISPBSD: U-APSD is decided by the coming (re)association response;
 	 * do not hand the firmware a stale node flag with the new station.
 	 */
@@ -8555,9 +8718,14 @@ iwx_run(struct iwx_softc *sc)
 	/* LISPBSD: HT: both Rx chains, 40 MHz if the AP uses it. */
 	if (ic->ic_opmode == IEEE80211_M_STA &&
 	    (in->in_ni.ni_flags & IEEE80211_NODE_HT)) {
+		uint8_t chains = iwx_mimo_enabled(sc) ? 2 : 1;
+		/* dynamic SM power save: one chain until the AP's RTS */
+		int smps_dyn = ((ic->ic_htcaps & IEEE80211_HTCAP_SMPS_MASK) >>
+		    IEEE80211_HTCAP_SMPS_SHIFT) == 1;
+
 		sc->sc_ht_stats.hs_assoc_ht++;
 		err = iwx_phy_ctxt_update(sc, in->in_phyctxt,
-		    iwx_mimo_enabled(sc) ? 2 : 1,
+		    smps_dyn ? 1 : chains, chains,
 		    iwx_node_sco(sc, &in->in_ni));
 		if (err) {
 			printf("%s: failed to update PHY\n", DEVNAME(sc));
@@ -8833,6 +9001,8 @@ iwx_newstate(struct ieee80211com *ic, enum ieee80211_state nstate, int arg)
 	if (ic->ic_state == IEEE80211_S_RUN) {
 		iwx_del_task(sc, sc->sc_nswq, &sc->ba_task);
 		sc->ba_rx.start_tidmask = sc->ba_rx.stop_tidmask = 0;
+		sc->ba_tx.start_tidmask = 0;
+		sc->ba_txreq_tidmask = 0;
 	}
 
 	sc->ns_nstate = nstate;
@@ -9498,6 +9668,8 @@ iwx_stop_locked(struct ifnet *ifp)
 	sc->sc_rx_ba_sessions = 0;
 	memset(sc->aggqid, 0, sizeof(sc->aggqid));
 	sc->ba_rx.start_tidmask = sc->ba_rx.stop_tidmask = 0;
+	sc->ba_tx.start_tidmask = 0;
+	sc->ba_txreq_tidmask = 0;
 	for (i = 0; i < nitems(sc->sc_rxba_data); i++)
 		iwx_clear_reorder_buffer(sc, &sc->sc_rxba_data[i]);
 
@@ -10059,7 +10231,7 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data)
 			break;
 
 		case IWX_BA_NOTIF:
-			/* Tx aggregation is not supported by this port. */
+			iwx_rx_compressed_ba(sc, pkt);
 			break;
 
 		case IWX_MISSED_BEACONS_NOTIFICATION:
@@ -11348,6 +11520,10 @@ iwx_config_complete(struct iwx_softc *sc)
 		iwx_setup_ht_rates(sc);
 		ic->ic_ampdu_rx_start = iwx_ampdu_rx_start;
 		ic->ic_ampdu_rx_stop = iwx_ampdu_rx_stop;
+		ic->ic_ampdu_tx_start = iwx_ampdu_tx_start;
+		ic->ic_ampdu_tx_stop = NULL;	/* the queue stays */
+		/* the firmware sends ADDBA/DELBA frames itself */
+		ic->ic_addba_offload = 1;
 	}
 
 	/* LISPBSD: U-APSD on all ACs, unlimited SP, as in OpenBSD. */
@@ -12161,12 +12337,14 @@ iwx_sysctl_ht_status(SYSCTLFN_ARGS)
 		if (off < sizeof(buf) && ni != NULL &&
 		    sc->sc_ic.ic_state == IEEE80211_S_RUN)
 			off += snprintf(buf + off, sizeof(buf) - off,
-			    " assoc=%s qos=%d ap_htcap=%d width=%s mhz"
+			    " assoc=%s qos=%d ap_htcap=%d width=%s mhz smps=%s"
 			    " ap_mcs=%02x%02x ap_htcaps=0x%04x htop=%02x/%04x",
 			    (ni->ni_flags & IEEE80211_NODE_HT) ? "ht" : "legacy",
 			    (ni->ni_flags & IEEE80211_NODE_QOS) != 0,
 			    (ni->ni_flags & IEEE80211_NODE_HTCAP) != 0,
 			    sconame[iwx_node_sco(sc, ni) & 3],
+			    ((sc->sc_ic.ic_htcaps & IEEE80211_HTCAP_SMPS_MASK) >>
+			    IEEE80211_HTCAP_SMPS_SHIFT) == 1 ? "dynamic" : "off",
 			    ni->ni_rxmcs[1], ni->ni_rxmcs[0], ni->ni_htcaps,
 			    ni->ni_htop0, ni->ni_htop1);
 		if (off < sizeof(buf))
@@ -12188,12 +12366,23 @@ iwx_sysctl_ht_status(SYSCTLFN_ARGS)
 			    " ht_assocs=%u addba=%u refused=%u delba=%u"
 			    " reordered=%u dropped=%u bar_release=%u"
 			    " timer_release=%u rate_n_flags v%d rx=0x%08x tx=0x%08x"
-			    " rx_ht40=%u rx_ht20=%u rx_legacy=%u",
+			    " rx_ht40=%u rx_ht20=%u rx_legacy=%u"
+			    " tx_agg=%u tx_agg_frames=%u ba_notif=%u",
 			    hs->hs_assoc_ht, hs->hs_addba, hs->hs_addba_refused,
 			    hs->hs_delba, hs->hs_stored, hs->hs_dropped,
 			    hs->hs_bar, hs->hs_timer, sc->sc_rate_n_flags_version,
 			    hs->hs_rx_rate, hs->hs_tx_rate, hs->hs_rx_ht40,
-			    hs->hs_rx_ht20, hs->hs_rx_legacy);
+			    hs->hs_rx_ht20, hs->hs_rx_legacy, hs->hs_tx_agg,
+			    hs->hs_tx_agg_frames, hs->hs_ba_notif);
+		for (j = 0; j < IWX_MAX_TID_COUNT && off < sizeof(buf) &&
+		    ni != NULL; j++) {
+			if (ni->ni_tx_ba[j].ba_state == IEEE80211_BA_INIT &&
+			    sc->aggqid[j] == 0)
+				continue;
+			off += snprintf(buf + off, sizeof(buf) - off,
+			    " [tx tid %d state %d qid %d]", j,
+			    ni->ni_tx_ba[j].ba_state, sc->aggqid[j]);
+		}
 	}
 	if (off >= sizeof(buf))
 		buf[sizeof(buf) - 1] = '\0';

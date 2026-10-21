@@ -822,6 +822,7 @@ struct ieee80211_duration {
 #define	IEEE80211_DELBA_TID_MASK	0xf000
 #define	IEEE80211_DELBA_TID_SHIFT	12
 #define	IEEE80211_BA_MAX_WINSZ		64
+#define	IEEE80211_NONQOS_TID		16	/* ni_txseqs index for non-QoS */
 
 /* HT Capability Information */
 #define	IEEE80211_HTCAP_LDPC		0x0001

@@ -655,6 +655,8 @@ struct iwx_softc {
 	/* LISPBSD: 802.11n */
 	struct iwx_rxba_data sc_rxba_data[IWX_MAX_BAID];
 	struct iwx_ba_task_data ba_rx;
+	struct iwx_ba_task_data ba_tx;	/* start: enable an aggregation queue */
+	uint32_t ba_txreq_tidmask;	/* send an ADDBA request */
 	struct iwx_ht_stats {		/* hw.iwx.ht_status */
 		uint32_t	hs_assoc_ht;	/* HT associations */
 		uint32_t	hs_addba;	/* sessions started */
@@ -669,6 +671,9 @@ struct iwx_softc {
 		uint32_t	hs_rx_ht40;	/* unicast data frames at 40 MHz */
 		uint32_t	hs_rx_ht20;
 		uint32_t	hs_rx_legacy;
+		uint32_t	hs_tx_agg;	/* Tx agreements started */
+		uint32_t	hs_tx_agg_frames;	/* frames on agg queues */
+		uint32_t	hs_ba_notif;	/* compressed Block Acks */
 	} sc_ht_stats;
 	uint8_t sc_chan40[howmany(IEEE80211_CHAN_MAX + 1, NBBY)];
 

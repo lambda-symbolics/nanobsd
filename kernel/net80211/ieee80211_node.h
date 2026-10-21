@@ -191,6 +191,16 @@ struct ieee80211_node {
 		u_int16_t	ba_winstart;
 		u_int16_t	ba_winsize;
 	}			ni_rx_ba[8];	/* per TID */
+	/* Block Ack agreements we set up for our traffic to the peer. */
+	struct ieee80211_tx_ba {
+		u_int8_t	ba_state;	/* IEEE80211_BA_* */
+		u_int8_t	ba_token;
+		u_int16_t	ba_winstart;
+		u_int16_t	ba_winsize;
+		int		ba_req_sent;	/* ticks of the ADDBA request */
+		int		ba_next_req;	/* no new request before */
+		int		ba_req_intval;	/* backoff, seconds */
+	}			ni_tx_ba[8];	/* per TID */
 };
 
 /* LISPBSD: HT predicates, as in OpenBSD.  MCS 0-7 must not all be off. */

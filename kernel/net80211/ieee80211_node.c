@@ -2687,6 +2687,12 @@ ieee80211_ht_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
 
 	ni->ni_flags &= ~IEEE80211_NODE_HT;
 	memset(ni->ni_rx_ba, 0, sizeof(ni->ni_rx_ba));
+	memset(ni->ni_tx_ba, 0, sizeof(ni->ni_tx_ba));
+	for (i = 0; i < __arraycount(ni->ni_tx_ba); i++) {
+		/* first request a second into the association */
+		ni->ni_tx_ba[i].ba_req_intval = 1;
+		ni->ni_tx_ba[i].ba_next_req = getticks() + hz;
+	}
 	if (!ieee80211_ht_wanted(ic, ni))
 		return;
 	for (i = 0; i < IEEE80211_HT_NUM_MCS; i++) {

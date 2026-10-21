@@ -1,0 +1,53 @@
+#+TITLE: 802.11n on the Nano's AX201 (iwx)
+#+DATE: 2026-10-22
+
+* What it is
+NetBSD 11's net80211 only knows 11a/b/g, and our iwx(4) port had OpenBSD's
+HT code stripped.  Kernels 193-198 put 802.11n station mode back, modeled on
+OpenBSD:
+
+- net80211 (=kernel/net80211=): HT Capabilities/Operation parsing in beacons
+  and the association response, our HT Capabilities element in the
+  (re)association request, HT negotiation (=ieee80211_ht_negotiate=, CCMP or
+  open only), Block Ack action frames (ADDBA request/response, DELBA), the
+  transmit agreement state with backoff, A-MSDU decapsulation, and a separate
+  non-QoS sequence counter (index 16; it used to share TID 0's, which would
+  punch holes into a TID 0 Block Ack window).
+- iwx: HT rates and firmware rate control (MCS 0-15, SGI, STBC), 40 MHz PHY
+  context, HT station flags and protection, the firmware Rx Block Ack session
+  and the driver reorder buffer (with a 100 ms gap timer, as Linux), BAR and
+  firmware frame-release notifications, Tx aggregation queues and compressed
+  Block Ack reclaim.
+
+* The switch
+=hw.iwx.ht= (0/1) decides what the *next* association offers; it is 1 in
+=/etc/sysctl.conf=.  To go back: =sysctl -w hw.iwx.ht=0; wpa_cli -i iwx0
+reassociate=.  HT also turns WME (QoS) on, as an HT station must be a QoS
+station.  =hw.iwx.ht_status= shows the association (width, SM power save,
+AP MCS), Rx Block Ack sessions, reorder counters, the last Rx/Tx
+=rate_n_flags= (0x0010ca17 = HT MCS 15, 40 MHz, SGI) and Tx aggregation.
+
+* Tx aggregation is the firmware's job
+The AX201 firmware sends the ADDBA request and consumes the AP's response
+itself once the driver binds an aggregation queue to the TID (OpenBSD's
+IEEE80211_C_ADDBA_OFFLOAD; =ic_addba_offload= here).  Requests sent by
+net80211 were acked by the AP but never answered (kernel 197 probe), and the
+answers never reached the driver.  So net80211 just calls
+=ic_ampdu_tx_start= when a TID carries QoS data.
+
+* SM power save
+With =powersave= on, the association request asks for dynamic SM power save
+and the PHY context listens on one chain, the second waking on the AP's RTS
+(Linux's default).  Same download rate as with both chains always on.
+
+* Measured (2026-10-22, Zyxel 5 GHz ch 40, 40 MHz below, LAN peer on Wi-Fi)
+| direction | legacy 11a | HT, kernel 194 (Rx only) | HT, kernel 198 |
+|-----------+------------+--------------------------+----------------|
+| download  | 13 Mbit/s  | 39-45 Mbit/s             | 100-112 Mbit/s |
+| upload    | 12.6       | 16-17                    | 100            |
+
+* Not done
+- Idle and transfer power not measured yet (fewer airtime-seconds per byte
+  should help; two chains during MIMO bursts cost some).
+- s2idle with HT associated is untested.
+- No VHT (11ac) or HE (11ax).

@@ -79,6 +79,14 @@ void	ieee80211_addba_req_refuse(struct ieee80211com *,
 	    struct ieee80211_node *, u_int8_t);
 void	ieee80211_delba_request(struct ieee80211com *, struct ieee80211_node *,
 	    u_int16_t, u_int8_t);
+int	ieee80211_tx_ba_due(struct ieee80211com *, struct ieee80211_node *,
+	    u_int8_t);
+int	ieee80211_addba_request(struct ieee80211com *, struct ieee80211_node *,
+	    u_int16_t, u_int8_t);
+void	ieee80211_addba_resp_accept(struct ieee80211com *,
+	    struct ieee80211_node *, u_int8_t);
+void	ieee80211_addba_resp_refuse(struct ieee80211com *,
+	    struct ieee80211_node *, u_int8_t);
 void	ieee80211_recv_mgmt(struct ieee80211com *, struct mbuf *,
 		struct ieee80211_node *, int, int, u_int32_t);
 int	ieee80211_send_nulldata(struct ieee80211_node *);

@@ -202,6 +202,18 @@ struct ieee80211com {
 	void			(*ic_ampdu_rx_stop)(struct ieee80211com *,
 				    struct ieee80211_node *, u_int8_t);
 	/*
+	 * LISPBSD: the AP accepted our ADDBA request; as ic_ampdu_rx_start.
+	 * With ic_addba_offload the device negotiates the agreement itself
+	 * and this is called instead of sending a request (OpenBSD's
+	 * IEEE80211_C_ADDBA_OFFLOAD).  ic_ampdu_tx_stop: the agreement
+	 * ended (may be NULL).
+	 */
+	int			ic_addba_offload; /* the device sends ADDBA */
+	int			(*ic_ampdu_tx_start)(struct ieee80211com *,
+				    struct ieee80211_node *, u_int8_t);
+	void			(*ic_ampdu_tx_stop)(struct ieee80211com *,
+				    struct ieee80211_node *, u_int8_t);
+	/*
 	 * Inactivity timer settings for nodes.
 	 */
 	int			ic_inact_init;	/* initial setting */

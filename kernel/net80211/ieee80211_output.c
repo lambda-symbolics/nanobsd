@@ -149,10 +149,16 @@ ieee80211_send_setup(struct ieee80211com *ic,
 	}
 
 	*(u_int16_t *)&wh->i_dur[0] = 0;
-	/* NB: use non-QoS tid */
+	/*
+	 * NB: use non-QoS tid.  LISPBSD: that is its own counter, as in
+	 * 802.11-2012 9.3.2.10 (FreeBSD's IEEE80211_NONQOS_TID); QoS TID 0
+	 * shared index 0, so every management frame left a hole in TID 0's
+	 * sequence space, which a Block Ack recipient waits on.
+	 */
 	*(u_int16_t *)&wh->i_seq[0] =
-	    htole16(ni->ni_txseqs[0] << IEEE80211_SEQ_SEQ_SHIFT);
-	ni->ni_txseqs[0]++;
+	    htole16(ni->ni_txseqs[IEEE80211_NONQOS_TID] <<
+	    IEEE80211_SEQ_SEQ_SHIFT);
+	ni->ni_txseqs[IEEE80211_NONQOS_TID]++;
 #undef WH4
 }
 
@@ -670,8 +676,9 @@ ieee80211_encap(struct ieee80211com *ic, struct mbuf *m,
 		ni->ni_txseqs[tid]++;
 	} else {
 		*(u_int16_t *)wh->i_seq =
-		    htole16(ni->ni_txseqs[0] << IEEE80211_SEQ_SEQ_SHIFT);
-		ni->ni_txseqs[0]++;
+		    htole16(ni->ni_txseqs[IEEE80211_NONQOS_TID] <<
+		    IEEE80211_SEQ_SEQ_SHIFT);
+		ni->ni_txseqs[IEEE80211_NONQOS_TID]++;
 	}
 
 	/* check if xmit fragmentation is required */
@@ -1433,8 +1440,9 @@ ieee80211_add_htcaps(u_int8_t *frm, struct ieee80211com *ic)
 
 /*
  * LISPBSD: send a Block Ack action frame (802.11-2012 8.5.5).  arg is
+ * the TID for an ADDBA request (the rest comes from ni_tx_ba[tid]),
  * status << 16 | token << 8 | tid for an ADDBA response and
- * reason << 16 | tid for a DELBA (sent as the recipient).
+ * reason << 16 | originator << 8 | tid for a DELBA.
  */
 int
 ieee80211_send_action(struct ieee80211com *ic, struct ieee80211_node *ni,
@@ -1446,7 +1454,7 @@ ieee80211_send_action(struct ieee80211com *ic, struct ieee80211_node *ni,
 	u_int16_t params;
 	int ret;
 
-	if (categ != IEEE80211_CATEG_BA)
+	if (categ != IEEE80211_CATEG_BA || tid >= __arraycount(ni->ni_tx_ba))
 		return EINVAL;
 
 	m = ieee80211_getmgtframe(&frm, 9);
@@ -1457,6 +1465,22 @@ ieee80211_send_action(struct ieee80211com *ic, struct ieee80211_node *ni,
 	*frm++ = categ;
 	*frm++ = action;
 	switch (action) {
+	case IEEE80211_ACTION_ADDBA_REQ: {
+		struct ieee80211_tx_ba *tba = &ni->ni_tx_ba[tid];
+
+		*frm++ = tba->ba_token;
+		/* immediate Block Ack, no A-MSDU in A-MPDU */
+		params = IEEE80211_ADDBA_BA_POLICY |
+		    (tid << IEEE80211_ADDBA_TID_SHIFT) |
+		    (tba->ba_winsize << IEEE80211_ADDBA_BUFSZ_SHIFT);
+		*frm++ = params & 0xff;
+		*frm++ = params >> 8;
+		*frm++ = 0;				/* no timeout */
+		*frm++ = 0;
+		*frm++ = (tba->ba_winstart << 4) & 0xff;	/* SSN */
+		*frm++ = (tba->ba_winstart << 4) >> 8;
+		break;
+	}
 	case IEEE80211_ACTION_ADDBA_RESP:
 		*frm++ = (arg >> 8) & 0xff;		/* token */
 		*frm++ = (arg >> 16) & 0xff;		/* status */
@@ -1480,6 +1504,8 @@ ieee80211_send_action(struct ieee80211com *ic, struct ieee80211_node *ni,
 		break;
 	case IEEE80211_ACTION_DELBA:
 		params = tid << IEEE80211_DELBA_TID_SHIFT;
+		if (arg & 0x100)			/* we are the originator */
+			params |= IEEE80211_DELBA_INITIATOR;
 		*frm++ = params & 0xff;
 		*frm++ = params >> 8;
 		*frm++ = (arg >> 16) & 0xff;		/* reason */

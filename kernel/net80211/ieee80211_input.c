@@ -139,6 +139,8 @@ static void ieee80211_amsdu_input(struct ieee80211com *,
     struct ieee80211_node *, struct mbuf *, int);
 static void ieee80211_recv_mgmt_action(struct ieee80211com *, struct mbuf *,
     struct ieee80211_node *);
+static void ieee80211_recv_addba_resp(struct ieee80211com *, const u_int8_t *,
+    struct ieee80211_node *);
 static void ieee80211_send_error(struct ieee80211com *, struct ieee80211_node *,
 	const u_int8_t *mac, int subtype, int arg);
 static void ieee80211_deliver_data(struct ieee80211com *,
@@ -3242,6 +3244,125 @@ ieee80211_delba_request(struct ieee80211com *ic, struct ieee80211_node *ni,
 	    IEEE80211_ACTION_DELBA, reason << 16 | tid);
 }
 
+/*
+ * LISPBSD: the transmit side.  The driver asks with ieee80211_tx_ba_due()
+ * whether a TID it sends QoS data on should get an agreement, and sends
+ * the request with ieee80211_addba_request() from a context that may
+ * transmit.  A refused or unanswered request backs off, doubling up to
+ * IEEE80211_ADDBA_REQ_INTVAL_MAX seconds.
+ */
+#define	IEEE80211_ADDBA_REQ_INTVAL_MAX	64
+
+static void
+ieee80211_tx_ba_backoff(struct ieee80211_tx_ba *tba)
+{
+	tba->ba_state = IEEE80211_BA_INIT;
+	tba->ba_next_req = getticks() + tba->ba_req_intval * hz;
+	if (tba->ba_req_intval < IEEE80211_ADDBA_REQ_INTVAL_MAX)
+		tba->ba_req_intval *= 2;
+}
+
+int
+ieee80211_tx_ba_due(struct ieee80211com *ic, struct ieee80211_node *ni,
+    u_int8_t tid)
+{
+	struct ieee80211_tx_ba *tba;
+
+	if (tid >= __arraycount(ni->ni_tx_ba) ||
+	    (ni->ni_flags & IEEE80211_NODE_HT) == 0 ||
+	    ic->ic_state != IEEE80211_S_RUN || ic->ic_ampdu_tx_start == NULL)
+		return 0;
+	tba = &ni->ni_tx_ba[tid];
+	/* dot11ADDBAResponseTimeout: 1 s */
+	if (tba->ba_state == IEEE80211_BA_REQUESTED &&
+	    getticks() - tba->ba_req_sent > hz)
+		ieee80211_tx_ba_backoff(tba);
+	return tba->ba_state == IEEE80211_BA_INIT &&
+	    getticks() - tba->ba_next_req >= 0;
+}
+
+int
+ieee80211_addba_request(struct ieee80211com *ic, struct ieee80211_node *ni,
+    u_int16_t ssn, u_int8_t tid)
+{
+	static u_int8_t token;
+	struct ieee80211_tx_ba *tba = &ni->ni_tx_ba[tid];
+
+	if (tba->ba_state != IEEE80211_BA_INIT)
+		return EBUSY;
+	tba->ba_state = IEEE80211_BA_REQUESTED;
+	tba->ba_token = ++token;
+	tba->ba_winstart = ssn & 0xfff;
+	tba->ba_winsize = IEEE80211_BA_MAX_WINSZ;
+	tba->ba_req_sent = getticks();
+	if (ic->ic_addba_offload) {
+		/* The device sends the ADDBA request and takes the response. */
+		int error = (*ic->ic_ampdu_tx_start)(ic, ni, tid);
+
+		if (error == EBUSY)
+			return 0;	/* the driver answers when done */
+		if (error)
+			ieee80211_addba_resp_refuse(ic, ni, tid);
+		else
+			ieee80211_addba_resp_accept(ic, ni, tid);
+		return error;
+	}
+	return ieee80211_send_action(ic, ni, IEEE80211_CATEG_BA,
+	    IEEE80211_ACTION_ADDBA_REQ, tid);
+}
+
+void
+ieee80211_addba_resp_accept(struct ieee80211com *ic,
+    struct ieee80211_node *ni, u_int8_t tid)
+{
+	struct ieee80211_tx_ba *tba = &ni->ni_tx_ba[tid];
+
+	tba->ba_state = IEEE80211_BA_AGREED;
+	tba->ba_req_intval = 1;
+}
+
+void
+ieee80211_addba_resp_refuse(struct ieee80211com *ic,
+    struct ieee80211_node *ni, u_int8_t tid)
+{
+	ieee80211_tx_ba_backoff(&ni->ni_tx_ba[tid]);
+}
+
+static void
+ieee80211_recv_addba_resp(struct ieee80211com *ic, const u_int8_t *frm,
+    struct ieee80211_node *ni)
+{
+	struct ieee80211_tx_ba *tba;
+	u_int16_t status, params;
+	u_int8_t token, tid;
+	int error;
+
+	/* [1] category [1] action [1] token [2] status [2] params [2] timeout */
+	token = frm[2];
+	status = frm[3] | (frm[4] << 8);
+	params = frm[5] | (frm[6] << 8);
+	tid = (params & IEEE80211_ADDBA_TID_MASK) >> IEEE80211_ADDBA_TID_SHIFT;
+	if (tid >= __arraycount(ni->ni_tx_ba))
+		return;
+	tba = &ni->ni_tx_ba[tid];
+	if (tba->ba_state != IEEE80211_BA_REQUESTED || token != tba->ba_token)
+		return;
+
+	if (status != IEEE80211_STATUS_SUCCESS ||
+	    (params & IEEE80211_ADDBA_BA_POLICY) == 0) {
+		ieee80211_tx_ba_backoff(tba);
+		return;
+	}
+
+	error = (*ic->ic_ampdu_tx_start)(ic, ni, tid);
+	if (error == EBUSY)
+		return;		/* the driver answers when done */
+	if (error)
+		ieee80211_addba_resp_refuse(ic, ni, tid);
+	else
+		ieee80211_addba_resp_accept(ic, ni, tid);
+}
+
 static void
 ieee80211_recv_delba(struct ieee80211com *ic, const u_int8_t *frm,
     struct ieee80211_node *ni)
@@ -3253,10 +3374,19 @@ ieee80211_recv_delba(struct ieee80211com *ic, const u_int8_t *frm,
 	/* [1] category [1] action [2] params [2] reason */
 	params = frm[2] | (frm[3] << 8);
 	tid = params >> IEEE80211_DELBA_TID_SHIFT;
-	/* Only the originator (the AP) ends a receive agreement. */
-	if ((params & IEEE80211_DELBA_INITIATOR) == 0 ||
-	    tid >= __arraycount(ni->ni_rx_ba))
+	if (tid >= __arraycount(ni->ni_rx_ba))
 		return;
+	if ((params & IEEE80211_DELBA_INITIATOR) == 0) {
+		/* The AP, as recipient, ends our transmit agreement. */
+		struct ieee80211_tx_ba *tba = &ni->ni_tx_ba[tid];
+
+		if (tba->ba_state == IEEE80211_BA_AGREED &&
+		    ic->ic_ampdu_tx_stop != NULL)
+			(*ic->ic_ampdu_tx_stop)(ic, ni, tid);
+		tba->ba_state = IEEE80211_BA_INIT;
+		tba->ba_next_req = getticks() + tba->ba_req_intval * hz;
+		return;
+	}
 	ba = &ni->ni_rx_ba[tid];
 	if (ba->ba_state != IEEE80211_BA_AGREED)
 		return;
@@ -3289,6 +3419,10 @@ ieee80211_recv_mgmt_action(struct ieee80211com *ic, struct mbuf *m0,
 	case IEEE80211_ACTION_ADDBA_REQ:
 		if (len >= 9)
 			ieee80211_recv_addba_req(ic, frm, ni);
+		break;
+	case IEEE80211_ACTION_ADDBA_RESP:
+		if (len >= 9)
+			ieee80211_recv_addba_resp(ic, frm, ni);
 		break;
 	case IEEE80211_ACTION_DELBA:
 		if (len >= 6)
