@@ -1403,6 +1403,102 @@ ieee80211_send_probereq(struct ieee80211_node *ni,
 }
 
 /*
+ * LISPBSD: add an HT Capabilities element (802.11-2012 8.4.2.58).
+ */
+u_int8_t *
+ieee80211_add_htcaps(u_int8_t *frm, struct ieee80211com *ic)
+{
+	*frm++ = IEEE80211_ELEMID_HTCAP;
+	*frm++ = 26;
+	*frm++ = ic->ic_htcaps & 0xff;
+	*frm++ = ic->ic_htcaps >> 8;
+	*frm++ = ic->ic_ampdu_params;
+	memcpy(frm, ic->ic_sup_mcs, 10);
+	frm += 10;
+	*frm++ = 0;			/* highest rx rate: not specified */
+	*frm++ = 0;
+	*frm++ = 0;			/* tx MCS set: same as rx */
+	*frm++ = 0;			/* reserved */
+	*frm++ = 0;
+	*frm++ = 0;
+	*frm++ = ic->ic_htxcaps & 0xff;
+	*frm++ = ic->ic_htxcaps >> 8;
+	*frm++ = ic->ic_txbfcaps & 0xff;
+	*frm++ = (ic->ic_txbfcaps >> 8) & 0xff;
+	*frm++ = (ic->ic_txbfcaps >> 16) & 0xff;
+	*frm++ = ic->ic_txbfcaps >> 24;
+	*frm++ = ic->ic_aselcaps;
+	return frm;
+}
+
+/*
+ * LISPBSD: send a Block Ack action frame (802.11-2012 8.5.5).  arg is
+ * status << 16 | token << 8 | tid for an ADDBA response and
+ * reason << 16 | tid for a DELBA (sent as the recipient).
+ */
+int
+ieee80211_send_action(struct ieee80211com *ic, struct ieee80211_node *ni,
+    u_int8_t categ, u_int8_t action, u_int32_t arg)
+{
+	struct ieee80211_rx_ba *ba;
+	struct mbuf *m;
+	u_int8_t *frm, tid = arg & 0xff;
+	u_int16_t params;
+	int ret;
+
+	if (categ != IEEE80211_CATEG_BA)
+		return EINVAL;
+
+	m = ieee80211_getmgtframe(&frm, 9);
+	if (m == NULL) {
+		ic->ic_stats.is_tx_nobuf++;
+		return ENOMEM;
+	}
+	*frm++ = categ;
+	*frm++ = action;
+	switch (action) {
+	case IEEE80211_ACTION_ADDBA_RESP:
+		*frm++ = (arg >> 8) & 0xff;		/* token */
+		*frm++ = (arg >> 16) & 0xff;		/* status */
+		*frm++ = (arg >> 24) & 0xff;
+		if (tid < __arraycount(ni->ni_rx_ba) &&
+		    ((arg >> 16) & 0xffff) == IEEE80211_STATUS_SUCCESS) {
+			ba = &ni->ni_rx_ba[tid];
+			params = ba->ba_params;
+			*frm++ = params & 0xff;
+			*frm++ = params >> 8;
+			*frm++ = ba->ba_timeout & 0xff;
+			*frm++ = ba->ba_timeout >> 8;
+		} else {
+			params = (tid << IEEE80211_ADDBA_TID_SHIFT) |
+			    IEEE80211_ADDBA_BA_POLICY;
+			*frm++ = params & 0xff;
+			*frm++ = params >> 8;
+			*frm++ = 0;
+			*frm++ = 0;
+		}
+		break;
+	case IEEE80211_ACTION_DELBA:
+		params = tid << IEEE80211_DELBA_TID_SHIFT;
+		*frm++ = params & 0xff;
+		*frm++ = params >> 8;
+		*frm++ = (arg >> 16) & 0xff;		/* reason */
+		*frm++ = (arg >> 24) & 0xff;
+		break;
+	default:
+		m_freem(m);
+		return EINVAL;
+	}
+	m->m_pkthdr.len = m->m_len = frm - mtod(m, u_int8_t *);
+
+	ieee80211_ref_node(ni);
+	ret = ieee80211_mgmt_output(ic, ni, m, IEEE80211_FC0_SUBTYPE_ACTION, 0);
+	if (ret != 0)
+		ieee80211_free_node(ni);
+	return ret;
+}
+
+/*
  * Send a management frame.  The node is for the destination (or ic_bss
  * when in station mode).  Nodes other than ic_bss have their reference
  * count bumped to reflect our use for an indeterminant time.
@@ -1633,6 +1729,7 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 		 *	[tlv] extended supported rates
 		 *	[tlv] WME
 		 *	[tlv] user-specified ie's
+		 *	[tlv] HT capabilities (LISPBSD)
 		 */
 		m = ieee80211_getmgtframe(&frm,
 			 sizeof(u_int16_t)
@@ -1643,6 +1740,7 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 		       + 2 + (IEEE80211_RATE_MAXSIZE - IEEE80211_RATE_SIZE)
 		       + sizeof(struct ieee80211_wme_info)
 		       + (ic->ic_opt_ie != NULL ? ic->ic_opt_ie_len : 0)
+		       + 2 + 26
 		);
 		if (m == NULL)
 			senderr(ENOMEM, is_tx_nobuf);
@@ -1694,6 +1792,8 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 			memcpy(frm, ic->ic_opt_ie, ic->ic_opt_ie_len);
 			frm += ic->ic_opt_ie_len;
 		}
+		if (ieee80211_ht_wanted(ic, ni))
+			frm = ieee80211_add_htcaps(frm, ic);
 		m->m_pkthdr.len = m->m_len = frm - mtod(m, u_int8_t *);
 
 		timer = IEEE80211_TRANS_WAIT;

@@ -183,6 +183,24 @@ struct ieee80211com {
 	u_int8_t		ic_des_bssid[IEEE80211_ADDR_LEN];
 	void			*ic_opt_ie;	/* user-specified IE's */
 	u_int16_t		ic_opt_ie_len;	/* length of ni_opt_ie */
+
+	/*
+	 * LISPBSD: 802.11n (HT) capabilities the driver offers, sent in our
+	 * HT Capabilities element when IEEE80211_FEXT_HTON is set and the
+	 * AP is HT.  ic_ampdu_rx_start: the AP asks for a Block Ack
+	 * agreement on a TID; return 0 to accept, an error to refuse, or
+	 * EBUSY and call ieee80211_addba_req_accept/refuse later.
+	 */
+	u_int16_t		ic_htcaps;
+	u_int8_t		ic_ampdu_params;
+	u_int8_t		ic_sup_mcs[10];
+	u_int16_t		ic_htxcaps;
+	u_int32_t		ic_txbfcaps;
+	u_int8_t		ic_aselcaps;
+	int			(*ic_ampdu_rx_start)(struct ieee80211com *,
+				    struct ieee80211_node *, u_int8_t);
+	void			(*ic_ampdu_rx_stop)(struct ieee80211com *,
+				    struct ieee80211_node *, u_int8_t);
 	/*
 	 * Inactivity timer settings for nodes.
 	 */
@@ -265,6 +283,7 @@ extern struct ieee80211com_head ieee80211com_head;
 /* 0x00000006 reserved */
 #define	IEEE80211_FEXT_BGSCAN	0x00000008	/* STATUS: enable full bgscan completion */
 #define	IEEE80211_FEXT_UAPSD	0x00000100	/* CONF: request U-APSD */
+#define	IEEE80211_FEXT_HTON	0x00000200	/* LISPBSD CONF: request HT (11n) */
 #define	IEEE80211_FEXT_PROBECHAN 0x00020000	/* CONF: probe passive channel*/
 
 /* ic_caps */

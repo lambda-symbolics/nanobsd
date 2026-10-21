@@ -1338,6 +1338,14 @@ ieee80211_add_scan(struct ieee80211com *ic,
 	saveie(&ni->ni_wme_ie, sp->sp_wme);
 	saveie(&ni->ni_wpa_ie, sp->sp_wpa);
 
+	/* LISPBSD: 802.11n */
+	if (sp->sp_htcap != NULL)
+		ieee80211_setup_htcaps(ni, sp->sp_htcap + 2, sp->sp_htcap[1]);
+	else
+		ni->ni_flags &= ~IEEE80211_NODE_HTCAP;
+	if (sp->sp_htop != NULL)
+		ieee80211_setup_htop(ni, sp->sp_htop + 2, sp->sp_htop[1], 1);
+
 	/* NB: must be after ni_chan is setup */
 	ieee80211_setup_rates(ni, sp->sp_rates, sp->sp_xrates,
 	    IEEE80211_R_DOSORT);
@@ -2545,4 +2553,145 @@ ieee80211_node_table_cleanup(struct ieee80211_node_table *nt)
 	}
 	IEEE80211_SCAN_LOCK_DESTROY(nt);
 	IEEE80211_NODE_LOCK_DESTROY(nt);
+}
+
+/*
+ * LISPBSD: 802.11n (HT) station support, from OpenBSD's net80211.
+ */
+
+/* Install a received HT Capabilities element in the node. */
+void
+ieee80211_setup_htcaps(struct ieee80211_node *ni, const u_int8_t *data,
+    u_int8_t len)
+{
+	if (len != 26)
+		return;
+
+	ni->ni_htcaps = data[0] | (data[1] << 8);
+	ni->ni_ampdu_param = data[2];
+	memcpy(ni->ni_rxmcs, &data[3], sizeof(ni->ni_rxmcs));
+	/* clear the reserved bits 77-79 */
+	ni->ni_rxmcs[9] &= 0x1f;
+	ni->ni_flags |= IEEE80211_NODE_HTCAP;
+}
+
+/*
+ * Only 40 MHz pairs from the regulatory operating classes (802.11ac
+ * 2013, Tables E-1 to E-5); firmware asserts on others.
+ */
+static int
+ieee80211_40mhz_valid_secondary_above(u_int8_t primary_chan)
+{
+	static const u_int8_t valid[] = {
+		5, 6, 7, 8, 9, 10, 11, 12, 13,
+		40, 48, 56, 64, 104, 112, 120, 128, 136, 144, 153, 161
+	};
+	u_int i;
+
+	for (i = 0; i < __arraycount(valid); i++)
+		if (primary_chan + 4 == valid[i])
+			return 1;
+	return 0;
+}
+
+static int
+ieee80211_40mhz_valid_secondary_below(u_int8_t primary_chan)
+{
+	static const u_int8_t valid[] = {
+		1, 2, 3, 4, 5, 6, 7, 8, 9,
+		36, 44, 52, 60, 100, 108, 116, 124, 132, 140, 149, 157
+	};
+	u_int i;
+
+	if (primary_chan < 5)
+		return 0;
+	for (i = 0; i < __arraycount(valid); i++)
+		if (primary_chan - 4 == valid[i])
+			return 1;
+	return 0;
+}
+
+/* Install a received HT Operation element in the node. */
+int
+ieee80211_setup_htop(struct ieee80211_node *ni, const u_int8_t *data,
+    u_int8_t len, int isprobe)
+{
+	int ok;
+
+	if (len != 22)
+		return 0;
+
+	ni->ni_primary_chan = data[0];
+	ni->ni_htop0 = data[1];
+	switch (data[1] & IEEE80211_HTOP0_SCO_MASK) {
+	case IEEE80211_HTOP0_SCO_SCN:
+		ok = 1;
+		break;
+	case IEEE80211_HTOP0_SCO_SCA:
+		ok = ieee80211_40mhz_valid_secondary_above(data[0]);
+		break;
+	case IEEE80211_HTOP0_SCO_SCB:
+		ok = ieee80211_40mhz_valid_secondary_below(data[0]);
+		break;
+	default:
+		ok = 0;
+		break;
+	}
+	if (!ok)
+		ni->ni_htop0 &= ~IEEE80211_HTOP0_SCO_MASK;
+	ni->ni_htop1 = data[2] | (data[3] << 8);
+	ni->ni_htop2 = data[4] | (data[5] << 8);
+	/* The Basic MCS set is only meaningful in beacons and probe responses. */
+	if (isprobe)
+		memcpy(ni->ni_basic_mcs, &data[6], sizeof(ni->ni_basic_mcs));
+	return 1;
+}
+
+/*
+ * Whether to offer HT to this AP: the driver turned it on, the AP is
+ * HT, and the pairwise cipher is CCMP or none (802.11-2012 11.1.6 does
+ * not allow WEP or TKIP with HT).  With wpa_supplicant the cipher is
+ * the one in the RSN element it hands us in ic_opt_ie.
+ */
+int
+ieee80211_ht_wanted(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+	const u_int8_t *ie = ic->ic_opt_ie;
+	static const u_int8_t ccmp[4] = { 0x00, 0x0f, 0xac, 4 };
+	u_int n;
+
+	if ((ic->ic_flags_ext & IEEE80211_FEXT_HTON) == 0 ||
+	    ic->ic_opmode != IEEE80211_M_STA ||
+	    !ieee80211_node_supports_ht(ni))
+		return 0;
+	if ((ic->ic_flags & IEEE80211_F_PRIVACY) == 0)
+		return 1;
+	/* RSN: id, len, version(2), group(4), count(2), pairwise suites */
+	if (ie == NULL || ic->ic_opt_ie_len < 14 ||
+	    ie[0] != IEEE80211_ELEMID_RSN || ie[1] + 2 > ic->ic_opt_ie_len)
+		return 0;
+	n = ie[8] | (ie[9] << 8);
+	if (n != 1 || ie[1] < 12)
+		return 0;
+	return memcmp(&ie[10], ccmp, sizeof(ccmp)) == 0;
+}
+
+/*
+ * Decide on HT after a successful (re)association: we offered it and
+ * we support the AP's basic MCS set.  Block Ack state starts over.
+ */
+void
+ieee80211_ht_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+	int i;
+
+	ni->ni_flags &= ~IEEE80211_NODE_HT;
+	memset(ni->ni_rx_ba, 0, sizeof(ni->ni_rx_ba));
+	if (!ieee80211_ht_wanted(ic, ni))
+		return;
+	for (i = 0; i < IEEE80211_HT_NUM_MCS; i++) {
+		if (isset(ni->ni_basic_mcs, i) && !isset(ic->ic_sup_mcs, i))
+			return;
+	}
+	ni->ni_flags |= IEEE80211_NODE_HT;
 }

@@ -106,6 +106,8 @@ struct ieee80211_node {
 #define	IEEE80211_NODE_PWR_MGT	0x0010		/* power save mode enabled */
 #define	IEEE80211_NODE_AREF	0x0020		/* authentication ref held */
 #define	IEEE80211_NODE_UAPSD	0x0040		/* U-APSD negotiated */
+#define	IEEE80211_NODE_HT	0x0080		/* LISPBSD: HT negotiated */
+#define	IEEE80211_NODE_HTCAP	0x0100		/* LISPBSD: peer sent HT caps */
 	u_int16_t		ni_associd;	/* assoc response */
 	u_int16_t		ni_txpower;	/* current transmit power */
 	u_int16_t		ni_vlan;	/* vlan tag */
@@ -164,7 +166,64 @@ struct ieee80211_node {
 	int			ni_txrate;	/* index to ni_rates[] */
 	struct	ifqueue		ni_savedq;	/* ps-poll queue */
 	struct ieee80211_nodestats ni_stats;	/* per-node statistics */
+
+	/*
+	 * LISPBSD: 802.11n (HT), as in OpenBSD's net80211.  From the peer's
+	 * HT Capabilities and HT Operation elements, and the Block Ack
+	 * agreements it set up for traffic to us (the driver reorders).
+	 */
+	u_int16_t		ni_htcaps;
+	u_int8_t		ni_ampdu_param;
+	u_int8_t		ni_rxmcs[10];	/* MCS 0-76 bitmask */
+	u_int8_t		ni_basic_mcs[10];
+	u_int8_t		ni_primary_chan;
+	u_int8_t		ni_htop0;
+	u_int16_t		ni_htop1;
+	u_int16_t		ni_htop2;
+	struct ieee80211_rx_ba {
+		u_int8_t	ba_state;
+#define	IEEE80211_BA_INIT	0
+#define	IEEE80211_BA_REQUESTED	1	/* driver setting it up */
+#define	IEEE80211_BA_AGREED	2
+		u_int8_t	ba_token;
+		u_int16_t	ba_params;	/* as sent in the response */
+		u_int16_t	ba_timeout;	/* TUs */
+		u_int16_t	ba_winstart;
+		u_int16_t	ba_winsize;
+	}			ni_rx_ba[8];	/* per TID */
 };
+
+/* LISPBSD: HT predicates, as in OpenBSD.  MCS 0-7 must not all be off. */
+static __inline int
+ieee80211_node_supports_ht(const struct ieee80211_node *ni)
+{
+	return (ni->ni_flags & IEEE80211_NODE_HTCAP) && ni->ni_rxmcs[0] != 0;
+}
+
+static __inline int
+ieee80211_node_supports_ht_sgi20(const struct ieee80211_node *ni)
+{
+	return ieee80211_node_supports_ht(ni) &&
+	    (ni->ni_htcaps & IEEE80211_HTCAP_SGI20);
+}
+
+static __inline int
+ieee80211_node_supports_ht_sgi40(const struct ieee80211_node *ni)
+{
+	return ieee80211_node_supports_ht(ni) &&
+	    (ni->ni_htcaps & IEEE80211_HTCAP_SGI40);
+}
+
+/* The secondary channel offset in use: SCN unless HT at 40 MHz. */
+static __inline u_int8_t
+ieee80211_node_ht_sco(const struct ieee80211_node *ni)
+{
+	if ((ni->ni_flags & IEEE80211_NODE_HT) &&
+	    (ni->ni_htcaps & IEEE80211_HTCAP_CBW20_40) &&
+	    (ni->ni_htop0 & IEEE80211_HTOP0_CHW))
+		return ni->ni_htop0 & IEEE80211_HTOP0_SCO_MASK;
+	return IEEE80211_HTOP0_SCO_SCN;
+}
 MALLOC_DECLARE(M_80211_NODE);
 
 #define	IEEE80211_NODE_AID(ni)	IEEE80211_AID(ni->ni_associd)
@@ -326,6 +385,8 @@ struct ieee80211_scanparams {
 	u_int8_t	*sp_xrates;
 	u_int8_t	*sp_wpa;
 	u_int8_t	*sp_wme;
+	u_int8_t	*sp_htcap;	/* LISPBSD: HT Capabilities element */
+	u_int8_t	*sp_htop;	/* LISPBSD: HT Operation element */
 };
 
 /*

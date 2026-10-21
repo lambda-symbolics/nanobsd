@@ -336,6 +336,54 @@ struct iwx_phy_ctxt {
 };
 
 /*
+ * LISPBSD: 802.11n receive Block Ack, as in OpenBSD.  The firmware
+ * de-aggregates A-MPDUs and tags each MPDU with its BAID, sequence
+ * number and the window's next expected one; the driver reorders.
+ *
+ * struct iwx_reorder_buffer - per BAID reorder window
+ * @head_sn: reorder window head sn
+ * @num_stored: number of MPDUs stored in the buffer
+ * @buf_size: the reorder buffer size as set by the last ADDBA request
+ * @valid: reordering is valid (the first in-window frame was seen)
+ */
+struct iwx_reorder_buffer {
+	uint16_t head_sn;
+	uint16_t num_stored;
+	uint16_t buf_size;
+	int valid;
+};
+
+/* Frames stored for one sequence number (several for an A-MSDU). */
+struct iwx_reorder_buf_entry {
+	struct mbuf *frames;		/* linked by m_nextpkt */
+	struct mbuf **frames_tail;
+	uint32_t rx_pkt_status;
+	int chanidx;
+	int is_shortpre;
+	uint32_t rate_n_flags;
+	uint32_t device_timestamp;
+	int rssi;
+};
+
+struct iwx_rxba_data {
+	uint8_t sta_id;
+	uint8_t tid;
+	uint8_t baid;
+	uint32_t timeout;		/* session timeout, usec (0: none) */
+	struct timeval last_rx;
+	callout_t session_timer;
+	callout_t reorder_timer;	/* releases frames stuck behind a gap */
+	struct iwx_softc *sc;
+	struct iwx_reorder_buffer reorder_buf;
+	struct iwx_reorder_buf_entry entries[IEEE80211_BA_MAX_WINSZ];
+};
+
+struct iwx_ba_task_data {
+	uint32_t start_tidmask;
+	uint32_t stop_tidmask;
+};
+
+/*
  * LISPBSD: U-APSD state for hw.iwx.uapsd_status (what the AP offered,
  * what was negotiated and the power table last sent to the firmware).
  */
@@ -499,6 +547,7 @@ struct iwx_softc {
 	enum ieee80211_state	ns_nstate;
 	int			ns_arg;
 	struct iwx_task		uapsd_task;	/* LISPBSD: U-APSD fallback */
+	struct iwx_task		ba_task;	/* LISPBSD: Rx Block Ack setup */
 	struct iwx_uapsd_diag	sc_uapsd;	/* LISPBSD: U-APSD state */
 
 	bus_space_tag_t sc_st;
@@ -603,6 +652,20 @@ struct iwx_softc {
 
 	int sc_tx_timer[IWX_NUM_TX_QUEUES];
 	int sc_rx_ba_sessions;
+	/* LISPBSD: 802.11n */
+	struct iwx_rxba_data sc_rxba_data[IWX_MAX_BAID];
+	struct iwx_ba_task_data ba_rx;
+	struct iwx_ht_stats {		/* hw.iwx.ht_status */
+		uint32_t	hs_assoc_ht;	/* HT associations */
+		uint32_t	hs_addba;	/* sessions started */
+		uint32_t	hs_addba_refused;
+		uint32_t	hs_delba;	/* sessions stopped */
+		uint32_t	hs_stored;	/* frames held for reordering */
+		uint32_t	hs_dropped;	/* duplicate or behind window */
+		uint32_t	hs_bar;		/* BAR/firmware releases */
+		uint32_t	hs_timer;	/* reorder timer releases */
+	} sc_ht_stats;
+	uint8_t sc_chan40[howmany(IEEE80211_CHAN_MAX + 1, NBBY)];
 
 	int sc_scan_last_antenna;
 

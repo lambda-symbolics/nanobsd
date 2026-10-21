@@ -135,6 +135,10 @@ static void ieee80211_discard_mac(struct ieee80211com *,
 static struct mbuf *ieee80211_defrag(struct ieee80211_node *,
     struct mbuf *, int);
 static struct mbuf *ieee80211_decap(struct mbuf *, int);
+static void ieee80211_amsdu_input(struct ieee80211com *,
+    struct ieee80211_node *, struct mbuf *, int);
+static void ieee80211_recv_mgmt_action(struct ieee80211com *, struct mbuf *,
+    struct ieee80211_node *);
 static void ieee80211_send_error(struct ieee80211com *, struct ieee80211_node *,
 	const u_int8_t *mac, int subtype, int arg);
 static void ieee80211_deliver_data(struct ieee80211com *,
@@ -310,6 +314,29 @@ ieee80211_input_data(struct ieee80211com *ic, struct mbuf **mp,
 
 	/* copy to listener after decrypt */
 	bpf_mtap3(ic->ic_rawbpf, m, BPF_D_IN);
+
+	/*
+	 * LISPBSD: an HT peer may send several MSDUs in one A-MSDU.  The
+	 * subframes carry Ethernet-style headers; check the port as for
+	 * a single MSDU, then deliver each one.
+	 */
+	wh = mtod(m, struct ieee80211_frame *);
+	if (dir != IEEE80211_FC1_DIR_DSTODS && ieee80211_has_qos(wh) &&
+	    (((struct ieee80211_qosframe *)wh)->i_qos[0] & IEEE80211_QOS_AMSDU)) {
+		if (!ieee80211_node_is_authorized(ni)) {
+			ic->ic_stats.is_rx_unauth++;
+			IEEE80211_NODE_STAT(ni, rx_unauth);
+			goto err;
+		}
+		if ((ic->ic_flags & IEEE80211_F_DROPUNENC) && key == NULL) {
+			ic->ic_stats.is_rx_unencrypted++;
+			IEEE80211_NODE_STAT(ni, rx_unencrypted);
+			goto out;
+		}
+		ieee80211_amsdu_input(ic, ni, m, hdrspace);
+		*mp = NULL;
+		return 0;
+	}
 
 	/*
 	 * Finally, strip the 802.11 header.
@@ -2194,6 +2221,12 @@ ieee80211_recv_mgmt_beacon(struct ieee80211com *ic, struct mbuf *m0,
 			/* no length check needed */
 			scan.sp_wpa = frm;
 			break;
+		case IEEE80211_ELEMID_HTCAP:	/* LISPBSD: 802.11n */
+			scan.sp_htcap = frm;
+			break;
+		case IEEE80211_ELEMID_HTINFO:
+			scan.sp_htop = frm;
+			break;
 		case IEEE80211_ELEMID_VENDOR:
 			/* no length check needed */
 			if (iswpaoui(frm))
@@ -2803,7 +2836,7 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 {
 	struct ieee80211_frame *wh;
 	u_int8_t *frm, *efrm;
-	u_int8_t *rates, *xrates, *wme;
+	u_int8_t *rates, *xrates, *wme, *htcap, *htop;
 	u_int8_t rate, wmm_qosinfo = 0;
 	int has_wmm_qosinfo = 0;
 	IEEE80211_DEBUGVAR(char ebuf[3 * ETHER_ADDR_LEN]);
@@ -2848,7 +2881,7 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 	associd = le16toh(*(u_int16_t *)frm);
 	frm += 2;
 
-	rates = xrates = wme = NULL;
+	rates = xrates = wme = htcap = htop = NULL;
 	while (frm + 1 < efrm) {
 		IEEE80211_VERIFY_LENGTH(efrm - frm, frm[1] + 2);
 
@@ -2858,6 +2891,12 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 			break;
 		case IEEE80211_ELEMID_XRATES:
 			xrates = frm;
+			break;
+		case IEEE80211_ELEMID_HTCAP:	/* LISPBSD: 802.11n */
+			htcap = frm;
+			break;
+		case IEEE80211_ELEMID_HTINFO:
+			htop = frm;
 			break;
 		case IEEE80211_ELEMID_VENDOR:
 			if (iswmeoui(frm))
@@ -2910,6 +2949,13 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 	ieee80211_setup_uapsd(ic, ni, has_wmm_qosinfo &&
 	    (wmm_qosinfo & IEEE80211_WMM_IE_AP_QOSINFO_UAPSD));
 
+	/* LISPBSD: 802.11n, if we offered it */
+	if (htcap != NULL)
+		ieee80211_setup_htcaps(ni, htcap + 2, htcap[1]);
+	if (htop != NULL)
+		ieee80211_setup_htop(ni, htop + 2, htop[1], 0);
+	ieee80211_ht_negotiate(ic, ni);
+
 	/*
 	 * Configure state now that we are associated.
 	 *
@@ -2941,13 +2987,14 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 	}
 
 	IEEE80211_DPRINTF(ic, IEEE80211_MSG_ASSOC,
-	    "[%s] %sassoc success: %s preamble, %s slot time%s%s%s\n",
+	    "[%s] %sassoc success: %s preamble, %s slot time%s%s%s%s\n",
 	    ether_snprintf(ebuf, sizeof(ebuf), wh->i_addr2),
 	    ISREASSOC(subtype) ? "re" : "",
 	    ic->ic_flags&IEEE80211_F_SHPREAMBLE ? "short" : "long",
 	    ic->ic_flags&IEEE80211_F_SHSLOT ? "short" : "long",
 	    ic->ic_flags&IEEE80211_F_USEPROT ? ", protection" : "",
 	    ni->ni_flags & IEEE80211_NODE_QOS ? ", QoS" : "",
+	    ni->ni_flags & IEEE80211_NODE_HT ? ", HT" : "",
 	    (ic->ic_flags_ext & IEEE80211_FEXT_UAPSD) ?
 		((ni->ni_flags & IEEE80211_NODE_UAPSD) ?
 		    ", uAPSD enabled" : ", uAPSD disabled") : ""
@@ -3074,6 +3121,257 @@ ieee80211_recv_mgmt_disassoc(struct ieee80211com *ic, struct mbuf *m0,
 
 /* -------------------------------------------------------------------------- */
 
+/*
+ * LISPBSD: 802.11n Block Ack (802.11-2012 10.5), receive side only, as in
+ * OpenBSD.  The AP sets up an agreement per TID; the driver (firmware)
+ * does the reordering, so net80211 only keeps the agreement's state and
+ * answers.
+ */
+static void
+ieee80211_recv_addba_req(struct ieee80211com *ic, const u_int8_t *frm,
+    struct ieee80211_node *ni)
+{
+	struct ieee80211_rx_ba *ba;
+	u_int16_t params, bufsz, timeout, ssn;
+	u_int8_t token, tid;
+	int error = 0;
+
+	if (ic->ic_state != IEEE80211_S_RUN ||
+	    (ni->ni_flags & IEEE80211_NODE_HT) == 0)
+		return;
+
+	/* [1] category [1] action [1] token [2] params [2] timeout [2] ssn */
+	token = frm[2];
+	params = frm[3] | (frm[4] << 8);
+	timeout = frm[5] | (frm[6] << 8);
+	ssn = (frm[7] | (frm[8] << 8)) >> 4;
+	tid = (params & IEEE80211_ADDBA_TID_MASK) >> IEEE80211_ADDBA_TID_SHIFT;
+	bufsz = (params & IEEE80211_ADDBA_BUFSZ_MASK) >>
+	    IEEE80211_ADDBA_BUFSZ_SHIFT;
+
+	if (tid >= __arraycount(ni->ni_rx_ba)) {
+		/* TSPEC TIDs: not supported */
+		ieee80211_send_action(ic, ni, IEEE80211_CATEG_BA,
+		    IEEE80211_ACTION_ADDBA_RESP,
+		    IEEE80211_STATUS_REFUSED << 16 | token << 8 | tid);
+		return;
+	}
+	ba = &ni->ni_rx_ba[tid];
+	/* The driver is still setting up an agreement for this TID. */
+	if (ba->ba_state == IEEE80211_BA_REQUESTED)
+		return;
+	/* An agreement exists already: ignore, as OpenBSD does. */
+	if (ba->ba_state == IEEE80211_BA_AGREED)
+		return;
+
+	/* Only immediate Block Ack. */
+	if ((params & IEEE80211_ADDBA_BA_POLICY) == 0)
+		goto refuse;
+
+	ba->ba_state = IEEE80211_BA_REQUESTED;
+	ba->ba_token = token;
+	ba->ba_timeout = timeout;
+	ba->ba_winsize = bufsz;
+	if (ba->ba_winsize == 0 || ba->ba_winsize > IEEE80211_BA_MAX_WINSZ)
+		ba->ba_winsize = IEEE80211_BA_MAX_WINSZ;
+	ba->ba_winstart = ssn;
+	/* No A-MSDU inside A-MPDU: the AMSDU bit stays clear. */
+	ba->ba_params = IEEE80211_ADDBA_BA_POLICY |
+	    (ba->ba_winsize << IEEE80211_ADDBA_BUFSZ_SHIFT) |
+	    (tid << IEEE80211_ADDBA_TID_SHIFT);
+
+	if (ic->ic_ampdu_rx_start != NULL)
+		error = (*ic->ic_ampdu_rx_start)(ic, ni, tid);
+	else
+		error = EOPNOTSUPP;
+	if (error == EBUSY)
+		return;		/* the driver answers when done */
+	if (error)
+		ieee80211_addba_req_refuse(ic, ni, tid);
+	else
+		ieee80211_addba_req_accept(ic, ni, tid);
+	return;
+
+refuse:
+	ieee80211_send_action(ic, ni, IEEE80211_CATEG_BA,
+	    IEEE80211_ACTION_ADDBA_RESP,
+	    IEEE80211_STATUS_REFUSED << 16 | token << 8 | tid);
+}
+
+void
+ieee80211_addba_req_accept(struct ieee80211com *ic, struct ieee80211_node *ni,
+    u_int8_t tid)
+{
+	struct ieee80211_rx_ba *ba = &ni->ni_rx_ba[tid];
+
+	ba->ba_state = IEEE80211_BA_AGREED;
+	ieee80211_send_action(ic, ni, IEEE80211_CATEG_BA,
+	    IEEE80211_ACTION_ADDBA_RESP,
+	    IEEE80211_STATUS_SUCCESS << 16 | ba->ba_token << 8 | tid);
+}
+
+void
+ieee80211_addba_req_refuse(struct ieee80211com *ic, struct ieee80211_node *ni,
+    u_int8_t tid)
+{
+	struct ieee80211_rx_ba *ba = &ni->ni_rx_ba[tid];
+
+	ba->ba_state = IEEE80211_BA_INIT;
+	ieee80211_send_action(ic, ni, IEEE80211_CATEG_BA,
+	    IEEE80211_ACTION_ADDBA_RESP,
+	    IEEE80211_STATUS_REFUSED << 16 | ba->ba_token << 8 | tid);
+}
+
+/*
+ * End a receive agreement from our side (the driver gave up on it, e.g.
+ * its inactivity timeout fired) and tell the AP.
+ */
+void
+ieee80211_delba_request(struct ieee80211com *ic, struct ieee80211_node *ni,
+    u_int16_t reason, u_int8_t tid)
+{
+	struct ieee80211_rx_ba *ba = &ni->ni_rx_ba[tid];
+
+	if (ba->ba_state != IEEE80211_BA_AGREED)
+		return;
+	if (ic->ic_ampdu_rx_stop != NULL)
+		(*ic->ic_ampdu_rx_stop)(ic, ni, tid);
+	ba->ba_state = IEEE80211_BA_INIT;
+	/* we are the recipient: the initiator bit stays clear */
+	ieee80211_send_action(ic, ni, IEEE80211_CATEG_BA,
+	    IEEE80211_ACTION_DELBA, reason << 16 | tid);
+}
+
+static void
+ieee80211_recv_delba(struct ieee80211com *ic, const u_int8_t *frm,
+    struct ieee80211_node *ni)
+{
+	struct ieee80211_rx_ba *ba;
+	u_int16_t params;
+	u_int8_t tid;
+
+	/* [1] category [1] action [2] params [2] reason */
+	params = frm[2] | (frm[3] << 8);
+	tid = params >> IEEE80211_DELBA_TID_SHIFT;
+	/* Only the originator (the AP) ends a receive agreement. */
+	if ((params & IEEE80211_DELBA_INITIATOR) == 0 ||
+	    tid >= __arraycount(ni->ni_rx_ba))
+		return;
+	ba = &ni->ni_rx_ba[tid];
+	if (ba->ba_state != IEEE80211_BA_AGREED)
+		return;
+	if (ic->ic_ampdu_rx_stop != NULL)
+		(*ic->ic_ampdu_rx_stop)(ic, ni, tid);
+	ba->ba_state = IEEE80211_BA_INIT;
+}
+
+static void
+ieee80211_recv_mgmt_action(struct ieee80211com *ic, struct mbuf *m0,
+    struct ieee80211_node *ni)
+{
+	const struct ieee80211_frame *wh;
+	const u_int8_t *frm;
+	int len;
+
+	wh = mtod(m0, struct ieee80211_frame *);
+	frm = (const u_int8_t *)(wh + 1);
+	len = m0->m_len - (int)sizeof(*wh);
+
+	if (ic->ic_opmode != IEEE80211_M_STA || ni != ic->ic_bss ||
+	    !IEEE80211_ADDR_EQ(wh->i_addr1, ic->ic_myaddr) ||
+	    !IEEE80211_ADDR_EQ(wh->i_addr2, ni->ni_bssid) || len < 2) {
+		ic->ic_stats.is_rx_mgtdiscard++;
+		return;
+	}
+	if (frm[0] != IEEE80211_CATEG_BA)
+		return;
+	switch (frm[1]) {
+	case IEEE80211_ACTION_ADDBA_REQ:
+		if (len >= 9)
+			ieee80211_recv_addba_req(ic, frm, ni);
+		break;
+	case IEEE80211_ACTION_DELBA:
+		if (len >= 6)
+			ieee80211_recv_delba(ic, frm, ni);
+		break;
+	}
+}
+
+/*
+ * LISPBSD: split an A-MSDU (802.11-2012 8.3.2.2) and deliver its MSDUs.
+ * Each subframe is DA, SA, length, an LLC/SNAP payload, then padding to
+ * 4 bytes unless it is the last one.
+ */
+static void
+ieee80211_amsdu_input(struct ieee80211com *ic, struct ieee80211_node *ni,
+    struct mbuf *m, int hdrlen)
+{
+	struct ifnet *ifp = ic->ic_ifp;
+	struct ether_header *eh;
+	struct llc *llc;
+	struct mbuf *n;
+	int len, pad;
+
+	m_adj(m, hdrlen);
+	while (m != NULL) {
+		if (m->m_pkthdr.len < ETHER_HDR_LEN + LLC_SNAPFRAMELEN) {
+			if (m->m_pkthdr.len != 0)
+				if_statinc(ifp, if_ierrors);
+			m_freem(m);
+			return;
+		}
+		if (m->m_len < ETHER_HDR_LEN + LLC_SNAPFRAMELEN &&
+		    (m = m_pullup(m, ETHER_HDR_LEN + LLC_SNAPFRAMELEN)) == NULL) {
+			if_statinc(ifp, if_ierrors);
+			return;
+		}
+		eh = mtod(m, struct ether_header *);
+		len = ntohs(eh->ether_type);
+		if (len < LLC_SNAPFRAMELEN ||
+		    ETHER_HDR_LEN + len > m->m_pkthdr.len) {
+			if_statinc(ifp, if_ierrors);
+			m_freem(m);
+			return;
+		}
+		n = NULL;
+		if (ETHER_HDR_LEN + len < m->m_pkthdr.len) {
+			n = m_split(m, ETHER_HDR_LEN + len, M_DONTWAIT);
+			if (n == NULL) {
+				if_statinc(ifp, if_ierrors);
+				m_freem(m);
+				return;
+			}
+			pad = (4 - ((ETHER_HDR_LEN + len) & 3)) & 3;
+			m_adj(n, pad);
+		}
+
+		llc = (struct llc *)&eh[1];
+		if (llc->llc_dsap == LLC_SNAP_LSAP &&
+		    llc->llc_ssap == LLC_SNAP_LSAP &&
+		    llc->llc_control == LLC_UI &&
+		    llc->llc_snap.org_code[0] == 0 &&
+		    llc->llc_snap.org_code[1] == 0 &&
+		    llc->llc_snap.org_code[2] == 0) {
+			u_int16_t type = llc->llc_snap.ether_type;
+
+			memmove(mtod(m, u_int8_t *) + LLC_SNAPFRAMELEN,
+			    mtod(m, u_int8_t *), 2 * ETHER_ADDR_LEN);
+			m_adj(m, LLC_SNAPFRAMELEN);
+			eh = mtod(m, struct ether_header *);
+			eh->ether_type = type;
+		}
+		/* else: an 802.3 frame, the length stays as the type */
+
+		if_statinc(ifp, if_ipackets);
+		IEEE80211_NODE_STAT(ni, rx_data);
+		IEEE80211_NODE_STAT_ADD(ni, rx_bytes, m->m_pkthdr.len);
+		ieee80211_deliver_data(ic, ni, m);
+		m = n;
+	}
+}
+
+/* -------------------------------------------------------------------------- */
+
 void
 ieee80211_recv_mgmt(struct ieee80211com *ic, struct mbuf *m0,
     struct ieee80211_node *ni, int subtype, int rssi, u_int32_t rstamp)
@@ -3112,6 +3410,10 @@ ieee80211_recv_mgmt(struct ieee80211com *ic, struct mbuf *m0,
 
 	case IEEE80211_FC0_SUBTYPE_DISASSOC:
 		ieee80211_recv_mgmt_disassoc(ic, m0, ni, subtype, rssi, rstamp);
+		return;
+
+	case IEEE80211_FC0_SUBTYPE_ACTION:	/* LISPBSD: 802.11n */
+		ieee80211_recv_mgmt_action(ic, m0, ni);
 		return;
 
 	default:

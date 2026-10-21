@@ -63,6 +63,22 @@ int	ieee80211_input(struct ieee80211com *, struct mbuf *,
 int	ieee80211_setup_rates(struct ieee80211_node *ni,
 		const u_int8_t *rates, const u_int8_t *xrates, int flags);
 void	ieee80211_saveie(u_int8_t **, const u_int8_t *);
+/* LISPBSD: 802.11n */
+void	ieee80211_setup_htcaps(struct ieee80211_node *, const u_int8_t *,
+	    u_int8_t);
+int	ieee80211_setup_htop(struct ieee80211_node *, const u_int8_t *,
+	    u_int8_t, int);
+int	ieee80211_ht_wanted(struct ieee80211com *, struct ieee80211_node *);
+void	ieee80211_ht_negotiate(struct ieee80211com *, struct ieee80211_node *);
+u_int8_t *ieee80211_add_htcaps(u_int8_t *, struct ieee80211com *);
+int	ieee80211_send_action(struct ieee80211com *, struct ieee80211_node *,
+	    u_int8_t, u_int8_t, u_int32_t);
+void	ieee80211_addba_req_accept(struct ieee80211com *,
+	    struct ieee80211_node *, u_int8_t);
+void	ieee80211_addba_req_refuse(struct ieee80211com *,
+	    struct ieee80211_node *, u_int8_t);
+void	ieee80211_delba_request(struct ieee80211com *, struct ieee80211_node *,
+	    u_int16_t, u_int8_t);
 void	ieee80211_recv_mgmt(struct ieee80211com *, struct mbuf *,
 		struct ieee80211_node *, int, int, u_int32_t);
 int	ieee80211_send_nulldata(struct ieee80211_node *);
