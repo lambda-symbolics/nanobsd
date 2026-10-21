@@ -197,6 +197,15 @@ struct ieee80211com {
 	u_int16_t		ic_htxcaps;
 	u_int32_t		ic_txbfcaps;
 	u_int8_t		ic_aselcaps;
+	/*
+	 * LISPBSD: 802.11ac (VHT) capabilities the driver offers on 5 GHz
+	 * when IEEE80211_FEXT_VHTON is set too and the AP is VHT.
+	 */
+	u_int32_t		ic_vhtcaps;
+	u_int16_t		ic_vht_rxmcs;
+	u_int16_t		ic_vht_rx_max_lgi_mbit_s;
+	u_int16_t		ic_vht_txmcs;
+	u_int16_t		ic_vht_tx_max_lgi_mbit_s;
 	int			(*ic_ampdu_rx_start)(struct ieee80211com *,
 				    struct ieee80211_node *, u_int8_t);
 	void			(*ic_ampdu_rx_stop)(struct ieee80211com *,
@@ -296,6 +305,7 @@ extern struct ieee80211com_head ieee80211com_head;
 #define	IEEE80211_FEXT_BGSCAN	0x00000008	/* STATUS: enable full bgscan completion */
 #define	IEEE80211_FEXT_UAPSD	0x00000100	/* CONF: request U-APSD */
 #define	IEEE80211_FEXT_HTON	0x00000200	/* LISPBSD CONF: request HT (11n) */
+#define	IEEE80211_FEXT_VHTON	0x00000400	/* LISPBSD CONF: request VHT (11ac) */
 #define	IEEE80211_FEXT_PROBECHAN 0x00020000	/* CONF: probe passive channel*/
 
 /* ic_caps */

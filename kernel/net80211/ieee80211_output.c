@@ -1439,6 +1439,29 @@ ieee80211_add_htcaps(u_int8_t *frm, struct ieee80211com *ic)
 }
 
 /*
+ * LISPBSD: add a VHT Capabilities element (802.11ac-2013 8.4.2.160).
+ */
+u_int8_t *
+ieee80211_add_vhtcaps(u_int8_t *frm, struct ieee80211com *ic)
+{
+	*frm++ = IEEE80211_ELEMID_VHTCAP;
+	*frm++ = 12;
+	*frm++ = ic->ic_vhtcaps & 0xff;
+	*frm++ = (ic->ic_vhtcaps >> 8) & 0xff;
+	*frm++ = (ic->ic_vhtcaps >> 16) & 0xff;
+	*frm++ = ic->ic_vhtcaps >> 24;
+	*frm++ = ic->ic_vht_rxmcs & 0xff;
+	*frm++ = ic->ic_vht_rxmcs >> 8;
+	*frm++ = ic->ic_vht_rx_max_lgi_mbit_s & 0xff;
+	*frm++ = ic->ic_vht_rx_max_lgi_mbit_s >> 8;
+	*frm++ = ic->ic_vht_txmcs & 0xff;
+	*frm++ = ic->ic_vht_txmcs >> 8;
+	*frm++ = ic->ic_vht_tx_max_lgi_mbit_s & 0xff;
+	*frm++ = ic->ic_vht_tx_max_lgi_mbit_s >> 8;
+	return frm;
+}
+
+/*
  * LISPBSD: send a Block Ack action frame (802.11-2012 8.5.5).  arg is
  * the TID for an ADDBA request (the rest comes from ni_tx_ba[tid]),
  * status << 16 | token << 8 | tid for an ADDBA response and
@@ -1756,6 +1779,7 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 		 *	[tlv] WME
 		 *	[tlv] user-specified ie's
 		 *	[tlv] HT capabilities (LISPBSD)
+		 *	[tlv] VHT capabilities (LISPBSD)
 		 */
 		m = ieee80211_getmgtframe(&frm,
 			 sizeof(u_int16_t)
@@ -1767,6 +1791,7 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 		       + sizeof(struct ieee80211_wme_info)
 		       + (ic->ic_opt_ie != NULL ? ic->ic_opt_ie_len : 0)
 		       + 2 + 26
+		       + 2 + 12
 		);
 		if (m == NULL)
 			senderr(ENOMEM, is_tx_nobuf);
@@ -1820,6 +1845,8 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 		}
 		if (ieee80211_ht_wanted(ic, ni))
 			frm = ieee80211_add_htcaps(frm, ic);
+		if (ieee80211_vht_wanted(ic, ni))
+			frm = ieee80211_add_vhtcaps(frm, ic);
 		m->m_pkthdr.len = m->m_len = frm - mtod(m, u_int8_t *);
 
 		timer = IEEE80211_TRANS_WAIT;

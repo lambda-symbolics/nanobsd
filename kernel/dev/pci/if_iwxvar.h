@@ -668,7 +668,10 @@ struct iwx_softc {
 		uint32_t	hs_timer;	/* reorder timer releases */
 		uint32_t	hs_rx_rate;	/* last unicast data rx rate_n_flags */
 		uint32_t	hs_tx_rate;	/* last rate from firmware TLC */
-		uint32_t	hs_rx_ht40;	/* unicast data frames at 40 MHz */
+		uint32_t	hs_assoc_vht;	/* VHT associations */
+		uint32_t	hs_rx_vht80;	/* unicast data: VHT at 80 MHz */
+		uint32_t	hs_rx_vht;	/* VHT at 20/40 MHz */
+		uint32_t	hs_rx_ht40;	/* HT at 40 MHz */
 		uint32_t	hs_rx_ht20;
 		uint32_t	hs_rx_legacy;
 		uint32_t	hs_tx_agg;	/* Tx agreements started */
@@ -676,6 +679,7 @@ struct iwx_softc {
 		uint32_t	hs_ba_notif;	/* compressed Block Acks */
 	} sc_ht_stats;
 	uint8_t sc_chan40[howmany(IEEE80211_CHAN_MAX + 1, NBBY)];
+	uint8_t sc_chan80[howmany(IEEE80211_CHAN_MAX + 1, NBBY)];
 
 	int sc_scan_last_antenna;
 

@@ -108,6 +108,8 @@ struct ieee80211_node {
 #define	IEEE80211_NODE_UAPSD	0x0040		/* U-APSD negotiated */
 #define	IEEE80211_NODE_HT	0x0080		/* LISPBSD: HT negotiated */
 #define	IEEE80211_NODE_HTCAP	0x0100		/* LISPBSD: peer sent HT caps */
+#define	IEEE80211_NODE_VHT	0x0200		/* LISPBSD: VHT negotiated */
+#define	IEEE80211_NODE_VHTCAP	0x0400		/* LISPBSD: peer sent VHT caps */
 	u_int16_t		ni_associd;	/* assoc response */
 	u_int16_t		ni_txpower;	/* current transmit power */
 	u_int16_t		ni_vlan;	/* vlan tag */
@@ -201,6 +203,17 @@ struct ieee80211_node {
 		int		ba_next_req;	/* no new request before */
 		int		ba_req_intval;	/* backoff, seconds */
 	}			ni_tx_ba[8];	/* per TID */
+
+	/* LISPBSD: 802.11ac (VHT), as in OpenBSD's net80211. */
+	u_int32_t		ni_vhtcaps;
+	u_int16_t		ni_vht_rxmcs;
+	u_int16_t		ni_vht_rx_max_lgi_mbit_s;
+	u_int16_t		ni_vht_txmcs;
+	u_int16_t		ni_vht_tx_max_lgi_mbit_s;
+	u_int8_t		ni_vht_chan_width;	/* IEEE80211_VHTOP0_* */
+	u_int8_t		ni_vht_chan_center_freq_idx0;
+	u_int8_t		ni_vht_chan_center_freq_idx1;
+	u_int16_t		ni_vht_basic_mcs;
 };
 
 /* LISPBSD: HT predicates, as in OpenBSD.  MCS 0-7 must not all be off. */
@@ -222,6 +235,36 @@ ieee80211_node_supports_ht_sgi40(const struct ieee80211_node *ni)
 {
 	return ieee80211_node_supports_ht(ni) &&
 	    (ni->ni_htcaps & IEEE80211_HTCAP_SGI40);
+}
+
+/* VHT: the peer sent VHT caps and does VHT MCS on one spatial stream. */
+static __inline int
+ieee80211_node_supports_vht(const struct ieee80211_node *ni)
+{
+	u_int16_t rx_mcs = (ni->ni_vht_rxmcs &
+	    IEEE80211_VHT_MCS_FOR_SS_MASK(1)) >>
+	    IEEE80211_VHT_MCS_FOR_SS_SHIFT(1);
+
+	return (ni->ni_flags & IEEE80211_NODE_VHTCAP) &&
+	    rx_mcs != IEEE80211_VHT_MCS_SS_NOT_SUPP;
+}
+
+static __inline int
+ieee80211_node_supports_vht_sgi80(const struct ieee80211_node *ni)
+{
+	return ieee80211_node_supports_vht(ni) &&
+	    (ni->ni_vhtcaps & IEEE80211_VHTCAP_SGI80);
+}
+
+/* The peer does 80 MHz and its BSS operates at 80 MHz (or wider). */
+static __inline int
+ieee80211_node_supports_vht_chan80(const struct ieee80211_node *ni)
+{
+	if (!ieee80211_node_supports_vht(ni))
+		return 0;
+	/* every VHT station does 80 MHz; the capability field says more */
+	return (ni->ni_vht_chan_width & IEEE80211_VHTOP0_CHAN_WIDTH_MASK) !=
+	    IEEE80211_VHTOP0_CHAN_WIDTH_HT;
 }
 
 /* The secondary channel offset in use: SCN unless HT at 40 MHz. */
@@ -397,6 +440,8 @@ struct ieee80211_scanparams {
 	u_int8_t	*sp_wme;
 	u_int8_t	*sp_htcap;	/* LISPBSD: HT Capabilities element */
 	u_int8_t	*sp_htop;	/* LISPBSD: HT Operation element */
+	u_int8_t	*sp_vhtcap;	/* LISPBSD: VHT Capabilities element */
+	u_int8_t	*sp_vhtop;	/* LISPBSD: VHT Operation element */
 };
 
 /*

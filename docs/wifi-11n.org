@@ -46,8 +46,43 @@ and the PHY context listens on one chain, the second waking on the AP's RTS
 | download  | 13 Mbit/s  | 39-45 Mbit/s             | 100-112 Mbit/s |
 | upload    | 12.6       | 16-17                    | 100            |
 
+* 802.11ac (VHT, 80 MHz): written 2026-10-22, NOT yet run on the Nano
+Behind its own switch, =hw.iwx.vht= (default 0, needs =hw.iwx.ht=1, 5 GHz
+only).  Compile-checked against the kernel 198 tree in the gefs VM
+(/build/agent-vht there); the Nano still runs 198.
+
+- net80211: VHT Capabilities/Operation elements parsed from beacons and
+  the association response (=ieee80211_setup_vhtcaps/vhtop=, OpenBSD's
+  center-frequency logic incl. 802.11-2016 160 MHz signalling, with two
+  OpenBSD slips fixed: the 80 MHz center list had 112 for 122, and a
+  deprecated 160 MHz BSS was cut to 80 MHz with the center 4 instead of 8
+  channel numbers off), =ieee80211_vht_negotiate= (HT first, AP basic
+  VHT-MCS set), our VHT Capabilities element after the HT one.
+- iwx: VHT capabilities (80 MHz, SGI80, MCS 0-9 on two streams, 3895-byte
+  MPDUs, 1 MB A-MPDUs, Rx STBC 1), 80 MHz PHY context with the control
+  channel position from the center (=iwx_get_vht_ctrl_pos=), ADD_STA 80 MHz
+  + VHT MIMO + A-MPDU length from the VHT caps, TLC in VHT mode,
+  =hw.iwx.ht_status= with =assoc=vht=, =width=80=, the AP's VHT elements and
+  rx_vht80/rx_vht counters.  No 160 MHz: we do not offer it.
+- The Zyxel (seen from the workstation): primary 40, secondary below, VHT
+  80 MHz centered on 42 (control position 1 below), basic VHT-MCS 0xffaa =
+  MCS 0-9 on two streams required (we offer exactly that), AP max MPDU
+  7991, no 160.
+
+** Test procedure (next session with the Nano)
+1. Build on the laptop from nanobsd (net80211/*, dev/pci/if_iwx.c,
+   if_iwxvar.h), install as kernel 199, 198 stays the previous entry.
+2. Boot; =hw.iwx.ht=1=, =hw.iwx.vht=0= as before: same as 198.
+3. =nohup sh userland/iwx-ht/ht-test.sh vht= (dead-man: back to HT if the
+   WireGuard peer is silent for 60 s), then =hw.iwx.ht_status= should say
+   =assoc=vht ... width=80=, rx rate mod type VHT (=rate_n_flags= bits 8-10
+   = 3) at 80 MHz (bits 11-13 = 2).
+4. A/B against HT on the LAN: =KNOB=hw.iwx.vht sh ht-ab.sh URL= and
+   =KNOB=hw.iwx.vht sh up-ab.sh= (ncat listener on the workstation).
+5. If good: =hw.iwx.vht=1= in /etc/sysctl.conf.
+
 * Not done
 - Idle and transfer power not measured yet (fewer airtime-seconds per byte
   should help; two chains during MIMO bursts cost some).
 - s2idle with HT associated is untested.
-- No VHT (11ac) or HE (11ax).
+- VHT is untested on hardware (above); no 160 MHz, no HE (11ax).

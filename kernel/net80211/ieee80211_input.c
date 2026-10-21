@@ -2229,6 +2229,12 @@ ieee80211_recv_mgmt_beacon(struct ieee80211com *ic, struct mbuf *m0,
 		case IEEE80211_ELEMID_HTINFO:
 			scan.sp_htop = frm;
 			break;
+		case IEEE80211_ELEMID_VHTCAP:	/* LISPBSD: 802.11ac */
+			scan.sp_vhtcap = frm;
+			break;
+		case IEEE80211_ELEMID_VHTOP:
+			scan.sp_vhtop = frm;
+			break;
 		case IEEE80211_ELEMID_VENDOR:
 			/* no length check needed */
 			if (iswpaoui(frm))
@@ -2838,7 +2844,7 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 {
 	struct ieee80211_frame *wh;
 	u_int8_t *frm, *efrm;
-	u_int8_t *rates, *xrates, *wme, *htcap, *htop;
+	u_int8_t *rates, *xrates, *wme, *htcap, *htop, *vhtcap, *vhtop;
 	u_int8_t rate, wmm_qosinfo = 0;
 	int has_wmm_qosinfo = 0;
 	IEEE80211_DEBUGVAR(char ebuf[3 * ETHER_ADDR_LEN]);
@@ -2883,7 +2889,7 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 	associd = le16toh(*(u_int16_t *)frm);
 	frm += 2;
 
-	rates = xrates = wme = htcap = htop = NULL;
+	rates = xrates = wme = htcap = htop = vhtcap = vhtop = NULL;
 	while (frm + 1 < efrm) {
 		IEEE80211_VERIFY_LENGTH(efrm - frm, frm[1] + 2);
 
@@ -2899,6 +2905,12 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 			break;
 		case IEEE80211_ELEMID_HTINFO:
 			htop = frm;
+			break;
+		case IEEE80211_ELEMID_VHTCAP:
+			vhtcap = frm;
+			break;
+		case IEEE80211_ELEMID_VHTOP:
+			vhtop = frm;
 			break;
 		case IEEE80211_ELEMID_VENDOR:
 			if (iswmeoui(frm))
@@ -2957,6 +2969,14 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 	if (htop != NULL)
 		ieee80211_setup_htop(ni, htop + 2, htop[1], 0);
 	ieee80211_ht_negotiate(ic, ni);
+	/* LISPBSD: 802.11ac, if we offered it */
+	if (vhtcap != NULL && htcap != NULL &&
+	    IEEE80211_IS_CHAN_5GHZ(ni->ni_chan)) {
+		ieee80211_setup_vhtcaps(ni, vhtcap + 2, vhtcap[1]);
+		if (vhtop != NULL)
+			ieee80211_setup_vhtop(ni, vhtop + 2, vhtop[1]);
+	}
+	ieee80211_vht_negotiate(ic, ni);
 
 	/*
 	 * Configure state now that we are associated.
@@ -2996,6 +3016,7 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 	    ic->ic_flags&IEEE80211_F_SHSLOT ? "short" : "long",
 	    ic->ic_flags&IEEE80211_F_USEPROT ? ", protection" : "",
 	    ni->ni_flags & IEEE80211_NODE_QOS ? ", QoS" : "",
+	    ni->ni_flags & IEEE80211_NODE_VHT ? ", VHT" :
 	    ni->ni_flags & IEEE80211_NODE_HT ? ", HT" : "",
 	    (ic->ic_flags_ext & IEEE80211_FEXT_UAPSD) ?
 		((ni->ni_flags & IEEE80211_NODE_UAPSD) ?

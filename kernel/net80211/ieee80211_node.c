@@ -1345,6 +1345,16 @@ ieee80211_add_scan(struct ieee80211com *ic,
 		ni->ni_flags &= ~IEEE80211_NODE_HTCAP;
 	if (sp->sp_htop != NULL)
 		ieee80211_setup_htop(ni, sp->sp_htop + 2, sp->sp_htop[1], 1);
+	/* LISPBSD: 802.11ac, on 5 GHz only and after the HT elements */
+	if (sp->sp_vhtcap != NULL && sp->sp_htcap != NULL &&
+	    IEEE80211_IS_CHAN_5GHZ(ni->ni_chan)) {
+		ieee80211_setup_vhtcaps(ni, sp->sp_vhtcap + 2,
+		    sp->sp_vhtcap[1]);
+		if (sp->sp_vhtop != NULL)
+			ieee80211_setup_vhtop(ni, sp->sp_vhtop + 2,
+			    sp->sp_vhtop[1]);
+	} else
+		ni->ni_flags &= ~IEEE80211_NODE_VHTCAP;
 
 	/* NB: must be after ni_chan is setup */
 	ieee80211_setup_rates(ni, sp->sp_rates, sp->sp_xrates,
@@ -2700,4 +2710,201 @@ ieee80211_ht_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
 			return;
 	}
 	ni->ni_flags |= IEEE80211_NODE_HT;
+}
+
+/*
+ * LISPBSD: 802.11ac (VHT) station support, from OpenBSD's net80211.
+ */
+
+/* Install a received VHT Capabilities element in the node. */
+void
+ieee80211_setup_vhtcaps(struct ieee80211_node *ni, const u_int8_t *data,
+    u_int8_t len)
+{
+	if (len != 12)
+		return;
+
+	ni->ni_vhtcaps = data[0] | (data[1] << 8) | (data[2] << 16) |
+	    ((u_int32_t)data[3] << 24);
+	ni->ni_vht_rxmcs = data[4] | (data[5] << 8);
+	ni->ni_vht_rx_max_lgi_mbit_s = (data[6] | (data[7] << 8)) &
+	    IEEE80211_VHT_MAX_LGI_MBIT_S_MASK;
+	ni->ni_vht_txmcs = data[8] | (data[9] << 8);
+	ni->ni_vht_tx_max_lgi_mbit_s = data[10] | (data[11] << 8);
+	ni->ni_flags |= IEEE80211_NODE_VHTCAP;
+}
+
+/*
+ * Only 80 MHz (and 160 MHz) channels from the regulatory operating
+ * classes (802.11ac-2013 Tables E-1 to E-5): firmware asserts on others.
+ * OpenBSD's list has 112 where 122 belongs.
+ */
+static int
+ieee80211_80mhz_center_freq_valid(u_int8_t chanidx)
+{
+	static const u_int8_t valid[] = {
+		42, 50, 58, 106, 114, 122, 138, 155, 163
+	};
+	u_int i;
+
+	for (i = 0; i < __arraycount(valid); i++)
+		if (chanidx == valid[i])
+			return 1;
+	return 0;
+}
+
+/*
+ * Install a received VHT Operation element in the node: the BSS width
+ * and center channel, as far as we can use them (802.11-2024 Table
+ * 9-314 decides where the 160 MHz center is signalled).  Needs the HT
+ * Operation element first: VHT widths build on a 40 MHz pair.
+ */
+int
+ieee80211_setup_vhtop(struct ieee80211_node *ni, const u_int8_t *data,
+    u_int8_t len)
+{
+	struct ieee80211com *ic = ni->ni_ic;
+	u_int8_t sco, ccfs0, ccfs1, ccfs2, supp_chwidth, ext_nss_bw_supp;
+	u_int8_t local_chwidth;
+	int have_40mhz, local_supports_160, width, ccf1;
+
+	if (len != 5)
+		return 0;
+	if (data[0] > IEEE80211_VHTOP0_CHAN_WIDTH_8080)
+		return 0;
+
+	sco = ni->ni_htop0 & IEEE80211_HTOP0_SCO_MASK;
+	have_40mhz = (sco == IEEE80211_HTOP0_SCO_SCA ||
+	    sco == IEEE80211_HTOP0_SCO_SCB);
+
+	if (have_40mhz && ieee80211_80mhz_center_freq_valid(data[1])) {
+		width = data[0];
+		ccfs0 = data[1];
+		ccfs1 = (data[2] && ieee80211_80mhz_center_freq_valid(data[2])) ?
+		    data[2] : 0;
+		ccfs2 = (ni->ni_htop1 & IEEE80211_HTOP1_CCFS2_MASK) >>
+		    IEEE80211_HTOP1_CCFS2_SHIFT;
+		if (!ieee80211_80mhz_center_freq_valid(ccfs2))
+			ccfs2 = 0;
+
+		supp_chwidth = (ni->ni_vhtcaps &
+		    IEEE80211_VHTCAP_CHAN_WIDTH_MASK) >>
+		    IEEE80211_VHTCAP_CHAN_WIDTH_SHIFT;
+		ext_nss_bw_supp = (ni->ni_vhtcaps &
+		    IEEE80211_VHTCAP_EXT_NSS_BW_MASK) >>
+		    IEEE80211_VHTCAP_EXT_NSS_BW_SHIFT;
+		/* The driver only offers 160 MHz where it can use it. */
+		local_chwidth = (ic->ic_vhtcaps &
+		    IEEE80211_VHTCAP_CHAN_WIDTH_MASK) >>
+		    IEEE80211_VHTCAP_CHAN_WIDTH_SHIFT;
+		local_supports_160 =
+		    local_chwidth == IEEE80211_VHTCAP_CHAN_WIDTH_160 ||
+		    local_chwidth == IEEE80211_VHTCAP_CHAN_WIDTH_160_8080;
+
+		switch ((supp_chwidth << 4) | ext_nss_bw_supp) {
+		case 0x01:
+		case 0x02:
+		case 0x03:
+			ccf1 = ccfs2;
+			break;
+		case 0x10:
+			ccf1 = ccfs1;
+			break;
+		case 0x11:
+		case 0x12:
+			ccf1 = ccfs1 != 0 ? ccfs1 : ccfs2;
+			break;
+		case 0x13:
+		case 0x20:
+		case 0x23:
+			ccf1 = ccfs1;
+			break;
+		default:
+			ccf1 = 0;
+			break;
+		}
+
+		ni->ni_vht_chan_center_freq_idx0 = ccfs0;
+		ni->ni_vht_chan_center_freq_idx1 = ccfs1;
+
+		if (width == IEEE80211_VHTOP0_CHAN_WIDTH_80 && ccf1 != 0) {
+			/* 160 MHz signalled the 802.11-2016 way */
+			if (abs(ccf1 - ccfs0) == 8) {
+				if (local_supports_160) {
+					ni->ni_vht_chan_center_freq_idx0 =
+					    ccf1;
+					width = IEEE80211_VHTOP0_CHAN_WIDTH_160;
+				}
+				ni->ni_vht_chan_center_freq_idx1 = 0;
+			}
+		} else if (width == IEEE80211_VHTOP0_CHAN_WIDTH_160) {
+			/*
+			 * 160 MHz the deprecated way: ccfs0 is the center of
+			 * the whole channel.  Without 160 MHz use the 80 MHz
+			 * half holding the primary channel, whose center is
+			 * 8 channel numbers (40 MHz) off.  (OpenBSD: 4.)
+			 */
+			if (!local_supports_160) {
+				ni->ni_vht_chan_center_freq_idx0 =
+				    ni->ni_primary_chan < ccfs0 ?
+				    ccfs0 - 8 : ccfs0 + 8;
+				width = IEEE80211_VHTOP0_CHAN_WIDTH_80;
+			}
+			ni->ni_vht_chan_center_freq_idx1 = 0;
+		} else if (width == IEEE80211_VHTOP0_CHAN_WIDTH_8080) {
+			/* 80+80 MHz: ccfs0 is the primary segment's center */
+			width = IEEE80211_VHTOP0_CHAN_WIDTH_80;
+			ni->ni_vht_chan_center_freq_idx1 = 0;
+		}
+		if (!ieee80211_80mhz_center_freq_valid(
+		    ni->ni_vht_chan_center_freq_idx0))
+			width = IEEE80211_VHTOP0_CHAN_WIDTH_HT;
+		ni->ni_vht_chan_width = width;
+	} else {
+		ni->ni_vht_chan_width = IEEE80211_VHTOP0_CHAN_WIDTH_HT;
+		ni->ni_vht_chan_center_freq_idx0 = 0;
+		ni->ni_vht_chan_center_freq_idx1 = 0;
+	}
+
+	ni->ni_vht_basic_mcs = data[3] | (data[4] << 8);
+	return 1;
+}
+
+/* Whether to offer VHT: HT is offered, the driver turned VHT on, 5 GHz. */
+int
+ieee80211_vht_wanted(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+	return (ic->ic_flags_ext & IEEE80211_FEXT_VHTON) &&
+	    ni->ni_chan != NULL && ni->ni_chan != IEEE80211_CHAN_ANYC &&
+	    IEEE80211_IS_CHAN_5GHZ(ni->ni_chan) &&
+	    ieee80211_ht_wanted(ic, ni);
+}
+
+/*
+ * Decide on VHT after a successful (re)association, once HT is settled:
+ * we offered it, the AP is VHT, and we do the AP's basic VHT-MCS set.
+ */
+void
+ieee80211_vht_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+	int n;
+
+	ni->ni_flags &= ~IEEE80211_NODE_VHT;
+	if ((ni->ni_flags & IEEE80211_NODE_HT) == 0 ||
+	    !ieee80211_vht_wanted(ic, ni) || !ieee80211_node_supports_vht(ni))
+		return;
+	for (n = 1; n <= IEEE80211_VHT_NUM_SS; n++) {
+		u_int16_t basic_mcs = (ni->ni_vht_basic_mcs &
+		    IEEE80211_VHT_MCS_FOR_SS_MASK(n)) >>
+		    IEEE80211_VHT_MCS_FOR_SS_SHIFT(n);
+		u_int16_t rx_mcs = (ic->ic_vht_rxmcs &
+		    IEEE80211_VHT_MCS_FOR_SS_MASK(n)) >>
+		    IEEE80211_VHT_MCS_FOR_SS_SHIFT(n);
+
+		if (basic_mcs != IEEE80211_VHT_MCS_SS_NOT_SUPP &&
+		    (rx_mcs == IEEE80211_VHT_MCS_SS_NOT_SUPP ||
+		    basic_mcs > rx_mcs))
+			return;
+	}
+	ni->ni_flags |= IEEE80211_NODE_VHT;
 }
