@@ -77,7 +77,11 @@ struct hdaudio_function_group {
 	uint16_t			fg_vendor;
 	uint16_t			fg_product;
 
-	int				(*fg_unsol)(device_t, uint8_t);
+	/*
+	 * LispBSD: the whole 32-bit unsolicited response, tag in bits 31:26;
+	 * called from a soft interrupt, without the command lock held.
+	 */
+	int				(*fg_unsol)(device_t, uint32_t);
 	/* LispBSD runtime power management: codec function group down/up */
 	void				(*fg_rt_suspend)(device_t);
 	void				(*fg_rt_resume)(device_t);
@@ -139,6 +143,18 @@ struct hdaudio_stream {
 
 	struct hdaudio_dma		st_data;
 	struct hdaudio_dma		st_bdl;
+
+	/*
+	 * LispBSD: completed-period accounting.  The audio layer advances
+	 * its ring one block per completion it is told about, so a late
+	 * interrupt that covered two blocks, or an error interrupt taken for
+	 * a completion, left it a block off the DMA engine for good.
+	 */
+	u_int				st_blksize;	/* bytes per BDL entry */
+	u_int				st_nblk;	/* BDL entries in the ring */
+	u_int				st_curblk;	/* block the DMA is in, as accounted */
+	uint64_t			st_blkns;	/* playing time of a block */
+	uint64_t			st_lastns;	/* nanouptime of the last accounting */
 };
 
 struct hdaudio_softc {
@@ -160,6 +176,22 @@ struct hdaudio_softc {
 	struct hdaudio_dma	sc_corb;
 	struct hdaudio_dma	sc_rirb;
 	uint16_t		sc_rirbrp;
+
+	/*
+	 * LispBSD: a command that timed out may still be answered; until the
+	 * next command has let that reply land and dropped it, the RIRB is
+	 * not trusted.  Unsolicited responses are queued here (under
+	 * sc_corb_mtx) and handled by a soft interrupt, never from inside a
+	 * command, whose reply a nested command could otherwise take.
+	 */
+	bool			sc_rirb_desync;
+#define	HDAUDIO_UNSOLQ_LEN	32
+	struct {
+		uint32_t	resp, resp_ex;	/* as in the RIRB entry */
+	}			sc_unsolq[HDAUDIO_UNSOLQ_LEN];
+	u_int			sc_unsolq_head, sc_unsolq_tail;
+	void			*sc_unsol_sih;
+	struct timeval		sc_stream_lastlog;	/* stream anomaly log rate */
 
 	struct hdaudio_codec	sc_codec[HDAUDIO_MAX_CODECS];
 
@@ -198,6 +230,8 @@ int	hdaudio_rescan(struct hdaudio_softc *, const char *, const int *);
 void	hdaudio_childdet(struct hdaudio_softc *, device_t);
 
 uint32_t hdaudio_command(struct hdaudio_codec *, int, uint32_t, uint32_t);
+int	hdaudio_command_checked(struct hdaudio_codec *, int, uint32_t,
+	    uint32_t, uint32_t *);
 uint32_t hdaudio_command_unlocked(struct hdaudio_codec *, int, uint32_t,
     uint32_t);
 int	hdaudio_intr(struct hdaudio_softc *);
@@ -213,6 +247,7 @@ void	hdaudio_stream_start(struct hdaudio_stream *, int, bus_size_t,
 			     const audio_params_t *);
 void	hdaudio_stream_stop(struct hdaudio_stream *);
 void	hdaudio_stream_reset(struct hdaudio_stream *);
+u_int	hdaudio_stream_elapsed(struct hdaudio_stream *, uint8_t);
 int	hdaudio_stream_tag(struct hdaudio_stream *);
 uint16_t hdaudio_stream_param(struct hdaudio_stream *, const audio_params_t *);
 

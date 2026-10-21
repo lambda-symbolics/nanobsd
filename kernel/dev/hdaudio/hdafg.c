@@ -352,7 +352,7 @@ static void	hdafg_childdet(device_t, device_t);
 static bool	hdafg_suspend(device_t, const pmf_qual_t *);
 static bool	hdafg_resume(device_t, const pmf_qual_t *);
 
-static int	hdafg_unsol(device_t, uint8_t);
+static int	hdafg_unsol(device_t, uint32_t);
 static int	hdafg_widget_info(void *, prop_dictionary_t,
 					prop_dictionary_t);
 static int	hdafg_codec_info(void *, prop_dictionary_t,
@@ -3325,19 +3325,33 @@ static int
 hdafg_stream_intr(struct hdaudio_stream *st)
 {
 	struct hdaudio_audiodev *ad = st->st_cookie;
+	struct hdaudio_softc *host = ad->ad_sc->sc_host;
 	int handled = 0;
+	uint8_t sts;
+	u_int n;
 
-	(void)hda_read1(ad->ad_sc->sc_host, HDAUDIO_SD_STS(st->st_shift));
-	hda_write1(ad->ad_sc->sc_host, HDAUDIO_SD_STS(st->st_shift),
-	    HDAUDIO_STS_DESE | HDAUDIO_STS_FIFOE | HDAUDIO_STS_BCIS);
+	/*
+	 * LispBSD: keep the status and clear only what was set.  The audio
+	 * layer moves its ring one block per call, so it is called once per
+	 * block that really completed: none for an error-only interrupt
+	 * (that used to count as a completion), several when the interrupt
+	 * was serviced late (that used to count as one, leaving the ring a
+	 * block off the DMA engine until the stream restarted).
+	 */
+	sts = hda_read1(host, HDAUDIO_SD_STS(st->st_shift));
+	sts &= HDAUDIO_STS_DESE | HDAUDIO_STS_FIFOE | HDAUDIO_STS_BCIS;
+	if (sts)
+		hda_write1(host, HDAUDIO_SD_STS(st->st_shift), sts);
+	n = hdaudio_stream_elapsed(st, sts);
 
 	mutex_spin_enter(&ad->ad_sc->sc_intr_lock);
-	/* XXX test (sts & HDAUDIO_STS_BCIS)? */
 	if (st == ad->ad_playback && ad->ad_playbackintr) {
-		ad->ad_playbackintr(ad->ad_playbackintrarg);
+		while (n-- > 0)
+			ad->ad_playbackintr(ad->ad_playbackintrarg);
 		handled = 1;
 	} else if (st == ad->ad_capture && ad->ad_captureintr) {
-		ad->ad_captureintr(ad->ad_captureintrarg);
+		while (n-- > 0)
+			ad->ad_captureintr(ad->ad_captureintrarg);
 		handled = 1;
 	}
 	mutex_spin_exit(&ad->ad_sc->sc_intr_lock);
@@ -3567,7 +3581,7 @@ hdafg_hp_switch_handler(struct hdafg_softc *sc)
 {
 	struct hdaudio_assoc *as = sc->sc_assocs;
 	struct hdaudio_widget *w;
-	uint32_t res = 0;
+	uint32_t res = 0, sense;
 	int i, j;
 
 	KASSERT(sc->sc_jack_polling);
@@ -3591,9 +3605,16 @@ hdafg_hp_switch_handler(struct hdafg_softc *sc)
 			if (COP_CFG_DEFAULT_DEVICE(w->w_pin.config) !=
 			    COP_DEVICE_HP_OUT)
 				continue;
-			res |= hdaudio_command(sc->sc_codec, as[i].as_pins[j],
-			    CORB_GET_PIN_SENSE, 0) &
-			    COP_GET_PIN_SENSE_PRESENSE_DETECT;
+			/*
+			 * LispBSD: a sense read that got no reply returned
+			 * 0xffffffff, presence bit included: headphones "in",
+			 * speakers off.  Keep the last routing instead.
+			 */
+			if (hdaudio_command_checked(sc->sc_codec,
+			    as[i].as_pins[j], CORB_GET_PIN_SENSE, 0,
+			    &sense) != 0)
+				return;
+			res |= sense & COP_GET_PIN_SENSE_PRESENSE_DETECT;
 		}
 	}
 
@@ -4132,7 +4153,14 @@ hdafg_set_format(void *opaque, int setmode,
     audio_filter_reg_t *pfil, audio_filter_reg_t *rfil)
 {
 	struct hdaudio_audiodev *ad = opaque;
+	int error;
 
+	/*
+	 * LispBSD: set_format can come without an open device (audioctl),
+	 * so the controller may be suspended: it sends verbs, hold it awake.
+	 */
+	if ((error = hdaudio_rt_use(ad->ad_sc->sc_host)) != 0)
+		return error;
 	if (play && (setmode & AUMODE_PLAY)) {
 		ad->ad_sc->sc_pparam = *play;
 		hdafg_stream_connect(ad->ad_sc, AUMODE_PLAY);
@@ -4141,6 +4169,7 @@ hdafg_set_format(void *opaque, int setmode,
 		ad->ad_sc->sc_rparam = *rec;
 		hdafg_stream_connect(ad->ad_sc, AUMODE_RECORD);
 	}
+	hdaudio_rt_release(ad->ad_sc->sc_host);
 	return 0;
 }
 
@@ -4539,10 +4568,12 @@ hdafg_get_locks(void *opaque, kmutex_t **intr, kmutex_t **thread)
 }
 
 static int
-hdafg_unsol(device_t self, uint8_t tag)
+hdafg_unsol(device_t self, uint32_t resp)
 {
 	struct hdafg_softc *sc = device_private(self);
 	struct hdaudio_assoc *as = sc->sc_assocs;
+	/* LispBSD: the tag set with SET_UNSOLICITED_RESPONSE is bits 31:26. */
+	u_int tag = (resp >> 26) & 0x3f;
 	int i, j;
 
 	switch (tag) {
@@ -4556,7 +4587,8 @@ hdafg_unsol(device_t self, uint8_t tag)
 			for (j = 0; j < HDAUDIO_MAXPINS; j++) {
 				if (as[i].as_pins[j] == 0)
 					continue;
-				hdafg_assoc_dump_dd(sc, &as[i], j, 0);
+				/* soft interrupt, command lock not held */
+				hdafg_assoc_dump_dd(sc, &as[i], j, 1);
 			}
 		}
 		break;

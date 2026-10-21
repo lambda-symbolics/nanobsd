@@ -44,6 +44,8 @@ __KERNEL_RCSID(0, "$NetBSD: hdaudio.c,v 1.18 2022/04/07 19:33:37 andvar Exp $");
 #include <sys/sysctl.h>
 #include <sys/atomic.h>
 #include <sys/module.h>
+#include <sys/intr.h>
+#include <sys/time.h>
 
 #include "hdaudiovar.h"
 #include "hdaudioreg.h"
@@ -56,6 +58,35 @@ __KERNEL_RCSID(0, "$NetBSD: hdaudio.c,v 1.18 2022/04/07 19:33:37 andvar Exp $");
 #define	HDAUDIO_RESET_TIMEOUT	5000
 #define HDAUDIO_CORB_TIMEOUT	1000
 #define	HDAUDIO_RIRB_TIMEOUT	5000
+/*
+ * LispBSD: how long a command waits for its reply, in 10 us steps.  The wait
+ * spins with sc_corb_mtx held at IPL_AUDIO, so it bounds how long a missing
+ * reply holds off the stream interrupt on that CPU; 50 ms (the RIRB timeout
+ * above) was five 10 ms audio blocks.  Codecs answer within a few frames.
+ */
+#define	HDAUDIO_CMD_TIMEOUT	500
+#define	HDAUDIO_CMD_SETTLE	100	/* after a timeout: let the late reply land */
+
+/*
+ * LispBSD: counters for hw.hdaudio.stats (all controllers together).
+ */
+static struct hdaudio_stats {
+	volatile uint64_t	cmd_timeouts;	/* no reply in HDAUDIO_CMD_TIMEOUT */
+	volatile uint64_t	stale_replies;	/* replies nobody was waiting for */
+	volatile uint64_t	foreign_replies;/* reply from another codec */
+	volatile uint64_t	unsol_events;
+	volatile uint64_t	unsol_dropped;	/* queue full */
+	volatile uint64_t	stream_irqs;	/* buffer completion interrupts */
+	volatile uint64_t	stream_late;	/* periods found complete beyond one */
+	volatile uint64_t	stream_early;	/* completion before LPIB crossed */
+	volatile uint64_t	stream_laps;	/* whole rings lost (time based) */
+	volatile uint64_t	stream_fifoe;	/* FIFO errors */
+	volatile uint64_t	stream_dese;	/* descriptor errors */
+	volatile uint64_t	stream_spurious;/* stream interrupt, no status */
+} hdaudio_stats;
+
+#define	HDAUDIO_STAT_INC(f)	atomic_inc_64(&hdaudio_stats.f)
+#define	HDAUDIO_STAT_ADD(f, n)	atomic_add_64(&hdaudio_stats.f, (n))
 
 #define	HDAUDIO_CODEC_DELAY	1000	/* spec calls for 250 */
 
@@ -244,11 +275,11 @@ hdaudio_corb_enqueue(struct hdaudio_softc *sc, int addr, int nid,
 }
 
 static void
-hdaudio_rirb_unsol(struct hdaudio_softc *sc, struct rirb_entry *entry)
+hdaudio_rirb_unsol(struct hdaudio_softc *sc, uint32_t resp, uint32_t resp_ex)
 {
 	struct hdaudio_codec *co;
 	struct hdaudio_function_group *fg;
-	uint8_t codecid = RIRB_CODEC_ID(entry);
+	uint8_t codecid = resp_ex & 0xf;	/* RIRB_CODEC_ID */
 	unsigned int i;
 
 	if (codecid >= HDAUDIO_MAX_CODECS) {
@@ -264,57 +295,177 @@ hdaudio_rirb_unsol(struct hdaudio_softc *sc, struct rirb_entry *entry)
 	for (i = 0; i < co->co_nfg; i++) {
 		fg = &co->co_fg[i];
 		if (fg->fg_device && fg->fg_unsol)
-			fg->fg_unsol(fg->fg_device, entry->resp);
+			fg->fg_unsol(fg->fg_device, resp);
 	}
 }
 
-static uint32_t
-hdaudio_rirb_dequeue(struct hdaudio_softc *sc, bool unsol)
+/*
+ * LispBSD: take the next entry the controller has written to the RIRB, if
+ * any.  Never waits.  Caller holds sc_corb_mtx.
+ */
+static bool
+hdaudio_rirb_next(struct hdaudio_softc *sc, struct rirb_entry *entry)
 {
-	uint16_t rirbwp;
 	uint64_t *rirb = DMA_KERNADDR(&sc->sc_rirb);
+	uint16_t rirbwp;
+
+	KASSERT(mutex_owned(&sc->sc_corb_mtx));
+
+	rirbwp = hda_read2(sc, HDAUDIO_MMIO_RIRBWP);
+	if ((rirbwp & 0xff) == sc->sc_rirbrp)
+		return false;
+
+	sc->sc_rirbrp++;
+	if (sc->sc_rirbrp >= (sc->sc_rirb.dma_size / sizeof(*rirb)))
+		sc->sc_rirbrp = 0;
+
+	bus_dmamap_sync(sc->sc_dmat, sc->sc_rirb.dma_map, 0,
+	    sc->sc_rirb.dma_size, BUS_DMASYNC_POSTREAD);
+	*entry = *(struct rirb_entry *)&rirb[sc->sc_rirbrp];
+	bus_dmamap_sync(sc->sc_dmat, sc->sc_rirb.dma_map, 0,
+	    sc->sc_rirb.dma_size, BUS_DMASYNC_PREREAD);
+
+	hda_trace(sc, "%s: response %08X %08X\n",
+	    RIRB_UNSOL(entry) ? "unsol" : "cmd  ", entry->resp, entry->resp_ex);
+	return true;
+}
+
+/* Queue an unsolicited response for the soft interrupt.  Holds sc_corb_mtx. */
+static void
+hdaudio_unsol_queue(struct hdaudio_softc *sc, const struct rirb_entry *entry)
+{
+	u_int next = (sc->sc_unsolq_tail + 1) % HDAUDIO_UNSOLQ_LEN;
+
+	KASSERT(mutex_owned(&sc->sc_corb_mtx));
+
+	HDAUDIO_STAT_INC(unsol_events);
+	if (next == sc->sc_unsolq_head) {
+		HDAUDIO_STAT_INC(unsol_dropped);
+		return;
+	}
+	sc->sc_unsolq[sc->sc_unsolq_tail].resp = entry->resp;
+	sc->sc_unsolq[sc->sc_unsolq_tail].resp_ex = entry->resp_ex;
+	sc->sc_unsolq_tail = next;
+}
+
+/*
+ * LispBSD: empty the RIRB without waiting.  Unsolicited responses go to the
+ * queue; solicited ones have nobody waiting for them (the late reply to a
+ * command that timed out) and are dropped, so a later command can never take
+ * one for its own.  Returns whether unsolicited work is pending.
+ */
+static bool
+hdaudio_rirb_drain(struct hdaudio_softc *sc)
+{
 	struct rirb_entry entry;
-	int retry;
+
+	KASSERT(mutex_owned(&sc->sc_corb_mtx));
+
+	while (hdaudio_rirb_next(sc, &entry)) {
+		if (RIRB_UNSOL(&entry))
+			hdaudio_unsol_queue(sc, &entry);
+		else
+			HDAUDIO_STAT_INC(stale_replies);
+	}
+	return sc->sc_unsolq_head != sc->sc_unsolq_tail;
+}
+
+/* Soft interrupt: run the queued unsolicited responses, lock not held. */
+static void
+hdaudio_unsol_softint(void *arg)
+{
+	struct hdaudio_softc *sc = arg;
+	uint32_t resp, resp_ex;
 
 	for (;;) {
-		retry = HDAUDIO_RIRB_TIMEOUT;
+		mutex_enter(&sc->sc_corb_mtx);
+		if (sc->sc_unsolq_head == sc->sc_unsolq_tail) {
+			mutex_exit(&sc->sc_corb_mtx);
+			return;
+		}
+		resp = sc->sc_unsolq[sc->sc_unsolq_head].resp;
+		resp_ex = sc->sc_unsolq[sc->sc_unsolq_head].resp_ex;
+		sc->sc_unsolq_head = (sc->sc_unsolq_head + 1) %
+		    HDAUDIO_UNSOLQ_LEN;
+		mutex_exit(&sc->sc_corb_mtx);
 
-		rirbwp = hda_read2(sc, HDAUDIO_MMIO_RIRBWP);
-		while (--retry > 0 && (rirbwp & 0xff) == sc->sc_rirbrp) {
-			if (unsol) {
-				/* don't wait for more unsol events */
-				hda_trace(sc, "unsol: rirb empty\n");
-				return 0xffffffff;
-			}
+		/* Events may arrive just before a runtime suspend; drop them. */
+		if (!sc->sc_rt_suspended)
+			hdaudio_rirb_unsol(sc, resp, resp_ex);
+	}
+}
+
+/*
+ * Send one verb and wait for its reply.  Caller holds sc_corb_mtx.  Returns 0
+ * with the reply in *respp, or ETIMEDOUT (and 0xffffffff in *respp).
+ */
+static int
+hdaudio_command_locked(struct hdaudio_codec *co, int nid, uint32_t control,
+    uint32_t param, uint32_t *respp)
+{
+	struct hdaudio_softc *sc = co->co_host;
+	struct rirb_entry entry;
+	bool pending;
+	int retry, error;
+
+	KASSERT(mutex_owned(&sc->sc_corb_mtx));
+
+	/*
+	 * LispBSD: the previous command timed out; its reply may still come.
+	 * Give it a moment and drop whatever lands, so it cannot be returned
+	 * as the reply to this command.
+	 */
+	if (sc->sc_rirb_desync) {
+		for (retry = HDAUDIO_CMD_SETTLE; retry > 0; retry--) {
+			(void)hdaudio_rirb_drain(sc);
 			hda_delay(10);
-			rirbwp = hda_read2(sc, HDAUDIO_MMIO_RIRBWP);
 		}
-		if (retry == 0) {
-			hda_error(sc, "RIRB timeout\n");
-			return 0xffffffff;
-		}
+		sc->sc_rirb_desync = false;
+	}
+	(void)hdaudio_rirb_drain(sc);
 
-		sc->sc_rirbrp++;
-		if (sc->sc_rirbrp >= (sc->sc_rirb.dma_size / sizeof(*rirb)))
-			sc->sc_rirbrp = 0;
+	hda_trace(sc, "cmd  : request %08X %08X (%02X)\n",
+	    control, param, nid);
+	hdaudio_corb_enqueue(sc, co->co_addr, nid, control, param);
 
-		bus_dmamap_sync(sc->sc_dmat, sc->sc_rirb.dma_map, 0,
-		    sc->sc_rirb.dma_size, BUS_DMASYNC_POSTREAD);
-		entry = *(struct rirb_entry *)&rirb[sc->sc_rirbrp];
-		bus_dmamap_sync(sc->sc_dmat, sc->sc_rirb.dma_map, 0,
-		    sc->sc_rirb.dma_size, BUS_DMASYNC_PREREAD);
-
-		hda_trace(sc, "%s: response %08X %08X\n",
-		    unsol ? "unsol" : "cmd  ",
-		    entry.resp, entry.resp_ex);
-
-		if (RIRB_UNSOL(&entry)) {
-			hdaudio_rirb_unsol(sc, &entry);
+	error = ETIMEDOUT;
+	*respp = 0xffffffff;
+	for (retry = HDAUDIO_CMD_TIMEOUT; retry > 0; ) {
+		if (!hdaudio_rirb_next(sc, &entry)) {
+			hda_delay(10);
+			retry--;
 			continue;
 		}
-
-		return entry.resp;
+		if (RIRB_UNSOL(&entry)) {
+			hdaudio_unsol_queue(sc, &entry);
+			continue;
+		}
+		if (RIRB_CODEC_ID(&entry) != co->co_addr) {
+			/* A late reply from another codec's command. */
+			HDAUDIO_STAT_INC(foreign_replies);
+			continue;
+		}
+		*respp = entry.resp;
+		error = 0;
+		break;
 	}
+	if (error) {
+		HDAUDIO_STAT_INC(cmd_timeouts);
+		sc->sc_rirb_desync = true;
+		hda_error(sc, "no response codec=%u nid=%d verb=0x%x param=0x%x corb=%x/%x rirb=%x/%x\n",
+		    co->co_addr, nid, control, param,
+		    hda_read2(sc, HDAUDIO_MMIO_CORBRP),
+		    hda_read2(sc, HDAUDIO_MMIO_CORBWP),
+		    hda_read2(sc, HDAUDIO_MMIO_RIRBWP), sc->sc_rirbrp);
+	}
+
+	/* Clear response interrupt status */
+	hda_write1(sc, HDAUDIO_MMIO_RIRBSTS, hda_read1(sc, HDAUDIO_MMIO_RIRBSTS));
+
+	pending = sc->sc_unsolq_head != sc->sc_unsolq_tail;
+	if (pending && sc->sc_unsol_sih != NULL)
+		softint_schedule(sc->sc_unsol_sih);
+	return error;
 }
 
 uint32_t
@@ -324,32 +475,35 @@ hdaudio_command(struct hdaudio_codec *co, int nid, uint32_t control,
 	uint32_t result;
 	struct hdaudio_softc *sc = co->co_host;
 	mutex_enter(&sc->sc_corb_mtx);
-	result = hdaudio_command_unlocked(co, nid, control, param);
+	(void)hdaudio_command_locked(co, nid, control, param, &result);
 	mutex_exit(&sc->sc_corb_mtx);
 	return result;
+}
+
+/*
+ * LispBSD: as hdaudio_command, but tells a missing reply apart from a reply
+ * of 0xffffffff (a pin sense with every bit set looked like "plugged in").
+ */
+int
+hdaudio_command_checked(struct hdaudio_codec *co, int nid, uint32_t control,
+    uint32_t param, uint32_t *respp)
+{
+	struct hdaudio_softc *sc = co->co_host;
+	int error;
+
+	mutex_enter(&sc->sc_corb_mtx);
+	error = hdaudio_command_locked(co, nid, control, param, respp);
+	mutex_exit(&sc->sc_corb_mtx);
+	return error;
 }
 
 uint32_t
 hdaudio_command_unlocked(struct hdaudio_codec *co, int nid, uint32_t control,
     uint32_t param)
 {
-	struct hdaudio_softc *sc = co->co_host;
 	uint32_t result;
 
-	hda_trace(sc, "cmd  : request %08X %08X (%02X)\n",
-	    control, param, nid);
-	hdaudio_corb_enqueue(sc, co->co_addr, nid, control, param);
-	result = hdaudio_rirb_dequeue(sc, false);
-	if (result == 0xffffffff)
-		hda_error(sc, "no response codec=%u nid=%d verb=0x%x param=0x%x corb=%x/%x rirb=%x/%x\n",
-		    co->co_addr, nid, control, param,
-		    hda_read2(sc, HDAUDIO_MMIO_CORBRP),
-		    hda_read2(sc, HDAUDIO_MMIO_CORBWP),
-		    hda_read2(sc, HDAUDIO_MMIO_RIRBWP), sc->sc_rirbrp);
-
-	/* Clear response interrupt status */
-	hda_write1(sc, HDAUDIO_MMIO_RIRBSTS, hda_read1(sc, HDAUDIO_MMIO_RIRBSTS));
-
+	(void)hdaudio_command_locked(co, nid, control, param, &result);
 	return result;
 }
 
@@ -573,6 +727,7 @@ hdaudio_rirb_config(struct hdaudio_softc *sc)
 	/* Clear the write pointer */
 	hda_write2(sc, HDAUDIO_MMIO_RIRBWP, HDAUDIO_RIRBWP_WP_RESET);
 	sc->sc_rirbrp = 0;
+	sc->sc_rirb_desync = false;	/* LispBSD: a fresh ring owes nothing */
 
 	return 0;
 }
@@ -1037,6 +1192,42 @@ SYSCTL_SETUP(sysctl_hw_hdaudio_setup, "hw.hdaudio")
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "power_save",
 	    SYSCTL_DESCR("Seconds without an open audio device before the codecs and controller power down (0: never, and wake now)"),
 	    hdaudio_sysctl_power_save, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+
+	/* LispBSD: hw.hdaudio.stats, command transport and stream accounting */
+	{
+		const struct sysctlnode *stats = NULL;
+		static const struct {
+			const char *name, *descr;
+			volatile uint64_t *ptr;
+		} ctr[] = {
+#define	HDAUDIO_CTR(f, d)	{ #f, d, &hdaudio_stats.f }
+			HDAUDIO_CTR(cmd_timeouts, "Codec commands without a reply"),
+			HDAUDIO_CTR(stale_replies, "Replies dropped because no command waited for them"),
+			HDAUDIO_CTR(foreign_replies, "Replies dropped because another codec sent them"),
+			HDAUDIO_CTR(unsol_events, "Unsolicited responses"),
+			HDAUDIO_CTR(unsol_dropped, "Unsolicited responses dropped, queue full"),
+			HDAUDIO_CTR(stream_irqs, "Buffer completion interrupts"),
+			HDAUDIO_CTR(stream_late, "Blocks found complete beyond one per interrupt"),
+			HDAUDIO_CTR(stream_early, "Completions taken before the position crossed"),
+			HDAUDIO_CTR(stream_laps, "Whole DMA rings lost to a late interrupt"),
+			HDAUDIO_CTR(stream_fifoe, "Stream FIFO errors"),
+			HDAUDIO_CTR(stream_dese, "Stream descriptor errors"),
+			HDAUDIO_CTR(stream_spurious, "Stream interrupts without status"),
+#undef	HDAUDIO_CTR
+		};
+		size_t i;
+
+		sysctl_createv(clog, 0, &node, &stats, CTLFLAG_PERMANENT,
+		    CTLTYPE_NODE, "stats",
+		    SYSCTL_DESCR("Codec command and stream counters"),
+		    NULL, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+		for (i = 0; stats != NULL && i < __arraycount(ctr); i++)
+			sysctl_createv(clog, 0, &stats, NULL,
+			    CTLFLAG_PERMANENT | CTLFLAG_READONLY,
+			    CTLTYPE_QUAD, ctr[i].name,
+			    SYSCTL_DESCR(ctr[i].descr), NULL, 0,
+			    __UNVOLATILE(ctr[i].ptr), 0, CTL_CREATE, CTL_EOL);
+	}
 }
 
 int
@@ -1049,6 +1240,10 @@ hdaudio_attach(device_t dev, struct hdaudio_softc *sc)
 	sc->sc_dev = dev;
 	mutex_init(&sc->sc_corb_mtx, MUTEX_DEFAULT, IPL_AUDIO);
 	mutex_init(&sc->sc_stream_mtx, MUTEX_DEFAULT, IPL_AUDIO);
+	sc->sc_unsol_sih = softint_establish(SOFTINT_SERIAL | SOFTINT_MPSAFE,
+	    hdaudio_unsol_softint, sc);
+	if (sc->sc_unsol_sih == NULL)
+		aprint_error_dev(dev, "no soft interrupt, unsolicited events dropped\n");
 	hdaudio_rt_init(sc);
 
 	/*
@@ -1161,6 +1356,8 @@ hdaudio_detach(struct hdaudio_softc *sc, int flags)
 	}
 
 	hdaudio_rt_fini(sc);
+	if (sc->sc_unsol_sih != NULL)
+		softint_disestablish(sc->sc_unsol_sih);
 	mutex_destroy(&sc->sc_corb_mtx);
 	mutex_destroy(&sc->sc_stream_mtx);
 
@@ -1281,10 +1478,17 @@ hdaudio_intr(struct hdaudio_softc *sc)
 
 	if (intsts & HDAUDIO_INTSTS_CIS) {
 		rirbsts = hda_read1(sc, HDAUDIO_MMIO_RIRBSTS);
-		if (rirbsts & HDAUDIO_RIRBSTS_RINTFL) {
-			mutex_enter(&sc->sc_corb_mtx);
-			hdaudio_rirb_dequeue(sc, true);
+		/*
+		 * LispBSD: only queue unsolicited responses here, and never
+		 * wait for a command in progress on another CPU: it drains
+		 * the ring itself, and waiting would hold off the streams.
+		 */
+		if ((rirbsts & HDAUDIO_RIRBSTS_RINTFL) &&
+		    mutex_tryenter(&sc->sc_corb_mtx)) {
+			bool pending = hdaudio_rirb_drain(sc);
 			mutex_exit(&sc->sc_corb_mtx);
+			if (pending && sc->sc_unsol_sih != NULL)
+				softint_schedule(sc->sc_unsol_sih);
 		}
 		if (rirbsts & (HDAUDIO_RIRBSTS_RIRBOIS|HDAUDIO_RIRBSTS_RINTFL))
 			hda_write1(sc, HDAUDIO_MMIO_RIRBSTS, rirbsts);
@@ -1520,6 +1724,25 @@ hdaudio_stream_start(struct hdaudio_stream *st, int blksize,
 	}
 
 	/*
+	 * LispBSD: geometry for hdaudio_stream_elapsed, and the DMA starts in
+	 * block 0 now.
+	 */
+	{
+		struct timespec ts;
+		u_int framebytes = params->channels * (params->precision / 8);
+
+		st->st_blksize = blksize;
+		st->st_nblk = cnt;
+		st->st_curblk = 0;
+		st->st_blkns = (framebytes && params->sample_rate) ?
+		    (uint64_t)blksize * 1000000000ULL /
+		    ((uint64_t)framebytes * params->sample_rate) : 0;
+		nanouptime(&ts);
+		st->st_lastns = (uint64_t)ts.tv_sec * 1000000000ULL +
+		    ts.tv_nsec;
+	}
+
+	/*
 	 * Program buffer descriptor list
 	 */
 	dmaaddr = DMA_DMAADDR(&st->st_bdl);
@@ -1589,6 +1812,86 @@ hdaudio_stream_stop(struct hdaudio_stream *st)
 	intctl = hda_read4(sc, HDAUDIO_MMIO_INTCTL);
 	intctl &= ~(1 << st->st_shift);
 	hda_write4(sc, HDAUDIO_MMIO_INTCTL, intctl);
+}
+
+/*
+ * LispBSD: how many blocks of this stream completed since the last call, for
+ * a stream interrupt with status STS (SD_STS as read, before it was cleared).
+ *
+ * Only a buffer completion (BCIS) reports blocks; a FIFO or descriptor error
+ * alone is counted and logged, never taken for a completed block.  The count
+ * comes from the link position (LPIB), not from the number of interrupts: an
+ * interrupt serviced late covers every block that finished meanwhile, so the
+ * audio layer's ring stays in step with the DMA engine.  The position only
+ * gives the count modulo the ring, so whole laps are taken from the time since
+ * the last call.  A completion reported just before LPIB crosses into the
+ * next block (the controller may raise it when the last byte is fetched)
+ * counts as one.  Called from the interrupt handler.
+ */
+u_int
+hdaudio_stream_elapsed(struct hdaudio_stream *st, uint8_t sts)
+{
+	struct hdaudio_softc *sc = st->st_host;
+	static const struct timeval lograte = { 10, 0 };
+	struct timespec ts;
+	uint64_t now, elapsed, lapns;
+	u_int nblk = st->st_nblk, hwblk, npos, n;
+	uint32_t lpib;
+
+	if (sts & HDAUDIO_STS_FIFOE)
+		HDAUDIO_STAT_INC(stream_fifoe);
+	if (sts & HDAUDIO_STS_DESE)
+		HDAUDIO_STAT_INC(stream_dese);
+	if ((sts & (HDAUDIO_STS_FIFOE | HDAUDIO_STS_DESE)) &&
+	    ratecheck(&sc->sc_stream_lastlog, &lograte))
+		hda_error(sc, "stream %d:%s%s\n", st->st_num,
+		    (sts & HDAUDIO_STS_FIFOE) ? " FIFO error" : "",
+		    (sts & HDAUDIO_STS_DESE) ? " descriptor error" : "");
+	if (!(sts & HDAUDIO_STS_BCIS)) {
+		if (!(sts & (HDAUDIO_STS_FIFOE | HDAUDIO_STS_DESE)))
+			HDAUDIO_STAT_INC(stream_spurious);
+		return 0;
+	}
+	HDAUDIO_STAT_INC(stream_irqs);
+	if (nblk == 0 || st->st_blksize == 0)
+		return 1;
+
+	lpib = hda_read4(sc, HDAUDIO_SD_LPIB(st->st_shift));
+	hwblk = lpib / st->st_blksize;
+	if (hwblk >= nblk)
+		hwblk = nblk - 1;
+	npos = (hwblk + nblk - st->st_curblk) % nblk;
+
+	nanouptime(&ts);
+	now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+	elapsed = now - st->st_lastns;
+	n = npos;
+	lapns = (uint64_t)nblk * st->st_blkns;
+	if (lapns != 0 && elapsed > npos * st->st_blkns + lapns / 2) {
+		u_int laps = (elapsed - npos * st->st_blkns + lapns / 2) /
+		    lapns;
+
+		HDAUDIO_STAT_ADD(stream_laps, laps);
+		n += laps * nblk;
+	}
+	if (n == 0) {
+		HDAUDIO_STAT_INC(stream_early);
+		n = 1;
+	}
+	if (n > 1) {
+		HDAUDIO_STAT_ADD(stream_late, n - 1);
+		if (ratecheck(&sc->sc_stream_lastlog, &lograte))
+			hda_error(sc, "stream %d: interrupt %ju us late, "
+			    "%u blocks completed (LPIB %u)\n", st->st_num,
+			    (uintmax_t)(elapsed / 1000), n, lpib);
+	}
+	/* Beyond two laps the old data is gone anyway; don't flood. */
+	if (n > 2 * nblk)
+		n = 2 * nblk;
+
+	st->st_curblk = (st->st_curblk + n) % nblk;
+	st->st_lastns = now;
+	return n;
 }
 
 /*
@@ -1885,6 +2188,16 @@ hdaudioioctl(dev_t dev, u_long cmd, void *addr, int flag, struct lwp *l)
 		return err;
 	}
 
+	/*
+	 * LispBSD: every request below may talk to the codecs; keep the
+	 * controller awake (or wake it) for the duration.
+	 */
+	if ((err = hdaudio_rt_use(sc)) != 0) {
+		prop_object_release(response);
+		prop_object_release(request);
+		return err;
+	}
+
 	switch (cmd) {
 	case HDAUDIO_FGRP_INFO:
 		err = hdaudioioctl_fgrp_info(sc, request, response);
@@ -1906,6 +2219,7 @@ hdaudioioctl(dev_t dev, u_long cmd, void *addr, int flag, struct lwp *l)
 		err = EINVAL;
 		break;
 	}
+	hdaudio_rt_release(sc);
 
 	if (!err)
 		err = prop_dictionary_copyout_ioctl(pref, cmd, response);
