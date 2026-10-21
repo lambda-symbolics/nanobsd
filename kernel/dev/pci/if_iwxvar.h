@@ -664,6 +664,11 @@ struct iwx_softc {
 		uint32_t	hs_dropped;	/* duplicate or behind window */
 		uint32_t	hs_bar;		/* BAR/firmware releases */
 		uint32_t	hs_timer;	/* reorder timer releases */
+		uint32_t	hs_rx_rate;	/* last unicast data rx rate_n_flags */
+		uint32_t	hs_tx_rate;	/* last rate from firmware TLC */
+		uint32_t	hs_rx_ht40;	/* unicast data frames at 40 MHz */
+		uint32_t	hs_rx_ht20;
+		uint32_t	hs_rx_legacy;
 	} sc_ht_stats;
 	uint8_t sc_chan40[howmany(IEEE80211_CHAN_MAX + 1, NBBY)];
 

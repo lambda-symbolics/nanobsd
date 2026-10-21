@@ -5043,6 +5043,32 @@ iwx_rx_mpdu_mq(struct iwx_softc *sc, struct mbuf *m, void *pktdata,
 
 	rssi = iwx_rxmq_get_signal_strength(sc, desc);
 
+	/* LISPBSD: hw.iwx.ht_status: the rates unicast data arrives at. */
+	{
+		struct ieee80211_frame *wh = mtod(m, struct ieee80211_frame *);
+
+		if ((wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) ==
+		    IEEE80211_FC0_TYPE_DATA &&
+		    !IEEE80211_IS_MULTICAST(wh->i_addr1)) {
+			struct iwx_ht_stats *hs = &sc->sc_ht_stats;
+			int ht = sc->sc_rate_n_flags_version >= 2 ?
+			    (rate_n_flags & IWX_RATE_MCS_MOD_TYPE_MSK) ==
+			    IWX_RATE_MCS_HT_MSK :
+			    (rate_n_flags & IWX_RATE_MCS_HT_MSK_V1) != 0;
+
+			hs->hs_rx_rate = rate_n_flags;
+			if (!ht)
+				hs->hs_rx_legacy++;
+			else if (rate_n_flags &
+			    (sc->sc_rate_n_flags_version >= 2 ?
+			    IWX_RATE_MCS_CHAN_WIDTH_MSK :
+			    IWX_RATE_MCS_CHAN_WIDTH_MSK_V1))
+				hs->hs_rx_ht40++;
+			else
+				hs->hs_rx_ht20++;
+		}
+	}
+
 	/* LISPBSD: frames of a Block Ack session go through the reorder buffer. */
 	if (iwx_rx_reorder(sc, m, chanidx, desc,
 	    (phy_info & IWX_RX_MPDU_PHY_SHORT_PREAMBLE),
@@ -8260,6 +8286,7 @@ iwx_rs_update(struct iwx_softc *sc, struct iwx_tlc_update_notif *notif)
 		return;
 
 	rate_n_flags = le32toh(notif->rate);
+	sc->sc_ht_stats.hs_tx_rate = rate_n_flags;	/* LISPBSD */
 
 	cmd_ver = iwx_lookup_notif_ver(sc, IWX_DATA_PATH_GROUP,
 	    IWX_TLC_MNG_UPDATE_NOTIF);
@@ -12160,10 +12187,13 @@ iwx_sysctl_ht_status(SYSCTLFN_ARGS)
 			off += snprintf(buf + off, sizeof(buf) - off,
 			    " ht_assocs=%u addba=%u refused=%u delba=%u"
 			    " reordered=%u dropped=%u bar_release=%u"
-			    " timer_release=%u",
+			    " timer_release=%u rate_n_flags v%d rx=0x%08x tx=0x%08x"
+			    " rx_ht40=%u rx_ht20=%u rx_legacy=%u",
 			    hs->hs_assoc_ht, hs->hs_addba, hs->hs_addba_refused,
 			    hs->hs_delba, hs->hs_stored, hs->hs_dropped,
-			    hs->hs_bar, hs->hs_timer);
+			    hs->hs_bar, hs->hs_timer, sc->sc_rate_n_flags_version,
+			    hs->hs_rx_rate, hs->hs_tx_rate, hs->hs_rx_ht40,
+			    hs->hs_rx_ht20, hs->hs_rx_legacy);
 	}
 	if (off >= sizeof(buf))
 		buf[sizeof(buf) - 1] = '\0';
