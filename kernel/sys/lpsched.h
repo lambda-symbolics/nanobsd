@@ -17,6 +17,14 @@
  *   - input-activity timestamp from wskbd/wsmouse, exported as idle_ms.
  *
  * The per-CPU idle depth is written by the cidle module's idle loop.
+ *
+ * Demand and latency accounting (machdep.lpsched.latency): when an LWP
+ * becomes runnable, how long it waits for a CPU (a histogram per class:
+ * focused process, other user, kernel, realtime), how long it then runs.
+ * Updated lazily at enqueue and at the scheduler's pick, no sampling
+ * interrupt.  The per-LWP burst average also steers placement: packing
+ * queues work only behind short bursts, and a queue that has waited past
+ * machdep.lpsched.wait_budget_us may be stolen from after all.
  */
 
 #ifndef _SYS_LPSCHED_H_
@@ -71,8 +79,21 @@ enum {
 	LPSCHED_ST_COAL_NOSLACK,	/* callout did not opt in to slack */
 	LPSCHED_ST_COAL_SHORT,		/* opted in but shorter than the grid */
 	LPSCHED_ST_COAL_PRECISE,	/* CALLOUT_PRECISE */
+	LPSCHED_ST_PACK_GUARD,		/* sibling skipped: focused/RT core */
+	LPSCHED_ST_PACK_LONGBURST,	/* not queued behind a long burst */
+	LPSCHED_ST_CATCH_ESCAPE,	/* queue waited too long: steal */
 	LPSCHED_NSTAT
 };
+
+/* Latency accounting classes and histogram buckets. */
+enum {
+	LPSCHED_CL_FG,			/* the focused process */
+	LPSCHED_CL_USER,		/* other user timeshare */
+	LPSCHED_CL_KERNEL,		/* kernel threads */
+	LPSCHED_CL_RT,			/* SCHED_FIFO/SCHED_RR */
+	LPSCHED_NCLASS
+};
+#define	LPSCHED_NBUCKET		16	/* bucket i: wait < 8 us << i */
 
 /*
  * Per-CPU idle depth and counters, one cache line group each: a bare
@@ -82,13 +103,37 @@ enum {
  */
 struct lpsched_cpu {
 	volatile uint8_t	depth;
+	volatile uint8_t	critical;	/* runs focused/realtime work */
+	volatile uint32_t	cur_burst_us;	/* burst average of the runner */
+	volatile uint64_t	q_since;	/* cpu_counter() when the run
+						   queue became non-empty */
 	uint64_t		st[LPSCHED_NSTAT];
+	/* written by this CPU only, at its own scheduler pick */
+	uint64_t		lat[LPSCHED_NCLASS][LPSCHED_NBUCKET];
+	uint64_t		wait_us[LPSCHED_NCLASS];
+	uint64_t		run_us[LPSCHED_NCLASS];
+	uint32_t		wait_max_us[LPSCHED_NCLASS];
 } __aligned(COHERENCY_UNIT);
 
 extern struct lpsched_cpu lpsched_cpu[MAXCPUS];
 extern int	lpsched_stats_enabled;
+extern int	lpsched_latency;	/* demand/latency accounting */
+extern int	lpsched_wait_budget_us;	/* longest acceptable queueing */
 
+struct lwp;
+struct cpu_info;
 void	lpsched_stat_bump(u_int);
+void	lpsched_enqueued(struct lwp *, struct cpu_info *, bool);
+void	lpsched_dequeued(struct cpu_info *, bool);
+void	lpsched_switch(struct lwp *, struct lwp *);
+bool	lpsched_queue_overdue(struct cpu_info *);
+
+static inline bool
+lpsched_accounting(void)
+{
+
+	return __predict_false(lpsched_enabled != 0 && lpsched_latency != 0);
+}
 
 static inline void
 lpsched_stat(u_int idx)

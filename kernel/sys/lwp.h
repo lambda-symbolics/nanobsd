@@ -220,6 +220,17 @@ struct lwp {
 #ifdef KCOV
 	void		*l_kcov; /* !: KCOV private data. */
 #endif
+
+	/*
+	 * LISPBSD: lpsched demand and latency accounting (kern_lpsched.c),
+	 * appended so the offsets above stay those of stock NetBSD.  Zeroed
+	 * at creation with the rest of the structure after l_startzero.
+	 */
+	uint64_t	l_lp_runnable;	/* s: cpu_counter() when made runnable,
+					   0 while not waiting for a CPU */
+	uint64_t	l_lp_oncpu;	/* s: cpu_counter() when it got the CPU */
+	uint32_t	l_lp_burst_us;	/* s: moving average of its run bursts */
+	uint32_t	l_lp_wait_us;	/* s: moving average of its waits */
 };
 
 /*

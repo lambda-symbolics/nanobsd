@@ -236,6 +236,9 @@ sched_enqueue(struct lwp *l)
 		TAILQ_INSERT_TAIL(q_head, l, l_runq);
 	}
 	spc->spc_flags &= ~SPCF_IDLE;
+	/* lpsched: a wait starts; an empty queue now holds work. */
+	if (lpsched_accounting())
+		lpsched_enqueued(l, ci, spc->spc_count == 0);
 	spc->spc_count++;
 	if ((l->l_pflag & LP_BOUND) == 0) {
 		atomic_store_relaxed(&spc->spc_mcount,
@@ -274,6 +277,8 @@ sched_dequeue(struct lwp *l)
 		spc->spc_migrating = NULL;
 
 	spc->spc_count--;
+	if (lpsched_accounting())
+		lpsched_dequeued(l->l_cpu, spc->spc_count == 0);
 	if ((l->l_pflag & LP_BOUND) == 0) {
 		atomic_store_relaxed(&spc->spc_mcount,
 		    atomic_load_relaxed(&spc->spc_mcount) - 1);
@@ -593,18 +598,30 @@ lpsched_exempt(const struct lwp *l)
  * lpsched: how expensive is it to run something on "ci" right now?
  * 0 if an SMT sibling is busy (the physical core is already awake),
  * otherwise 1 + the idle depth cidle recorded for it.
+ *
+ * A sibling running focused or realtime work is not free, though: the
+ * packed LWP would share its core's pipeline and caches (Elfen, USENIX
+ * ATC 2016).  Such a CPU costs as much as waking a shallow-idle core, so a
+ * core of its own wins whenever one is that cheap.
  */
 static inline int
 lpsched_wake_cost(struct cpu_info *ci)
 {
 	struct cpu_info *tci;
+	int cost = -1;
 
 	for (tci = ci->ci_sibling[CPUREL_CORE]; tci != ci;
 	    tci = tci->ci_sibling[CPUREL_CORE]) {
-		if ((tci->ci_schedstate.spc_flags & SPCF_IDLE) == 0)
-			return 0;
+		if ((tci->ci_schedstate.spc_flags & SPCF_IDLE) != 0)
+			continue;
+		if (lpsched_accounting() &&
+		    lpsched_cpu[cpu_index(tci)].critical) {
+			lpsched_stat(LPSCHED_ST_PACK_GUARD);
+			return 1 + LPSCHED_IDLE_SHALLOW;
+		}
+		cost = 0;
 	}
-	return 1 + lpsched_idle_depth(cpu_index(ci));
+	return cost == 0 ? 0 : 1 + lpsched_idle_depth(cpu_index(ci));
 }
 
 /*
@@ -647,10 +664,11 @@ lpsched_is_packed(struct cpu_info *ci)
 
 /*
  * lpsched: power packing.  For a non-exempt LWP find the cheapest idle CPU
- * to wake: an idle SMT sibling of a busy core first, then shallow-idle,
- * then tickless-deep.  With pack >= 2, rather than wake a sleeping core at
- * all, queue behind a running LWP on an awake CPU whose run queue is empty
- * -- but only behind timeshare work.  Queuing behind a realtime or kernel
+ * to wake: an idle SMT sibling of a busy core first (unless that core runs
+ * focused or realtime work), then shallow-idle, then tickless-deep.  With
+ * pack >= 2, rather than wake a sleeping core at all, queue behind a
+ * running LWP on an awake CPU whose run queue is empty -- but only behind
+ * timeshare work whose bursts are short (the latency accounting).  Queuing behind a realtime or kernel
  * priority thread could strand the LWP: it cannot preempt it, and an idle
  * core may decline to steal a one-entry queue.  Returns NULL to fall back
  * to the stock placement.
@@ -698,6 +716,20 @@ lpsched_pack_pick(struct lwp *l, struct cpu_info *pivot)
 				    spc->spc_curpriority > MAXPRI_USER) {
 					continue;
 				}
+				/*
+				 * Only behind a runner whose bursts end within
+				 * the wait budget, and never behind focused
+				 * work: the queued LWP runs when the runner
+				 * blocks, or at the end of its time slice.
+				 */
+				if (lpsched_accounting() &&
+				    (lpsched_cpu[cpu_index(ci)].critical ||
+				    lpsched_cpu[cpu_index(ci)].cur_burst_us == 0 ||
+				    lpsched_cpu[cpu_index(ci)].cur_burst_us >
+				    (uint32_t)lpsched_wait_budget_us)) {
+					lpsched_stat(LPSCHED_ST_PACK_LONGBURST);
+					continue;
+				}
 				lpsched_stat(LPSCHED_ST_PACK_BUSY);
 				return ci;
 			} while (ci = ci->ci_sibling[CPUREL_PACKAGE],
@@ -723,8 +755,9 @@ lpsched_pack_pick(struct lwp *l, struct cpu_info *pivot)
  * the only place realtime and kernel work can be protected from it.
  */
 static inline u_int
-lpsched_min_catch(struct cpu_info *local, struct schedstate_percpu *remote)
+lpsched_min_catch(struct cpu_info *local, struct cpu_info *remote_ci)
 {
+	struct schedstate_percpu *remote = &remote_ci->ci_schedstate;
 	struct cpu_info *tci;
 	u_int raised, have;
 
@@ -732,6 +765,16 @@ lpsched_min_catch(struct cpu_info *local, struct schedstate_percpu *remote)
 		return min_catch;
 	if (remote->spc_maxpriority > MAXPRI_USER)
 		return min_catch;
+	/*
+	 * A queue that has held work for longer than the wait budget is
+	 * taken from even if it holds a single LWP: the threshold below
+	 * counts LWPs and would otherwise strand one indefinitely.
+	 */
+	if (lpsched_accounting() &&
+	    lpsched_queue_overdue(remote_ci)) {
+		lpsched_stat(LPSCHED_ST_CATCH_ESCAPE);
+		return min_catch;
+	}
 	for (tci = local->ci_sibling[CPUREL_CORE]; tci != local;
 	    tci = tci->ci_sibling[CPUREL_CORE]) {
 		if ((tci->ci_schedstate.spc_flags & SPCF_IDLE) == 0)
@@ -868,7 +911,7 @@ sched_catchlwp(struct cpu_info *ci)
 	gentle = !cpu_is_better(curci, ci);
 
 	if (atomic_load_relaxed(&spc->spc_mcount) <
-	    (gentle ? lpsched_min_catch(curci, spc) : 1) ||
+	    (gentle ? lpsched_min_catch(curci, ci) : 1) ||
 	    curspc->spc_psid != spc->spc_psid) {
 		spc_unlock(ci);
 		return NULL;
@@ -1085,7 +1128,7 @@ sched_idle(void)
 			if (ci == inner || ci == mci ||
 			    spc->spc_psid != tspc->spc_psid ||
 			    atomic_load_relaxed(&tspc->spc_mcount) <
-			    lpsched_min_catch(ci, tspc)) {
+			    lpsched_min_catch(ci, inner)) {
 				continue;
 			}
 			spc_dlock(ci, inner);
@@ -1302,16 +1345,25 @@ sched_nextlwp(void)
 
 	/* Return to idle LWP if there is a migrating thread */
 	spc = &ci->ci_schedstate;
-	if (__predict_false(spc->spc_migrating != NULL))
+	if (__predict_false(spc->spc_migrating != NULL)) {
+		if (lpsched_accounting())
+			lpsched_switch(l, NULL);
 		return NULL;
+	}
 
 	/* Return to idle LWP if there is no runnable job */
-	if (__predict_false(spc->spc_count == 0))
+	if (__predict_false(spc->spc_count == 0)) {
+		if (lpsched_accounting())
+			lpsched_switch(l, NULL);
 		return NULL;
+	}
 
 	/* Take the highest priority thread */
 	KASSERT(spc->spc_bitmap[spc->spc_maxpriority >> BITMAP_SHIFT]);
 	q_head = sched_getrq(spc, spc->spc_maxpriority);
+	/* lpsched: the outgoing LWP's burst ends, its wait does. */
+	if (lpsched_accounting())
+		lpsched_switch(l, TAILQ_FIRST(q_head));
 	l = TAILQ_FIRST(q_head);
 	KASSERT(l != NULL);
 

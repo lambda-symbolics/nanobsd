@@ -480,3 +480,81 @@ cd /usr/src/sys/modules/cidle && make && cp cidle.kmod /stand/amd64/11.0/modules
 cc -O2 -Wall -o /usr/local/sbin/lpschedd lpschedd.c -lutil
 shutdown -r now        # NOT `reboot` (iwx recursion panic)
 #+end_example
+
+* 2026-10-23: the LAVD / PELT / Elfen / EEVDF advice, evaluated
+An external review proposed: per-thread demand and wake-to-run tracking
+(PELT/UTIL_EST), LAVD-style latency-critical classes and QoS hints, an
+SMT-contention-aware successor to =lpsched_pack_pick()= with a bounded-wait
+escape, an adaptive active-core set, an EEVDF timeshare class, temporal
+coordination of housekeeping, and workload-aware HWP hints.  Weighed
+against what this machine has already measured:
+
+| Proposal                        | Verdict | Why                                       |
+|---------------------------------+---------+-------------------------------------------|
+| demand + wake-to-run accounting | done    | needed to judge any policy (latency tails) |
+| single saturated thread (12.5%) | done    | lpschedd: busiest-CPU signal, attended only |
+| SMT sibling contention guard    | done    | cheap; packing itself saves nothing        |
+| bounded-wait escape             | done    | min_catch counted LWPs only                |
+| stop packing at interaction     | done    | balanced pack 1 -> 0                       |
+| QoS classes / LAVD criticality  | later   | needs a measured latency problem first     |
+| adaptive active-core set        | later   | same as packing: no energy evidence        |
+| EEVDF timeshare class           | later   | fairness/latency, no battery claim         |
+| housekeeping timer slack        | had it  | kernel 152 deferrable callouts: cpu0 timer
+                                              irqs 15 -> 6/s, no resolvable power change |
+| per-runqueue HWP hints          | later   | EPP per CPU is writable, but the gain on
+                                              TGL-U's shared clock is unproven          |
+
+The governing fact: packing measured null on energy (RAPL, 3x interleaved,
+2026-09-20: 0.891 vs 0.893 W package, +13.6 % interrupts), and EPP is the
+only watt-class lever.  So nothing here is expected to save watts by
+itself; the accounting is what lets the next experiments say whether a
+policy costs latency, and the lpschedd change is the one policy change.
+
+** What changed (kernel, not deployed yet; lpschedd)
+- =struct lwp= gets four appended fields (stock offsets unchanged):
+  runnable stamp, on-CPU stamp, burst and wait moving averages.
+- =sched_enqueue()= stamps the wait; =sched_nextlwp()= ends the outgoing
+  burst and the incoming wait: histogram per class (fg = the focused
+  process, user, kernel, rt) in log2 buckets from 8 us, mean, max, run
+  time.  cpu_counter() stamps, per-CPU counters, no sampling interrupt.
+  =machdep.lpsched.latency= (default 1, inert while lpsched is disabled),
+  =latency_hist=, =latency_reset=, =wait_budget_us= (2000).
+- =lpsched_wake_cost()=: an idle sibling of a core running focused or
+  realtime work costs as much as a shallow-idle core (counter pack_guard).
+- pack=2 queues behind a runner only if its burst average is under the
+  wait budget and it is not focused work (pack_longburst).
+- =lpsched_min_catch()=: a queue non-empty for longer than the budget is
+  stolen from even with one LWP (catch_escape).  Only CPUs that scan for
+  work act on it; a deep-idle core does not wake to look.
+- lpschedd: =kern.cp_time= per CPU; a CPU over 85 % busy (released under
+  60 %) while input is within the interactive window selects =load= (EPP
+  192).  Unattended, the same thread stays =powersave= (EPP 240): a
+  spinning background page should not be sped up.  =balanced= no longer
+  packs.
+
+** VM results (gefs VM, 8 vCPUs, /build/agent-vht kernel)
+- Accounting correct: user run time 80.0 s for 4 busy loops x 20 s.  The
+  focused periodic waker: kernel wake-to-run 6-12 us mean, p99 < 32 us,
+  while its own measured lateness was 5-11 ms -- the 100 Hz timer tick,
+  which the histogram now separates from scheduling delay.
+- pack=2 costs latency: user waits 46 us mean, max 7.6-11.5 ms, vs 4-10 us
+  with pack=0 (focused work exempt either way).  pack_longburst refused
+  ~130 queue-behinds per run (busy loops have long bursts), catch_escape 2.
+- SMT guard (VM started as 4 cores x 2 threads): sibling placements beside
+  the focused spinner 3050 -> 58 per 20 s, pack_guard 3020.  The spinner's
+  throughput did not change measurably (QEMU's SMT threads are not host
+  siblings, and the wakers are ~0.5 % duty), so contention itself needs
+  the Nano.  Tests: =userland/lpsched-lat/= (waker.c, spin.c, run.sh,
+  guard.sh).
+
+** On the Nano (when allowed)
+1. Kernel with the accounting + lpschedd: confirm no regression in idle
+   power (the accounting adds a TSC read and a few stores per switch;
+   =latency=0= is the A/B arm).
+2. Real-use latency picture: =latency_reset=, an hour of normal use,
+   =latency_hist= -- does fg ever wait > 1 ms?  If not, QoS classes have
+   nothing to fix.
+3. The acceptance test the reviewer asked for: battery Wh over a fixed
+   browsing/SSH/media session, with input-latency tails (fg histogram),
+   frame drops, audio underruns and completed work; pack 0 vs 2 in
+   powersave, interleaved A/B/A/B.

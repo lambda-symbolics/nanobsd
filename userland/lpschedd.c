@@ -10,7 +10,9 @@
  *               hook; seeded from envstat(8) at startup.
  *   busy        CPU utilisation since the previous wakeup (kern.cp_time),
  *               with a hysteresis band.  The 1-minute load average used
- *               before followed a change in work a minute late.
+ *               before followed a change in work a minute late.  Also the
+ *               busiest single CPU: one saturated thread on 8 logical CPUs
+ *               is only 12.5 % of the machine, under the band.
  *   idle_ms     machdep.lpsched.idle_ms, ms since the last keyboard/mouse input.
  *   fgpid       "fgpid <pid>" datagrams on /var/run/lpsched.sock from the WM.
  *   input       "input <pid>" datagrams from a compositor (Mahogany) that sees
@@ -34,7 +36,10 @@
  *               interaction boost.  It used to last the whole 10 s
  *               interactive window, holding EPP 128 long after the input
  *               that justified it.
- *   load        battery + busy + input within the interactive window.
+ *   load        battery + busy + input within the interactive window, or
+ *               one CPU saturated (a single busy thread) while input is
+ *               that recent: someone is waiting on it.  The same thread
+ *               unattended (a spinning background page) stays powersave.
  *   batch       battery + busy, no recent input.
  *   powersave   battery, not busy, no input within boost_ms.
  * Heavy load on battery no longer means EPP perf.  Measured on the X1 Nano
@@ -87,7 +92,13 @@ static const struct {
 	int epp, pack, coalesce_ms;
 } profiles[P_COUNT] = {
 	[P_PERF]      = { "perf",       32, 0,  0 },
-	[P_BALANCED]  = { "balanced",  128, 1, 20 },
+	/*
+	 * No packing in balanced: it is the second after input, when a
+	 * background LWP put on the busy core's idle SMT sibling slows the
+	 * thread the user waits for, and packing measured no energy gain
+	 * (RAPL, 3x interleaved, docs/lpsched-design.org).
+	 */
+	[P_BALANCED]  = { "balanced",  128, 0, 20 },
 	[P_LOAD]      = { "load",      192, 0,  0 },
 	[P_BATCH]     = { "batch",     224, 0,  0 },
 	[P_POWERSAVE] = { "powersave", 240, 2, 50 },
@@ -97,6 +108,9 @@ static int	 interactive_ms = 10000;	/* -i: input within this = interactive */
 static int	 boost_ms = 1000;		/* -b: EPP 128 this long after input */
 static double	 load_hi = 0.25;		/* -H: CPU busy fraction = load/batch */
 static double	 load_lo = 0.15;		/* -L: below this releases the latch */
+static double	 one_hi = 0.85;			/* busiest CPU: one thread saturated */
+static double	 one_lo = 0.60;			/* below this releases that latch */
+static int	 ncpu = 1;
 static int	 pl1_bat = 10000;		/* -P: battery PL1, mW (0: leave) */
 static int	 pl1_boot = 0;			/* machdep.hwp.pl1_boot */
 static bool	 debug = false;			/* -d: foreground, log to stderr */
@@ -237,7 +251,8 @@ apply_profile(enum profile p)
 }
 
 static enum profile
-decide(int ac, double busy, int idle_ms, bool *load_latched)
+decide(int ac, double busy, double busy_max, int idle_ms, bool *load_latched,
+    bool *one_latched)
 {
 
 	if (ac != 0)			/* AC, or unknown: do no harm */
@@ -246,10 +261,16 @@ decide(int ac, double busy, int idle_ms, bool *load_latched)
 		*load_latched = false;
 	else if (!*load_latched && busy > load_hi)
 		*load_latched = true;
+	if (*one_latched && busy_max < one_lo)
+		*one_latched = false;
+	else if (!*one_latched && busy_max > one_hi)
+		*one_latched = true;
 	if (idle_ms < boost_ms)
 		return P_BALANCED;
 	if (*load_latched)
 		return idle_ms < interactive_ms ? P_LOAD : P_BATCH;
+	if (*one_latched && idle_ms < interactive_ms)
+		return P_LOAD;
 	return P_POWERSAVE;
 }
 
@@ -262,27 +283,50 @@ now_ms(void)
 	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* Busy fraction of all CPUs since the previous call (0 on the first). */
+/*
+ * Busy fraction of all CPUs since the previous call (0 on the first), and
+ * of the busiest single CPU in *busy_max.  A buffer for every CPU's states
+ * makes kern.cp_time return them all instead of their sum.
+ */
 static double
-cpu_busy(void)
+cpu_busy(double *busy_max)
 {
-	static uint64_t last[CPUSTATES];
+	static uint64_t *last, *cur;
 	static bool have;
-	uint64_t cur[CPUSTATES], total = 0, idle;
-	size_t len = sizeof(cur);
-	double busy = 0.0;
-	int i;
+	uint64_t total = 0, idle = 0, t, d;
+	size_t len = (size_t)ncpu * CPUSTATES * sizeof(uint64_t);
+	double busy = 0.0, b;
+	int c, i;
 
-	if (sysctlbyname("kern.cp_time", cur, &len, NULL, 0) == -1)
+	*busy_max = 0.0;
+	if (last == NULL) {
+		last = calloc((size_t)ncpu * CPUSTATES, sizeof(uint64_t));
+		cur = calloc((size_t)ncpu * CPUSTATES, sizeof(uint64_t));
+		if (last == NULL || cur == NULL)
+			return 0.0;
+	}
+	if (sysctlbyname("kern.cp_time", cur, &len, NULL, 0) == -1 ||
+	    len != (size_t)ncpu * CPUSTATES * sizeof(uint64_t))
 		return 0.0;
 	if (have) {
-		for (i = 0; i < CPUSTATES; i++)
-			total += cur[i] - last[i];
-		idle = cur[CP_IDLE] - last[CP_IDLE];
+		for (c = 0; c < ncpu; c++) {
+			for (t = 0, i = 0; i < CPUSTATES; i++)
+				t += cur[c * CPUSTATES + i] -
+				    last[c * CPUSTATES + i];
+			d = cur[c * CPUSTATES + CP_IDLE] -
+			    last[c * CPUSTATES + CP_IDLE];
+			total += t;
+			idle += d;
+			if (t > 0) {
+				b = 1.0 - (double)d / (double)t;
+				if (b > *busy_max)
+					*busy_max = b;
+			}
+		}
 		if (total > 0)
 			busy = 1.0 - (double)idle / (double)total;
 	}
-	memcpy(last, cur, sizeof(last));
+	memcpy(last, cur, (size_t)ncpu * CPUSTATES * sizeof(uint64_t));
 	have = true;
 	return busy;
 }
@@ -430,10 +474,10 @@ main(int argc, char **argv)
 {
 	struct pollfd pfd;
 	enum profile cur = P_COUNT, want;
-	bool load_latched = false;
+	bool load_latched = false, one_latched = false;
 	int ac, idle_ms = 0, fgpid = 0, pending = 0, c, timeout, last_ac = -2;
 	uint64_t pending_since = 0, pl_checked = 0;
-	double load;
+	double load, load_max = 0.0;
 
 	while ((c = getopt(argc, argv, "dnb:i:H:L:P:")) != -1) {
 		switch (c) {
@@ -484,7 +528,14 @@ main(int argc, char **argv)
 	    "busy_hi=%.2f busy_lo=%.2f epp(orig)=%d pl1 boot=%d bat=%d mW",
 	    ac, boost_ms, interactive_ms, load_hi, load_lo, orig_epp,
 	    pl1_boot, pl1_bat);
-	(void)cpu_busy();
+	{
+		int n;
+		size_t nlen = sizeof(n);
+
+		if (sysctlbyname("hw.ncpu", &n, &nlen, NULL, 0) == 0 && n > 0)
+			ncpu = n;
+	}
+	(void)cpu_busy(&load_max);
 
 	sockfd = open_socket();
 	sysctl_set("machdep.lpsched.enabled", 1);
@@ -515,7 +566,7 @@ main(int argc, char **argv)
 		c = read_ac_file();
 		if (c != -1)
 			ac = c;
-		load = cpu_busy();
+		load = cpu_busy(&load_max);
 		if (sysctl_get("machdep.lpsched.idle_ms", &idle_ms) == -1)
 			idle_ms = 0;
 		if (ac != last_ac || now_ms() - pl_checked >= PL_CHECK_MS) {
@@ -524,7 +575,8 @@ main(int argc, char **argv)
 			pl_checked = now_ms();
 		}
 
-		want = decide(ac, load, idle_ms, &load_latched);
+		want = decide(ac, load, load_max, idle_ms, &load_latched,
+		    &one_latched);
 		if (cur == P_COUNT || want < cur) {
 			/* First pass, or upshift: immediate. */
 			cur = want;
