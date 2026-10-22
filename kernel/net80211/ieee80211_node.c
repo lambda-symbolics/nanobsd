@@ -2882,7 +2882,8 @@ ieee80211_vht_wanted(struct ieee80211com *ic, struct ieee80211_node *ni)
 
 /*
  * Decide on VHT after a successful (re)association, once HT is settled:
- * we offered it, the AP is VHT, and we do the AP's basic VHT-MCS set.
+ * we offered it, the AP is VHT, and we do the AP's basic VHT-MCS set on
+ * the streams we have.
  */
 void
 ieee80211_vht_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
@@ -2901,9 +2902,15 @@ ieee80211_vht_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
 		    IEEE80211_VHT_MCS_FOR_SS_MASK(n)) >>
 		    IEEE80211_VHT_MCS_FOR_SS_SHIFT(n);
 
+		/*
+		 * Only the streams we have: APs ask for more than they mean
+		 * (the Zyxel's 0xffaa wants MCS 0-9 on 4 streams), which is
+		 * why Linux ignores the basic set unless in strict mode.
+		 */
+		if (rx_mcs == IEEE80211_VHT_MCS_SS_NOT_SUPP)
+			continue;
 		if (basic_mcs != IEEE80211_VHT_MCS_SS_NOT_SUPP &&
-		    (rx_mcs == IEEE80211_VHT_MCS_SS_NOT_SUPP ||
-		    basic_mcs > rx_mcs))
+		    basic_mcs > rx_mcs)
 			return;
 	}
 	ni->ni_flags |= IEEE80211_NODE_VHT;

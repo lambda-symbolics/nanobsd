@@ -46,10 +46,28 @@ and the PHY context listens on one chain, the second waking on the AP's RTS
 | download  | 13 Mbit/s  | 39-45 Mbit/s             | 100-112 Mbit/s |
 | upload    | 12.6       | 16-17                    | 100            |
 
-* 802.11ac (VHT, 80 MHz): written 2026-10-22, NOT yet run on the Nano
-Behind its own switch, =hw.iwx.vht= (default 0, needs =hw.iwx.ht=1, 5 GHz
-only).  Compile-checked against the kernel 198 tree in the gefs VM
-(/build/agent-vht there); the Nano still runs 198.
+* 802.11ac (VHT, 80 MHz): kernel 200, on since 2026-10-22 evening
+Behind its own switch, =hw.iwx.vht= (needs =hw.iwx.ht=1, 5 GHz only), 1 in
+=/etc/sysctl.conf=.  Written that morning without the Nano and
+compile-checked in the gefs VM (/build/agent-vht there), then run:
+
+- Kernel 199 associated as HT only: the Zyxel's basic VHT-MCS set 0xffaa
+  asks for MCS 0-9 on *four* streams, which a 2x2 client can never meet.
+  Linux ignores the basic set outside strict mode for this reason; OpenBSD
+  passes it by accident (NOT_SUPP = 3 compares as "more").  Kernel 200
+  checks only the streams we have.
+- Kernel 200: =assoc=vht width=80=, rx and tx =rate_n_flags= 0x0010d319 =
+  VHT MCS 9, 2 streams, 80 MHz, SGI (866 Mbit/s).  The AP had moved to
+  primary channel 48 (center 42: control position 2 above), which worked.
+
+| LAN, 20 s each (Wi-Fi peer on the same channel) | HT40       | VHT80           |
+|-------------------------------------------------+------------+-----------------|
+| download                                        | 109 Mbit/s | 119, 144, 181   |
+| upload                                          | 98         | 123, 128        |
+
+CPU stays 99.5 % idle at 181 Mbit/s (software CCMP).  The limit is the
+shared channel: the test peer is a Wi-Fi client of the same AP, so every
+byte crosses the air twice.
 
 - net80211: VHT Capabilities/Operation elements parsed from beacons and
   the association response (=ieee80211_setup_vhtcaps/vhtop=, OpenBSD's
@@ -69,7 +87,7 @@ only).  Compile-checked against the kernel 198 tree in the gefs VM
   MCS 0-9 on two streams required (we offer exactly that), AP max MPDU
   7991, no 160.
 
-** Test procedure (next session with the Nano)
+** Test procedure (as run)
 1. Build on the laptop from nanobsd (net80211/*, dev/pci/if_iwx.c,
    if_iwxvar.h), install as kernel 199, 198 stays the previous entry.
 2. Boot; =hw.iwx.ht=1=, =hw.iwx.vht=0= as before: same as 198.
@@ -85,4 +103,4 @@ only).  Compile-checked against the kernel 198 tree in the gefs VM
 - Idle and transfer power not measured yet (fewer airtime-seconds per byte
   should help; two chains during MIMO bursts cost some).
 - s2idle with HT associated is untested.
-- VHT is untested on hardware (above); no 160 MHz, no HE (11ax).
+- No 160 MHz (the Zyxel does not do it either), no HE (11ax).
