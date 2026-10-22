@@ -4738,6 +4738,7 @@ struct iwx_mac_data_p2p_dev {
 #define IWX_MAC_FILTER_OUT_BCAST		(1 << 8)
 #define IWX_MAC_FILTER_IN_CRC32			(1 << 11)
 #define IWX_MAC_FILTER_IN_PROBE_REQUEST		(1 << 12)
+#define IWX_MAC_FILTER_IN_11AX			(1 << 14) /* LISPBSD: HE BSS */
 
 /**
  * QoS flags
@@ -5157,6 +5158,116 @@ struct iwx_he_pkt_ext_v1 {
 struct iwx_he_pkt_ext_v2 {
 	uint8_t pkt_ext_qam_th[MAX_HE_SUPP_NSS][MAX_CHANNEL_BW_INDX_API_D_VER_3][2];
 } __packed; /* PKT_EXT_DOT11AX_API_S_VER_2 */
+
+/*
+ * LISPBSD: the HE station context of the pre-MLD API (Linux iwlwifi
+ * fw/api/mac.h): how the firmware works with an HE AP.
+ */
+#define IWX_STA_HE_CTXT_CMD	0x7	/* IWX_DATA_PATH_GROUP */
+
+/* packet extension QAM thresholds */
+#define IWX_HE_PKT_EXT_BPSK	0
+#define IWX_HE_PKT_EXT_QPSK	1
+#define IWX_HE_PKT_EXT_16QAM	2
+#define IWX_HE_PKT_EXT_64QAM	3
+#define IWX_HE_PKT_EXT_256QAM	4
+#define IWX_HE_PKT_EXT_1024QAM	5
+#define IWX_HE_PKT_EXT_NONE	7
+
+/* HE station context flags */
+#define IWX_STA_CTXT_HE_REF_BSSID_VALID		(1 << 4)
+#define IWX_STA_CTXT_HE_BSS_COLOR_DIS		(1 << 5)
+#define IWX_STA_CTXT_HE_PARTIAL_BSS_COLOR	(1 << 6)
+#define IWX_STA_CTXT_HE_32BIT_BA_BITMAP		(1 << 7)
+#define IWX_STA_CTXT_HE_PACKET_EXT		(1 << 8)
+#define IWX_STA_CTXT_HE_TRIG_RND_ALLOC		(1 << 9)
+#define IWX_STA_CTXT_HE_CONST_TRIG_RND_ALLOC	(1 << 10)
+#define IWX_STA_CTXT_HE_ACK_ENABLED		(1 << 11)
+#define IWX_STA_CTXT_HE_MU_EDCA_CW		(1 << 12)
+#define IWX_STA_CTXT_HE_NIC_NOT_ACK_ENABLED	(1 << 13)
+#define IWX_STA_CTXT_HE_RU_2MHZ_BLOCK		(1 << 14)
+
+/* HE HT-control (A-Control) support */
+#define IWX_HE_HTC_SUPPORT			(1 << 0)
+#define IWX_HE_HTC_LINK_ADAP_UNSOLICITED	(2 << 1)
+#define IWX_HE_HTC_LINK_ADAP_BOTH		(3 << 1)
+#define IWX_HE_HTC_UL_MU_RESP_SCHED		(1 << 3)
+#define IWX_HE_HTC_BSR_SUPP			(1 << 4)
+#define IWX_HE_HTC_OMI_SUPP			(1 << 5)
+#define IWX_HE_HTC_BQR_SUPP			(1 << 6)
+
+/*
+ * struct iwx_he_sta_context_cmd_v1/v2/v3 - configure the firmware to work
+ * with an HE AP.  v1 is v2 without the multiple-BSSID tail; v3 has the
+ * 5-bandwidth packet extension table.
+ */
+struct iwx_he_sta_context_cmd_v2 {
+	uint8_t sta_id;
+	uint8_t tid_limit;	/* max TIDs in an HE-SU multi-TID A-MPDU */
+	uint8_t reserved1;
+	uint8_t reserved2;
+	uint32_t flags;		/* IWX_STA_CTXT_HE_* */
+	/* from the Multiple BSSID element */
+	uint8_t ref_bssid_addr[6];
+	uint16_t reserved0;
+	/* from the HE Capabilities element */
+	uint32_t htc_flags;
+	uint8_t frag_flags;
+	uint8_t frag_level;
+	uint8_t frag_max_num;
+	uint8_t frag_min_size;
+	/* from the PPE thresholds */
+	struct iwx_he_pkt_ext_v1 pkt_ext;
+	/* from the HE Operation element */
+	uint8_t bss_color;
+	uint8_t htc_trig_based_pkt_ext;	/* default PE, 4 us units */
+	uint16_t frame_time_rts_th;	/* 32 us units */
+	/* UORA: random access */
+	uint8_t rand_alloc_ecwmin;
+	uint8_t rand_alloc_ecwmax;
+	uint16_t reserved3;
+	/* from the MU EDCA Parameter Set element */
+	struct iwx_he_backoff_conf trig_based_txf[IWX_AC_NUM];
+	/* v2 only */
+	uint8_t max_bssid_indicator;
+	uint8_t bssid_index;
+	uint8_t ema_ap;
+	uint8_t profile_periodicity;
+	uint8_t bssid_count;
+	uint8_t reserved4[3];
+} __packed; /* STA_CONTEXT_DOT11AX_API_S_VER_2 */
+
+#define IWX_HE_STA_CTXT_CMD_V1_SIZE \
+	offsetof(struct iwx_he_sta_context_cmd_v2, max_bssid_indicator)
+
+struct iwx_he_sta_context_cmd_v3 {
+	uint8_t sta_id;
+	uint8_t tid_limit;
+	uint8_t reserved1;
+	uint8_t reserved2;
+	uint32_t flags;
+	uint8_t ref_bssid_addr[6];
+	uint16_t reserved0;
+	uint32_t htc_flags;
+	uint8_t frag_flags;
+	uint8_t frag_level;
+	uint8_t frag_max_num;
+	uint8_t frag_min_size;
+	struct iwx_he_pkt_ext_v2 pkt_ext;
+	uint8_t bss_color;
+	uint8_t htc_trig_based_pkt_ext;
+	uint16_t frame_time_rts_th;
+	uint8_t rand_alloc_ecwmin;
+	uint8_t rand_alloc_ecwmax;
+	uint16_t puncture_mask;
+	struct iwx_he_backoff_conf trig_based_txf[IWX_AC_NUM];
+	uint8_t max_bssid_indicator;
+	uint8_t bssid_index;
+	uint8_t ema_ap;
+	uint8_t profile_periodicity;
+	uint8_t bssid_count;
+	uint8_t reserved4[3];
+} __packed; /* STA_CONTEXT_DOT11AX_API_S_VER_2 (sic, v3) */
 
 /**
  * struct iwx_mvm_sta_cfg_cmd - cmd structure to add a peer sta to the uCode's
@@ -5855,7 +5966,7 @@ enum {
 
 /* Bit 10 - OFDM HE */
 #define IWX_RATE_MCS_HE_POS_V1	10
-#define IWX_RATE_MCS_HE_MSK_V1	(1 << RATE_MCS_HE_POS_V1)
+#define IWX_RATE_MCS_HE_MSK_V1	(1 << IWX_RATE_MCS_HE_POS_V1)
 
 /*
  * Bit 11-12: (0) 20MHz, (1) 40MHz, (2) 80MHz, (3) 160MHz

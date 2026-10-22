@@ -110,6 +110,8 @@ struct ieee80211_node {
 #define	IEEE80211_NODE_HTCAP	0x0100		/* LISPBSD: peer sent HT caps */
 #define	IEEE80211_NODE_VHT	0x0200		/* LISPBSD: VHT negotiated */
 #define	IEEE80211_NODE_VHTCAP	0x0400		/* LISPBSD: peer sent VHT caps */
+#define	IEEE80211_NODE_HE	0x0800		/* LISPBSD: HE negotiated */
+#define	IEEE80211_NODE_HECAP	0x1000		/* LISPBSD: peer sent HE caps */
 	u_int16_t		ni_associd;	/* assoc response */
 	u_int16_t		ni_txpower;	/* current transmit power */
 	u_int16_t		ni_vlan;	/* vlan tag */
@@ -214,6 +216,24 @@ struct ieee80211_node {
 	u_int8_t		ni_vht_chan_center_freq_idx0;
 	u_int8_t		ni_vht_chan_center_freq_idx1;
 	u_int16_t		ni_vht_basic_mcs;
+
+	/* LISPBSD: 802.11ax (HE), as in OpenBSD's net80211. */
+	u_int8_t		ni_he_mac_cap[IEEE80211_HE_MAC_CAPS_LEN];
+	u_int8_t		ni_he_phy_cap[IEEE80211_HE_PHY_CAPS_LEN];
+	u_int16_t		ni_he_rxmcs_80;
+	u_int16_t		ni_he_txmcs_80;
+	u_int8_t		ni_he_ppe[IEEE80211_HE_PPE_MAXLEN];
+	u_int8_t		ni_he_ppe_len;		/* 0: none */
+	u_int32_t		ni_he_oper;		/* params + BSS color */
+	u_int16_t		ni_he_basic_mcs;
+	/* MU EDCA Parameter Set records, BE BK VI VO; valid if set */
+	u_int8_t		ni_he_mu_edca_valid;
+	struct ieee80211_he_mu_edca {
+		u_int8_t	aci_aifsn;
+		u_int8_t	ecw_min_max;
+		u_int8_t	mu_edca_timer;
+	}			ni_he_mu_edca[4];
+	u_int8_t		ni_he_uora;		/* OCW range, 0xff: none */
 };
 
 /* LISPBSD: HT predicates, as in OpenBSD.  MCS 0-7 must not all be off. */
@@ -265,6 +285,18 @@ ieee80211_node_supports_vht_chan80(const struct ieee80211_node *ni)
 	/* every VHT station does 80 MHz; the capability field says more */
 	return (ni->ni_vht_chan_width & IEEE80211_VHTOP0_CHAN_WIDTH_MASK) !=
 	    IEEE80211_VHTOP0_CHAN_WIDTH_HT;
+}
+
+/* HE: the peer sent HE caps and does HE-MCS 0-7 on one stream at least. */
+static __inline int
+ieee80211_node_supports_he(const struct ieee80211_node *ni)
+{
+	u_int16_t rx_mcs = (ni->ni_he_rxmcs_80 &
+	    IEEE80211_HE_MCS_FOR_SS_MASK(1)) >>
+	    IEEE80211_HE_MCS_FOR_SS_SHIFT(1);
+
+	return (ni->ni_flags & IEEE80211_NODE_HECAP) &&
+	    rx_mcs != IEEE80211_HE_MCS_SS_NOT_SUPP;
 }
 
 /* The secondary channel offset in use: SCN unless HT at 40 MHz. */
@@ -442,6 +474,10 @@ struct ieee80211_scanparams {
 	u_int8_t	*sp_htop;	/* LISPBSD: HT Operation element */
 	u_int8_t	*sp_vhtcap;	/* LISPBSD: VHT Capabilities element */
 	u_int8_t	*sp_vhtop;	/* LISPBSD: VHT Operation element */
+	u_int8_t	*sp_hecap;	/* LISPBSD: HE Capabilities element */
+	u_int8_t	*sp_heop;	/* LISPBSD: HE Operation element */
+	u_int8_t	*sp_muedca;	/* LISPBSD: MU EDCA Parameter Set */
+	u_int8_t	*sp_uora;	/* LISPBSD: UORA Parameter Set */
 };
 
 /*

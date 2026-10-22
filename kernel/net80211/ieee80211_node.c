@@ -1355,6 +1355,22 @@ ieee80211_add_scan(struct ieee80211com *ic,
 			    sp->sp_vhtop[1]);
 	} else
 		ni->ni_flags &= ~IEEE80211_NODE_VHTCAP;
+	/* LISPBSD: 802.11ax; the Element ID Extension byte is skipped */
+	if (sp->sp_hecap != NULL && sp->sp_htcap != NULL) {
+		ieee80211_setup_hecaps(ni, sp->sp_hecap + 3,
+		    sp->sp_hecap[1] - 1);
+		if (sp->sp_heop != NULL)
+			ieee80211_setup_heop(ni, sp->sp_heop + 3,
+			    sp->sp_heop[1] - 1, 1);
+	} else
+		ni->ni_flags &= ~IEEE80211_NODE_HECAP;
+	if (sp->sp_muedca != NULL)
+		ieee80211_setup_he_muedca(ni, sp->sp_muedca + 3,
+		    sp->sp_muedca[1] - 1);
+	else
+		ni->ni_he_mu_edca_valid = 0;
+	ni->ni_he_uora = (sp->sp_uora != NULL && sp->sp_uora[1] >= 2) ?
+	    sp->sp_uora[3] : 0xff;
 
 	/* NB: must be after ni_chan is setup */
 	ieee80211_setup_rates(ni, sp->sp_rates, sp->sp_xrates,
@@ -2914,4 +2930,119 @@ ieee80211_vht_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
 			return;
 	}
 	ni->ni_flags |= IEEE80211_NODE_VHT;
+}
+
+/*
+ * LISPBSD: 802.11ax (HE) station support, from OpenBSD's net80211; the
+ * elements are passed without their Element ID Extension byte.
+ */
+
+/* Install a received HE Capabilities element in the node. */
+void
+ieee80211_setup_hecaps(struct ieee80211_node *ni, const u_int8_t *data,
+    u_int8_t len)
+{
+	const u_int8_t *mcs;
+	int mcslen, ppelen;
+
+	if (len < IEEE80211_HE_CAPS_FIXED_LEN + IEEE80211_HE_MCS_NSS_80_LEN)
+		return;
+	/* the MCS/NSS fields grow with the 160 and 80+80 MHz bits */
+	mcslen = IEEE80211_HE_MCS_NSS_SIZE(data[IEEE80211_HE_MAC_CAPS_LEN]);
+	if (len < IEEE80211_HE_CAPS_FIXED_LEN + mcslen)
+		return;
+
+	memcpy(ni->ni_he_mac_cap, data, IEEE80211_HE_MAC_CAPS_LEN);
+	memcpy(ni->ni_he_phy_cap, data + IEEE80211_HE_MAC_CAPS_LEN,
+	    IEEE80211_HE_PHY_CAPS_LEN);
+	mcs = data + IEEE80211_HE_CAPS_FIXED_LEN;
+	ni->ni_he_rxmcs_80 = mcs[0] | (mcs[1] << 8);
+	ni->ni_he_txmcs_80 = mcs[2] | (mcs[3] << 8);
+
+	ni->ni_he_ppe_len = 0;
+	if (ni->ni_he_phy_cap[6] & IEEE80211_HE_PHY_CAP6_PPE_THRESHOLD_PRESENT) {
+		ppelen = len - IEEE80211_HE_CAPS_FIXED_LEN - mcslen;
+		if (ppelen > IEEE80211_HE_PPE_MAXLEN)
+			ppelen = IEEE80211_HE_PPE_MAXLEN;
+		memcpy(ni->ni_he_ppe, mcs + mcslen, ppelen);
+		ni->ni_he_ppe_len = ppelen;
+	}
+	ni->ni_flags |= IEEE80211_NODE_HECAP;
+}
+
+/*
+ * Install a received HE Operation element.  The Basic HE-MCS set is only
+ * defined in beacons and probe responses.
+ */
+void
+ieee80211_setup_heop(struct ieee80211_node *ni, const u_int8_t *data,
+    u_int8_t len, int isprobe)
+{
+	if (len < IEEE80211_HEOP_FIXED_LEN)
+		return;
+	ni->ni_he_oper = data[0] | (data[1] << 8) | (data[2] << 16) |
+	    ((u_int32_t)data[3] << 24);
+	if (isprobe)
+		ni->ni_he_basic_mcs = data[4] | (data[5] << 8);
+}
+
+/* MU EDCA Parameter Set: QoS Info, then records for BE, BK, VI, VO. */
+void
+ieee80211_setup_he_muedca(struct ieee80211_node *ni, const u_int8_t *data,
+    u_int8_t len)
+{
+	int ac;
+
+	if (len < 1 + 4 * 3) {
+		ni->ni_he_mu_edca_valid = 0;
+		return;
+	}
+	for (ac = 0; ac < 4; ac++) {
+		ni->ni_he_mu_edca[ac].aci_aifsn = data[1 + 3 * ac];
+		ni->ni_he_mu_edca[ac].ecw_min_max = data[2 + 3 * ac];
+		ni->ni_he_mu_edca[ac].mu_edca_timer = data[3 + 3 * ac];
+	}
+	ni->ni_he_mu_edca_valid = 1;
+}
+
+/* Whether to offer HE: HT is offered and the driver turned HE on. */
+int
+ieee80211_he_wanted(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+	return (ic->ic_flags_ext & IEEE80211_FEXT_HEON) &&
+	    ieee80211_ht_wanted(ic, ni);
+}
+
+/*
+ * Decide on HE after a successful (re)association, once HT (and VHT) is
+ * settled: we offered it, the AP is HE, and we do its basic HE-MCS set
+ * on the streams we have (as with VHT, APs ask for more than they mean).
+ */
+void
+ieee80211_he_negotiate(struct ieee80211com *ic, struct ieee80211_node *ni)
+{
+	int n;
+
+	ni->ni_flags &= ~IEEE80211_NODE_HE;
+	if ((ni->ni_flags & IEEE80211_NODE_HT) == 0 ||
+	    !ieee80211_he_wanted(ic, ni) || !ieee80211_node_supports_he(ni))
+		return;
+	for (n = 1; n <= IEEE80211_HE_NUM_SS; n++) {
+		u_int16_t basic_mcs = (ni->ni_he_basic_mcs &
+		    IEEE80211_HE_MCS_FOR_SS_MASK(n)) >>
+		    IEEE80211_HE_MCS_FOR_SS_SHIFT(n);
+		u_int16_t rx_mcs = (ic->ic_he_rxmcs_80 &
+		    IEEE80211_HE_MCS_FOR_SS_MASK(n)) >>
+		    IEEE80211_HE_MCS_FOR_SS_SHIFT(n);
+
+		if (rx_mcs == IEEE80211_HE_MCS_SS_NOT_SUPP) {
+			if (n == 1)
+				return;
+			continue;
+		}
+		if (basic_mcs != IEEE80211_HE_MCS_SS_NOT_SUPP &&
+		    basic_mcs > rx_mcs)
+			return;
+	}
+	ni->ni_flags |= IEEE80211_NODE_HE;
 }

@@ -206,6 +206,16 @@ struct ieee80211com {
 	u_int16_t		ic_vht_rx_max_lgi_mbit_s;
 	u_int16_t		ic_vht_txmcs;
 	u_int16_t		ic_vht_tx_max_lgi_mbit_s;
+	/*
+	 * LISPBSD: 802.11ax (HE) capabilities, offered when
+	 * IEEE80211_FEXT_HEON is set too and the AP is HE (2.4 and 5 GHz).
+	 */
+	u_int8_t		ic_he_mac_cap[IEEE80211_HE_MAC_CAPS_LEN];
+	u_int8_t		ic_he_phy_cap[IEEE80211_HE_PHY_CAPS_LEN];
+	u_int16_t		ic_he_rxmcs_80;
+	u_int16_t		ic_he_txmcs_80;
+	u_int8_t		ic_he_ppe[IEEE80211_HE_PPE_MAXLEN];
+	u_int8_t		ic_he_ppe_len;
 	int			(*ic_ampdu_rx_start)(struct ieee80211com *,
 				    struct ieee80211_node *, u_int8_t);
 	void			(*ic_ampdu_rx_stop)(struct ieee80211com *,
@@ -306,6 +316,7 @@ extern struct ieee80211com_head ieee80211com_head;
 #define	IEEE80211_FEXT_UAPSD	0x00000100	/* CONF: request U-APSD */
 #define	IEEE80211_FEXT_HTON	0x00000200	/* LISPBSD CONF: request HT (11n) */
 #define	IEEE80211_FEXT_VHTON	0x00000400	/* LISPBSD CONF: request VHT (11ac) */
+#define	IEEE80211_FEXT_HEON	0x00000800	/* LISPBSD CONF: request HE (11ax) */
 #define	IEEE80211_FEXT_PROBECHAN 0x00020000	/* CONF: probe passive channel*/
 
 /* ic_caps */

@@ -2235,6 +2235,24 @@ ieee80211_recv_mgmt_beacon(struct ieee80211com *ic, struct mbuf *m0,
 		case IEEE80211_ELEMID_VHTOP:
 			scan.sp_vhtop = frm;
 			break;
+		case IEEE80211_ELEMID_EXTENSION:	/* LISPBSD: 802.11ax */
+			if (frm[1] < 1)
+				break;
+			switch (frm[2]) {
+			case IEEE80211_ELEMID_EXT_HECAP:
+				scan.sp_hecap = frm;
+				break;
+			case IEEE80211_ELEMID_EXT_HEOP:
+				scan.sp_heop = frm;
+				break;
+			case IEEE80211_ELEMID_EXT_MU_EDCA:
+				scan.sp_muedca = frm;
+				break;
+			case IEEE80211_ELEMID_EXT_UORA:
+				scan.sp_uora = frm;
+				break;
+			}
+			break;
 		case IEEE80211_ELEMID_VENDOR:
 			/* no length check needed */
 			if (iswpaoui(frm))
@@ -2845,6 +2863,7 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 	struct ieee80211_frame *wh;
 	u_int8_t *frm, *efrm;
 	u_int8_t *rates, *xrates, *wme, *htcap, *htop, *vhtcap, *vhtop;
+	u_int8_t *hecap, *heop, *muedca, *uora;
 	u_int8_t rate, wmm_qosinfo = 0;
 	int has_wmm_qosinfo = 0;
 	IEEE80211_DEBUGVAR(char ebuf[3 * ETHER_ADDR_LEN]);
@@ -2890,6 +2909,7 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 	frm += 2;
 
 	rates = xrates = wme = htcap = htop = vhtcap = vhtop = NULL;
+	hecap = heop = muedca = uora = NULL;
 	while (frm + 1 < efrm) {
 		IEEE80211_VERIFY_LENGTH(efrm - frm, frm[1] + 2);
 
@@ -2911,6 +2931,18 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 			break;
 		case IEEE80211_ELEMID_VHTOP:
 			vhtop = frm;
+			break;
+		case IEEE80211_ELEMID_EXTENSION:
+			if (frm[1] < 1)
+				break;
+			if (frm[2] == IEEE80211_ELEMID_EXT_HECAP)
+				hecap = frm;
+			else if (frm[2] == IEEE80211_ELEMID_EXT_HEOP)
+				heop = frm;
+			else if (frm[2] == IEEE80211_ELEMID_EXT_MU_EDCA)
+				muedca = frm;
+			else if (frm[2] == IEEE80211_ELEMID_EXT_UORA)
+				uora = frm;
 			break;
 		case IEEE80211_ELEMID_VENDOR:
 			if (iswmeoui(frm))
@@ -2977,6 +3009,17 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 			ieee80211_setup_vhtop(ni, vhtop + 2, vhtop[1]);
 	}
 	ieee80211_vht_negotiate(ic, ni);
+	/* LISPBSD: 802.11ax, if we offered it */
+	if (hecap != NULL && htcap != NULL) {
+		ieee80211_setup_hecaps(ni, hecap + 3, hecap[1] - 1);
+		if (heop != NULL)
+			ieee80211_setup_heop(ni, heop + 3, heop[1] - 1, 0);
+	}
+	if (muedca != NULL)
+		ieee80211_setup_he_muedca(ni, muedca + 3, muedca[1] - 1);
+	if (uora != NULL && uora[1] >= 2)
+		ni->ni_he_uora = uora[3];
+	ieee80211_he_negotiate(ic, ni);
 
 	/*
 	 * Configure state now that we are associated.
@@ -3016,6 +3059,7 @@ ieee80211_recv_mgmt_assoc_resp(struct ieee80211com *ic, struct mbuf *m0,
 	    ic->ic_flags&IEEE80211_F_SHSLOT ? "short" : "long",
 	    ic->ic_flags&IEEE80211_F_USEPROT ? ", protection" : "",
 	    ni->ni_flags & IEEE80211_NODE_QOS ? ", QoS" : "",
+	    ni->ni_flags & IEEE80211_NODE_HE ? ", HE" :
 	    ni->ni_flags & IEEE80211_NODE_VHT ? ", VHT" :
 	    ni->ni_flags & IEEE80211_NODE_HT ? ", HT" : "",
 	    (ic->ic_flags_ext & IEEE80211_FEXT_UAPSD) ?

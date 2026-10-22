@@ -99,8 +99,47 @@ byte crosses the air twice.
    =KNOB=hw.iwx.vht sh up-ab.sh= (ncat listener on the workstation).
 5. If good: =hw.iwx.vht=1= in /etc/sysctl.conf.
 
+* 802.11ax (HE): written 2026-10-22 evening, NOT yet run on the Nano
+Behind =hw.iwx.he= (default 0, needs =hw.iwx.ht=1, 2.4 and 5 GHz).
+Compile-checked in the gefs VM; nanobsd only, the Nano runs kernel 200.
+
+- net80211 (after OpenBSD): Element ID Extension parsing in beacons and
+  the association response (HE Capabilities incl. PPE thresholds, HE
+  Operation, MU EDCA Parameter Set, UORA), =ieee80211_he_negotiate= (HT
+  first; basic HE-MCS set checked on our streams only, as for VHT), our HE
+  Capabilities element after the VHT one.
+- iwx (after Linux iwlwifi mvm, which OpenBSD's iwx lacks):
+  - capabilities = Linux's station template for the 22000 family with the
+    HR RF (no 1024-QAM in small RUs), 2x2 fixups, no 160 MHz, no A-MSDU in
+    A-MPDU (we refuse it in ADDBA anyway), PPE thresholds 61 1c c7 71;
+  - STA_HE_CTXT_CMD v1/v2/v3 (=iwx_he_sta_ctxt_cmd=): BSS color, default PE
+    duration and RTS threshold from HE Operation, HT-control flags from the
+    AP's MAC caps, the packet extension table from the AP's PPE thresholds
+    or nominal padding, MU EDCA, UORA; sent in =iwx_run= after the MAC
+    context; struct sizes asserted against Linux (80/88/92);
+  - MAC context =IWX_MAC_FILTER_IN_11AX=, TLC in HE mode (MCS 0-11 per
+    stream, LDPC, DCM, STBC; no SGI bits: the firmware picks the HE GI),
+    ADD_STA MIMO from the HE-MCS map, =ht_status= =assoc=he=, the AP's HE
+    elements (=ap_he_mcs=, =ap_he_ppe=, =heop=, =bss_color=, =mu_edca=,
+    =uora=) and an =rx_he= counter.
+- Fixed in if_iwxreg.h on the way: =IWX_RATE_MCS_HE_MSK_V1= named
+  =RATE_MCS_HE_POS_V1= (never used before, so never compiled).
+- No HE AP to test with here: the Zyxel is 11ac only (no HE elements; the
+  workstation's AX-capable card connects to it with VHT), and the
+  workstation sees no HE AP.  "net6" (ASUS, DFS channel 64, seen by the
+  Nano) may be one.
+
+** Test procedure
+1. Build 201 on the Nano from nanobsd, 200 stays the previous entry.
+2. On the Zyxel: =sh ht-test.sh he= must associate as VHT as before (a
+   non-HE AP ignores our HE Capabilities element).
+3. At an 11ax AP: =ht-test.sh he=, then =hw.iwx.ht_status= should show
+   =assoc=he=, =rx_he= counting, rx =rate_n_flags= mod type 4 (bits 8-10).
+4. A/B with =KNOB=hw.iwx.he=.
+
 * Not done
 - Idle and transfer power not measured yet (fewer airtime-seconds per byte
   should help; two chains during MIMO bursts cost some).
 - s2idle with HT associated is untested.
-- No 160 MHz (the Zyxel does not do it either), no HE (11ax).
+- No 160 MHz (the Zyxel does not do it either); HE untested on hardware;
+  no TWT (target wake time, an HE power saver needing AP support).

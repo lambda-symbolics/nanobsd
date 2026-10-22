@@ -1462,6 +1462,32 @@ ieee80211_add_vhtcaps(u_int8_t *frm, struct ieee80211com *ic)
 }
 
 /*
+ * LISPBSD: add an HE Capabilities element (802.11ax-2021 9.4.2.248).
+ */
+u_int8_t *
+ieee80211_add_hecaps(u_int8_t *frm, struct ieee80211com *ic)
+{
+	/* No 160 or 80+80 MHz MCS/NSS fields: the driver offers neither. */
+	KASSERT(IEEE80211_HE_MCS_NSS_SIZE(ic->ic_he_phy_cap[0]) ==
+	    IEEE80211_HE_MCS_NSS_80_LEN);
+	*frm++ = IEEE80211_ELEMID_EXTENSION;
+	*frm++ = 1 + IEEE80211_HE_CAPS_FIXED_LEN + IEEE80211_HE_MCS_NSS_80_LEN +
+	    ic->ic_he_ppe_len;
+	*frm++ = IEEE80211_ELEMID_EXT_HECAP;
+	memcpy(frm, ic->ic_he_mac_cap, IEEE80211_HE_MAC_CAPS_LEN);
+	frm += IEEE80211_HE_MAC_CAPS_LEN;
+	memcpy(frm, ic->ic_he_phy_cap, IEEE80211_HE_PHY_CAPS_LEN);
+	frm += IEEE80211_HE_PHY_CAPS_LEN;
+	*frm++ = ic->ic_he_rxmcs_80 & 0xff;
+	*frm++ = ic->ic_he_rxmcs_80 >> 8;
+	*frm++ = ic->ic_he_txmcs_80 & 0xff;
+	*frm++ = ic->ic_he_txmcs_80 >> 8;
+	memcpy(frm, ic->ic_he_ppe, ic->ic_he_ppe_len);
+	frm += ic->ic_he_ppe_len;
+	return frm;
+}
+
+/*
  * LISPBSD: send a Block Ack action frame (802.11-2012 8.5.5).  arg is
  * the TID for an ADDBA request (the rest comes from ni_tx_ba[tid]),
  * status << 16 | token << 8 | tid for an ADDBA response and
@@ -1780,6 +1806,7 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 		 *	[tlv] user-specified ie's
 		 *	[tlv] HT capabilities (LISPBSD)
 		 *	[tlv] VHT capabilities (LISPBSD)
+		 *	[tlv] HE capabilities (LISPBSD)
 		 */
 		m = ieee80211_getmgtframe(&frm,
 			 sizeof(u_int16_t)
@@ -1792,6 +1819,8 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 		       + (ic->ic_opt_ie != NULL ? ic->ic_opt_ie_len : 0)
 		       + 2 + 26
 		       + 2 + 12
+		       + 3 + IEEE80211_HE_CAPS_FIXED_LEN + 12
+		       + IEEE80211_HE_PPE_MAXLEN
 		);
 		if (m == NULL)
 			senderr(ENOMEM, is_tx_nobuf);
@@ -1847,6 +1876,8 @@ ieee80211_send_mgmt(struct ieee80211com *ic, struct ieee80211_node *ni,
 			frm = ieee80211_add_htcaps(frm, ic);
 		if (ieee80211_vht_wanted(ic, ni))
 			frm = ieee80211_add_vhtcaps(frm, ic);
+		if (ieee80211_he_wanted(ic, ni))
+			frm = ieee80211_add_hecaps(frm, ic);
 		m->m_pkthdr.len = m->m_len = frm - mtod(m, u_int8_t *);
 
 		timer = IEEE80211_TRANS_WAIT;

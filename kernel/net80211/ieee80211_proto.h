@@ -77,6 +77,15 @@ int	ieee80211_setup_vhtop(struct ieee80211_node *, const u_int8_t *,
 int	ieee80211_vht_wanted(struct ieee80211com *, struct ieee80211_node *);
 void	ieee80211_vht_negotiate(struct ieee80211com *, struct ieee80211_node *);
 u_int8_t *ieee80211_add_vhtcaps(u_int8_t *, struct ieee80211com *);
+void	ieee80211_setup_hecaps(struct ieee80211_node *, const u_int8_t *,
+	    u_int8_t);
+void	ieee80211_setup_heop(struct ieee80211_node *, const u_int8_t *,
+	    u_int8_t, int);
+void	ieee80211_setup_he_muedca(struct ieee80211_node *, const u_int8_t *,
+	    u_int8_t);
+int	ieee80211_he_wanted(struct ieee80211com *, struct ieee80211_node *);
+void	ieee80211_he_negotiate(struct ieee80211com *, struct ieee80211_node *);
+u_int8_t *ieee80211_add_hecaps(u_int8_t *, struct ieee80211com *);
 u_int8_t *ieee80211_add_htcaps(u_int8_t *, struct ieee80211com *);
 int	ieee80211_send_action(struct ieee80211com *, struct ieee80211_node *,
 	    u_int8_t, u_int8_t, u_int32_t);
