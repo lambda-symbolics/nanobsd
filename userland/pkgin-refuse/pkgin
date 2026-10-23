@@ -1,0 +1,20 @@
+#!/bin/sh
+# pkgin is disabled on this machine.
+#
+# Packages here are built from the local pkgsrc tree, several with our own
+# patches (MesaLib, libopeninput, mpv, ...).  On 2026-10-23 a pkgin run
+# half-upgraded 155 packages from the binary repository, which lacked the
+# glib2 its own packages needed: pkgin removed cairo, pango, gtk3, gtk4,
+# dbus and more before failing to add their replacements, and Mahogany,
+# Firefox and Emacs stopped starting.  Recovery: /root/nanobsd docs
+# pkgin-rollback-2026-10-23.org (/usr/pkg restored from a gefs snapshot).
+#
+# Build from source instead:  cd /usr/pkgsrc/CATEGORY/NAME && make install
+# The original binary is /usr/pkg/bin/pkgin.real, mode 000.
+cat >&2 <<'MSG'
+pkgin is disabled on this machine: it replaces our patched local builds
+with binary packages and broke the desktop on 2026-10-23.
+Build from source instead:  cd /usr/pkgsrc/<category>/<name> && make install
+(local packages: /usr/pkgsrc/packages/All, pkg_add from there)
+MSG
+exit 1
