@@ -1,0 +1,32 @@
+#+TITLE: Undoing a pkgin run with a gefs snapshot
+#+DATE: 2026-10-23
+
+* What happened
+10:59-11:02 UTC a =pkgin= run upgraded or reinstalled 155 packages from the
+binary repository (97 upgrades, 10 installs, 48 "refreshes" of the same
+version, which replace local builds).  The repository was mid-rebuild:
+=glib2>=2.88.3nb1= and =fftw= were missing, so every add that needed them
+failed *after* pkgin had already removed the old version.  Gone: cairo,
+pango, harfbuzz, dbus, at-spi2-core, gtk3+, gtk4, shared-mime-info, mpv
+(our local build), librsvg and more.  Mahogany died at start:
+=libheart.so: Shared object "libcairo.so.2" not found= (~/.mahogany.log),
+and startmh's pixman retry failed the same way.  Firefox and Emacs (gtk3)
+were broken too.  Outside /usr/pkg only /etc/shells changed (same lines,
+reordered).  graphviz itself had been built from source at 10:35 UTC.
+
+* Recovery (root on gefs+, automatic snapshots, labels in UTC)
+#+begin_src sh
+gefs status /                                    # list main@hour.* etc.
+mount -r -t gefs -o snap=main@hour.2026.10.23_10:34:56 /dev/dk1 /mnt/s1034
+gefs snap / main pkgin-wreck-20261023            # keep the broken state
+env LD_LIBRARY_PATH=/mnt/s1034/usr/pkg/lib /mnt/s1034/usr/pkg/bin/rsync \
+    -aH --delete --numeric-ids /mnt/s1034/usr/pkg/ /usr/pkg/
+pkg_add /usr/pkgsrc/packages/All/graphviz-14.1.5nb2.tgz
+#+end_src
+- =mount= needs =-r= for a snapshot.  Use the snapshot's own rsync and
+  libraries so nothing depends on the half-upgraded tree.
+- The 11:00:02 label was taken 34 s into the pkgin run: half-modified.
+- Result: 0 missing libraries for libheart, wlroots, firefox, emacs, mpv,
+  foot, alacritty, dot; 343 packages as before plus graphviz.
+- =pkgin-wreck-20261023= can be deleted once the session is confirmed:
+  =gefs delsnap / pkgin-wreck-20261023=.
