@@ -48,7 +48,7 @@ images were lost.  The timeslice timer had the same stale state, which forced
 needless preemptions.  cancel_timer() at reset prepare did not clear it
 either, hence the back-to-back reset bursts.
 
-* Fix (kernel 202, build #204)
+* Fix (kernel 202, build #203)
 i915_utils.c: on NetBSD, cancel_timer() calls callout_stop(), which clears
 CALLOUT_FIRED.  The evcnt "i915 cancel after fire" (vmstat -e) counts the
 cancels that found a fired timer, i.e. the cases that used to stay "expired".
