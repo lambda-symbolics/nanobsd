@@ -1,0 +1,72 @@
+#+TITLE: rcs0 resets and the frozen, flickering screen (2026-10-23, kernel 202)
+
+* Symptom
+The screen flickered between two still frames: mpv fullscreen, and mpv as a
+full-width column.  Sound kept playing and the picture did not move.  It had
+happened a few times before, always "with mpv around".
+
+* What the live session showed (kernel 200)
+- dmesg: "Resetting rcs0 for preemption time out" three times, 3 s apart.  Each
+  engine reset failed its handshake (RESET_CTL ready never set, ret -60).  The
+  heartbeat then reset the chip: the request was forced through the non-ready
+  path and mpv was blamed ("mpv[3636] context reset due to GPU hang").
+- After that the GPU worked: a fresh GLES context (glprobe.c: clear, draw a
+  triangle, read back) gave the right pixels.
+- Mahogany kept submitting about 21 execbufs/s, and every ioctl returned 0.
+  But grim (which renders through Mahogany's renderer) gave a solid black
+  frame, and repainting the whole output changed nothing.
+- So the forced reset left Mahogany's context state lost, without telling it.
+  Its renders drew nothing, and the scanout cycled through the two swapchain
+  buffers that still held the last good frames: fullscreen and column (probably
+  a fullscreen toggle right before the reset).
+- GET_RESET_STATS showed nothing for Mahogany.  __execlists_reset only marks
+  the request on the engine, so wlroots never saw a lost renderer.  Restarting
+  Mahogany (startmh) recovered.
+
+* The history
+/var/log/messages since 10-04 holds thousands of "preemption time out"
+resets: 1019 within about a second on 10-10, and 815 on 10-19.  They come a
+few ms apart, while the timeout is 640 ms.  The context blamed in the eight
+chip resets is whoever was running: mahogany, alacritty, transmission-gtk,
+and mpv three times on 10-23.  So the trigger is not one workload.
+
+* Root cause: cancel_timer() could not cancel a timer that had fired
+i915 checks its preempt and timeslice timers with timer_expired().  On
+NetBSD that is callout_expired(), which reads CALLOUT_FIRED.  cancel_timer()
+called del_timer(), and the compat del_timer() returns early when the callout
+is not pending, so a timer that had fired was never stopped.  CALLOUT_FIRED
+stayed set until the next re-arm.  Linux clears expires there, and the port
+had #ifdef'd that out.
+
+Effect: once the 640 ms preempt timer fired (normally harmless, with nothing
+pending), every later submission to an idle engine "cancelled" it without
+effect.  The next tasklet run that found an ELSP submission pending saw
+preempt_timeout() = true and reset a healthy rcs0 in the middle of a batch
+or a context load.  The busy engine (most likely) could not reach ready-to-reset in time,
+the heartbeat escalated to a forced chip reset, and the innocent contexts'
+images were lost.  The timeslice timer had the same stale state, which forced
+needless preemptions.  cancel_timer() at reset prepare did not clear it
+either, hence the back-to-back reset bursts.
+
+* Fix (kernel 202, build #204)
+i915_utils.c: on NetBSD, cancel_timer() calls callout_stop(), which clears
+CALLOUT_FIRED.  The evcnt "i915 cancel after fire" (vmstat -e) counts the
+cancels that found a fired timer, i.e. the cases that used to stay "expired".
+
+* To verify
+- dmesg and /var/log/messages: no "preemption time out" resets during
+  normal use and mpv playback.
+- vmstat -e | grep i915: the counter grows, so the condition is real and now
+  handled.
+- Power: fewer forced timeslice preemptions on rcs0; measure if worth it.
+
+* Not done
+- Mahogany does not handle wlroots' renderer "lost".  Even if it did, a
+  forced reset does not mark innocent contexts, so wlroots would not see it.
+  Not needed while resets are real hangs only; revisit if a real hang shows
+  up again.
+- On a failed reset handshake, STOP_RING stays set (MI_MODE 0x100) until the
+  chip reset.
+- Evidence: /var/tmp/gpuhang-20261023-2246 on the Nano (dmesg, Mahogany log,
+  rcshang register dumps after recovery, glprobe.c, ktrace of Mahogany and
+  mpv).

@@ -6,6 +6,10 @@
  */
 
 #include <sys/cdefs.h>
+#ifdef __NetBSD__
+#include <sys/callout.h>
+#include <sys/evcnt.h>
+#endif
 __KERNEL_RCSID(0, "$NetBSD: i915_utils.c,v 1.4 2021/12/19 11:37:41 riastradh Exp $");
 
 #include <drm/drm_drv.h>
@@ -103,15 +107,33 @@ bool i915_error_injected(void)
 
 #endif
 
-void cancel_timer(struct timer_list *t)
-{
-#ifndef __NetBSD__
-	if (!READ_ONCE(t->expires))
-		return;
+#ifdef __NetBSD__
+/* LISPBSD: cancels that found the timer already fired (vmstat -e). */
+static struct evcnt lispbsd_timer_fired_ev =
+    EVCNT_INITIALIZER(EVCNT_TYPE_MISC, NULL, "i915", "cancel after fire");
+EVCNT_ATTACH_STATIC(lispbsd_timer_fired_ev);
 #endif
 
+void cancel_timer(struct timer_list *t)
+{
+#ifdef __NetBSD__
+	/*
+	 * LISPBSD: timer_expired() is callout_expired(), which reads
+	 * CALLOUT_FIRED.  del_timer() returns early when the callout is
+	 * not pending, so a timer that had fired stayed "expired" until
+	 * it was re-armed: the preempt timer then reported a timeout for
+	 * every later submission to an idle engine and reset a healthy
+	 * rcs0 mid-batch, and the timeslice timer forced needless
+	 * preemptions.  callout_stop() clears CALLOUT_FIRED, which is
+	 * what Linux gets from expires = 0.
+	 */
+	if (callout_stop(&t->tl_callout))
+		lispbsd_timer_fired_ev.ev_count++;
+#else
+	if (!READ_ONCE(t->expires))
+		return;
+
 	del_timer(t);
-#ifndef __NetBSD__
 	WRITE_ONCE(t->expires, 0);
 #endif
 }
