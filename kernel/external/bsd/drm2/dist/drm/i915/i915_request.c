@@ -999,10 +999,16 @@ i915_request_await_dma_fence(struct i915_request *rq, struct dma_fence *fence)
 
 	do {
 		fence = *child++;
-		if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags)) {
-			i915_sw_fence_set_error_once(&rq->submit, fence->error);
+		/*
+		 * LISPBSD: Linux 3761baae908a (revert of 9e31c1fe45d5).  An
+		 * already signaled fence's error is not copied into this
+		 * request: it skipped the request, the skipped request's
+		 * fence carried the error into the next await, and one hung
+		 * client (mpv) left the compositor's every later render a
+		 * no-op.  Gen12 has no command parser relying on it.
+		 */
+		if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags))
 			continue;
-		}
 
 		/*
 		 * Requests on the same timeline are explicitly ordered, along
@@ -1109,10 +1115,9 @@ i915_request_await_execution(struct i915_request *rq,
 
 	do {
 		fence = *child++;
-		if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags)) {
-			i915_sw_fence_set_error_once(&rq->submit, fence->error);
+		/* LISPBSD: no error copied from a signaled fence, see above. */
+		if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags))
 			continue;
-		}
 
 		/*
 		 * We don't squash repeated fence dependencies here as we
