@@ -87,6 +87,9 @@ and the desktop kept rendering.
 Verified: 4 min HDR playback, 0 resets; a playback capture has clean edges
 and no strongly coloured pixels (grim reads the composited image, not the
 scanout: the user has to judge the fringes).
+2026-10-25: the user confirms the fringes are gone in mpv on kernel 206.
+Not bisected between the AUX invalidation and the HDC flush; both are
+correct as Linux has them.
 
 * Not done
 - Mahogany still has no renderer-loss recovery and ignores the result of
