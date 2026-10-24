@@ -3166,6 +3166,7 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
 #define GEN7_FF_THREAD_MODE		_MMIO(0x20a0)
 #define   GEN7_FF_SCHED_MASK		0x0077070
 #define   GEN8_FF_DS_REF_CNT_FFME	(1 << 19)
+#define   GEN12_FF_TESSELATION_DOP_GATE_DISABLE	(1 << 19) /* LISPBSD: from Linux */
 #define   GEN7_FF_TS_SCHED_HS1		(0x5 << 16)
 #define   GEN7_FF_TS_SCHED_HS0		(0x3 << 16)
 #define   GEN7_FF_TS_SCHED_LOAD_BALANCE	(0x1 << 16)
@@ -7838,6 +7839,11 @@ enum {
 #define HIZ_CHICKEN					_MMIO(0x7018)
 # define CHV_HZ_8X8_MODE_IN_1X				(1 << 15)
 # define BDW_HIZ_POWER_COMPILER_CLOCK_GATING_DISABLE	(1 << 3)
+# define HZ_DEPTH_TEST_LE_GE_OPT_DISABLE		(1 << 13) /* LISPBSD: from Linux */
+
+/* LISPBSD: from Linux */
+#define COMMON_SLICE_CHICKEN4				_MMIO(0x7300)
+# define DISABLE_TDC_LOAD_BALANCING_CALC		(1 << 6)
 
 #define GEN9_SLICE_COMMON_ECO_CHICKEN0		_MMIO(0x7308)
 #define  DISABLE_PIXEL_MASK_CAMMING		(1 << 14)
@@ -7927,6 +7933,8 @@ enum {
 #define FF_MODE2			_MMIO(0x6604)
 #define   FF_MODE2_TDS_TIMER_MASK	REG_GENMASK(23, 16)
 #define   FF_MODE2_TDS_TIMER_128	REG_FIELD_PREP(FF_MODE2_TDS_TIMER_MASK, 4)
+#define   FF_MODE2_GS_TIMER_MASK	REG_GENMASK(31, 24)	/* LISPBSD: from Linux */
+#define   FF_MODE2_GS_TIMER_224	REG_FIELD_PREP(FF_MODE2_GS_TIMER_MASK, 224)
 
 /* PCH */
 
@@ -9115,6 +9123,7 @@ enum {
 
 #define GEN10_SAMPLER_MODE		_MMIO(0xE18C)
 #define   GEN11_SAMPLER_ENABLE_HEADLESS_MSG	REG_BIT(5)
+#define   ENABLE_SMALLPL			REG_BIT(15)	/* LISPBSD: from Linux */
 
 /* IVYBRIDGE DPF */
 #define GEN7_L3CDERRST1(slice)		_MMIO(0xB008 + (slice) * 0x200) /* L3CD Error Status 1 */
@@ -9156,6 +9165,11 @@ enum {
 #define   DOP_CLOCK_GATING_DISABLE	(1 << 0)
 #define   PUSH_CONSTANT_DEREF_DISABLE	(1 << 8)
 #define   GEN11_TDL_CLOCK_GATING_FIX_DISABLE	(1 << 1)
+#define   GEN12_DISABLE_EARLY_READ	(1 << 14)	/* LISPBSD: from Linux */
+
+/* LISPBSD: from Linux */
+#define GEN9_ROW_CHICKEN4		_MMIO(0xe48c)
+#define   GEN12_DISABLE_TDL_PUSH	(1 << 9)
 
 #define HSW_ROW_CHICKEN3		_MMIO(0xe49c)
 #define  HSW_ROW_CHICKEN3_L3_GLOBAL_ATOMICS_DISABLE    (1 << 6)

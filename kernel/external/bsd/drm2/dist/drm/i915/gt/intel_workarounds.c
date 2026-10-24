@@ -582,24 +582,38 @@ static void icl_ctx_workarounds_init(struct intel_engine_cs *engine,
 static void tgl_ctx_workarounds_init(struct intel_engine_cs *engine,
 				     struct i915_wa_list *wal)
 {
-	u32 val;
-
 	/* Wa_1409142259:tgl */
 	WA_SET_BIT_MASKED(GEN11_COMMON_SLICE_CHICKEN3,
 			  GEN12_DISABLE_CPS_AWARE_COLOR_PIPE);
 
-	/* Wa_1604555607:tgl */
-	val = intel_uncore_read(engine->uncore, FF_MODE2);
-	val &= ~FF_MODE2_TDS_TIMER_MASK;
-	val |= FF_MODE2_TDS_TIMER_128;
 	/*
-	 * FIXME: FF_MODE2 register is not readable till TGL B0. We can
-	 * enable verification of WA from the later steppings, which enables
-	 * the read of FF_MODE2.
+	 * LISPBSD: the rest is Linux gen12_ctx_workarounds_init (v6.6).
+	 *
+	 * WaDisableGPGPUMidThreadPreemption:gen12.  Without it a preemption
+	 * request (timeslice, display boost) that lands in a compute
+	 * dispatch asks for mid-thread preemption, which needs a system
+	 * routine nobody installs: rcs0 never acknowledges, never reaches
+	 * ready-to-reset, and the heartbeat resets the chip (mpv's HDR peak
+	 * detection, every time).
 	 */
-	wa_add(wal, FF_MODE2, FF_MODE2_TDS_TIMER_MASK, val,
-	       IS_TGL_REVID(engine->i915, TGL_REVID_A0, TGL_REVID_A0) ? 0 :
-			    FF_MODE2_TDS_TIMER_MASK);
+	WA_SET_FIELD_MASKED(GEN8_CS_CHICKEN1,
+			    GEN9_PREEMPT_GPGPU_LEVEL_MASK,
+			    GEN9_PREEMPT_GPGPU_THREAD_GROUP_LEVEL);
+
+	/*
+	 * Wa_1604555607, Wa_16011163337 (GS timer), Wa_1608008084: FF_MODE2
+	 * reads back wrong from the CPU, so write the whole value instead
+	 * of a read-modify-write, and do not verify it.
+	 */
+	wa_add(wal, FF_MODE2, ~0,
+	       FF_MODE2_TDS_TIMER_128 | FF_MODE2_GS_TIMER_224, 0);
+
+	/* Wa_1806527549 */
+	WA_SET_BIT_MASKED(HIZ_CHICKEN, HZ_DEPTH_TEST_LE_GE_OPT_DISABLE);
+
+	/* Wa_1606376872 */
+	WA_SET_BIT_MASKED(COMMON_SLICE_CHICKEN4,
+			  DISABLE_TDC_LOAD_BALANCING_CALC);
 }
 
 static void
@@ -1261,6 +1275,18 @@ static void tgl_whitelist_build(struct intel_engine_cs *engine)
 		whitelist_reg_ext(w, PS_INVOCATION_COUNT,
 				  RING_FORCE_TO_NONPRIV_ACCESS_RD |
 				  RING_FORCE_TO_NONPRIV_RANGE_4);
+
+		/*
+		 * LISPBSD, as in Linux tgl_whitelist_build:
+		 * Wa_1808121037, Wa_1508744258 (Mesa toggles RHWO in it)
+		 */
+		whitelist_reg(w, GEN7_COMMON_SLICE_CHICKEN1);
+
+		/* Wa_1806527549 */
+		whitelist_reg(w, HIZ_CHICKEN);
+
+		/* Recommended tuning setting (not a workaround) */
+		whitelist_reg(w, GEN11_COMMON_SLICE_CHICKEN3);
 		break;
 	default:
 		break;
@@ -1354,6 +1380,42 @@ rcs_engine_wa_init(struct intel_engine_cs *engine, struct i915_wa_list *wal)
 			    GEN7_DISABLE_SAMPLER_PREFETCH);
 	}
 
+	if (IS_TIGERLAKE(i915)) {
+		/*
+		 * LISPBSD: the TGL entries of Linux rcs_engine_wa_init
+		 * (v6.6); this tree had them for A0 silicon only.
+		 */
+
+		/* Wa_1606931601:tgl */
+		wa_masked_en(wal, GEN7_ROW_CHICKEN2, GEN12_DISABLE_EARLY_READ);
+
+		/* Wa_18011464164:tgl[B0+], Wa_22010931296:tgl[B0+] */
+		wa_write_or(wal, GEN7_FF_THREAD_MODE,
+			    GEN12_FF_TESSELATION_DOP_GATE_DISABLE);
+
+		/*
+		 * Wa_1606700617:tgl, Wa_22010271021:tgl,
+		 * Wa_14010826681:tgl
+		 */
+		wa_masked_en(wal, GEN9_CS_DEBUG_MODE1,
+			     FF_DOP_CLOCK_GATE_DISABLE);
+
+		/* Wa_1409804808 */
+		wa_masked_en(wal, GEN7_ROW_CHICKEN2,
+			     PUSH_CONSTANT_DEREF_DISABLE);
+
+		/* Wa_14010229206 */
+		wa_masked_en(wal, GEN9_ROW_CHICKEN4, GEN12_DISABLE_TDL_PUSH);
+
+		/* Wa_1607297627 (all steppings, per Linux) */
+		wa_masked_en(wal, GEN6_RC_SLEEP_PSMI_CONTROL,
+			     GEN12_WAIT_FOR_EVENT_POWER_DOWN_DISABLE |
+			     GEN8_RC_SEMA_IDLE_MSG_DISABLE);
+
+		/* Wa_1406941453:tgl */
+		wa_masked_en(wal, GEN10_SAMPLER_MODE, ENABLE_SMALLPL);
+	}
+
 	if (IS_GEN(i915, 11)) {
 		/* This is not an Wa. Enable for better image quality */
 		wa_masked_en(wal,
@@ -1419,8 +1481,12 @@ rcs_engine_wa_init(struct intel_engine_cs *engine, struct i915_wa_list *wal)
 				   0);
 	}
 
-	if (IS_GEN_RANGE(i915, 9, 11)) {
-		/* FtrPerCtxtPreemptionGranularityControl:skl,bxt,kbl,cfl,cnl,icl */
+	if (IS_GEN_RANGE(i915, 9, 12)) {
+		/*
+		 * FtrPerCtxtPreemptionGranularityControl:skl,bxt,kbl,cfl,cnl,icl
+		 * LISPBSD: and tgl, as in Linux; without it the per-context
+		 * CS_CHICKEN1 preemption level above is not honoured.
+		 */
 		wa_masked_en(wal,
 			     GEN7_FF_SLICE_CS_CHICKEN1,
 			     GEN9_FFSC_PERCTX_PREEMPT_CTRL);
