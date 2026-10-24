@@ -1,5 +1,14 @@
 #+TITLE: rcs0 resets and the frozen, flickering screen (2026-10-23, kernel 202)
 
+* Correction (2026-10-24)
+The timer fix below is real and stays, but this was not the whole story,
+and the explanation of the frozen screen here is wrong.  The hang is mpv's
+HDR peak-detection compute shader being preempted mid-thread (kernel 205),
+and the frozen compositor was fence-error propagation, not a lost context
+(kernel 204).  The claim that STOP_RING stays set after a failed reset is
+too broad: intel_engine_reset() clears it on its error exit too.  See
+docs/gpu-hang-2026-10-24.org.
+
 * Symptom
 The screen flickered between two still frames: mpv fullscreen, and mpv as a
 full-width column.  Sound kept playing and the picture did not move.  It had

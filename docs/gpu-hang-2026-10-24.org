@@ -1,0 +1,99 @@
+#+TITLE: Frozen, flickering screen after mpv: root causes (2026-10-24, kernels 204-206)
+
+* Symptom
+The screen alternates between two still frames, many times a second while
+a video plays and every few seconds otherwise, or sticks on one frame.  The
+cursor stays live.  Suspend does not help; restarting Mahogany does.  Fine
+magenta/cyan fringes show at hard edges, like static during playback.
+
+* Reproduction
+/var/tmp/hangrun.sh LABEL SECONDS [mpv options] on the Nano (nanobsd
+userland/gpu/hangrun.sh) plays The Martian (720p HEVC 10-bit HDR) in the
+live session with mpv.conf, dumps rcs0 registers (/var/tmp/rcshang) at the
+first "preemption time out", and stops at the chip reset.  On kernel 203 it
+hung after 7 s, 36 s, 42 s (--hwdec=no) and 12 s (--vo=gpu), and never in
+180 s with --hdr-compute-peak=no.
+
+* Cause 1: the hang (fixed in kernel 205)
+At the hang IPEHR = 0x70000007 (MEDIA_VFE_STATE: GPGPU pipeline), ACTHD
+fixed inside mpv's batch, sampler/row INSTDONE all ones: a compute dispatch
+that does not drain.  It is libplacebo's HDR peak detection, in both mpv
+renderers.  The first symptom is always a preemption timeout: i915 asks
+rcs0 to preempt (timeslice, display boost) and the compute dispatch is
+preempted MID-THREAD, which needs a system routine nobody installs; the
+engine wedges and cannot even reach ready-to-reset.
+
+Linux sets WaDisableGPGPUMidThreadPreemption for gen12 (thread-group
+level) and FtrPerCtxtPreemptionGranularityControl for gen9-12; this
+5.6-based tree had both for gen11 only, and every other TGL render
+workaround for A0 silicon only.  Kernel 205 (intel_workarounds.c, i915_reg.h)
+backports from Linux v6.6:
+- ctx: GPGPU thread-group preemption; FF_MODE2 written whole (TDS 128 +
+  GS 224, Wa_1604555607/16011163337/1608008084, it reads back wrong);
+  Wa_1806527549 (HIZ_CHICKEN); Wa_1606376872 (COMMON_SLICE_CHICKEN4).
+- rcs engine, all steppings: per-context preemption control (gen12 too);
+  Wa_1606931601, Wa_18011464164/22010931296, Wa_1606700617/22010271021/
+  14010826681, Wa_1409804808, Wa_14010229206, Wa_1607297627, Wa_1406941453.
+- whitelist for Mesa: COMMON_SLICE_CHICKEN1 (Mesa's Wa_1508744258 RHWO
+  toggle was silently dropped), HIZ_CHICKEN, COMMON_SLICE_CHICKEN3.
+Verified: default config 7 min, --vo=gpu 5 min, --hwdec=no 5 min, 0 resets.
+Power: Wa_1607297627 keeps the render engine from powering down while it
+waits for an event; measure with the next battery A/B.
+
+* Cause 2: the frozen compositor (fixed in kernel 204)
+After the chip reset Mahogany kept submitting ~21 execbufs/s, all ioctls
+returned 0, its context was robust (LOSE_CONTEXT_ON_RESET) and reported no
+reset, and a fresh GL context drew fine.  But a clear-to-red in Mahogany's
+own context (/var/tmp/ctxprobe.lisp, %ctx-probe through mahoganyctl) read
+back 0,0,0,0: its batches were being skipped.
+
+i915_request_await_dma_fence() and i915_request_await_execution() copied
+the error of an ALREADY SIGNALLED fence into the new request (Linux
+9e31c1fe45d5); submit_notify() then skips a request with an error.  mpv's
+buffers carry -EIO after the reset, Mahogany's frames awaited them, their
+own fences got the error, and every later render into those swapchain
+buffers awaited an errored fence again: skipped forever.  The panel kept
+flipping between the two buffers that still held the last good frames.
+Linux reverted it (3761baae908a, 5.13, "a hang in an app can propagate to
+the X server which causes the whole desktop to lock up").  The backport
+note's prerequisite concerns the command parser, which runs on gen7 and
+the gen9 blitter only (i915_cmd_parser.c), not on this gen12 part.
+Verified: after a forced hang on kernel 204, %ctx-probe read 255,0,0,255
+and the desktop kept rendering.
+
+* Kernel 206: compression and flush fixes, dma-buf poll
+- Gen12 AUX table invalidation (Linux 972282c4cf24 plus the 2023 fixes
+  "Ensure memory quiesced before invalidation" and "Poll aux invalidation
+  register bit on invalidation"): every client has its own AUX (CCS
+  metadata) table but the hardware caches lookups across contexts; the
+  tree never invalidated it.  rcs: flush PIPE_CONTROL, then invalidate
+  PIPE_CONTROL + LRI GFX_CCS_AUX_NV + semaphore poll, pre-parser off.
+  vcs/vecs: new gen12_emit_flush (MI_FLUSH_DW, LRI + poll for each
+  sibling of a virtual engine), pre-parser off.  Blitter left out as
+  Linux did for TGL.  Suspected cause of the colour fringes.
+- HDC pipeline flush: the tree set bit 9 of PIPE_CONTROL dword 1 (which is
+  INDIRECT_STATE_DISABLE) instead of dword 0 (Linux "Fix HDC pipeline
+  flush"), so no gen12 render flush, end of batch included, ever flushed
+  the HDC.  Now PIPE_CONTROL0_HDC_PIPELINE_FLUSH via
+  gen12_emit_pipe_control / gen12_emit_ggtt_write_rcs.
+- linux_dma_resv.c (Astra's review of kernel 191): rp_fence was stored
+  after dma_fence_add_callback() without rp_lock; if the callback ran and
+  another poller claimed it in between, the late store overwrote its fence
+  and teardown removed the callback from the wrong fence's queue.
+  dma_resv_poll_arm() publishes a separate reference under rp_lock first,
+  rolls back if nothing was queued, and never touches the slot after.
+  userland/drm/dmabuf-poll (2000 rounds) and the new dmabuf-poll-race
+  (300 rounds x 6 threads, 1.66 M polls) pass.
+Verified: 4 min HDR playback, 0 resets; a playback capture has clean edges
+and no strongly coloured pixels (grim reads the composited image, not the
+scanout: the user has to judge the fringes).
+
+* Not done
+- Mahogany still has no renderer-loss recovery and ignores the result of
+  wlr_scene_output_commit (Astra).  With 204 a client's hang no longer
+  poisons the compositor; recovery matters only if Mahogany's own context
+  is ever lost.
+- GT-level gen12 workarounds from Linux (Wa_14011060649 media clock
+  gating, Wa_14011059788 DFR, Wa_14015795083 MISCCPCTL) not ported.
+- The reset handshake still fails on a wedged compute dispatch; with
+  thread-group preemption it should no longer wedge.

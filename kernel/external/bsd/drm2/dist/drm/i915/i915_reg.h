@@ -9167,6 +9167,16 @@ enum {
 #define   GEN11_TDL_CLOCK_GATING_FIX_DISABLE	(1 << 1)
 #define   GEN12_DISABLE_EARLY_READ	(1 << 14)	/* LISPBSD: from Linux */
 
+/* LISPBSD: gen12 AUX table (CCS) invalidation, from Linux */
+#define GEN12_GFX_CCS_AUX_NV		_MMIO(0x4208)
+#define GEN12_VD0_AUX_NV		_MMIO(0x4218)
+#define GEN12_VD1_AUX_NV		_MMIO(0x4228)
+#define GEN12_VD2_AUX_NV		_MMIO(0x4298)
+#define GEN12_VD3_AUX_NV		_MMIO(0x42a8)
+#define GEN12_VE0_AUX_NV		_MMIO(0x4238)
+#define GEN12_VE1_AUX_NV		_MMIO(0x42b8)
+#define   AUX_INV			REG_BIT(0)
+
 /* LISPBSD: from Linux */
 #define GEN9_ROW_CHICKEN4		_MMIO(0xe48c)
 #define   GEN12_DISABLE_TDL_PUSH	(1 << 9)

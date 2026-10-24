@@ -257,6 +257,37 @@ static inline u32 *gen8_emit_pipe_control(u32 *batch, u32 flags, u32 offset)
 	return batch + 6;
 }
 
+/* LISPBSD: from Linux; gen12 has flags in both dwords (bit_group_0/1). */
+static inline u32 *gen12_emit_pipe_control(u32 *batch, u32 bit_group_0,
+					   u32 bit_group_1, u32 offset)
+{
+	memset(batch, 0, 6 * sizeof(u32));
+
+	batch[0] = GFX_OP_PIPE_CONTROL(6) | bit_group_0;
+	batch[1] = bit_group_1;
+	batch[2] = offset;
+
+	return batch + 6;
+}
+
+static inline u32 *
+gen12_emit_ggtt_write_rcs(u32 *cs, u32 value, u32 gtt_offset, u32 flags0,
+			  u32 flags1)
+{
+	/* We're using qword write, offset should be aligned to 8 bytes. */
+	GEM_BUG_ON(!IS_ALIGNED(gtt_offset, 8));
+
+	*cs++ = GFX_OP_PIPE_CONTROL(6) | flags0;
+	*cs++ = flags1 | PIPE_CONTROL_QW_WRITE | PIPE_CONTROL_GLOBAL_GTT_IVB;
+	*cs++ = gtt_offset;
+	*cs++ = 0;
+	*cs++ = value;
+	/* We're thrashing one dword of HWS. */
+	*cs++ = 0;
+
+	return cs;
+}
+
 static inline u32 *
 gen8_emit_ggtt_write_rcs(u32 *cs, u32 value, u32 gtt_offset, u32 flags)
 {

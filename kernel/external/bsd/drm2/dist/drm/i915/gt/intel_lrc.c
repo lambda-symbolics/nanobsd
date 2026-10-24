@@ -4032,13 +4032,143 @@ static u32 preparser_disable(bool state)
 	return MI_ARB_CHECK | 1 << 8 | state;
 }
 
+/*
+ * LISPBSD: gen12 AUX table invalidation (Linux 972282c4cf24, "Add aux
+ * table invalidate for all engines", with the 2023 fixes "Ensure memory
+ * quiesced before invalidation" and "Poll aux invalidation register bit
+ * on invalidation").  Every client has its own AUX table (the CCS
+ * metadata map for compressed surfaces) but the hardware caches its
+ * lookups across contexts: without an invalidation before each batch, a
+ * compressed surface can be decoded with another client's stale metadata.
+ * The blitter is left out, as Linux did for Tiger Lake.
+ */
+static i915_reg_t gen12_aux_inv_reg(const struct intel_engine_cs *engine)
+{
+	static const i915_reg_t vd[] = {
+		GEN12_VD0_AUX_NV,
+		GEN12_VD1_AUX_NV,
+		GEN12_VD2_AUX_NV,
+		GEN12_VD3_AUX_NV,
+	};
+	static const i915_reg_t ve[] = {
+		GEN12_VE0_AUX_NV,
+		GEN12_VE1_AUX_NV,
+	};
+
+	switch (engine->class) {
+	case RENDER_CLASS:
+		return GEN12_GFX_CCS_AUX_NV;
+	case VIDEO_DECODE_CLASS:
+		if (engine->instance < ARRAY_SIZE(vd))
+			return vd[engine->instance];
+		break;
+	case VIDEO_ENHANCEMENT_CLASS:
+		if (engine->instance < ARRAY_SIZE(ve))
+			return ve[engine->instance];
+		break;
+	}
+	return INVALID_MMIO_REG;
+}
+
+#define GEN12_AUX_INV_DWORDS 8
+
+/* Request the invalidation and wait until the hardware clears the bit. */
+static u32 *gen12_emit_aux_table_inv(i915_reg_t reg, u32 *cs)
+{
+	*cs++ = MI_LOAD_REGISTER_IMM(1) | MI_LRI_MMIO_REMAP_EN;
+	*cs++ = i915_mmio_reg_offset(reg);
+	*cs++ = AUX_INV;
+
+	*cs++ = MI_SEMAPHORE_WAIT_TOKEN |
+		MI_SEMAPHORE_REGISTER_POLL |
+		MI_SEMAPHORE_POLL |
+		MI_SEMAPHORE_SAD_EQ_SDD;
+	*cs++ = 0;
+	*cs++ = i915_mmio_reg_offset(reg);
+	*cs++ = 0;
+	*cs++ = 0;
+
+	return cs;
+}
+
+/*
+ * LISPBSD: gen12 flush for the video, enhance and copy engines (Linux
+ * gen12_emit_flush_xcs): pre-parser fence around the TLB invalidate and
+ * AUX invalidation after the MI_FLUSH_DW.  A virtual engine's request
+ * can run on any sibling, so every sibling's table is invalidated.
+ */
+static int gen12_emit_flush(struct i915_request *request, u32 mode)
+{
+	intel_engine_mask_t aux_inv = 0;
+	struct intel_engine_cs *engine;
+	intel_engine_mask_t tmp;
+	u32 cmd = 4;
+	u32 *cs;
+
+	if (mode & EMIT_INVALIDATE) {
+		cmd += 2;
+		for_each_engine_masked(engine, request->engine->gt,
+				       request->engine->mask, tmp) {
+			if (i915_mmio_reg_valid(gen12_aux_inv_reg(engine))) {
+				aux_inv |= engine->mask;
+				cmd += GEN12_AUX_INV_DWORDS;
+			}
+		}
+	}
+
+	cs = intel_ring_begin(request, cmd);
+	if (IS_ERR(cs))
+		return PTR_ERR(cs);
+
+	if (mode & EMIT_INVALIDATE)
+		*cs++ = preparser_disable(true);
+
+	cmd = MI_FLUSH_DW + 1;
+
+	/*
+	 * We always require a command barrier so that subsequent
+	 * commands, such as breadcrumb interrupts, are strictly ordered
+	 * wrt the contents of the write cache being flushed to memory
+	 * (and thus being coherent from the CPU).
+	 */
+	cmd |= MI_FLUSH_DW_STORE_INDEX | MI_FLUSH_DW_OP_STOREDW;
+
+	if (mode & EMIT_INVALIDATE) {
+		cmd |= MI_INVALIDATE_TLB;
+		if (request->engine->class == VIDEO_DECODE_CLASS)
+			cmd |= MI_INVALIDATE_BSD;
+	}
+
+	*cs++ = cmd;
+	*cs++ = LRC_PPHWSP_SCRATCH_ADDR;
+	*cs++ = 0; /* upper addr */
+	*cs++ = 0; /* value */
+
+	for_each_engine_masked(engine, request->engine->gt, aux_inv, tmp)
+		cs = gen12_emit_aux_table_inv(gen12_aux_inv_reg(engine), cs);
+
+	if (mode & EMIT_INVALIDATE)
+		*cs++ = preparser_disable(false);
+
+	intel_ring_advance(request, cs);
+
+	return 0;
+}
+
 static int gen12_emit_flush_render(struct i915_request *request,
 				   u32 mode)
 {
-	if (mode & EMIT_FLUSH) {
+	/*
+	 * LISPBSD: the AUX invalidation below needs memory traffic quiesced
+	 * first, so flush on an invalidate too (Linux).  The HDC pipeline
+	 * flush goes in dword 0.
+	 */
+	if (mode & (EMIT_FLUSH | EMIT_INVALIDATE)) {
 		u32 flags = 0;
 		u32 *cs;
 
+		if (mode & EMIT_FLUSH)
+			flags |= PIPE_CONTROL_FLUSH_L3;
 		flags |= PIPE_CONTROL_TILE_CACHE_FLUSH;
 		flags |= PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH;
 		flags |= PIPE_CONTROL_DEPTH_CACHE_FLUSH;
@@ -4046,7 +4176,6 @@ static int gen12_emit_flush_render(struct i915_request *request,
 		flags |= PIPE_CONTROL_DEPTH_STALL;
 		flags |= PIPE_CONTROL_DC_FLUSH_ENABLE;
 		flags |= PIPE_CONTROL_FLUSH_ENABLE;
-		flags |= PIPE_CONTROL_HDC_PIPELINE_FLUSH;
 
 		flags |= PIPE_CONTROL_STORE_DATA_INDEX;
 		flags |= PIPE_CONTROL_QW_WRITE;
@@ -4057,7 +4186,8 @@ static int gen12_emit_flush_render(struct i915_request *request,
 		if (IS_ERR(cs))
 			return PTR_ERR(cs);
 
-		cs = gen8_emit_pipe_control(cs, flags, LRC_PPHWSP_SCRATCH_ADDR);
+		cs = gen12_emit_pipe_control(cs, PIPE_CONTROL0_HDC_PIPELINE_FLUSH,
+					     flags, LRC_PPHWSP_SCRATCH_ADDR);
 		intel_ring_advance(request, cs);
 	}
 
@@ -4079,7 +4209,7 @@ static int gen12_emit_flush_render(struct i915_request *request,
 
 		flags |= PIPE_CONTROL_CS_STALL;
 
-		cs = intel_ring_begin(request, 8);
+		cs = intel_ring_begin(request, 8 + GEN12_AUX_INV_DWORDS);
 		if (IS_ERR(cs))
 			return PTR_ERR(cs);
 
@@ -4092,6 +4222,9 @@ static int gen12_emit_flush_render(struct i915_request *request,
 
 		cs = gen8_emit_pipe_control(cs, flags, LRC_PPHWSP_SCRATCH_ADDR);
 
+		/* LISPBSD: hsdes 1809175790 */
+		cs = gen12_emit_aux_table_inv(GEN12_GFX_CCS_AUX_NV, cs);
+
 		*cs++ = preparser_disable(false);
 		intel_ring_advance(request, cs);
 
@@ -4101,7 +4234,6 @@ static int gen12_emit_flush_render(struct i915_request *request,
 		if (IS_TGL_REVID(request->i915, TGL_REVID_A0, TGL_REVID_A0)) {
 			flags = 0;
 			flags |= PIPE_CONTROL_CS_STALL;
-			flags |= PIPE_CONTROL_HDC_PIPELINE_FLUSH;
 
 			flags |= PIPE_CONTROL_STORE_DATA_INDEX;
 			flags |= PIPE_CONTROL_QW_WRITE;
@@ -4110,8 +4242,10 @@ static int gen12_emit_flush_render(struct i915_request *request,
 			if (IS_ERR(cs))
 				return PTR_ERR(cs);
 
-			cs = gen8_emit_pipe_control(cs, flags,
-						    LRC_PPHWSP_SCRATCH_ADDR);
+			cs = gen12_emit_pipe_control(cs,
+						     PIPE_CONTROL0_HDC_PIPELINE_FLUSH,
+						     flags,
+						     LRC_PPHWSP_SCRATCH_ADDR);
 			intel_ring_advance(request, cs);
 		}
 	}
@@ -4269,18 +4403,19 @@ static u32 *gen12_emit_fini_breadcrumb(struct i915_request *request, u32 *cs)
 static u32 *
 gen12_emit_fini_breadcrumb_rcs(struct i915_request *request, u32 *cs)
 {
-	cs = gen8_emit_ggtt_write_rcs(cs,
-				      request->fence.seqno,
-				      i915_request_active_timeline(request)->hwsp_offset,
-				      PIPE_CONTROL_CS_STALL |
-				      PIPE_CONTROL_TILE_CACHE_FLUSH |
-				      PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH |
-				      PIPE_CONTROL_DEPTH_CACHE_FLUSH |
-				      /* Wa_1409600907:tgl */
-				      PIPE_CONTROL_DEPTH_STALL |
-				      PIPE_CONTROL_DC_FLUSH_ENABLE |
-				      PIPE_CONTROL_FLUSH_ENABLE |
-				      PIPE_CONTROL_HDC_PIPELINE_FLUSH);
+	/* LISPBSD: the HDC pipeline flush is a dword 0 bit on gen12. */
+	cs = gen12_emit_ggtt_write_rcs(cs,
+				       request->fence.seqno,
+				       i915_request_active_timeline(request)->hwsp_offset,
+				       PIPE_CONTROL0_HDC_PIPELINE_FLUSH,
+				       PIPE_CONTROL_CS_STALL |
+				       PIPE_CONTROL_TILE_CACHE_FLUSH |
+				       PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH |
+				       PIPE_CONTROL_DEPTH_CACHE_FLUSH |
+				       /* Wa_1409600907:tgl */
+				       PIPE_CONTROL_DEPTH_STALL |
+				       PIPE_CONTROL_DC_FLUSH_ENABLE |
+				       PIPE_CONTROL_FLUSH_ENABLE);
 
 	return gen12_emit_fini_breadcrumb_footer(request, cs);
 }
@@ -4350,8 +4485,10 @@ logical_ring_default_vfuncs(struct intel_engine_cs *engine)
 	engine->emit_flush = gen8_emit_flush;
 	engine->emit_init_breadcrumb = gen8_emit_init_breadcrumb;
 	engine->emit_fini_breadcrumb = gen8_emit_fini_breadcrumb;
-	if (INTEL_GEN(engine->i915) >= 12)
+	if (INTEL_GEN(engine->i915) >= 12) {
 		engine->emit_fini_breadcrumb = gen12_emit_fini_breadcrumb;
+		engine->emit_flush = gen12_emit_flush; /* LISPBSD */
+	}
 
 	engine->set_default_submission = intel_execlists_set_default_submission;
 

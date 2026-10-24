@@ -1289,6 +1289,48 @@ dma_resv_poll_cb(struct dma_fence *fence, struct dma_fence_cb *fcb)
 }
 
 /*
+ * dma_resv_poll_arm(rpoll, fence)
+ *
+ *	LISPBSD: request the poll callback on fence.  The fence is
+ *	published in rp_fence (with its own reference, for
+ *	dma_resv_poll_fini) BEFORE the callback is queued: once queued it
+ *	may run at once and release the claim, and another poller may
+ *	then claim it and publish its own fence, which a late store here
+ *	would overwrite (teardown would then take the callback off the
+ *	wrong fence's queue).  The caller keeps its own reference across
+ *	the call.  rp_lock is not held over dma_fence_add_callback: the
+ *	callback takes rp_lock under the fence lock.
+ *
+ *	Returns 0 if the callback was queued, nonzero (fence already
+ *	signalled) if not, as dma_fence_add_callback does.
+ */
+static int
+dma_resv_poll_arm(struct dma_resv_poll *rpoll, struct dma_fence *fence)
+{
+	struct dma_fence *held = dma_fence_get(fence);
+	int ret;
+
+	mutex_enter(&rpoll->rp_lock);
+	KASSERT(rpoll->rp_claimed);
+	KASSERT(rpoll->rp_fence == NULL);
+	rpoll->rp_fence = held;
+	mutex_exit(&rpoll->rp_lock);
+
+	ret = dma_fence_add_callback(fence, &rpoll->rp_fcb, dma_resv_poll_cb);
+	if (ret != 0) {
+		/* Nothing queued: we still own the claim, take it back. */
+		mutex_enter(&rpoll->rp_lock);
+		KASSERT(rpoll->rp_claimed);
+		KASSERT(rpoll->rp_fence == held);
+		rpoll->rp_fence = NULL;
+		mutex_exit(&rpoll->rp_lock);
+		dma_fence_put(held);
+	}
+	/* Queued: the callback may have run already; leave rp_fence alone. */
+	return ret;
+}
+
+/*
  * dma_resv_do_poll(robj, events, rpoll)
  *
  *	Poll for reservation object events using the reservation poll
@@ -1390,10 +1432,8 @@ top:	KASSERT(fence == NULL);
 			fence = atomic_load_relaxed(&list->shared[i]);
 			if ((fence = dma_fence_get_rcu(fence)) == NULL)
 				goto restart;
-			if (!dma_fence_add_callback(fence, &rpoll->rp_fcb,
-				dma_resv_poll_cb)) {
-				/* LISPBSD: kept for dma_resv_poll_fini */
-				rpoll->rp_fence = fence;
+			if (!dma_resv_poll_arm(rpoll, fence)) {
+				dma_fence_put(fence);
 				fence = NULL;
 				revents &= ~POLLOUT;
 				callback = true;
@@ -1439,10 +1479,8 @@ top:	KASSERT(fence == NULL);
 		 * signalled in the interim, leave the events set; we
 		 * will simulate the callback later.
 		 */
-		if (!dma_fence_add_callback(fence, &rpoll->rp_fcb,
-			dma_resv_poll_cb)) {
-			/* LISPBSD: kept for dma_resv_poll_fini */
-			rpoll->rp_fence = fence;
+		if (!dma_resv_poll_arm(rpoll, fence)) {
+			dma_fence_put(fence);
 			fence = NULL;
 			revents = 0;
 			callback = true;
