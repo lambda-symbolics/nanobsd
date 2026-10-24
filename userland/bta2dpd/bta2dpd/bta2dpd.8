@@ -48,6 +48,7 @@
 .Op Fl m Ar mode
 .Op Fl r Ar rate
 .Op Fl V Ar volume
+.Op Fl w Ar seconds
 .Fl a Ar address
 .Ar files ...
 .Nm
@@ -107,6 +108,9 @@ with only the
 option and the maximum bitpool for your device will be printed to stdout.
 .It Fl D
 Run in the background.
+The command returns once the stream to the remote device runs
+.Pq exit status 0 ,
+or as a sink once it listens, and exits 1 if the daemon gave up first.
 .It Fl n
 Do not close connection on end of file (EOF).
 Useful for
@@ -150,6 +154,12 @@ increased volume.
 .Pp
 .Sy USE WITH CARE
 as this may mean the output is quite loud.
+.It Fl w Ar seconds
+How long to keep retrying the SDP query and the AVDTP connection to the
+remote device before giving up
+.Pq default 60 .
+Headphones that page this host themselves while it connects make the
+first attempts fail.
 .It Fl v
 Be verbose.
 .It Ar files ...

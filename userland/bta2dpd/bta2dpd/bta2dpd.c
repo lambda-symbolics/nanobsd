@@ -71,18 +71,22 @@ __RCSID("$NetBSD");
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 
 #include <assert.h>
 #include <bluetooth.h>
 #include <err.h>
 #include <event.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <sdp.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 #include <util.h>
 #include <errno.h>
@@ -207,6 +211,9 @@ __dead static void usage(void);
 static int init_server(struct l2cap_info *);
 static int init_client(struct l2cap_info *);
 static void client_query(void);
+static int connect_avdtp(struct l2cap_info *);
+static void daemonize(void);
+static void notify_ready(void);
 static void exit_func(void);
 
 static int sc;		/* avdtp streaming channel */
@@ -219,6 +226,16 @@ static struct event ctl_ev;			/* avdtp ctl event */
 
 struct l2cap_info	info;
 static bool		runasDaemon;
+/*
+ * LISPBSD: how long to keep retrying the connection to the headphones
+ * (-w).  The first attempts fail with the Denon PerL Pro: the logs
+ * suggest it pages this host itself when the radio comes up, queries its
+ * SDP records and drops that link a few seconds later, and a connect
+ * made meanwhile rides its link and fails with it.  Later attempts work.
+ */
+static int		connect_wait = 60;
+static time_t		connect_deadline;
+static int		ready_fd = -1;	/* -D: tells the parent we stream */
 static bool		asSpeaker;
 static bool		dontStop;
 static bool		initDiscover;	/* initiate avdtp discover */
@@ -280,7 +297,7 @@ main(int ac, char *av[])
 	alloc_config[0] = alloc_method;
 	channel_config[0] = channel_mode;
 
-	while ((ch = getopt(ac, av, "A:a:B:b:Dd:e:f:IKnM:m:p:r:tV:v")) !=
+	while ((ch = getopt(ac, av, "A:a:B:b:Dd:e:f:IKnM:m:p:r:tV:vw:")) !=
 	    EOF) {
 		switch (ch) {
 		case 'A':
@@ -449,6 +466,11 @@ main(int ac, char *av[])
 		case 'v':
 			verbose = true;
 			break;
+		case 'w':
+			connect_wait = atoi(optarg);
+			if (connect_wait < 0)
+				usage();
+			break;
 		default:
 			usage();
 		}
@@ -527,8 +549,7 @@ main(int ac, char *av[])
 		bitpool = (uint8_t)tmpbitpool;
 
 	if (runasDaemon) {
-		if (daemon(0, 0) == -1)
-			err(EXIT_FAILURE, "daemon");
+		daemonize();
 		pidfile(NULL);
 		openlog(getprogname(), LOG_NDELAY | LOG_PID, LOG_DAEMON);
 	} else {
@@ -540,11 +561,13 @@ again:
 	base = event_init();
 
 	if (asSpeaker == 0) {
+		connect_deadline = time(NULL) + connect_wait;
 		if (init_client(&info) < 0)
 			log_err(EXIT_FAILURE, "init client: %m");
 	} else {
 		if (init_server(&info) < 0)
 			log_err(EXIT_FAILURE, "init server: %m");
+		notify_ready();
 	}
 
 	if (verbose) {
@@ -574,7 +597,7 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage:\t%s [-v] [-D] [-n] [-d device] [-m mode] [-r rate]\n"
+	    "usage:\t%s [-v] [-D] [-n] [-d device] [-m mode] [-r rate] [-w secs]\n"
 	    "\t\t[-M mtu] [-V volume] [-f mode] [-b blocks] [-e bands]\n"
 	    "\t\t[-A alloc] [-B bitpool] -a address files...\n"
 	    "\t%s [-v] [-D] [-d device] [-m mode] [-p psm] [-B bitpool]\n"
@@ -586,7 +609,8 @@ usage(void)
 	    "\t-a address   Remote device address\n"
 	    "\tfiles...     Files to read from (Defaults to stdin/stdout)\n"
 	    "\t-v           Verbose output\n"
-	    "\t-D           Run in the background\n"
+	    "\t-D           Run in the background once connected\n"
+	    "\t-w secs      Keep retrying the connection this long (60)\n"
 	    "\t-M mtu       MTU for transmission\n"
 	    "\t-B bitpool   Maximum bitpool value for encoding\n"
 	    "\t-V volume    Volume multiplier 0,1,2.\n"
@@ -802,8 +826,10 @@ do_ctlreq(int fd, short ev, void *arg)
 	}
 
 	bdaddr_copy(&addr.bt_bdaddr, &info.raddr);
-	if (connect(sc,(struct sockaddr*)&addr, sizeof(addr)) < 0)
+	if (connect(sc,(struct sockaddr*)&addr, sizeof(addr)) < 0) {
+		log_warn("stream channel connect: %m");
 		return;
+	}
 
 	if (!asSpeaker)
 		avdtpStart(fd, fd, mySepInfo.sep); 
@@ -822,6 +848,8 @@ opened_connection:
 		if (event_add(&interrupt_ev, NULL) < 0)
 			log_err(EXIT_FAILURE, "interrupt_ev: %m");
 		state = 7;
+		log_info("Streaming to %s", bt_ntoa(&info.raddr, NULL));
+		notify_ready();
 	}
 
 	mtusize = sizeof(uint16_t);
@@ -993,7 +1021,6 @@ just_decode:
 static int
 init_client(struct l2cap_info *myInfo)
 {
-	struct sockaddr_bt addr;
 	int i;
 
 	if (atexit(exit_func))
@@ -1035,27 +1062,7 @@ init_client(struct l2cap_info *myInfo)
 
 	client_query();
 
-	orighc = socket(PF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
-	if (orighc < 0)
-		return -1;
-
-	memset(&addr, 0, sizeof(addr));
-	addr.bt_len = sizeof(addr);
-	addr.bt_family = AF_BLUETOOTH;
-	addr.bt_psm = l2cap_psm;
-	bdaddr_copy(&addr.bt_bdaddr, &myInfo->laddr);
-
-	if (bind(orighc, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-		return -1;
-
-	if (setsockopt(orighc, BTPROTO_L2CAP, SO_L2CAP_LM,
-	    &l2cap_mode, sizeof(l2cap_mode)) == -1) {
-		log_err(EXIT_FAILURE, "Could not set link mode (0x%4.4x)",
-		    l2cap_mode);
-	}
-
-	bdaddr_copy(&addr.bt_bdaddr, &myInfo->raddr);
-	if (connect(orighc,(struct sockaddr*)&addr, sizeof(addr)) < 0)
+	if (connect_avdtp(myInfo) < 0)
 		return -1;
 
 	hc = orighc;
@@ -1089,10 +1096,13 @@ client_query(void)
 	uint16_t attr;
 	bool rv;
 
-	myss = sdp_open(&info.laddr, &info.raddr);
-	if (myss == NULL) {
-		log_err(EXIT_FAILURE, "%s: Could not open sdp session",
+	while ((myss = sdp_open(&info.laddr, &info.raddr)) == NULL) {
+		if (time(NULL) >= connect_deadline)
+			log_err(EXIT_FAILURE, "%s: Could not open sdp session: %m",
+			    service_type);
+		log_warn("%s: Could not open sdp session: %m, retrying",
 		    service_type);
+		sleep(1);
 	}
 
 	log_info("Searching for %s service at %s",
@@ -1161,6 +1171,106 @@ client_query(void)
 
 	l2cap_psm = (uint16_t)psm;
 	log_info("Found PSM %u for service %s", l2cap_psm, service_type);
+}
+
+/*
+ * LISPBSD: open the AVDTP signalling channel, retrying until the
+ * deadline like the SDP query.  A socket whose connect failed is not
+ * reused.
+ */
+static int
+connect_avdtp(struct l2cap_info *myInfo)
+{
+	struct sockaddr_bt addr;
+
+	for (;;) {
+		orighc = socket(PF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
+		if (orighc < 0)
+			return -1;
+
+		memset(&addr, 0, sizeof(addr));
+		addr.bt_len = sizeof(addr);
+		addr.bt_family = AF_BLUETOOTH;
+		addr.bt_psm = l2cap_psm;
+		bdaddr_copy(&addr.bt_bdaddr, &myInfo->laddr);
+
+		if (bind(orighc, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+			return -1;
+
+		if (setsockopt(orighc, BTPROTO_L2CAP, SO_L2CAP_LM,
+		    &l2cap_mode, sizeof(l2cap_mode)) == -1) {
+			log_err(EXIT_FAILURE, "Could not set link mode (0x%4.4x)",
+			    l2cap_mode);
+		}
+
+		bdaddr_copy(&addr.bt_bdaddr, &myInfo->raddr);
+		if (connect(orighc, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+			return 0;
+
+		if (time(NULL) >= connect_deadline)
+			return -1;
+		log_warn("%s: connect to PSM %u: %m, retrying", service_type,
+		    l2cap_psm);
+		close(orighc);
+		orighc = -1;
+		sleep(1);
+	}
+}
+
+/*
+ * LISPBSD: -D detaches like daemon(3), but the command only returns
+ * once the stream runs (or, as a sink, once it listens): exit status 0
+ * then, 1 if the daemon gave up or died first.  Scripts can tell a
+ * working connection from one that is still being tried.  The daemon
+ * is killed if it is not ready a while after the connect deadline
+ * (a peer that stalls the AVDTP negotiation).
+ */
+static void
+daemonize(void)
+{
+	struct pollfd pfd;
+	int fds[2];
+	char c;
+
+	if (pipe(fds) == -1)
+		err(EXIT_FAILURE, "pipe");
+
+	switch (fork()) {
+	case -1:
+		err(EXIT_FAILURE, "fork");
+	case 0:
+		close(fds[0]);
+		ready_fd = fds[1];
+		if (daemon(0, 0) == -1)
+			err(EXIT_FAILURE, "daemon");
+		alarm((unsigned int)connect_wait + 30);
+		return;
+	default:
+		break;
+	}
+
+	close(fds[1]);
+	pfd.fd = fds[0];
+	pfd.events = POLLIN;
+	while (poll(&pfd, 1, INFTIM) == -1)
+		if (errno != EINTR)
+			err(EXIT_FAILURE, "poll");
+	if (read(fds[0], &c, 1) == 1)
+		exit(EXIT_SUCCESS);
+	errx(EXIT_FAILURE, "no connection to %s (see /var/log/messages)",
+	    bt_ntoa(&info.raddr, NULL));
+}
+
+static void
+notify_ready(void)
+{
+
+	if (ready_fd == -1)
+		return;
+	alarm(0);
+	(void)write(ready_fd, "R", 1);
+	close(ready_fd);
+	ready_fd = -1;
 }
 
 static void

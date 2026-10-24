@@ -16,22 +16,28 @@ builtin_index(){ audiocfg list 2>/dev/null | awk '/hdafg0/ { sub(":", "", $1); p
 case "${1:-status}" in
   on)
 	$SUDO usb on pch >/dev/null 2>&1
+	# "bluetooth off" detaches the radio; usb on alone does not bring it back.
+	drvctl -l uhub3 2>/dev/null | grep -q $DEV || { $SUDO drvctl -r uhub3; sleep 1; }
 	$SUDO btconfig $DEV up 2>&1 | grep -v "^$"
 	btconfig $DEV | grep -q UP || { echo "bt-headphones: $DEV did not come up (firmware? dmesg)"; exit 1; }
-	pgrep -x bthcid >/dev/null || $SUDO /usr/local/sbin/bthcid -d $DEV
+	# pgrep -x matches argv0 with its path, so "-x bthcid" never matched and
+	# every run started a second bthcid: it re-sent the SSP/SC setup to the
+	# controller (refused while a link is up), unlinked the running one's
+	# control socket and exited on the pid file.
+	pgrep -f '^/usr/local/sbin/bthcid' >/dev/null || $SUDO /usr/local/sbin/bthcid -d $DEV
 	pgrep -x sdpd >/dev/null || $SUDO sdpd
-	# sdpd listens a moment after it starts; bta2dpd gives up at once if it
-	# cannot open an SDP session, so wait for the socket, then retry once.
 	i=0; while [ ! -S /var/run/sdp ] && [ $i -lt 20 ]; do sleep 0.25; i=$((i+1)); done
+	# The first connects fail.  The logs point at the headphones paging
+	# this host themselves when it comes up, querying its SDP records and
+	# dropping the link a few seconds later, with our connect riding their
+	# link and failing with it (each failure comes ~1 s after their SDP
+	# query ends; to be confirmed with hcisniff).  The nanobsd bta2dpd retries for up to -w seconds and
+	# with -D returns only once the stream runs, so its exit status is the
+	# answer (the base one detaches at once and a 2 s pgrep said "ON" while
+	# it was still failing, hence the three runs).
 	if ! pgrep -f "bta2dpd.*$ADDR" >/dev/null; then
-		$SUDO bta2dpd -D -n -m encrypt -d $DEV -a "$ADDR" /dev/pad0 || exit 1
-		sleep 2
-		if ! pgrep -f "bta2dpd.*$ADDR" >/dev/null; then
-			echo "bt-headphones: first attempt ended, retrying (headphones on and in range?)"
-			sleep 2
-			$SUDO bta2dpd -D -n -m encrypt -d $DEV -a "$ADDR" /dev/pad0 || exit 1
-			sleep 2
-		fi
+		echo "bt-headphones: connecting to $ADDR"
+		$SUDO /usr/local/sbin/bta2dpd -D -n -w 60 -m encrypt -d $DEV -a "$ADDR" /dev/pad0 || exit 1
 	fi
 	pgrep -f "bta2dpd.*$ADDR" >/dev/null || { echo "bt-headphones: no stream to $ADDR (see /var/log/messages)"; exit 1; }
 	P=$(pad_index)
