@@ -29,4 +29,4 @@ pkg_add /usr/pkgsrc/packages/All/graphviz-14.1.5nb2.tgz
 - Result: 0 missing libraries for libheart, wlroots, firefox, emacs, mpv,
   foot, alacritty, dot; 343 packages as before plus graphviz.
 - =pkgin-wreck-20261023= can be deleted once the session is confirmed:
-  =gefs delsnap / pkgin-wreck-20261023=.
+  =gefs delsnap / pkgin-wreck-20261023=. Deleted 2026-10-27.
