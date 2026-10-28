@@ -26,6 +26,16 @@
         (meow-line 1))
     (meow-line 1)))
 
+;; Newer meow (2026) makes `meow-line-expand' extend from the stale mark
+;; even when nothing is selected; the workstation's 2022 meow selected the
+;; current line then.  Keep the old behaviour.
+(defun mag/meow-line-expand (n)
+  "Extend the selection linewise, or select N lines if there is none."
+  (interactive "p")
+  (if (region-active-p)
+      (meow-line n t)
+    (meow-line n)))
+
 (defun mag/meow-word-dwim ()
   "Select the current word, or extend forward by word."
   (interactive)
@@ -306,7 +316,7 @@
  '("w" . mag/meow-word-dwim)
  '("W" . mag/meow-word-next-dwim)
  '("x" . mag/meow-line-dwim)
- '("X" . meow-line-expand)
+ '("X" . mag/meow-line-expand)
  '("y" . meow-save)
  '("Y" . meow-sync-grab)
  '("z" . other-window)
