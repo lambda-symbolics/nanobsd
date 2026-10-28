@@ -222,7 +222,14 @@ stays installed for the colon prompt.
   on pointer motion only).  Since 9/28 it also takes a column only partly
   on the panel: =strip-layout= scrolls a newly selected column only as far
   as the edge that cut it, so the pointer stays on it and the next motion
-  does not bounce focus back.
+  does not bounce focus back.  Since 10-28 (mahogany 41fab68) only a border
+  the pointer itself crosses counts: heart compares the views under the old
+  and the new position in the current layout.  It used to remember the view
+  seen by the last motion, so after a new window opened (focus on it, the
+  strip scrolled, another window slid under the resting pointer) the next
+  1 px nudge focused that window.  Headless repro: =/var/tmp/sloppy-test.sh=
+  with the motion shim =/var/tmp/mhshim.so= (raises the cursor's motion
+  signal, the path a mouse takes).
 - The =eval= key (s-x) has no equivalent; =colon= (s-;) runs commands via rofi.
 - Media keys under wskbd/libopeninput are untested until someone presses them;
   =Key pressed:= lines in =~/.mahogany.log= (run with =-l DEBUG=) show what
