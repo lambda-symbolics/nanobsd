@@ -33,6 +33,7 @@ SHA1 (patch-js_src_jit_arm64_vixl_Registers-vixl.h) = 0e64f5b7ebc92ba12949181f78
 SHA1 (patch-js_src_util_NativeStack.cpp) = a0a16d8d8d78d3cc3f4d2a508586f1a7821f7dba
 SHA1 (patch-js_src_vm_TypedArrayObject-inl.h) = e7913c8d4b2b05b67040baa64dae62d6ba40390e
 SHA1 (patch-media_ffvpx_libavutil_arm_bswap.h) = d0bdc30d23447bd56185eb9dc5c86de591f9cc02
+SHA1 (patch-media_libcubeb_src_cubeb__sun.c) = a99f13eb0a4d16be0ab9c67b4d6a6a9986b6f00f
 SHA1 (patch-media_libpng_pngpriv.h) = ee952a703ee08e8ff2269c7178e55e00b12faa29
 SHA1 (patch-memory_build_mozjemalloc__types.h) = af87ef935653cb845a6b702af2f5645a6ada27db
 SHA1 (patch-mozglue_misc_Now.cpp) = 760724be1bdc4ca6e19edaf2c8df6dd84192d93f
