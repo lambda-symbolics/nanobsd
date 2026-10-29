@@ -231,6 +231,11 @@ struct lwp {
 	uint64_t	l_lp_oncpu;	/* s: cpu_counter() when it got the CPU */
 	uint32_t	l_lp_burst_us;	/* s: moving average of its run bursts */
 	uint32_t	l_lp_wait_us;	/* s: moving average of its waits */
+	/*
+	 * LISPBSD: run time (l_rtime plus the current slice) at the last
+	 * sched_pstats(), so %cpu comes from measured time, not tick samples.
+	 */
+	struct bintime	l_ps_rtime;	/* l: */
 };
 
 /*

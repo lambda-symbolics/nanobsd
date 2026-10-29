@@ -1133,6 +1133,17 @@ static const fixpt_t cexp[ ] = {
 };
 
 /*
+ * LISPBSD: microseconds in a bintime (sched_pstats only needs us).
+ */
+static uint64_t
+pstats_bt2us(const struct bintime *bt)
+{
+
+	return (uint64_t)bt->sec * 1000000 +
+	    (((uint64_t)1000000 * (uint32_t)(bt->frac >> 32)) >> 32);
+}
+
+/*
  * sched_pstats:
  *
  * => Update process statistics and check CPU resource allocation.
@@ -1143,12 +1154,35 @@ void
 sched_pstats(void)
 {
 	struct loadavg *avg = &averunnable;
-	const int clkhz = (stathz != 0 ? stathz : hz);
 	static bool backwardslwp = false;
 	static bool backwardsproc = false;
 	static u_int lavg_count = 0;
+	static struct bintime pstats_last;
+	struct bintime now, bt;
+	uint64_t elapsed_us;
 	struct proc *p;
 	int nrun;
+
+	/*
+	 * LISPBSD: l_pctcpu used to grow by the statclock samples that found
+	 * the LWP on a CPU (l_cpticks).  At 100 Hz that misreads short bursts
+	 * by whole factors: media threads woken by the 10 ms audio interrupt
+	 * run in phase with the tick and are always or never caught (top
+	 * showed 28 % for a process that ran 4.9 %, ps 0 % for another).  Use
+	 * the run time the kernel measures at every switch instead, over the
+	 * real time since the last call.
+	 */
+	binuptime(&now);
+	if (pstats_last.sec == 0 && pstats_last.frac == 0) {
+		elapsed_us = 1000000;
+	} else {
+		bt = now;
+		bintime_sub(&bt, &pstats_last);
+		elapsed_us = pstats_bt2us(&bt);
+		if (elapsed_us == 0)
+			elapsed_us = 1;
+	}
+	pstats_last = now;
 
 	sched_pstats_ticks++;
 	if (++lavg_count >= 5) {
@@ -1167,7 +1201,8 @@ sched_pstats(void)
 		runtm = p->p_rtime.sec;
 		LIST_FOREACH(l, &p->p_lwps, l_sibling) {
 			fixpt_t lpctcpu;
-			u_int lcpticks;
+			struct bintime rt;
+			uint64_t ran_us, ran;
 
 			if (__predict_false((l->l_flag & LW_IDLE) != 0))
 				continue;
@@ -1188,6 +1223,22 @@ sched_pstats(void)
 			runtm += l->l_rtime.sec;
 			l->l_swtime++;
 			sched_lwp_stats(l);
+
+			/* Run time since the last call, the current slice included. */
+			rt = l->l_rtime;
+			if (l->l_stat == LSONPROC &&
+			    bintimecmp(&now, &l->l_stime, >)) {
+				bt = now;
+				bintime_sub(&bt, &l->l_stime);
+				bintime_add(&rt, &bt);
+			}
+			ran_us = 0;
+			if (bintimecmp(&rt, &l->l_ps_rtime, >)) {
+				bt = rt;
+				bintime_sub(&bt, &l->l_ps_rtime);
+				ran_us = pstats_bt2us(&bt);
+			}
+			l->l_ps_rtime = rt;
 
 			/* For load average calculation. */
 			if (__predict_false(lavg_count == 0) &&
@@ -1211,9 +1262,11 @@ sched_pstats(void)
 				continue;
 
 			lpctcpu = l->l_pctcpu;
-			lcpticks = atomic_swap_uint(&l->l_cpticks, 0);
-			lpctcpu += ((FSCALE - ccpu) *
-			    (lcpticks * FSCALE / clkhz)) >> FSHIFT;
+			(void)atomic_swap_uint(&l->l_cpticks, 0);
+			ran = ran_us * FSCALE / elapsed_us;
+			if (ran > FSCALE)
+				ran = FSCALE;
+			lpctcpu += ((FSCALE - ccpu) * (fixpt_t)ran) >> FSHIFT;
 			l->l_pctcpu = lpctcpu;
 		}
 		/* Calculating p_pctcpu only for ps(1) */
