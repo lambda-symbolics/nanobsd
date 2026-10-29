@@ -1,0 +1,46 @@
+$NetBSD$
+
+Implement libinput_device_led_update on NetBSD (it was a TODO stub, so
+Caps Lock worked but its LED never lit under a wlroots compositor).
+
+--- src/libinput_openbsd.c.orig
++++ src/libinput_openbsd.c
+@@ -33,6 +33,10 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/epoll.h>
++#ifdef __NetBSD__
++#include <sys/ioctl.h>
++#include <dev/wscons/wsconsio.h>
++#endif
+ #include <unistd.h>
+ 
+ #include "input.h"
+@@ -3318,7 +3322,26 @@
+ LIBINPUT_EXPORT void
+ libinput_device_led_update(struct libinput_device *device, enum libinput_led leds)
+ {
+-	// TODO
++#ifdef __NetBSD__
++	/*
++	 * wskbd in event mode leaves the LEDs to us: set them on the
++	 * keyboard's own device (the driver, e.g. pckbd, sends the command).
++	 */
++	int wsleds = 0;
++
++	if (device->fd < 0 ||
++	    wscons_device(device)->capability != LIBINPUT_DEVICE_CAP_KEYBOARD)
++		return;
++	if (leds & LIBINPUT_LED_NUM_LOCK)
++		wsleds |= WSKBD_LED_NUM;
++	if (leds & LIBINPUT_LED_CAPS_LOCK)
++		wsleds |= WSKBD_LED_CAPS;
++	if (leds & LIBINPUT_LED_SCROLL_LOCK)
++		wsleds |= WSKBD_LED_SCROLL;
++	if (leds & LIBINPUT_LED_COMPOSE)
++		wsleds |= WSKBD_LED_COMPOSE;
++	(void)ioctl(device->fd, WSKBDIO_SETLEDS, &wsleds);
++#endif
+ }
+ 
+ LIBINPUT_EXPORT int
