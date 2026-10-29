@@ -31,7 +31,9 @@
     ("Session and screen"
      ("switch-to mahogany|stumpwm" "the session the console starts; startmh and startx-safe underneath")
      ("mahoganyctl FORM" "evaluate Lisp in the running Mahogany (never after a defstruct change)")
-     ("screenshot" "freeze, select a region, save timestamped")
+     ("screenshot [area|full]" "PrtSc: freeze, select a region, save timestamped, copy")
+     ("freezeshot FILE.png" "the freeze-and-drag part on its own (Esc/q/right button cancel)")
+     ("feh PATH... (imv)" "image viewer: files or folders, pan and zoom")
      ("screentemp [K] [-d]" "colour temperature of the panel")
      ("statusbar / statusbard" "a status snapshot / the daemon publishing it to the bar")
      ("waytemp" "temperatures under Wayland")

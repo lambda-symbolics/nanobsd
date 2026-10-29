@@ -17,11 +17,11 @@ OUT="$DIR/screenshot-$(date +%Y-%m-%d_%H-%M-%S).png"
 SELOPTS='--line style=dash,width=2,color=#E46876'
 
 if [ -n "$WAYLAND_DISPLAY" ]; then
-	# Under Mahogany: grim captures through wlr-screencopy, slurp selects.
-	# The selection box uses the same accent colour as the X version.
+	# Under Mahogany: freezeshot captures first and shows the frozen frame
+	# while you drag (the scrot -f behaviour), in the accent colour; grim
+	# takes whole screens.
 	case "${1:-area}" in
-	area)	region=$(slurp -d -b 00000044 -c E46876ff -w 2) || exit 1
-		grim -g "$region" "$OUT" || exit 1 ;;
+	area)	freezeshot "$OUT" >/dev/null || exit 1 ;;
 	window|full)
 		grim "$OUT" || exit 1 ;;
 	*)	echo "usage: screenshot [area|full|window]" >&2; exit 2 ;;
