@@ -480,6 +480,14 @@ int i915_vma_bind(struct i915_vma *vma,
 			return ret;
 	}
 
+	/*
+	 * LISPBSD: the GPU may cache translations of these pages from now
+	 * on; releasing them must invalidate the TLBs first (Linux
+	 * 7938d61591d3, "Flush TLBs before releasing backing store").
+	 */
+	if (vma->obj)
+		set_bit(I915_BO_WAS_BOUND_BIT, &vma->obj->flags);
+
 	atomic_or(bind_flags, &vma->flags);
 	return 0;
 }

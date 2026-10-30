@@ -2699,6 +2699,17 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
 #define GEN8_FAULT_TLB_DATA1		_MMIO(0x4b14)
 #define GEN12_FAULT_TLB_DATA0		_MMIO(0xceb8)
 #define GEN12_FAULT_TLB_DATA1		_MMIO(0xcebc)
+
+/* LISPBSD: per-engine TLB invalidation (Linux 7938d61591d3, 04aa64375f48) */
+#define GEN8_RTCR			_MMIO(0x4260)
+#define GEN8_M1TCR			_MMIO(0x4264)
+#define GEN8_M2TCR			_MMIO(0x4268)
+#define GEN8_BTCR			_MMIO(0x426c)
+#define GEN8_VTCR			_MMIO(0x4270)
+#define GEN12_GFX_TLB_INV_CR		_MMIO(0xced8)
+#define GEN12_VD_TLB_INV_CR		_MMIO(0xcedc)
+#define GEN12_VE_TLB_INV_CR		_MMIO(0xcee0)
+#define GEN12_BLT_TLB_INV_CR		_MMIO(0xcee4)
 #define   FAULT_VA_HIGH_BITS		(0xf << 0)
 #define   FAULT_GTT_SEL			(1 << 4)
 

@@ -14,6 +14,7 @@ __KERNEL_RCSID(0, "$NetBSD: i915_gem_pages.c,v 1.7 2024/01/19 22:22:54 riastradh
 #include "i915_scatterlist.h"
 #include "i915_gem_lmem.h"
 #include "i915_gem_mman.h"
+#include "gt/intel_gt.h"
 
 #ifdef __NetBSD__
 #include <sys/param.h>
@@ -215,6 +216,15 @@ __i915_gem_object_unset_pages(struct drm_i915_gem_object *obj)
 
 	__i915_gem_object_reset_page_iter(obj);
 	obj->mm.page_sizes.phys = obj->mm.page_sizes.sg = 0;
+
+	/*
+	 * LISPBSD: the pages go back to the system after this; an engine
+	 * TLB that still translates to them would let the GPU write into
+	 * memory that has meanwhile been given to someone else (Linux
+	 * 7938d61591d3, CVE-2022-0330).
+	 */
+	if (test_and_clear_bit(I915_BO_WAS_BOUND_BIT, &obj->flags))
+		intel_gt_invalidate_tlbs(&to_i915(obj->base.dev)->gt);
 
 	return pages;
 }

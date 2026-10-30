@@ -65,6 +65,9 @@ struct intel_gt {
 
 	struct intel_reset reset;
 
+	/* LISPBSD: serialises engine TLB invalidations */
+	struct mutex tlb_invalidate_lock;
+
 	/**
 	 * Is the GPU currently considered idle, or busy executing
 	 * userspace requests? Whilst idle, we allow runtime power
