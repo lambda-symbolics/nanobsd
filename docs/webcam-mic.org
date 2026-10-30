@@ -1,0 +1,60 @@
+#+TITLE: Camera frozen on the first frame; microphone and the F4 mute key
+#+DATE: 2026-10-30
+
+* Camera
+Symptom: in a meeting the picture appears and freezes on the first frame.
+ffmpeg on /dev/video1 (MJPEG; video0/video2 are a raw format uvideo does not
+know) got no frame at all; DQBUF returned EAGAIN forever after STREAMON.
+
+dtrace on uvideo_stream_recv_isoc_complete: the three isochronous xfers
+completed normally for about a second, then all three at once with
+USBD_IOERROR, and uvideo resubmits only after USBD_STALLED, so the stream
+stopped.  The xHCI event ring (read with gdb, =target kvm /dev/mem=,
+=xhci_cd.cd_devs[1]->dv_private=) held a run of 92 Missed Service events
+(code 23), a Ring Overrun and a Length error after normal short packets.
+
+Cause, two layers:
+- xhci_device_isoc_enter gave every TD a Frame ID (the controller has CFC)
+  advancing one 1 ms frame per TD.  A high-speed bInterval counts 125 us
+  microframes, so the camera's every-microframe endpoint was served at 1/8
+  of its rate: 80 TDs took 80 ms instead of 10 ms.  The camera's FIFO
+  overflowed and the schedule fell into missed service.
+- xhci_event_transfer took the completion code of an xfer's last TD as the
+  status of the whole xfer, so one missed interval at the end failed 79
+  good frames with USBD_IOERROR.
+
+Kernel 214 (in 215): isochronous TDs always use SIA (start as soon as
+possible, as Linux does for URB_ISO_ASAP, which uvc and snd-usb-audio set);
+Missed Service, ring under/overrun, transaction, data buffer and isoch
+overrun codes make that frame empty and the xfer complete normally; uvideo
+resubmits after every status but USBD_CANCELLED.  The same xhci path carries
+USB audio (uaudio).
+
+| capture             | before        | kernel 215                    |
+|---------------------+---------------+-------------------------------|
+| 640x360 MJPEG, 30 s | 0 frames      | 450 frames (15 fps)           |
+| 1280x720 MJPEG, 20 s | -            | 301 frames, 2003 xfers, 0 errors |
+
+=usb off= at boot detaches the camera; =webcam on= reattaches it.
+
+* Microphone
+The Realtek 0287 exposes one capture pin, "Mic In [Jack]".  The built-in
+microphones are digital mics on the Tiger Lake audio DSP (the ACPI NHLT
+table describes them); NetBSD has no DSP driver.  With nothing in the jack a
+recording is white noise (left/right correlation -0.10).
+
+The capture mixer was found muted with the mic gain at 0: rc.d/mixerctl sets
+it from /etc/mixerctl.conf, then rc.local's hdafg-hp-fix reattaches the codec
+and resets it.  rc.local now runs =mic restore= after that.
+
+=mic [on|off|toggle|up|down|get]= (userland/mic): the record level mute, the
+mic pin mute, the gain (the control has four levels, 0 85 170 255) and the
+LED; state in ~/.mic.
+
+* F4 mic mute key
+The key arrives as ThinkPad HKEY event 0x101b, which thinkpad(4) ignored.
+Kernel 215 forces that bit into the hotkey mask (Linux enables it the same
+way), delivers it as the "mic-mute" hotkey (/etc/powerd/actions/mic-mute ->
+=mic toggle=) and exposes the key's LED as =hw.acpi.thinkpad0.micmute_led=
+(ACPI MMTS, 2 on / 0 off, writable by any user).  Presses are counted in
+=vmstat -e= ("mic mute hotkey").

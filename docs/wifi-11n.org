@@ -120,10 +120,11 @@ HE off and back to the Zyxel if the wg peer stays silent for 90 s):
   rx_he counted 55 k HE frames per run, BSS color 37, MU EDCA present, no
   UORA.  Throughput is the internet line's on all three, so the test shows
   that HE works, not that it is faster.
-- hw.iwx.he stays 0 by default: two APs of one vendor are all it has met;
-  =sysctl -w hw.iwx.he=1= enables it (re-associate to take effect).
+- hw.iwx.he is 1 by default since kernel 214 (2026-10-30); =sysctl -w
+  hw.iwx.he=0= falls back to VHT/HT if an AP misbehaves (re-associate to
+  take effect).
 
-Behind =hw.iwx.he= (default 0, needs =hw.iwx.ht=1, 2.4 and 5 GHz).
+Behind =hw.iwx.he= (default 1 since kernel 214, needs =hw.iwx.ht=1, 2.4 and 5 GHz).
 
 - net80211 (after OpenBSD): Element ID Extension parsing in beacons and
   the association response (HE Capabilities incl. PPE thresholds, HE
