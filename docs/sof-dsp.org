@@ -1,0 +1,35 @@
+#+TITLE: SOF on the Tiger Lake audio DSP (built-in microphones)
+#+DATE: 2026-10-30
+
+* Why
+The two built-in microphones are PDM digital mics on the cAVS 2.5 audio DSP
+(ACPI NHLT); the HDA codec only sees the headset jack.  NetBSD has no DSP
+driver.  kernel/modules/sofdsp is a loadable module that boots Sound Open
+Firmware (IPC3, sof-bin v2.2.6 sof-tgl.ri, Intel-signed, in
+/libdata/firmware/sofdsp/) beside hdaudio(4), which keeps the controller,
+codec and its coupled streams.  Reference: Linux v6.12 sound/soc/sof/intel
+(dual BSD/GPL), fetched to /root/sof-ref/l.
+
+* Boot sequence (Phase 1, polled IPC)
+hdaudio_rt_use; BAR4 (DSP, 1 MB); PP cap 0x800, SPIB cap 0x700, ISS 7;
+DSP clock/power gating off (PCI CGCTL.ADSPDCGE, EM2.L1SEN, PGCTL.ADSPPGD);
+PPCTL.GPROCEN; ICCMAX capture stream (decoupled, LTRP guardband 95);
+code loader output stream (decoupled, own tag = index in direction + 1,
+4 KB BDL entries, SPIB = image size); core 0 SPA, HIPCIDR = BUSY |
+ROM_CONTROL | PURGE_FW | (tag-1)<<9, CRST/CSTALL off, wait HIPCIDA DONE,
+ROM INIT_DONE; run the loader stream; wait FW_ENTERED; FW_READY in the
+uplink mailbox 0x81000.
+
+* Status
+- ROM handshake works: core 0 runs, ROM acks, INIT_DONE.
+- The loader DMA moves exactly 32 KB (PPHC LDP 0x8000) and the ROM halts
+  at 0x80000003 (FW_MANIFEST_LOADED, halted), error word 0, extended status
+  word 6 = 0x025101c4.
+- Same with the community-signed image, buffers and BDL below 4 GB, 4 KB or
+  256 KB BDL entries, Linux's exact ICCMAX programming and loader interrupt
+  enables, busy-waiting instead of sleeping.  Not yet explained.
+
+* Pipeline (decoded, not yet sent)
+/root/sof-ref/tplg/dmic48k-ipc.md: sof-hda-generic-2ch pipeline 10, DMIC0
+DAI -> IIR high-pass -> volume -> host PCM 6, 48 kHz 2 ch; dmic01: clock
+2.4-4.8 MHz, duty 40-60, FIFO 48 kHz 32 bit, PDM 0 mic A+B.
