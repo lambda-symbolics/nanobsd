@@ -1,0 +1,61 @@
+#+TITLE: Kernel pages zeroed after xhci0 comes back from a TCSS power loss
+#+DATE: 2026-10-30
+
+* Symptom
+Three panics on kernel #208 (boot entry "206"), each in a different
+subsystem, each soon after the laptop came back from s2idle or after USB-C
+was switched on:
+
+| dump | panic                                                      | victim                         |
+|------+------------------------------------------------------------+--------------------------------|
+| 21   | trap in vmem_xfree_bt during a Firefox core dump           | a vmem boundary tag (NULL)     |
+| 22   | "locking against myself" after a fault in uvm_unmap_remove | Firefox's vm_map entry list    |
+| 23   | gefs: assertion "off >= start" (blk.c:411, logappend)      | gefs arena free-range AVL node |
+
+Dump 20 (10-20, #186) is unrelated: a context-creation failure under the
+GEM buffer leak, no resume involved.
+
+* Evidence: whole 4 KB pages overwritten with zeros
+Read with the rebuilt #208 debug kernel (/var/crash/netbsd.gdb.208; the
+original was overwritten by the #209 build, rebuilt from the tree minus
+kernel 209's lwp.h/kern_synch.c; .rodata is shifted by the version string,
+data structures are exact) and =gdb target kvm=.
+
+- Dump 22: Firefox's map has 8036 entries; entry #1202 (0xffffb39859fcf200)
+  is all zeros, its predecessor still points to it.  The whole page
+  (PA 0x134bcf000, direct map) is zero.  Its vm_page is an ordinary
+  allocated pool page (BUSY|FAKE|CLEAN, no owner, not PG_FREE), and the
+  neighbouring vm_map_entry pool pages still link it into the pool's page
+  list (in-page headers at offset 0).  So the page allocator never handed it
+  out twice: something wrote 4096 zero bytes over it.  No other reference to
+  the page anywhere in the dump (vm_page pointer, PA, PFN, PTE-shaped value).
+- Dump 23: blkalloc took the highest free range of the arena; that node
+  read off=0 len=-16384 (0 minus one block), giving block -16384.  The node's
+  page (PA 0x3166ae000) is zero except the two fields later tree operations
+  wrote (parent pointer, len).
+- Dump 21: a NULL boundary tag in vmem, consistent with the same wipe.
+
+* Correlation: xhci0 cold recovery, not the s2idle resume as such
+| dump | "xhci0: resume: power was lost (ACPI), cold recovery" | panic   | gap   |
+|------+--------------------------------------------------------+---------+-------|
+| 21   | 80178 (at runtime, no s2idle)                          | 80214   | 36 s  |
+| 22   | 70276 (s2idle resume)                                  | 70435   | 159 s |
+| 23   | 24583 (s2idle resume)                                  | 24630   | 47 s  |
+Earlier cold recoveries in the same boots (dump 22 at 64489, dump 23 at
+1110) were not followed by a panic; s2idle resumes without a cold recovery
+never were.  A stray write to a random page fits: usually it lands somewhere
+harmless.
+
+* Ruled out so far
+- The Thunderbolt DMA engines (00:0d.2/.3, no driver) come back from D3cold
+  with their saved command register 0x0003: bus mastering off.
+- xhci0's own DMA memory is intact in dump 22: DCBAA[0] = scratchpad array,
+  array = the 34 attach-time scratchpad pages, rings where the softc says.
+- hdaudio keeps its CORB/RIRB across sleep and reprograms the same buffers.
+- dma-buf mmap hands the process the GEM object's aobj (UVM-managed pages).
+
+* Next
+userland/memwatch.c: fill ~3.5 GB with a per-word pattern, run a trigger,
+report changed pages.  Triggers: (B) =usb on usbc; usb off usbc= (runtime
+cold recovery), (C) the TCSS power cycle alone (hw.acpi.sleep.tcss_d3 0/1
+with xhci0 left suspended) vs xhci0's cold resume, (D) timed s2idle.
