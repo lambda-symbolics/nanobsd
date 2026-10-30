@@ -65,6 +65,7 @@
 /* This was based upon bthset.c */
 
 #include <sys/cdefs.h>
+#include <sys/param.h>
 __COPYRIGHT("@(#) Copyright (c) 2006 Itronix, Inc.  All rights reserved.");
 __RCSID("$NetBSD");
 
@@ -223,6 +224,21 @@ struct event_base *base;
 static struct event interrupt_ev;		/* audio event */
 static struct event recv_ev;			/* audio sink event */
 static struct event ctl_ev;			/* avdtp ctl event */
+/*
+ * LISPBSD: AVDTP transport suspension.  The stock code treated SUSPEND as
+ * START and, streaming, fell through into opening another media channel.
+ * Now a SUSPEND from the sink stops reading and encoding (state 8) and
+ * watch_ev drains the source, sending START once it carries sound again
+ * (state 9) -- pad(4) only produces while some program has the audio device
+ * open.  retry_ev re-arms interrupt_ev after a failed stream() with -n,
+ * which used to retry at once while the source stayed readable.
+ */
+#define	ST_STREAMING	7
+#define	ST_SUSPENDED	8
+#define	ST_STARTING	9
+static struct event watch_ev;			/* suspended: sound again? */
+static struct event retry_ev;			/* -n: stream() failed */
+static int		retry_ms;
 
 struct l2cap_info	info;
 static bool		runasDaemon;
@@ -269,6 +285,11 @@ static int startFileInd = 0;
 int audfile;
 
 static void do_interrupt(int, short, void *);
+static void do_watch(int, short, void *);
+static void do_retry(int, short, void *);
+static void ev_del(struct event *);
+static void stream_suspend(void);
+static void stream_resume(void);
 static void do_recv(int, short, void *);
 static void do_ctlreq(int, short, void *);
 static void bt_exit(int fd);
@@ -690,8 +711,11 @@ do_ctlreq(int fd, short ev, void *arg)
 			close(orighc);
 			orighc = -1;
 			event_del(&recv_ev);
-		} else
+		} else {
 			event_del(&interrupt_ev);
+			ev_del(&watch_ev);
+			ev_del(&retry_ev);
+		}
 
 		if (sc != -1)
 			close(sc);
@@ -706,8 +730,11 @@ do_ctlreq(int fd, short ev, void *arg)
 			avdtpSendAccept(fd, fd, trans, signal);
 			if (asSpeaker) {
 				event_del(&recv_ev);
-			} else
+			} else {
 				event_del(&interrupt_ev);
+				ev_del(&watch_ev);
+				ev_del(&retry_ev);
+			}
 
 			if (sc != -1)
 				close(sc);
@@ -736,9 +763,15 @@ do_ctlreq(int fd, short ev, void *arg)
 				state = 5;
 			break;
 		case AVDTP_SUSPEND:
+			avdtpSendAccept(fd, fd, trans, signal);
+			if (state == ST_STREAMING)
+				stream_suspend();
+			break;
 		case AVDTP_START:
 			avdtpSendAccept(fd, fd, trans, signal);
-			if (state < 6)
+			if (state == ST_SUSPENDED || state == ST_STARTING)
+				stream_resume();
+			else if (state < 6)
 				state = 6;
 			break;
 		default:
@@ -781,8 +814,13 @@ do_ctlreq(int fd, short ev, void *arg)
 				state = 5;
 			break;
 		case AVDTP_SUSPEND:
+			if (state == ST_STREAMING)
+				stream_suspend();
+			break;
 		case AVDTP_START:
-			if (state < 6)
+			if (state == ST_STARTING || state == ST_SUSPENDED)
+				stream_resume();
+			else if (state < 6)
 				state = 6;
 			break;
 		default:
@@ -793,7 +831,15 @@ do_ctlreq(int fd, short ev, void *arg)
 	}
 
 
-	if (state < 5 || state > 7)
+	/*
+	 * Only the opened (5: connect the media channel, once) and started
+	 * (6: begin streaming) states have setup left to do.  Anything else
+	 * -- streaming, suspended, or a message we merely answered -- must
+	 * not open another media channel.
+	 */
+	if (state != 5 && state != 6)
+		return;
+	if (state == 5 && !asSpeaker && sc != -1)
 		return;
 
 	if (asSpeaker && state == 6) {
@@ -816,8 +862,11 @@ do_ctlreq(int fd, short ev, void *arg)
 	if (sc < 0)
 		return;
 
-	if (bind(sc, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+	if (bind(sc, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(sc);
+		sc = -1;
 		return;
+	}
 
 	if (setsockopt(sc, BTPROTO_L2CAP, SO_L2CAP_LM,
 	    &l2cap_mode, sizeof(l2cap_mode)) == -1) {
@@ -828,6 +877,8 @@ do_ctlreq(int fd, short ev, void *arg)
 	bdaddr_copy(&addr.bt_bdaddr, &info.raddr);
 	if (connect(sc,(struct sockaddr*)&addr, sizeof(addr)) < 0) {
 		log_warn("stream channel connect: %m");
+		close(sc);
+		sc = -1;
 		return;
 	}
 
@@ -891,8 +942,20 @@ do_interrupt(int fd, short ev, void *arg)
 
 
 next_file:
-	if (dontStop && len == -1)
-		usleep(1);
+	if (dontStop && len == -1) {
+		/* Wait before trying again, backing off to a second. */
+		event_del(&interrupt_ev);
+		retry_ms = retry_ms == 0 ? 10 : MIN(retry_ms * 2, 1000);
+		{
+			struct timeval tv = { retry_ms / 1000,
+			    (retry_ms % 1000) * 1000 };
+
+			evtimer_set(&retry_ev, do_retry, NULL);
+			evtimer_add(&retry_ev, &tv);
+		}
+		return;
+	} else if (len >= 0)
+		retry_ms = 0;
 	else if (len == -1 && currentFileInd >= numfiles -1) {
 		event_del(&interrupt_ev);
 		bt_exit(fd);
@@ -915,6 +978,90 @@ next_file:
 
 	if (verbose)
 		log_debug("Streaming %zd bytes", len);
+}
+
+/* event_del for the events that may never have been set up. */
+static void
+ev_del(struct event *ev)
+{
+
+	if (event_initialized(ev))
+		event_del(ev);
+}
+
+/* -n: the stream failed a while ago; listen to the source again. */
+static void
+do_retry(int fd, short ev, void *arg)
+{
+
+	if (state != ST_STREAMING)
+		return;
+	event_set(&interrupt_ev, audfile, EV_READ | EV_PERSIST,
+	    do_interrupt, NULL);
+	if (event_add(&interrupt_ev, NULL) < 0)
+		log_err(EXIT_FAILURE, "interrupt_ev: %m");
+}
+
+/* The sink suspended the transport: stop encoding and sending. */
+static void
+stream_suspend(void)
+{
+
+	state = ST_SUSPENDED;
+	if (asSpeaker)
+		return;		/* the remote source just goes quiet */
+	event_del(&interrupt_ev);
+	ev_del(&retry_ev);
+	event_set(&watch_ev, audfile, EV_READ | EV_PERSIST, do_watch, NULL);
+	if (event_add(&watch_ev, NULL) < 0)
+		log_err(EXIT_FAILURE, "watch_ev: %m");
+	log_info("Stream to %s suspended", bt_ntoa(&info.raddr, NULL));
+}
+
+/* START (the sink's, or the answer to ours): stream on the open channel. */
+static void
+stream_resume(void)
+{
+
+	state = ST_STREAMING;
+	if (asSpeaker)
+		return;
+	ev_del(&watch_ev);
+	retry_ms = 0;
+	event_set(&interrupt_ev, audfile, EV_READ | EV_PERSIST,
+	    do_interrupt, NULL);
+	if (event_add(&interrupt_ev, NULL) < 0)
+		log_err(EXIT_FAILURE, "interrupt_ev: %m");
+	log_info("Streaming to %s again", bt_ntoa(&info.raddr, NULL));
+}
+
+/*
+ * Suspended: drain the source and ask the sink to start again once it is
+ * no longer silent.  The block read here is lost, a few milliseconds.
+ */
+static void
+do_watch(int fd, short ev, void *arg)
+{
+	int16_t buf[1024];
+	ssize_t len, i;
+
+	len = read(fd, buf, sizeof(buf));
+	if (len <= 0) {
+		/* EOF or an error: stop watching, the next START recovers. */
+		if (len == 0 || (errno != EAGAIN && errno != EINTR))
+			ev_del(&watch_ev);
+		return;
+	}
+	for (i = 0; i < len / (ssize_t)sizeof(buf[0]); i++)
+		if (buf[i] != 0)
+			break;
+	if (i == len / (ssize_t)sizeof(buf[0]) || state != ST_SUSPENDED)
+		return;
+	ev_del(&watch_ev);
+	state = ST_STARTING;
+	avdtpStart(hc, hc, mySepInfo.sep);
+	if (verbose)
+		log_debug("Sound again: asked the sink to start");
 }
 
 /*

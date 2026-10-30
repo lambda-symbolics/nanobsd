@@ -1,0 +1,137 @@
+#+title: Power and state-verification findings of 2026-10-30
+
+A second external review (after the crash audit, [[file:crash-audit-2026-10-30.org]])
+of 79ec275: the governor's CPU input, CPU settings that can read back
+"applied" while the hardware differs, Bluetooth transport suspension, and
+audio power.  Each finding was checked against the code.  The changes were
+written and tested the night of 2026-10-30 while the laptop sat in s2idle
+(unreachable: see below), so they are compiled and VM-tested, *not yet
+deployed or tried on the Nano*.
+
+* 1. lpschedd judged load from statclock samples
+Confirmed.  =cpu_busy()= read =kern.cp_time=, whose counters statclock()
+samples.  Two errors: a periodic job in step with that clock looks busier or
+quieter than it is; and under tickless idle a sleeping CPU posts its skipped
+ticks only when it wakes, so one window got the busy CPUs' work and a later
+one the sleepers' idle.  The per-process %cpu repair (kernels 209/212) never
+touched these counters.
+
+Fix:
+- kernel: =lpsched_set_idle_depth= (called by cidle at every idle entry and
+  exit) now also keeps each CPU's idle time: the cpu_counter() value at
+  entry and the cycles of closed intervals, in a per-CPU =lpsched_idle[]=
+  array behind a generation counter.  =machdep.lpsched.cpu_idle= returns
+  =uint64 us[1 + ncpu]=: the current time, then each CPU's idle time
+  including an interval still in progress, without waking anyone.
+  =machdep.lpsched.idle_acct= (default 1) switches it; closing an interval
+  is never gated, so turning it off cannot leave a stale entry time.  The
+  sysctl answers EOPNOTSUPP while cidle is not installed (the stock idle
+  loop reports nothing and every CPU would look busy): cidle sets
+  =lpsched_idle_hooked= after its cross-call has moved every CPU over and
+  clears it before switching back.  Interrupt handlers that run inside a
+  shallow (tick-mode) MWAIT with interrupts enabled count as idle; tickless
+  MWAIT runs with them masked.
+- The idle fields are a separate array, not more =lpsched_cpu= fields: cidle
+  inlines =lpsched_set_idle_depth=, and an old module with a new kernel
+  would have indexed =lpsched_cpu= with the old stride.  Now an old
+  =cidle.kmod= on the new kernel works as before (no accounting, lpschedd
+  falls back), and a new one on an old kernel fails to link.
+- lpschedd: busy = 1 - d(idle)/d(now) per CPU from that sysctl; falls back
+  to =kern.cp_time= when it is missing, and starts each source's window
+  afresh on a switch.  Logs which source it uses.
+
+Tested in the VM (userland/idleacct-test): a kernel thread on CPU 1 that
+reports 300 ms deep idle then busy-waits 100 ms reads 0.249-0.250 busy over
+2 s windows; 150 ms reads that fall inside an idle interval read 0.000, so
+the interval in progress is counted; the sysctl is EOPNOTSUPP before and
+after (the VM cannot run cidle: KVM hides MONITOR/MWAIT from the guest).
+
+Not done: comparing governor input and chosen profile against the duty
+tests on the Nano.
+
+* 2. CPU settings that read back as applied when the hardware differs
+Confirmed both.
+- =machdep.hwp.epp= returns the module's cached value and only programmed the
+  CPUs when a write differed from it, so rewriting the same value could not
+  repair a request register firmware or a resume had changed.  Now every
+  write programs all CPUs, and =machdep.hwp.epp_hw= (new, RO) reads each
+  CPU's IA32_HWP_REQUEST: the common EPP, or -1 if the CPUs differ or a
+  request's min/max/desired/EPP is not what the module writes.  It wakes
+  every CPU (an xcall), so it is for occasional checks.
+- PL1: lpschedd compared only the power field; a matching value with
+  PL1_ENABLE clear counted as applied.  =machdep.hwp.pl1_enabled= (new, RO)
+  reports the bit; lpschedd rewrites PL1 (the setter sets the bit) when it
+  is clear.
+- lpschedd's existing 30 s check now also compares =epp_hw= with the
+  profile's EPP and rewrites it on a mismatch (8 IPIs per 30 s).
+
+Compiled; not testable in the VM (no HWP MSRs under KVM).
+
+* 3. Bluetooth: AVDTP SUSPEND handled as START
+Confirmed, and wider than reported: after any control message in states
+5-7 the code went on to open a media channel, so while streaming even a
+message it merely answered (a rejected command) opened another L2CAP
+channel.  Now:
+- only states 5 (opened: connect the media channel, unless one is open)
+  and 6 (started) go on to setup; a failed bind/connect closes the socket;
+- SUSPEND (from the sink, or the answer to ours) while streaming stops
+  reading pad(4) and encoding and keeps the media channel (state 8);
+  =watch_ev= then drains the pad and, at the first non-silent block, sends
+  AVDTP START (state 9).  pad only produces while a program has the audio
+  device open, so an idle system pays nothing;
+- START (the sink's, or the answer to ours) in 8/9 streams again on the
+  same channel;
+- =-n= and a failing =stream()=: the read event comes off and a timer
+  re-arms it, 10 ms doubling to 1 s, reset by a good write (it used to
+  =usleep(1)= with the persistent event still armed).
+
+Tested: =userland/bta2dpd/bta2dpd/bttest.c= (includes bta2dpd.c, drives
+=do_ctlreq= over socketpairs) 25 checks pass; bta2dpd builds with its
+WARNS=6/-Wconversion/-Werror.  Not tried against the headphones yet.
+
+* 4. Audio stays awake while a descriptor is open
+Partly confirmed, with a different shape.  hdafg holds its runtime-PM
+reference from open to close, but audio(4) also only calls =halt_output=
+when the last playback track closes (=audio_unlink=: =sc_popens == 0=): once
+started, the play mixer runs, feeding silence, while any program has the
+device open, paused or not.  So "DMA stopped but the reference held" hardly
+occurs; the real cost is the mixer itself.  A fix has to stop the play mixer
+after some seconds in which every track only produced silence (restarting
+on write), then let hdafg drop its reference while halted and take it in a
+sleepable place before the next trigger (=trigger_output= runs under the
+interrupt lock).  Not changed: it touches audio(4)'s mixer and needs the
+measurement the review proposes first (play, pause with the program open,
+wait, close: controller power state and stream interrupts at each stage).
+
+* 5. A failed audio controller suspend recorded as done
+Confirmed.  =hdaudio_rt_suspend_locked= logged a failed bus suspend
+(pci_set_powerstate to D3) and then marked the controller suspended, so the
+worker never retried.  Now: the codec function groups go back to D0, the
+controller stays marked awake, =sc_rt_suspend_fails= counts it and the
+worker retries after power_save seconds, doubling, at most an hour; a
+success resets the backoff.  Compiled.
+
+* Deploying (kernel 221)
+Everything must go together:
+1. kernel sources: sys/lpsched.h, kern/kern_lpsched.c,
+   dev/hdaudio/hdaudio.c, dev/hdaudio/hdaudiovar.h into /usr/src/sys, build.
+2. cidle and hwp modules from kernel/modules into
+   /usr/src/sys/modules/{cidle,hwp}, make, copy the .kmod files to
+   /stand/amd64/11.0/modules/{cidle,hwp}/ (keep the old ones).  The new
+   cidle needs kernel 221; kernel 220 refuses it (link error) and then runs
+   without cidle, so a fallback to 220 needs the old cidle.kmod back.
+3. lpschedd: =cc -O2 -Wall -o lpschedd lpschedd.c -lutil=, install,
+   restart; its log should say "busy from measured idle time".
+4. bta2dpd: build in userland/bta2dpd, install to /usr/local/sbin.
+Then: duty tests with the governor's input logged, a suspend/resume cycle
+(set =hw.acpi.sleep.freeze_timeout= first when testing remotely), the
+headphones (pause long enough for the headphones to suspend, resume), and
+=machdep.hwp.epp_hw= after a resume.
+
+* The laptop on the night of 2026-10-30
+A remote s2idle test on kernel 220 (=s0ix suspend= with a backgrounded
+=sysctl hw.acpi.sleep.wake=1=) left the Nano asleep: rc.local sets
+=hw.acpi.sleep.freeze_timeout=0= and the freeze suspends all userland, so the
+wake never ran.  It still answers ping.  Opening the lid or pressing the
+power button wakes it; =/var/tmp/s2test.sh= then finishes (a GPU job and
+audio after the resume, log in /var/tmp/s2test.log).

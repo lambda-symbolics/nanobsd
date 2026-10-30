@@ -336,6 +336,14 @@ cidle_install(bool on)
 	KASSERT(mutex_owned(&cidle_lock));
 	if (on == (cidle_active != 0))
 		return;
+	/*
+	 * LISPBSD: machdep.lpsched.cpu_idle is only meaningful while every
+	 * CPU idles here (the stock idle loop reports nothing, so its CPUs
+	 * would look busy): off before the switch, on once the cross-call
+	 * has moved every CPU over.
+	 */
+	if (!on)
+		lpsched_idle_hooked = 0;
 	if (on)
 		x86_cpu_idle_set(cidle_idle, "cidle", false);
 	else
@@ -343,6 +351,8 @@ cidle_install(bool on)
 	cidle_active = on;
 	xc = xc_broadcast(0, cidle_xc_nop, NULL, NULL);
 	xc_wait(xc);
+	if (on)
+		lpsched_idle_hooked = 1;
 }
 
 static int

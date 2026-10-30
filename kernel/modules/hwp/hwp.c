@@ -6,6 +6,9 @@
  *
  *	machdep.hwp.enabled		(int, RO)  1 once HWP has been enabled
  *	machdep.hwp.epp			(int, RW)  0 = max perf .. 255 = max power save
+ *	machdep.hwp.epp_hw		(int, RO)  EPP every CPU's request register
+ *					holds, -1 if they differ from each
+ *					other or from what this module writes
  *	machdep.hwp.capabilities	(string, RO) decoded IA32_HWP_CAPABILITIES
  *	machdep.hwp.{highest,guaranteed,efficient,lowest} (int, RO)
  *
@@ -13,6 +16,7 @@
  * policy can lower the sustained budget on battery and keep the bursts:
  *
  *	machdep.hwp.pl1, machdep.hwp.pl2	(int, RW)  milliwatts
+ *	machdep.hwp.pl1_enabled			(int, RO)  PL1_ENABLE bit
  *	machdep.hwp.pl1_window			(int, RO)  ms, PL1 time window
  *	machdep.hwp.pl_locked			(int, RO)  1: firmware locked them
  *	machdep.hwp.pl1_boot, machdep.hwp.pl2_boot (int, RO) as found at load
@@ -105,6 +109,9 @@ static int		hwp_pl1_boot, hwp_pl2_boot, hwp_pl1_window, hwp_pl_locked;
 /* Filled in by the first CPU (index 0) to run hwp_xc_enable(). */
 static volatile unsigned hwp_ncpus_done;
 static uint64_t		hwp_caps_raw;
+static uint64_t		hwp_req_read[MAXCPUS];	/* hwp_xc_read results */
+
+static uint64_t	hwp_request(unsigned);
 
 /*
  * Runs on every CPU via xcall.  arg1 == NULL: first-time enable
@@ -126,12 +133,7 @@ hwp_xc_program(void *arg1, void *arg2)
 	}
 
 	caps = rdmsr(MSR_IA32_HWP_CAPABILITIES);
-
-	req  = HWP_REQ_MIN(HWP_CAP_LOWEST(caps));
-	req |= HWP_REQ_MAX(HWP_CAP_HIGHEST(caps));
-	req |= HWP_REQ_DESIRED(0);		/* autonomous */
-	if (hwp_has_epp)
-		req |= HWP_REQ_EPP(epp);	/* reserved if !EPP: keep 0 */
+	req = hwp_request(epp);
 	/* activity window (needs HWP_ACTWIN) and package ctl (HWP_PLR): 0 */
 	wrmsr(MSR_IA32_HWP_REQUEST, req);
 
@@ -140,6 +142,42 @@ hwp_xc_program(void *arg1, void *arg2)
 			hwp_caps_raw = caps;
 		atomic_inc_uint(&hwp_ncpus_done);
 	}
+}
+
+/*
+ * The IA32_HWP_REQUEST this module writes on this CPU, for EPP epp.
+ */
+static uint64_t
+hwp_request(unsigned epp)
+{
+	uint64_t caps = rdmsr(MSR_IA32_HWP_CAPABILITIES);
+	uint64_t req;
+
+	req  = HWP_REQ_MIN(HWP_CAP_LOWEST(caps));
+	req |= HWP_REQ_MAX(HWP_CAP_HIGHEST(caps));
+	req |= HWP_REQ_DESIRED(0);		/* autonomous */
+	if (hwp_has_epp)
+		req |= HWP_REQ_EPP(epp);	/* reserved if !EPP: keep 0 */
+	return req;
+}
+
+/*
+ * Runs on every CPU via xcall: record whether its request register is
+ * what we would write (low 32 bits: min, max, desired, EPP), and its EPP.
+ * Bit 63 of the result flags a mismatch.
+ */
+static void
+hwp_xc_read(void *arg1, void *arg2)
+{
+	const unsigned epp = *(const unsigned *)arg1;
+	uint64_t req = rdmsr(MSR_IA32_HWP_REQUEST);
+	uint64_t want = hwp_request(epp);
+	u_int i = cpu_index(curcpu());
+
+	if (i < MAXCPUS)
+		hwp_req_read[i] = (req & 0xffffffffULL) |
+		    ((req & 0xffffffffULL) != (want & 0xffffffffULL) ?
+		    __BIT(63) : 0);
 }
 
 static void
@@ -173,13 +211,70 @@ hwp_sysctl_epp(SYSCTLFN_ARGS)
 		error = EOPNOTSUPP;
 		goto out;
 	}
-	if (val != hwp_epp) {
-		hwp_epp = val;
-		hwp_program_all(false);
-	}
+	/*
+	 * LISPBSD: always program, even the cached value: a write is how a
+	 * caller repairs a request register firmware (or a resume) changed
+	 * behind our back, which machdep.hwp.epp_hw reveals.
+	 */
+	hwp_epp = val;
+	hwp_program_all(false);
 out:
 	mutex_exit(&hwp_lock);
 	return error;
+}
+
+/*
+ * machdep.hwp.epp_hw: read every CPU's IA32_HWP_REQUEST (an xcall: it wakes
+ * each CPU, so for occasional verification, not polling).
+ */
+static int
+hwp_sysctl_epp_hw(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	CPU_INFO_ITERATOR cii;
+	struct cpu_info *ci;
+	unsigned epp;
+	uint64_t xc;
+	int val = -2, e;
+	u_int i;
+
+	if (!hwp_has_epp)
+		return EOPNOTSUPP;
+	mutex_enter(&hwp_lock);
+	epp = (unsigned)hwp_epp;
+	memset(hwp_req_read, 0, sizeof(hwp_req_read));
+	xc = xc_broadcast(0, hwp_xc_read, &epp, NULL);
+	xc_wait(xc);
+	for (CPU_INFO_FOREACH(cii, ci)) {
+		i = cpu_index(ci);
+		if (i >= MAXCPUS)
+			continue;
+		e = (int)((hwp_req_read[i] >> 24) & 0xff);
+		if ((hwp_req_read[i] & __BIT(63)) != 0 ||
+		    (val != -2 && val != e)) {
+			val = -1;
+			break;
+		}
+		val = e;
+	}
+	mutex_exit(&hwp_lock);
+	node.sysctl_data = &val;
+	return sysctl_lookup(SYSCTLFN_CALL(&node));
+}
+
+/* machdep.hwp.pl1_enabled: whether the firmware or we left PL1 enforced. */
+static int
+hwp_sysctl_pl1_enabled(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	uint64_t lim;
+	int val;
+
+	if (rdmsr_safe(MSR_PKG_POWER_LIMIT, &lim) != 0)
+		return EIO;
+	val = (lim & PL1_ENABLE) != 0;
+	node.sysctl_data = &val;
+	return sysctl_lookup(SYSCTLFN_CALL(&node));
 }
 
 static int
@@ -317,6 +412,20 @@ hwp_sysctl_setup(void)
 	    SYSCTL_DESCR("Lowest performance level"),
 	    NULL, 0, &hwp_cap_lowest, 0, CTL_CREATE, CTL_EOL);
 	if (error != 0 || !hwp_has_rapl)
+		return error;
+
+	error = sysctl_createv(&hwp_sysctl_log, 0, &hnode, NULL,
+	    CTLFLAG_READONLY, CTLTYPE_INT, "epp_hw",
+	    SYSCTL_DESCR("EPP in every CPU's request register, -1 if they"
+	    " differ or do not match what this module writes"),
+	    hwp_sysctl_epp_hw, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+	if (error != 0)
+		return error;
+	error = sysctl_createv(&hwp_sysctl_log, 0, &hnode, NULL,
+	    CTLFLAG_READONLY, CTLTYPE_INT, "pl1_enabled",
+	    SYSCTL_DESCR("PL1_ENABLE: the PL1 value is enforced"),
+	    hwp_sysctl_pl1_enabled, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+	if (error != 0)
 		return error;
 
 	/* sysctl_data NULL: PL1, non-NULL (any marker): PL2. */

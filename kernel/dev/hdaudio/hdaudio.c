@@ -998,6 +998,27 @@ hdaudio_rt_arm(struct hdaudio_softc *sc)
 		callout_schedule(&sc->sc_rt_callout, hz * hdaudio_power_save);
 }
 
+/*
+ * LISPBSD: the codec function groups back to D0 after a suspend that did
+ * not complete, so the next attempt starts from the state it expects.
+ */
+static void
+hdaudio_rt_resume_fgs(struct hdaudio_softc *sc)
+{
+	struct hdaudio_function_group *fg;
+	int i, j;
+
+	for (i = 0; i < HDAUDIO_MAX_CODECS; i++) {
+		if (!sc->sc_codec[i].co_valid)
+			continue;
+		for (j = 0; j < sc->sc_codec[i].co_nfg; j++) {
+			fg = &sc->sc_codec[i].co_fg[j];
+			if (fg->fg_device != NULL && fg->fg_rt_resume != NULL)
+				(*fg->fg_rt_resume)(fg->fg_device);
+		}
+	}
+}
+
 static void
 hdaudio_rt_suspend_locked(struct hdaudio_softc *sc)
 {
@@ -1015,8 +1036,28 @@ hdaudio_rt_suspend_locked(struct hdaudio_softc *sc)
 				(*fg->fg_rt_suspend)(fg->fg_device);
 		}
 	}
-	if (sc->sc_rt_suspend != NULL && !(*sc->sc_rt_suspend)(sc))
-		aprint_error_dev(sc->sc_dev, "runtime suspend of the controller failed\n");
+	if (sc->sc_rt_suspend != NULL && !(*sc->sc_rt_suspend)(sc)) {
+		/*
+		 * LISPBSD: the controller is still powered.  Recording it as
+		 * suspended made the worker treat it as done and never try
+		 * again: put the codecs back and retry later, backing off
+		 * (power_save, doubling, at most an hour).
+		 */
+		u_int shift = MIN(sc->sc_rt_backoff, 9);
+		int delay = MIN(hz * hdaudio_power_save * (1 << shift),
+		    hz * 3600);
+
+		sc->sc_rt_suspend_fails++;
+		sc->sc_rt_backoff++;
+		aprint_error_dev(sc->sc_dev, "runtime suspend of the controller"
+		    " failed (%" PRIu64 " so far); retrying in %d s\n",
+		    sc->sc_rt_suspend_fails, delay / hz);
+		hdaudio_rt_resume_fgs(sc);
+		if (sc->sc_rt_wq != NULL)
+			callout_schedule(&sc->sc_rt_callout, MAX(delay, 1));
+		return;
+	}
+	sc->sc_rt_backoff = 0;
 	sc->sc_rt_suspended = true;
 	sc->sc_rt_suspends++;
 	aprint_debug_dev(sc->sc_dev, "runtime suspended\n");
@@ -1026,8 +1067,6 @@ hdaudio_rt_suspend_locked(struct hdaudio_softc *sc)
 static bool
 hdaudio_rt_resume_locked(struct hdaudio_softc *sc)
 {
-	struct hdaudio_function_group *fg;
-	int i, j;
 
 	KASSERT(mutex_owned(&sc->sc_rt_lock));
 	KASSERT(sc->sc_rt_suspended);
@@ -1036,15 +1075,7 @@ hdaudio_rt_resume_locked(struct hdaudio_softc *sc)
 		return false;	/* stays suspended; the next use retries */
 	}
 	sc->sc_rt_suspended = false;	/* the interrupt handler may run again */
-	for (i = 0; i < HDAUDIO_MAX_CODECS; i++) {
-		if (!sc->sc_codec[i].co_valid)
-			continue;
-		for (j = 0; j < sc->sc_codec[i].co_nfg; j++) {
-			fg = &sc->sc_codec[i].co_fg[j];
-			if (fg->fg_device != NULL && fg->fg_rt_resume != NULL)
-				(*fg->fg_rt_resume)(fg->fg_device);
-		}
-	}
+	hdaudio_rt_resume_fgs(sc);
 	sc->sc_rt_resumes++;
 	aprint_debug_dev(sc->sc_dev, "runtime resumed\n");
 	return true;

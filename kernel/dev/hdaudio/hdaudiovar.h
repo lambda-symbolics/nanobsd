@@ -217,6 +217,8 @@ struct hdaudio_softc {
 	bool			(*sc_rt_resume)(struct hdaudio_softc *);
 	int			sc_rt_lastbusy;		/* getticks() at the last release */
 	uint64_t		sc_rt_suspends, sc_rt_resumes, sc_rt_stale;
+	uint64_t		sc_rt_suspend_fails;	/* LISPBSD: all failures */
+	u_int			sc_rt_backoff;		/* failures in a row */
 	SLIST_ENTRY(hdaudio_softc) sc_rt_link;		/* all controllers, for the sysctl */
 };
 

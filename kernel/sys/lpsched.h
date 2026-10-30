@@ -34,6 +34,8 @@
 #include <sys/kernel.h>
 #include <sys/atomic.h>
 
+#include <machine/cpu_counter.h>
+
 /* lpsched_cpu[].depth values */
 #define	LPSCHED_IDLE_ACTIVE	0	/* running, or depth unknown */
 #define	LPSCHED_IDLE_SHALLOW	1	/* short MWAIT, periodic tick running */
@@ -115,10 +117,29 @@ struct lpsched_cpu {
 	uint32_t		wait_max_us[LPSCHED_NCLASS];
 } __aligned(COHERENCY_UNIT);
 
+/*
+ * Idle time, measured at the idle loop's own entry and exit (this CPU
+ * writes, anyone reads): since is the cpu_counter() value at entry, 0
+ * while running; cc the idle cycles of the closed intervals.  gen is odd
+ * while they change.  A reader adds the interval in progress itself, so a
+ * sleeping CPU need not wake for its idle time to be current
+ * (machdep.lpsched.cpu_idle).  A separate array, not more lpsched_cpu
+ * fields: the cidle module inlines lpsched_set_idle_depth, and a module
+ * built before this would index lpsched_cpu with the old stride.
+ */
+struct lpsched_idle {
+	volatile uint32_t	gen;
+	volatile uint64_t	since;
+	volatile uint64_t	cc;
+} __aligned(COHERENCY_UNIT);
+
 extern struct lpsched_cpu lpsched_cpu[MAXCPUS];
+extern struct lpsched_idle lpsched_idle[MAXCPUS];
 extern int	lpsched_stats_enabled;
 extern int	lpsched_latency;	/* demand/latency accounting */
 extern int	lpsched_wait_budget_us;	/* longest acceptable queueing */
+extern int	lpsched_idle_acct;	/* idle-time accounting (default on) */
+extern volatile int lpsched_idle_hooked; /* an idle loop reports its depth */
 
 struct lwp;
 struct cpu_info;
@@ -167,6 +188,35 @@ lpsched_set_idle_depth(u_int cpuidx, uint8_t depth)
 	 */
 	if (__predict_false(lpsched_enabled != 0) && cpuidx < MAXCPUS)
 		lpsched_cpu[cpuidx].depth = depth;
+
+	/*
+	 * Idle accounting.  Opening an interval is gated by its own knob;
+	 * closing one never is, so switching the knob off cannot leave a
+	 * stale entry time behind (off, this costs one load per call).
+	 */
+	if (cpuidx < MAXCPUS) {
+		struct lpsched_idle *li = &lpsched_idle[cpuidx];
+
+		if (depth == LPSCHED_IDLE_ACTIVE) {
+			if (__predict_false(li->since != 0)) {
+				uint64_t now = cpu_counter();
+
+				li->gen++;
+				membar_producer();
+				if (now > li->since)
+					li->cc += now - li->since;
+				li->since = 0;
+				membar_producer();
+				li->gen++;
+			}
+		} else if (lpsched_idle_acct != 0 && li->since == 0) {
+			li->gen++;
+			membar_producer();
+			li->since = cpu_counter() | 1;	/* never 0 */
+			membar_producer();
+			li->gen++;
+		}
+	}
 }
 
 static inline uint8_t

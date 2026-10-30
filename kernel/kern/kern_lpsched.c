@@ -15,6 +15,8 @@
  *					is below it (SCHED_4BSD only)
  *	machdep.lpsched.idle_ms		ms since last keyboard/mouse input (RO)
  *	machdep.lpsched.stats		placement/exemption counters (RO)
+ *	machdep.lpsched.cpu_idle	now and each CPU's idle time, us (RO)
+ *	machdep.lpsched.idle_acct	idle-time accounting on/off
  */
 
 #include <sys/cdefs.h>
@@ -26,6 +28,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <sys/inttypes.h>
 #include <sys/cpu.h>
 #include <sys/sysctl.h>
+#include <sys/kmem.h>
 #include <sys/lwp.h>
 #include <sys/proc.h>
 #include <sys/sched.h>
@@ -49,10 +52,13 @@ int	lpsched_estcpu_thresh = 0;
 
 volatile int		lpsched_last_input;
 struct lpsched_cpu	lpsched_cpu[MAXCPUS] __cacheline_aligned;
+struct lpsched_idle	lpsched_idle[MAXCPUS] __cacheline_aligned;
 
 int	lpsched_stats_enabled = 1;
 int	lpsched_latency = 1;
 int	lpsched_wait_budget_us = 2000;
+int	lpsched_idle_acct = 1;
+volatile int	lpsched_idle_hooked;	/* set by cidle while installed */
 
 static uint64_t	lpsched_tsc_mhz;	/* cpu_counter() ticks per us */
 
@@ -435,6 +441,71 @@ lpsched_sysctl_stats_enabled(SYSCTLFN_ARGS)
 	return lpsched_sysctl_clamp(SYSCTLFN_CALL(rnode), 0, 1);
 }
 
+/*
+ * machdep.lpsched.cpu_idle: uint64_t[1 + ncpu], microseconds: the current
+ * cpu_counter() time, then each CPU's idle time including an interval in
+ * progress.  Busy fraction over a window = 1 - d(idle) / d(now), exact
+ * rather than sampled by the statistics clock, and consistent across CPUs
+ * however long they sleep tickless (kern.cp_time posts a sleeping CPU's
+ * skipped ticks only when it wakes).  Interrupt handlers that run inside
+ * a shallow MWAIT with interrupts enabled count as idle.
+ *
+ * EOPNOTSUPP while no idle loop reports its depth (cidle not installed):
+ * every CPU would then look busy all the time.
+ */
+static int
+lpsched_sysctl_cpu_idle(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	uint64_t *buf, now, since, cc;
+	uint32_t g1, g2;
+	size_t len;
+	u_int c, n;
+	int error;
+
+	if (!lpsched_idle_hooked || !lpsched_idle_acct)
+		return EOPNOTSUPP;
+	if (__predict_false(lpsched_tsc_mhz == 0))
+		lpsched_tsc_mhz = MAX(1, cpu_frequency(curcpu()) / 1000000);
+	n = MIN(ncpu, MAXCPUS);
+	len = (1 + n) * sizeof(uint64_t);
+	if (oldp == NULL) {
+		*oldlenp = len;
+		return 0;
+	}
+	buf = kmem_alloc(len, KM_SLEEP);
+	now = cpu_counter();
+	buf[0] = now / lpsched_tsc_mhz;
+	for (c = 0; c < n; c++) {
+		struct lpsched_idle *li = &lpsched_idle[c];
+
+		do {
+			g1 = li->gen;
+			membar_consumer();
+			since = li->since;
+			cc = li->cc;
+			membar_consumer();
+			g2 = li->gen;
+		} while (g1 != g2 || (g1 & 1) != 0);
+		/* An interval opened after "now" was read is not counted. */
+		if (since != 0 && now > since)
+			cc += now - since;
+		buf[1 + c] = cc / lpsched_tsc_mhz;
+	}
+	node.sysctl_data = buf;
+	node.sysctl_size = len;
+	error = sysctl_lookup(SYSCTLFN_CALL(&node));
+	kmem_free(buf, len);
+	return error;
+}
+
+static int
+lpsched_sysctl_idle_acct(SYSCTLFN_ARGS)
+{
+
+	return lpsched_sysctl_clamp(SYSCTLFN_CALL(rnode), 0, 1);
+}
+
 SYSCTL_SETUP(sysctl_lpsched_setup, "sysctl machdep.lpsched subtree setup")
 {
 	const struct sysctlnode *node = NULL;
@@ -503,6 +574,16 @@ SYSCTL_SETUP(sysctl_lpsched_setup, "sysctl machdep.lpsched subtree setup")
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "latency_reset",
 	    SYSCTL_DESCR("write to clear the latency histograms"),
 	    lpsched_sysctl_latency_reset, 0, NULL, 0,
+	    CTL_CREATE, CTL_EOL);
+	sysctl_createv(clog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRUCT, "cpu_idle",
+	    SYSCTL_DESCR("uint64 us: now, then each CPU's idle time"),
+	    lpsched_sysctl_cpu_idle, 0, NULL, 0,
+	    CTL_CREATE, CTL_EOL);
+	sysctl_createv(clog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "idle_acct",
+	    SYSCTL_DESCR("measure each CPU's idle time at the idle loop (0/1)"),
+	    lpsched_sysctl_idle_acct, 0, &lpsched_idle_acct, 0,
 	    CTL_CREATE, CTL_EOL);
 	sysctl_createv(clog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING, "stats",

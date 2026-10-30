@@ -8,8 +8,16 @@
  * Inputs
  *   AC state    /var/run/lpsched.ac ("1"/"0"), written by powerd's acadapter
  *               hook; seeded from envstat(8) at startup.
- *   busy        CPU utilisation since the previous wakeup (kern.cp_time),
- *               with a hysteresis band.  The 1-minute load average used
+ *   busy        CPU utilisation since the previous wakeup, with a hysteresis
+ *               band: machdep.lpsched.cpu_idle, each CPU's idle time as the
+ *               idle loop measured it against a monotonic clock, including
+ *               an idle spell still in progress.  kern.cp_time, the
+ *               statistics clock's samples, only as a fallback (cidle not
+ *               loaded): a periodic job in step with that clock looked up to
+ *               six times busier or quieter than it was, and under tickless
+ *               idle a sleeping CPU posts its skipped ticks only when it
+ *               wakes, so one window got the busy CPUs' work and a later one
+ *               the sleepers' idle.  The 1-minute load average used
  *               before followed a change in work a minute late.  Also the
  *               busiest single CPU: one saturated thread on 8 logical CPUs
  *               is only 12.5 % of the machine, under the band.
@@ -27,7 +35,10 @@
  *   pl1_bat (-P, mW; 0 leaves it alone), the boot value on AC and at exit.
  *   Bursts (PL2) are untouched, so short work stays quick and only sustained
  *   work (a build left running, a busy background page) is capped.  The
- *   value is re-checked every PL_CHECK_MS, as firmware may reset it at a
+ *   value and its enable bit are re-checked every PL_CHECK_MS, as are
+ *   the EPP every CPU's HWP request register really holds
+ *   (machdep.hwp.epp_hw; machdep.hwp.epp only echoes the last write), as
+ *   firmware may reset either at a
  *   resume or a charger change.
  *
  * Profiles
@@ -284,21 +295,84 @@ now_ms(void)
 }
 
 /*
+ * Busy fraction of all CPUs since the previous call from the measured idle
+ * times (machdep.lpsched.cpu_idle: now, then each CPU's idle us), and of
+ * the busiest CPU in *busy_max.  False if the kernel cannot provide them;
+ * *reset forgets the previous sample.
+ */
+static bool
+cpu_busy_measured(double *busy, double *busy_max, bool reset)
+{
+	static uint64_t *last, *cur;
+	static bool have;
+	size_t len = (size_t)(1 + ncpu) * sizeof(uint64_t);
+	uint64_t dt, didle, sum = 0;
+	double b;
+	int c;
+
+	*busy = *busy_max = 0.0;
+	if (reset)
+		have = false;
+	if (last == NULL) {
+		last = calloc(1 + (size_t)ncpu, sizeof(uint64_t));
+		cur = calloc(1 + (size_t)ncpu, sizeof(uint64_t));
+		if (last == NULL || cur == NULL)
+			return false;
+	}
+	if (sysctlbyname("machdep.lpsched.cpu_idle", cur, &len, NULL, 0) == -1 ||
+	    len != (size_t)(1 + ncpu) * sizeof(uint64_t)) {
+		have = false;
+		return false;
+	}
+	if (have && cur[0] > last[0]) {
+		dt = cur[0] - last[0];
+		for (c = 1; c <= ncpu; c++) {
+			didle = cur[c] > last[c] ? cur[c] - last[c] : 0;
+			if (didle > dt)
+				didle = dt;
+			sum += didle;
+			b = 1.0 - (double)didle / (double)dt;
+			if (b > *busy_max)
+				*busy_max = b;
+		}
+		*busy = 1.0 - (double)sum / ((double)dt * ncpu);
+	}
+	memcpy(last, cur, (size_t)(1 + ncpu) * sizeof(uint64_t));
+	have = true;
+	return true;
+}
+
+/*
  * Busy fraction of all CPUs since the previous call (0 on the first), and
- * of the busiest single CPU in *busy_max.  A buffer for every CPU's states
- * makes kern.cp_time return them all instead of their sum.
+ * of the busiest single CPU in *busy_max: measured idle time when the
+ * kernel has it, else kern.cp_time.  A buffer for every CPU's states makes
+ * kern.cp_time return them all instead of their sum.  Changing source
+ * starts that source's window afresh rather than diffing against a sample
+ * taken before the switch.
  */
 static double
 cpu_busy(double *busy_max)
 {
 	static uint64_t *last, *cur;
-	static bool have;
+	static bool have, measured, measured_valid;
+	double mbusy;
 	uint64_t total = 0, idle = 0, t, d;
 	size_t len = (size_t)ncpu * CPUSTATES * sizeof(uint64_t);
 	double busy = 0.0, b;
 	int c, i;
 
 	*busy_max = 0.0;
+	if (cpu_busy_measured(&mbusy, busy_max, !measured_valid || !measured)) {
+		if (!measured)
+			logmsg(LOG_INFO, "busy from measured idle time");
+		measured = measured_valid = true;
+		have = false;
+		return mbusy;
+	}
+	if (measured || !measured_valid)
+		logmsg(LOG_INFO, "busy from kern.cp_time samples");
+	measured = false;
+	measured_valid = true;
 	if (last == NULL) {
 		last = calloc((size_t)ncpu * CPUSTATES, sizeof(uint64_t));
 		cur = calloc((size_t)ncpu * CPUSTATES, sizeof(uint64_t));
@@ -335,19 +409,41 @@ cpu_busy(double *busy_max)
 static void
 apply_pl1(int ac)
 {
-	int want, cur;
+	int want, cur, en;
 
 	if (pl1_bat <= 0 || pl1_boot <= 0)
 		return;
 	want = ac == 0 ? (pl1_bat < pl1_boot ? pl1_bat : pl1_boot) : pl1_boot;
 	if (sysctl_get("machdep.hwp.pl1", &cur) == -1)
 		return;
+	/* A value with PL1_ENABLE clear is not enforced (older hwp: assume). */
+	if (sysctl_get("machdep.hwp.pl1_enabled", &en) == -1)
+		en = 1;
 	/* The register holds 1/8 W steps: allow for the rounding. */
-	if (cur > want - 125 && cur < want + 125)
+	if (en && cur > want - 125 && cur < want + 125)
 		return;
-	logmsg(LOG_INFO, "package PL1 %d -> %d mW (%s)", cur, want,
-	    ac == 0 ? "battery" : "AC");
-	sysctl_set("machdep.hwp.pl1", want);
+	logmsg(LOG_INFO, "package PL1 %d%s -> %d mW (%s)", cur,
+	    en ? "" : " (not enabled)", want, ac == 0 ? "battery" : "AC");
+	sysctl_set("machdep.hwp.pl1", want);	/* sets PL1_ENABLE too */
+}
+
+/*
+ * The profile's EPP against what the CPUs' request registers hold; rewrite
+ * it on a mismatch (the hwp module programs every CPU on each write).
+ */
+static void
+verify_epp(int p)
+{
+	int hw;
+
+	if (p < 0 || p >= P_COUNT ||
+	    sysctl_get("machdep.hwp.epp_hw", &hw) == -1)
+		return;
+	if (hw == profiles[p].epp)
+		return;
+	logmsg(LOG_INFO, "EPP in hardware %d, profile %s wants %d: rewriting",
+	    hw, profiles[p].name, profiles[p].epp);
+	sysctl_set("machdep.hwp.epp", profiles[p].epp);
 }
 
 static int
@@ -571,6 +667,7 @@ main(int argc, char **argv)
 			idle_ms = 0;
 		if (ac != last_ac || now_ms() - pl_checked >= PL_CHECK_MS) {
 			apply_pl1(ac);
+			verify_epp(cur);
 			last_ac = ac;
 			pl_checked = now_ms();
 		}
