@@ -199,6 +199,7 @@ struct hdaudio_softc {
 	struct hdaudio_stream	sc_stream[HDAUDIO_MAX_STREAMS];
 	uint32_t		sc_stream_mask;
 	kmutex_t		sc_stream_mtx;
+	kmutex_t		sc_intctl_mtx;	/* LISPBSD: INTCTL updates */
 
 	/*
 	 * LispBSD runtime power management: with no audio device open for
@@ -248,6 +249,7 @@ void	hdaudio_stream_start(struct hdaudio_stream *, int, bus_size_t,
 			     const audio_params_t *);
 void	hdaudio_stream_stop(struct hdaudio_stream *);
 void	hdaudio_stream_reset(struct hdaudio_stream *);
+void	hdaudio_intctl_update(struct hdaudio_softc *, uint32_t, uint32_t);
 u_int	hdaudio_stream_elapsed(struct hdaudio_stream *, uint8_t);
 int	hdaudio_stream_tag(struct hdaudio_stream *);
 uint16_t hdaudio_stream_param(struct hdaudio_stream *, const audio_params_t *);

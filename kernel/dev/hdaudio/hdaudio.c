@@ -752,7 +752,7 @@ hdaudio_reset(struct hdaudio_softc *sc)
 	hda_write2(sc, HDAUDIO_MMIO_WAKEEN, 0);
 
 	/* Disable interrupts */
-	hda_write4(sc, HDAUDIO_MMIO_INTCTL, 0);
+	hdaudio_intctl_update(sc, ~0U, 0);
 
 	/* Clear state change status register */
 	hda_write2(sc, HDAUDIO_MMIO_STATESTS,
@@ -795,19 +795,36 @@ hdaudio_reset(struct hdaudio_softc *sc)
 	return 0;
 }
 
+/*
+ * LISPBSD: INTCTL holds the global, controller and per-stream interrupt
+ * enables, and more than one owner changes it (the audio streams here, the
+ * DSP's host streams in sofdsp): every update is a read-modify-write under
+ * this leaf spin lock, so none of them loses another's bit.
+ */
+void
+hdaudio_intctl_update(struct hdaudio_softc *sc, uint32_t mask, uint32_t val)
+{
+	uint32_t v;
+
+	mutex_spin_enter(&sc->sc_intctl_mtx);
+	v = hda_read4(sc, HDAUDIO_MMIO_INTCTL);
+	hda_write4(sc, HDAUDIO_MMIO_INTCTL, (v & ~mask) | (val & mask));
+	mutex_spin_exit(&sc->sc_intctl_mtx);
+}
+
 static void
 hdaudio_intr_enable(struct hdaudio_softc *sc)
 {
 	hda_write4(sc, HDAUDIO_MMIO_INTSTS,
 	    hda_read4(sc, HDAUDIO_MMIO_INTSTS));
-	hda_write4(sc, HDAUDIO_MMIO_INTCTL,
+	hdaudio_intctl_update(sc, ~0U,
 	    HDAUDIO_INTCTL_GIE | HDAUDIO_INTCTL_CIE);
 }
 
 static void
 hdaudio_intr_disable(struct hdaudio_softc *sc)
 {
-	hda_write4(sc, HDAUDIO_MMIO_INTCTL, 0);
+	hdaudio_intctl_update(sc, ~0U, 0);
 }
 
 static int
@@ -1240,6 +1257,7 @@ hdaudio_attach(device_t dev, struct hdaudio_softc *sc)
 	sc->sc_dev = dev;
 	mutex_init(&sc->sc_corb_mtx, MUTEX_DEFAULT, IPL_AUDIO);
 	mutex_init(&sc->sc_stream_mtx, MUTEX_DEFAULT, IPL_AUDIO);
+	mutex_init(&sc->sc_intctl_mtx, MUTEX_SPIN, IPL_HIGH);
 	sc->sc_unsol_sih = softint_establish(SOFTINT_SERIAL | SOFTINT_MPSAFE,
 	    hdaudio_unsol_softint, sc);
 	if (sc->sc_unsol_sih == NULL)
@@ -1360,6 +1378,7 @@ hdaudio_detach(struct hdaudio_softc *sc, int flags)
 		softint_disestablish(sc->sc_unsol_sih);
 	mutex_destroy(&sc->sc_corb_mtx);
 	mutex_destroy(&sc->sc_stream_mtx);
+	mutex_destroy(&sc->sc_intctl_mtx);
 
 	hdaudio_dma_free(sc, &sc->sc_corb);
 	hdaudio_dma_free(sc, &sc->sc_rirb);
@@ -1694,7 +1713,6 @@ hdaudio_stream_start(struct hdaudio_stream *st, int blksize,
 	struct hdaudio_softc *sc = st->st_host;
 	struct hdaudio_bdl_entry *bdl;
 	uint64_t dmaaddr;
-	uint32_t intctl;
 	uint16_t fmt;
 	uint8_t ctl0, ctl2;
 	int cnt, snum = st->st_shift;
@@ -1777,9 +1795,7 @@ hdaudio_stream_start(struct hdaudio_stream *st, int blksize,
 	/*
 	 * Switch on interrupts for this stream
 	 */
-	intctl = hda_read4(sc, HDAUDIO_MMIO_INTCTL);
-	intctl |= (1 << st->st_shift);
-	hda_write4(sc, HDAUDIO_MMIO_INTCTL, intctl);
+	hdaudio_intctl_update(sc, 1U << st->st_shift, 1U << st->st_shift);
 
 	/*
 	 * LispBSD: the FIFO size is known once the format is programmed.
@@ -1803,7 +1819,6 @@ void
 hdaudio_stream_stop(struct hdaudio_stream *st)
 {
 	struct hdaudio_softc *sc = st->st_host;
-	uint32_t intctl;
 	uint8_t ctl0;
 	int snum = st->st_shift;
 
@@ -1818,9 +1833,7 @@ hdaudio_stream_stop(struct hdaudio_stream *st)
 	/*
 	 * Switch off interrupts for this stream
 	 */
-	intctl = hda_read4(sc, HDAUDIO_MMIO_INTCTL);
-	intctl &= ~(1 << st->st_shift);
-	hda_write4(sc, HDAUDIO_MMIO_INTCTL, intctl);
+	hdaudio_intctl_update(sc, 1U << st->st_shift, 0);
 }
 
 /*

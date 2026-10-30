@@ -83,6 +83,7 @@ static void	i915drmkms_task_work(struct work *, void *);
 int i915_lispbsd_rpm_suspend(struct drm_device *);
 int i915_lispbsd_rpm_resume(struct drm_device *);
 extern int i915_lispbsd_s0idle;
+extern int lispbsd_tlb_inject;
 
 static struct i915drmkms_softc *lispbsd_i915_sc;
 static int lispbsd_i915rpm;	/* 0 active, 1 rpm-suspended, 2 rpm+D3 */
@@ -515,6 +516,13 @@ i915drmkms_attach_real(device_t self)
 	    CTLFLAG_READWRITE, CTLTYPE_INT, "i915s0idle",
 	    SYSCTL_DESCR("LISPBSD force i915 S0-idle suspend (preserve RC6)"),
 	    NULL, 0, &i915_lispbsd_s0idle, 0,
+	    CTL_HW, CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(NULL, 0, NULL, NULL,
+	    CTLFLAG_READWRITE, CTLTYPE_INT, "i915tlbfail",
+	    SYSCTL_DESCR("LISPBSD test: treat the next N GPU TLB invalidations"
+	    " as timed out (the GT is then reset before pages are released)"),
+	    NULL, 0, &lispbsd_tlb_inject, 0,
 	    CTL_HW, CTL_CREATE, CTL_EOL);
 
 	(void)sysctl_createv(NULL, 0, NULL, NULL,

@@ -3,7 +3,9 @@
 An external review of the kernel changes since 4e863a5
 (nanobsd-crash-audit-2026-10-30.zip: REVIEW.md, host-only control-flow
 models).  Each finding was checked against the code; all six are real.
-Kernel 216 carries the fixes.  None of them is a proven cause of the
+Kernel 216 carried the first fixes; kernel 220 (default since 2026-10-30)
+finishes every item, including the ones 216 had left alone, and each
+failure path was exercised on the laptop with an injection knob (below).  None of them is a proven cause of the
 post-resume corruption dumps (21-23); see [[file:post-resume-corruption.org]].
 
 * A. xHCI: ring freed after an unacknowledged stop and drop
@@ -21,10 +23,19 @@ Fixed (bounded):
   is 8 bits, the array is sc_maxslots + 1) and events for a slot or
   endpoint with no ring.
 
-Not fixed: the abort path (=xhci_pipe_restart=) still reports a failed stop
-and goes on; the aborted transfers' buffers belong to the caller, and keeping
-them needs a controller reset path that does not exist.  The only recorded
-instance of this error family is an old SET_TR_DEQUEUE timeout on resume.
+Kernel 220 also covers the abort path: =xhci_pipe_restart= resets an
+endpoint that halted under the stop, retries a failed stop once, and
+returns whether the endpoint ended up stopped (or in error, or disabled).
+If not, =xhci_abortx= marks every transfer queued on the pipe =ux_dmaleak=
+(new field in usbdivar.h) and =usbd_free_buffer= leaks such a buffer
+instead of freeing it ("usb: leaking N-byte transfer buffer ...").
+=xhci_set_dequeue= now returns its status.
+
+Test knob: =hw.usbpm.inject_stopfail=N= reports the next N endpoint stops
+(abort or close) as unconfirmed after really stopping them.  Verified on the
+camera: three injected abort failures leaked its three 40 KB isochronous
+buffers, an injected close failure kept the ring ("did not stop (15);
+keeping its ring"), and the camera streamed normally afterwards.
 
 * B. i915: OA unit TLB not invalidated on Tiger Lake
 Confirmed backport gap.  Kernel 211 ported Linux 7938d61591d3 (engine TLB
@@ -35,11 +46,32 @@ uncore lock, on Tiger Lake (the only one of the upstream platforms this
 i915 knows).
 
 * C. i915: a timed-out invalidation still lets the pages go
-Confirmed, not changed.  Upstream behaves the same in every version up to
-current (it logs "TLB invalidation did not complete" and carries on).
-Holding the pages back needs the object page-lifetime rules reworked.  The
-timeout has never been seen on the Nano (the 20-cycle stress run logged
-none); if it ever appears in dmesg it is the first thing to look at.
+Confirmed (upstream behaves the same).  Kernel 220: =intel_gt_invalidate_tlbs=
+returns whether every engine confirmed; if not,
+=__i915_gem_object_unset_pages= runs =intel_gt_reset_full= (new, intel_reset.c)
+before the pages are handed back: a full GT reset, which drops every TLB,
+with no engine blamed, so requests in flight are replayed.  It is the
+full-reset half of =intel_gt_handle_error= (no per-engine attempt) and waits
+out a reset already in progress before doing its own.
+
+Test knob: =hw.i915tlbfail=N= treats the next N invalidations as timed out.
+
+How it got there:
+- kernel 218 wedged and unwedged the GT instead; the engines were left
+  uninitialised and the next heartbeat request faulted in
+  =__i915_request_create= (dump 24);
+- kernel 219 used the full reset, which livelocked a CPU: the reset
+  disables the execlists tasklets, and NetBSD's Linux tasklet emulation
+  requeued a disabled tasklet and retriggered its softint until it was
+  enabled again.  The thread that would enable it was the one the softint
+  had interrupted on that CPU: "heart stopped beating" in softser (dump 25).
+  Linux escapes the same pattern through ksoftirqd; NetBSD softints have no
+  such fallback.  Kernel 220 parks a disabled tasklet off the queue and the
+  enable that brings the count to zero requeues it
+  (external/bsd/common/linux/linux_tasklet.c, PARKED and HI state bits).
+- kernel 220: one injected failure, then three in a row, each "Resetting
+  chip", every encode job finished, the GPU worked afterwards.  One frame of
+  one job got EIO during the back-to-back resets.
 
 * D. SOF: stream buffers freed without a confirmed stop
 Confirmed.  =stream_teardown= cleared RUN and freed the buffers at once.
@@ -50,8 +82,11 @@ the buffers are leaked, not freed; the stream is always given back to
 hdaudio so no interrupt can reach the module after unload.  Verified with
 modload on the laptop: both streams stop and reset, buffers freed.
 
-Not changed: INTCTL read-modify-writes are not serialized with hdaudio's
-own (=hdaudio_stream_start/stop= take no lock for it either).
+INTCTL (kernel 220): every update goes through =hdaudio_intctl_update=, a
+read-modify-write under a new leaf spin lock (=sc_intctl_mtx=, IPL_HIGH),
+used by hdaudio's stream start/stop, interrupt enable/disable and reset,
+and by sofdsp.  Verified: sofdsp loaded during playback, playback took its
+real time and the module's streams stopped cleanly.
 
 * E. SOF: FW_READY mailbox parsing bounds
 Confirmed.  Now:

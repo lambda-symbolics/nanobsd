@@ -15,6 +15,7 @@ __KERNEL_RCSID(0, "$NetBSD: i915_gem_pages.c,v 1.7 2024/01/19 22:22:54 riastradh
 #include "i915_gem_lmem.h"
 #include "i915_gem_mman.h"
 #include "gt/intel_gt.h"
+#include "gt/intel_reset.h"
 
 #ifdef __NetBSD__
 #include <sys/param.h>
@@ -223,8 +224,23 @@ __i915_gem_object_unset_pages(struct drm_i915_gem_object *obj)
 	 * memory that has meanwhile been given to someone else (Linux
 	 * 7938d61591d3, CVE-2022-0330).
 	 */
-	if (test_and_clear_bit(I915_BO_WAS_BOUND_BIT, &obj->flags))
-		intel_gt_invalidate_tlbs(&to_i915(obj->base.dev)->gt);
+	if (test_and_clear_bit(I915_BO_WAS_BOUND_BIT, &obj->flags)) {
+		struct intel_gt *gt = &to_i915(obj->base.dev)->gt;
+
+		/*
+		 * An unconfirmed invalidation is no guarantee: reset the
+		 * whole GT, which drops every TLB, before the pages are
+		 * handed back.  Nothing is blamed: requests in flight are
+		 * replayed.  (Wedging and unwedging instead left the
+		 * engines uninitialised: the next heartbeat request
+		 * faulted, dump 24.)
+		 */
+		if (!intel_gt_invalidate_tlbs(gt)) {
+			DRM_ERROR("TLB invalidation unconfirmed:"
+			    " resetting the GT before releasing pages\n");
+			intel_gt_reset_full(gt, "unconfirmed TLB invalidation");
+		}
+	}
 
 	return pages;
 }

@@ -52,6 +52,17 @@ __KERNEL_RCSID(0, "$NetBSD: linux_tasklet.c,v 1.12 2023/02/24 11:02:05 riastradh
 
 #define	TASKLET_SCHEDULED	((unsigned)__BIT(0))
 #define	TASKLET_RUNNING		((unsigned)__BIT(1))
+/*
+ * LISPBSD: a scheduled tasklet found disabled is parked: taken off the
+ * queue, still SCHEDULED, until the disable count drops to zero and
+ * tasklet_unpark puts it back on the queue recorded by HI.  Requeueing it
+ * instead made the softint retrigger itself until the tasklet was enabled,
+ * and the thread that would enable it could be the one it had interrupted:
+ * a GPU reset (which disables the i915 submission tasklets) livelocked its
+ * CPU that way, "heart stopped beating" in softser (dump 25).
+ */
+#define	TASKLET_PARKED		((unsigned)__BIT(2))
+#define	TASKLET_HI		((unsigned)__BIT(3))
 
 struct tasklet_queue {
 	struct percpu	*tq_percpu;	/* struct tasklet_cpu * */
@@ -72,6 +83,7 @@ static int	tasklet_queue_init(struct tasklet_queue *, unsigned);
 static void	tasklet_queue_fini(struct tasklet_queue *);
 static void	tasklet_queue_schedule(struct tasklet_queue *,
 		    struct tasklet_struct *);
+static void	tasklet_unpark(struct tasklet_struct *);
 static void	tasklet_queue_enqueue(struct tasklet_queue *,
 		    struct tasklet_struct *);
 
@@ -249,11 +261,16 @@ tasklet_softintr(void *cookie)
 		 */
 		if (atomic_load_acquire(&tasklet->tl_disablecount)) {
 			/*
-			 * Disabled: clear the RUNNING bit and, requeue
-			 * it, but keep it SCHEDULED.
+			 * Disabled: park it, still SCHEDULED, and clear
+			 * RUNNING.  If it was enabled meanwhile, the
+			 * enabler may have missed PARKED: unpark it
+			 * ourselves (only one of us clears PARKED).
 			 */
+			atomic_or_uint(&tasklet->tl_state, TASKLET_PARKED);
 			tasklet_unlock(tasklet);
-			tasklet_queue_enqueue(tq, tasklet);
+			membar_sync();
+			if (atomic_load_relaxed(&tasklet->tl_disablecount) == 0)
+				tasklet_unpark(tasklet);
 			continue;
 		}
 
@@ -286,7 +303,8 @@ tasklet_queue_schedule(struct tasklet_queue *tq,
 		ostate = atomic_load_relaxed(&tasklet->tl_state);
 		if (ostate & TASKLET_SCHEDULED)
 			return;
-		nstate = ostate | TASKLET_SCHEDULED;
+		nstate = (ostate & ~TASKLET_HI) | TASKLET_SCHEDULED |
+		    (tq == &tasklet_hi_queue ? TASKLET_HI : 0);
 	} while (atomic_cas_uint(&tasklet->tl_state, ostate, nstate)
 	    != ostate);
 
@@ -323,6 +341,29 @@ tasklet_queue_enqueue(struct tasklet_queue *tq, struct tasklet_struct *tasklet)
 	splx(s);
 	softint_schedule(tq->tq_sih);
 	percpu_putref(tq->tq_percpu);
+}
+
+/*
+ * tasklet_unpark(tasklet)
+ *
+ *	LISPBSD: if tasklet is parked, put it back on its queue.  Called
+ *	when its disable count may have reached zero; whoever clears
+ *	PARKED requeues it, so it is queued exactly once.
+ */
+static void
+tasklet_unpark(struct tasklet_struct *tasklet)
+{
+	unsigned ostate;
+
+	do {
+		ostate = atomic_load_relaxed(&tasklet->tl_state);
+		if ((ostate & TASKLET_PARKED) == 0)
+			return;
+	} while (atomic_cas_uint(&tasklet->tl_state, ostate,
+		ostate & ~TASKLET_PARKED) != ostate);
+
+	tasklet_queue_enqueue((ostate & TASKLET_HI) ? &tasklet_hi_queue :
+	    &tasklet_queue, tasklet);
 }
 
 /*
@@ -378,9 +419,9 @@ tasklet_hi_schedule(struct tasklet_struct *tasklet)
  *	to complete -- it may remain running after this returns.
  *
  *	As long as the disable count is nonzero, the tasklet's function
- *	will not run, but if already scheduled, the tasklet will remain
- *	so and the softint will repeatedly trigger itself in a sort of
- *	busy-wait, so this should be used only for short durations.
+ *	will not run; if already scheduled, it stays so, parked off the
+ *	queue until the count drops to zero (LISPBSD; it used to make the
+ *	softint retrigger itself in a busy-wait meanwhile).
  *
  *	Load-acquire semantics.
  */
@@ -405,9 +446,9 @@ tasklet_disable_nosync(struct tasklet_struct *tasklet)
  *	running, busy-wait for it to complete.
  *
  *	As long as the disable count is nonzero, the tasklet's function
- *	will not run, but if already scheduled, the tasklet will remain
- *	so and the softint will repeatedly trigger itself in a sort of
- *	busy-wait, so this should be used only for short durations.
+ *	will not run; if already scheduled, it stays so, parked off the
+ *	queue until the count drops to zero (LISPBSD; it used to make the
+ *	softint retrigger itself in a busy-wait meanwhile).
  *
  *	If tasklet is guaranteed not to be scheduled, e.g. if you have
  *	just invoked tasklet_kill, then tasklet_disable serves to wait
@@ -614,10 +655,15 @@ __tasklet_enable_sync_once(struct tasklet_struct *tasklet)
 
 	/*
 	 * If it became zero, kill the tasklet.  If it was not zero,
-	 * caller must not care whether it was running.
+	 * caller must not care whether it was running.  (LISPBSD: a
+	 * parked one must be requeued first, or the kill waits for a
+	 * run that never comes.)
 	 */
-	if (disablecount == 0)
+	if (disablecount == 0) {
+		membar_sync();
+		tasklet_unpark(tasklet);
 		tasklet_kill(tasklet);
+	}
 }
 
 /*
@@ -678,6 +724,12 @@ __tasklet_enable(struct tasklet_struct *tasklet)
 	/* Decrement the disable count.  */
 	disablecount = atomic_dec_uint_nv(&tasklet->tl_disablecount);
 	KASSERT(disablecount != UINT_MAX);
+
+	/* LISPBSD: a parked tasklet may run again now. */
+	if (disablecount == 0) {
+		membar_sync();
+		tasklet_unpark(tasklet);
+	}
 
 	return (disablecount == 0);
 }

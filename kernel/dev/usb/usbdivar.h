@@ -317,6 +317,12 @@ struct usbd_xfer {
 	usb_dma_t		ux_dmabuf;
 	void		       *ux_buf;
 	uint32_t		ux_bufsize;
+	/*
+	 * LISPBSD: set by the host controller driver when an abort could
+	 * not confirm the controller stopped using this xfer's buffer; the
+	 * buffer is then leaked at destroy instead of freed for reuse.
+	 */
+	bool			ux_dmaleak;
 
 	uint8_t			ux_rqflags;
 #define URQ_REQUEST	0x01

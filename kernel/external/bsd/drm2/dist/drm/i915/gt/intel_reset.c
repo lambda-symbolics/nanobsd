@@ -1340,6 +1340,64 @@ out:
 	intel_runtime_pm_put(gt->uncore->rpm, wakeref);
 }
 
+/*
+ * LISPBSD: a full GT reset now, with no engine to blame (stalled mask 0:
+ * requests in flight are replayed, not failed), for a caller that must know
+ * every GPU TLB has been dropped before it goes on (a TLB invalidation that
+ * did not complete, before the pages behind it are released).  This is the
+ * full-reset half of intel_gt_handle_error without the per-engine attempt.
+ * A reset already under way may have hit the hardware before our caller's
+ * mappings were gone, so wait for it and then do our own.
+ */
+void intel_gt_reset_full(struct intel_gt *gt, const char *reason)
+{
+	struct intel_engine_cs *engine;
+	intel_wakeref_t wakeref;
+	intel_engine_mask_t tmp;
+
+	wakeref = intel_runtime_pm_get(gt->uncore->rpm);
+
+	while (test_and_set_bit(I915_RESET_BACKOFF, &gt->reset.flags)) {
+		int ret;
+		spin_lock(&gt->reset.lock);
+		DRM_SPIN_WAIT_NOINTR_UNTIL(ret,
+		    &gt->reset.queue,
+		    &gt->reset.lock,
+		    !test_bit(I915_RESET_BACKOFF, &gt->reset.flags));
+		spin_unlock(&gt->reset.lock);
+	}
+
+	/* A wedged GT runs nothing, so a stale TLB entry is never used. */
+	if (intel_gt_is_wedged(gt))
+		goto unbackoff;
+
+	/* Make sure i915_reset_trylock() sees the I915_RESET_BACKOFF */
+	synchronize_rcu_expedited();
+
+	/* Prevent any other reset-engine attempt. */
+	for_each_engine(engine, gt, tmp) {
+		while (test_and_set_bit(I915_RESET_ENGINE + engine->id,
+					&gt->reset.flags))
+			wait_on_bit(&gt->reset.flags,
+				    I915_RESET_ENGINE + engine->id,
+				    TASK_UNINTERRUPTIBLE);
+	}
+
+	intel_gt_reset_global(gt, 0, reason);
+
+	for_each_engine(engine, gt, tmp)
+		clear_bit_unlock(I915_RESET_ENGINE + engine->id,
+				 &gt->reset.flags);
+unbackoff:
+	clear_bit_unlock(I915_RESET_BACKOFF, &gt->reset.flags);
+	smp_mb__after_atomic();
+	spin_lock(&gt->reset.lock);
+	DRM_SPIN_WAKEUP_ALL(&gt->reset.queue, &gt->reset.lock);
+	spin_unlock(&gt->reset.lock);
+
+	intel_runtime_pm_put(gt->uncore->rpm, wakeref);
+}
+
 int intel_gt_reset_trylock(struct intel_gt *gt, int *srcu)
 {
 	might_lock(&gt->reset.backoff_srcu);

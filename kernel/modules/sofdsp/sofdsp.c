@@ -460,7 +460,7 @@ stream_teardown(struct sofdsp_softc *sc, struct hdaudio_stream *st)
 	int err;
 
 	err = stream_stop(sc, st);
-	hda_update4(sc, HDAUDIO_MMIO_INTCTL, __BIT(n), 0);
+	hdaudio_intctl_update(sc->sc_hda, __BIT(n), 0);
 	if (err == 0) {
 		hda_write4(hda, HDAUDIO_SD_BDPL(n), 0);
 		hda_write4(hda, HDAUDIO_SD_BDPU(n), 0);
@@ -816,8 +816,7 @@ sofdsp_boot(struct sofdsp_softc *sc)
 	if (err)
 		goto out;
 
-	hda_update4(sc, HDAUDIO_MMIO_INTCTL, __BIT(cl->st_shift),
-	    __BIT(cl->st_shift));
+	hdaudio_intctl_update(hda, __BIT(cl->st_shift), __BIT(cl->st_shift));
 	stream_run(sc, cl, true);
 	err = rom_poll(sc, FSR_FW_ENTERED, 3000);
 	if (err) {

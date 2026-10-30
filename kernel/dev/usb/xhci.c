@@ -174,7 +174,7 @@ static usbd_status xhci_new_device(device_t, struct usbd_bus *, int, int, int,
 static int xhci_roothub_ctrl(struct usbd_bus *, usb_device_request_t *,
     void *, int);
 
-static void xhci_pipe_restart(struct usbd_pipe *);
+static bool xhci_pipe_restart(struct usbd_pipe *);
 static void xhci_pipe_restart_async_task(void *);
 static void xhci_pipe_restart_async(struct usbd_pipe *);
 
@@ -186,7 +186,7 @@ static usbd_status xhci_stop_endpoint_cmd(struct xhci_softc *,
 static usbd_status xhci_stop_endpoint(struct usbd_pipe *);
 
 static void xhci_host_dequeue(struct xhci_ring * const);
-static void xhci_set_dequeue(struct usbd_pipe *);
+static usbd_status xhci_set_dequeue(struct usbd_pipe *);
 
 static usbd_status xhci_do_command(struct xhci_softc * const,
     struct xhci_soft_trb * const, int);
@@ -1836,6 +1836,12 @@ int xhci_autosuspend_hid = 0;
 int xhci_rt_debug = 0;		/* hw.usbpm.debug: say why a park is refused */
 int xhci_rt_deferrable = 1;	/* hw.usbpm.deferrable: idle deadlines may run late */
 u_int xhci_rt_inject_suspend;	/* hw.usbpm.inject_suspend: fail N suspends */
+/*
+ * hw.usbpm.inject_stopfail: report the next N endpoint stops (abort or
+ * close) as unconfirmed, after really stopping them, to exercise the paths
+ * that keep transfer buffers and rings away from the allocator.
+ */
+u_int xhci_inject_stopfail;
 u_int xhci_rt_inject_resume;	/* hw.usbpm.inject_resume: fail N resumes */
 #define XHCI_RT_WHY(sc, xs, fmt, ...) do { if (xhci_rt_debug) \
 	device_printf((sc)->sc_dev, "port %u: " fmt "\n", (xs)->xs_ctlrport, ##__VA_ARGS__); } while (0)
@@ -3159,6 +3165,10 @@ SYSCTL_SETUP(sysctl_hw_usbpm_setup, "hw.usbpm")
 	    SYSCTL_DESCR("Test: fail the next N runtime resumes (before any port write)"),
 	    sysctl_hw_usbpm_inject, 0, &xhci_rt_inject_resume, 0, CTL_CREATE, CTL_EOL);
 	sysctl_createv(clog, 0, &node, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT, "inject_stopfail",
+	    SYSCTL_DESCR("Test: report the next N endpoint stops as unconfirmed (their buffers and rings are then leaked)"),
+	    sysctl_hw_usbpm_inject, 0, &xhci_inject_stopfail, 0, CTL_CREATE, CTL_EOL);
+	sysctl_createv(clog, 0, &node, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_STRING, "stats",
 	    SYSCTL_DESCR("suspends, resumes, remote wakes, failures; deadline callouts, scans, reconciles, tasks, retries, giveups; armed callouts, armed deadlines, dormant slots, worst lateness"),
 	    sysctl_hw_usbpm_stats, 0, NULL, 384, CTL_CREATE, CTL_EOL);
@@ -3819,7 +3829,7 @@ xhci_stop_endpoint(struct usbd_pipe *pipe)
  * EPSTATE of endpoint must be ERROR or STOPPED, otherwise CONTEXT_STATE
  * error will be generated.
  */
-static void
+static usbd_status
 xhci_set_dequeue(struct usbd_pipe *pipe)
 {
 	struct xhci_softc * const sc = XHCI_PIPE2SC(pipe);
@@ -3827,6 +3837,7 @@ xhci_set_dequeue(struct usbd_pipe *pipe)
 	const u_int dci = xhci_ep_get_dci(pipe->up_endpoint->ue_edesc);
 	struct xhci_ring * const xr = xs->xs_xr[dci];
 	struct xhci_soft_trb trb;
+	usbd_status err;
 
 	XHCIHIST_FUNC();
 	XHCIHIST_CALLARGS("slot %ju dci %ju", xs->xs_idx, dci, 0, 0);
@@ -3843,10 +3854,12 @@ xhci_set_dequeue(struct usbd_pipe *pipe)
 	    XHCI_TRB_3_EP_SET(dci) |
 	    XHCI_TRB_3_TYPE_SET(XHCI_TRB_TYPE_SET_TR_DEQUEUE);
 
-	if (xhci_do_command_locked(sc, &trb, USBD_DEFAULT_TIMEOUT)) {
+	err = xhci_do_command_locked(sc, &trb, USBD_DEFAULT_TIMEOUT);
+	if (err) {
 		device_printf(sc->sc_dev, "%s: endpoint 0x%x: timed out\n",
 		    __func__, pipe->up_endpoint->ue_edesc->bEndpointAddress);
 	}
+	return err;
 }
 
 /*
@@ -4051,6 +4064,11 @@ xhci_close_pipe(struct usbd_pipe *pipe)
 	err = xhci_do_command_locked(sc, &trb, USBD_DEFAULT_TIMEOUT);
 	usb_syncmem(&xs->xs_dc_dma, 0, sc->sc_pgsz, BUS_DMASYNC_POSTREAD);
 
+	if (err == USBD_NORMAL_COMPLETION &&
+	    xhci_rt_inject(&xhci_inject_stopfail)) {
+		quiet = false;
+		err = USBD_TIMEOUT;	/* test: as if neither was acked */
+	}
 	if (err != USBD_NORMAL_COMPLETION && !quiet) {
 		/*
 		 * Neither the stop nor the drop was acknowledged: the
@@ -4086,7 +4104,18 @@ xhci_abortx(struct usbd_xfer *xfer)
 		xfer->ux_status == USBD_TIMEOUT),
 	    "bad abort status: %d", xfer->ux_status);
 
-	xhci_pipe_restart(xfer->ux_pipe);
+	/*
+	 * LISPBSD: if the endpoint could not be shown to have stopped, the
+	 * controller may still hold TRBs pointing into any transfer queued
+	 * on this pipe: those buffers must not go back to the allocator.
+	 */
+	if (!xhci_pipe_restart(xfer->ux_pipe)) {
+		struct usbd_xfer *x;
+
+		xfer->ux_dmaleak = true;
+		SIMPLEQ_FOREACH(x, &xfer->ux_pipe->up_queue, ux_next)
+			x->ux_dmaleak = true;
+	}
 
 	DPRINTFN(14, "end", 0, 0, 0, 0);
 }
@@ -4110,7 +4139,7 @@ xhci_host_dequeue(struct xhci_ring * const xr)
  * Issue RESET_EP to recover halt condition and SET_TR_DEQUEUE to remove
  * all transfers on transfer ring.
  */
-static void
+static bool
 xhci_pipe_restart(struct usbd_pipe *pipe)
 {
 	struct xhci_softc * const sc = XHCI_PIPE2SC(pipe);
@@ -4130,33 +4159,58 @@ xhci_pipe_restart(struct usbd_pipe *pipe)
 	 *   endpoint.
 	 *
 	 * In any case, clear the ring.
+	 *
+	 * LISPBSD: returns whether the controller is known to have let go
+	 * of the ring's TDs (the endpoint ended up stopped, in error or
+	 * disabled).  A stop that raced the endpoint halting is followed by
+	 * a reset, and a failed stop is tried once more, before giving up.
 	 */
-	switch (xhci_get_epstate(sc, xs, dci)) {
-	case XHCI_EPSTATE_HALTED:
-		xhci_reset_endpoint(pipe);
-		break;
-	case XHCI_EPSTATE_STOPPED:
-		break;
-	default:
-		xhci_stop_endpoint(pipe);
-		break;
+	u_int state;
+	bool quiet;
+	int try;
+
+	for (try = 0; try < 2; try++) {
+		switch (xhci_get_epstate(sc, xs, dci)) {
+		case XHCI_EPSTATE_HALTED:
+			xhci_reset_endpoint(pipe);
+			break;
+		case XHCI_EPSTATE_RUNNING:
+			xhci_stop_endpoint(pipe);
+			break;
+		}
+		state = xhci_get_epstate(sc, xs, dci);
+		if (state != XHCI_EPSTATE_RUNNING &&
+		    state != XHCI_EPSTATE_HALTED)
+			break;
 	}
 
 	switch (xhci_get_epstate(sc, xs, dci)) {
 	case XHCI_EPSTATE_STOPPED:
+	case XHCI_EPSTATE_DISABLED:
+		quiet = true;
 		break;
 	case XHCI_EPSTATE_ERROR:
 		device_printf(sc->sc_dev, "endpoint 0x%x error\n",
 		    pipe->up_endpoint->ue_edesc->bEndpointAddress);
+		quiet = true;
 		break;
 	default:
-		device_printf(sc->sc_dev, "endpoint 0x%x failed to stop\n",
+		device_printf(sc->sc_dev, "endpoint 0x%x failed to stop;"
+		    " its transfer buffers will not be reused\n",
 		    pipe->up_endpoint->ue_edesc->bEndpointAddress);
+		quiet = false;
 	}
 
-	xhci_set_dequeue(pipe);
+	(void)xhci_set_dequeue(pipe);
+
+	if (quiet && xhci_rt_inject(&xhci_inject_stopfail)) {
+		device_printf(sc->sc_dev, "endpoint 0x%x: injected stop"
+		    " failure\n", pipe->up_endpoint->ue_edesc->bEndpointAddress);
+		quiet = false;
+	}
 
 	DPRINTFN(4, "ends", 0, 0, 0, 0);
+	return quiet;
 }
 
 static void

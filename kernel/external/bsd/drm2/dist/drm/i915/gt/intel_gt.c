@@ -721,7 +721,15 @@ get_reg_and_bit(const struct intel_engine_cs *engine, const bool gen8,
 	return rb;
 }
 
-void intel_gt_invalidate_tlbs(struct intel_gt *gt)
+/*
+ * LISPBSD: returns false if an engine did not confirm the invalidation, so
+ * the caller can make the GPU forget its translations some other way
+ * before the pages are reused.  True also when nothing could be cached:
+ * no engines with these registers, a wedged (stopped) GT, a parked GT.
+ */
+int lispbsd_tlb_inject;	/* hw.i915tlbfail: fail the next N (test) */
+
+bool intel_gt_invalidate_tlbs(struct intel_gt *gt)
 {
 	static const i915_reg_t gen8_regs[] = {
 		[RENDER_CLASS]			= GEN8_RTCR,
@@ -741,6 +749,7 @@ void intel_gt_invalidate_tlbs(struct intel_gt *gt)
 	enum intel_engine_id id;
 	const i915_reg_t *regs;
 	unsigned int num;
+	bool ok = true;
 
 	if (INTEL_GEN(i915) == 12) {
 		regs = gen12_regs;
@@ -749,12 +758,12 @@ void intel_gt_invalidate_tlbs(struct intel_gt *gt)
 		regs = gen8_regs;
 		num = ARRAY_SIZE(gen8_regs);
 	} else
-		return;
+		return true;
 
 	if (intel_gt_is_wedged(gt))
-		return;
+		return true;
 	if (!intel_gt_pm_get_if_awake(gt))
-		return;
+		return true;
 
 	mutex_lock(&gt->tlb_invalidate_lock);
 	intel_uncore_forcewake_get(uncore, FORCEWAKE_ALL);
@@ -805,12 +814,21 @@ void intel_gt_invalidate_tlbs(struct intel_gt *gt)
 		if (__intel_wait_for_register_fw(uncore,
 						 rb.reg, rb.bit, 0,
 						 timeout_us, timeout_ms,
-						 NULL))
+						 NULL)) {
 			DRM_ERROR_RATELIMITED("%s TLB invalidation did not "
 			    "complete in %ums!\n", engine->name, timeout_ms);
+			ok = false;
+		}
+	}
+
+	if (ok && READ_ONCE(lispbsd_tlb_inject) > 0) {
+		lispbsd_tlb_inject--;	/* racy decrement is fine for a test */
+		DRM_ERROR("TLB invalidation failure injected\n");
+		ok = false;
 	}
 
 	intel_uncore_forcewake_put(uncore, FORCEWAKE_ALL);
 	mutex_unlock(&gt->tlb_invalidate_lock);
 	intel_gt_pm_put(gt);
+	return ok;
 }

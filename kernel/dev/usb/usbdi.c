@@ -578,6 +578,12 @@ usbd_free_buffer(struct usbd_xfer *xfer)
 	if (bus->ub_usedma) {
 		usb_dma_t *dmap = &xfer->ux_dmabuf;
 
+		if (xfer->ux_dmaleak) {
+			/* LISPBSD: the controller may still write it */
+			printf("usb: leaking %u-byte transfer buffer the host"
+			    " controller never released\n", size);
+			return;
+		}
 		usb_freemem(dmap);
 		return;
 	}
