@@ -54,8 +54,81 @@ harmless.
 - hdaudio keeps its CORB/RIRB across sleep and reprograms the same buffers.
 - dma-buf mmap hands the process the GEM object's aobj (UVM-managed pages).
 
-* Next
-userland/memwatch.c: fill ~3.5 GB with a per-word pattern, run a trigger,
-report changed pages.  Triggers: (B) =usb on usbc; usb off usbc= (runtime
-cold recovery), (C) the TCSS power cycle alone (hw.acpi.sleep.tcss_d3 0/1
-with xhci0 left suspended) vs xhci0's cold resume, (D) timed s2idle.
+* Experiments (2026-10-30, kernel #208, on AC)
+userland/memwatch.c fills ~3.5 GB (22 % of RAM) with a per-word pattern,
+locks it, runs a trigger, and reports changed pages; userland/zexp.sh holds
+the triggers, log in /var/log/zexp.log.
+
+| run | trigger                                             | rounds | changed pages |
+|-----+-----------------------------------------------------+--------+---------------|
+| A   | none (10 s idle)                                    |      3 |             0 |
+| B   | =usb on usbc; usb off usbc= (xhci0 cold recovery)    |     10 |             0 |
+
+B ran ten real cold recoveries ("power was lost (ACPI), cold recovery",
+"empty controller restarted") without a single changed word, so the TCSS
+power cycle and xhci0's cold path alone are not the writer (a writer that
+hit a random page each time would have been seen with ~92 % probability).
+
+The dumps' logs show what B left out: in all three boots the PCH controller
+xhci1 was on as well, with devices.  Dump 21: =usb on= at runtime, camera
+re-attached, Bluetooth firmware loaded, bt-headphones (pad0) 8 s later,
+panic 36 s after.  Dumps 22 and 23: a GenesysLogic USB2 hub pair with a
+keyboard (uhidev) and in 22 a USB stick (umass0) on uhub3 port 5 (the USB-C
+port's USB2 lines go to the PCH controller); in 22 the resume logged
+"xhci1: xhci_set_dequeue: endpoint 0x0: timed out".  Boots with =usb off=
+never had an xhci0 cold recovery, so "xhci0 cold" and "xhci1 on with
+devices" always came together.
+
+| run | trigger                                             | rounds | changed pages |
+|-----+-----------------------------------------------------+--------+---------------|
+| E   | =bluetooth on= (both controllers, firmware load, bthub), =btconfig ubt0 up/down=, =usb off= | 10 | 0 |
+
+E repeated the dump 21 sequence (xhci0 cold recovery, xhci1 resume with
+camera, fingerprint reader and ubt, firmware download) ten times: clean.
+
+Timing points elsewhere too: kernel 206 (build #208) became the default on
+10-24 22:13 and all three panics (10-26, 10-28, 10-29) are on it; the weeks
+before, with the same USB code and many s2idle cycles, had none.  206 changed
+the GPU side (gen12 AUX-table invalidation, the HDC flush bit, the dma-buf
+poll race).  A GPU still writing through a mapping of pages that were freed
+(a render-target clear writes zeros) would leave exactly a zeroed page that
+the allocator has meanwhile given to someone else, and the fixed memwatch
+region cannot see it: its pages were never GPU pages.  memwatch therefore
+got MEMWATCH_ROLL=MB, a region taken from the free list at the end of every
+round and checked at the end of the next.
+
+| run | trigger                                                | rounds | changed pages      |
+|-----+--------------------------------------------------------+--------+--------------------|
+| F   | usb on + bt up, timed s2idle (20 s), roll 1500 MB       |      6 | 0 (fresh: 0)       |
+| G   | VA-API decode + scale_vaapi churn (ffmpeg8), roll 3000 MB |   20 | see below          |
+
+F reproduced the state of dumps 22 and 23 (both controllers on, Bluetooth
+up, TCSS cut during the freeze, xhci0 cold recovery and xhci1 warm resume
+after it) six times: clean.  So no USB trigger reproduces the wipe in short
+runs; the real panics needed hours of desktop use around a few resumes.
+
+* Suspect: GPU TLB entries outliving the pages (CVE-2022-0330)
+The i915 in NetBSD 11 is Linux 5.6.  Linux 7938d61591d3 ("Flush TLBs
+before releasing backing store", 2022, CVE-2022-0330) and its gen12 fix
+04aa64375f48 (masked video/enhance invalidation registers, CVE-2022-4139)
+are missing: when a GEM object's pages go back to UVM nothing invalidates
+the engine TLBs, so the GPU can keep writing through a cached translation
+into a page that the allocator has meanwhile given to a pool, a process or
+the file system.  This matches every finding in the dumps:
+
+- the victim is a page with an ordinary, unrelated current owner;
+- nothing in memory refers to it (no PA, PFN, PTE or direct-map pointer
+  anywhere in dump 22): a hardware TLB entry leaves no trace in RAM, a stale
+  CPU pointer or USB descriptor would;
+- whole pages of zeros are what a cleared render target or a transparent
+  WebRender surface writes;
+- Firefox (WebRender, VA-API, dma-buf sharing with Mahogany) was running in
+  all three; kernel 191 (10-19) started freeing exported dma-buf objects
+  that used to leak, which multiplied the frees of GPU-visible pages.
+
+Kernel 211 ports it: i915_vma_bind marks the object (I915_BO_WAS_BOUND_BIT),
+__i915_gem_object_unset_pages invalidates the TLBs of every engine through
+GEN12_{GFX,VD,VE,BLT}_TLB_INV_CR (masked bits for VD/VE) and waits up to
+4 ms for completion, serialised with GT reset under uncore->lock and skipped
+when wedged.  It does not wake a parked GT (nothing is in flight and every
+request starts with a TLB-invalidating flush), so the idle cost is zero.
