@@ -3968,7 +3968,10 @@ xhci_close_pipe(struct usbd_pipe *pipe)
 	usb_endpoint_descriptor_t * const ed = pipe->up_endpoint->ue_edesc;
 	const u_int dci = xhci_ep_get_dci(ed);
 	struct xhci_soft_trb trb;
+	usbd_status err;
 	uint32_t *cp;
+	u_int epstate;
+	bool quiet;
 
 	XHCIHIST_FUNC();
 
@@ -4008,8 +4011,18 @@ xhci_close_pipe(struct usbd_pipe *pipe)
 		return;
 	}
 
-	if (xhci_get_epstate(sc, xs, dci) != XHCI_EPSTATE_STOPPED)
-		(void)xhci_stop_endpoint(pipe);
+	/*
+	 * LISPBSD: remember whether the controller is known to be done with
+	 * the ring: the endpoint stopped (or is halted, in error or
+	 * disabled, where it runs no TDs).  If it is not, and the drop
+	 * below fails too, the ring must not go back to the allocator.
+	 */
+	epstate = xhci_get_epstate(sc, xs, dci);
+	quiet = epstate != XHCI_EPSTATE_RUNNING;
+	if (epstate != XHCI_EPSTATE_STOPPED) {
+		if (xhci_stop_endpoint(pipe) == USBD_NORMAL_COMPLETION)
+			quiet = true;
+	}
 
 	/*
 	 * set appropriate bit to be dropped.
@@ -4035,9 +4048,22 @@ xhci_close_pipe(struct usbd_pipe *pipe)
 	trb.trb_3 = XHCI_TRB_3_SLOT_SET(xs->xs_idx) |
 	    XHCI_TRB_3_TYPE_SET(XHCI_TRB_TYPE_CONFIGURE_EP);
 
-	(void)xhci_do_command_locked(sc, &trb, USBD_DEFAULT_TIMEOUT);
+	err = xhci_do_command_locked(sc, &trb, USBD_DEFAULT_TIMEOUT);
 	usb_syncmem(&xs->xs_dc_dma, 0, sc->sc_pgsz, BUS_DMASYNC_POSTREAD);
 
+	if (err != USBD_NORMAL_COMPLETION && !quiet) {
+		/*
+		 * Neither the stop nor the drop was acknowledged: the
+		 * controller may still fetch from this ring, so leak it
+		 * (its cookies were cleared above) instead of freeing it.
+		 * Events for it are dropped by xhci_event_transfer.
+		 */
+		device_printf(sc->sc_dev, "slot %u endpoint 0x%x did not stop"
+		    " (%d); keeping its ring\n", xs->xs_idx,
+		    ed->bEndpointAddress, err);
+		xs->xs_xr[dci] = NULL;
+		return;
+	}
 	xhci_ring_free(sc, &xs->xs_xr[dci]);
 	xs->xs_xr[dci] = NULL;
 }
@@ -4261,14 +4287,26 @@ xhci_event_transfer(struct xhci_softc * const sc,
 	trbcode = XHCI_TRB_2_ERROR_GET(trb_2);
 	slot = XHCI_TRB_3_SLOT_GET(trb_3);
 	dci = XHCI_TRB_3_EP_GET(trb_3);
-	xs = &sc->sc_slots[slot];
-	xs->xs_lastbusy = getticks();	/* LispBSD runtime PM */
-	xr = xs->xs_xr[dci];
 
-	/* sanity check */
-	KASSERT(xr != NULL);
-	KASSERTMSG(xs->xs_idx != 0 && xs->xs_idx <= sc->sc_maxslots,
-	    "invalid xs_idx %u slot %u", xs->xs_idx, slot);
+	/*
+	 * LISPBSD: an event can name a slot or endpoint whose ring is gone
+	 * (it arrived after the pipe closed, or close kept a ring the
+	 * controller never released, see xhci_close_pipe).  Drop it rather
+	 * than assert or dereference a NULL ring.
+	 */
+	if (slot == 0 || slot > sc->sc_maxslots || dci == 0) {
+		DPRINTFN(1, "event for slot %ju dci %ju out of range",
+		    slot, dci, 0, 0);
+		return;
+	}
+	xs = &sc->sc_slots[slot];
+	xr = xs->xs_xr[dci];
+	if (xs->xs_idx == 0 || xr == NULL) {
+		DPRINTFN(1, "stale event: slot %ju dci %ju cc %ju",
+		    slot, dci, trbcode, 0);
+		return;
+	}
+	xs->xs_lastbusy = getticks();	/* LispBSD runtime PM */
 
 	int idx = 0;
 	if ((trb_3 & XHCI_TRB_3_ED_BIT) == 0) {

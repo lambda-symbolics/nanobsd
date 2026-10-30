@@ -62,6 +62,7 @@ struct sofdsp_hdaudio_pci_softc {
 #define SPIB_SPIB(i)		(0x08 + 0x08 * (i))
 
 /* Stream descriptor bits */
+#define SD_CTL_SRST		0x01
 #define SD_CTL_RUN		0x02
 #define SD_INT_MASK		0x1c	/* DESE | FIFOE | BCIS */
 #define CL_STREAM_FORMAT	0x40
@@ -89,6 +90,9 @@ struct sofdsp_hdaudio_pci_softc {
 #define SRAM_ROM_STATUS		(SRAM_WINDOW(0) + 0x0)
 #define SRAM_ROM_ERROR		(SRAM_WINDOW(0) + 0x4)
 #define MBOX_UPLINK		0x81000
+#define MBOX_UPLINK_SIZE	0x1000
+#define SRAM_NWINDOWS		4
+#define SRAM_WINDOW_SIZE	0x20000
 #define  FSR_STATE(x)		((x) & 0xffffff)
 #define  FSR_INIT_DONE		0x1
 #define  FSR_FW_ENTERED		0x5
@@ -155,6 +159,13 @@ struct sof_ipc_window {
 	uint32_t num_windows;
 	struct sof_ipc_window_elem window[];
 } __packed;
+
+/* mbox_read moves whole words: every record read must be word-sized. */
+CTASSERT(sizeof(struct sof_ipc_cmd_hdr) % 4 == 0);
+CTASSERT(sizeof(struct sof_ipc_fw_ready) % 4 == 0);
+CTASSERT(sizeof(struct sof_ipc_ext_data_hdr) % 4 == 0);
+CTASSERT(sizeof(struct sof_ipc_window) % 4 == 0);
+CTASSERT(sizeof(struct sof_ipc_window_elem) % 4 == 0);
 
 struct sof_ext_man_header {
 	uint32_t magic;
@@ -391,21 +402,80 @@ stream_run(struct sofdsp_softc *sc, struct hdaudio_stream *st, bool run)
 	hda_write1(hda, HDAUDIO_SD_CTL0(n), c);
 }
 
-static void
-stream_teardown(struct sofdsp_softc *sc, struct hdaudio_stream *st)
+/* Poll SD_CTL0 until (ctl & mask) == want, 10 us steps; usec timeout. */
+static int
+stream_poll(struct sofdsp_softc *sc, int n, uint8_t mask, uint8_t want, u_int us)
+{
+	struct hdaudio_softc *hda = sc->sc_hda;
+
+	for (;;) {
+		if ((hda_read1(hda, HDAUDIO_SD_CTL0(n)) & mask) == want)
+			return 0;
+		if (us < 10)
+			return ETIMEDOUT;
+		DELAY(10);
+		us -= 10;
+	}
+}
+
+/*
+ * Clear RUN and wait until the DMA engine reports it stopped, then put the
+ * stream through reset, checking both edges (hda_dsp_stream_trigger STOP and
+ * hda_dsp_stream_reset).  Until this succeeds the stream may still be
+ * writing into (ICCMAX) or reading from (loader) its buffer.
+ */
+static int
+stream_stop(struct sofdsp_softc *sc, struct hdaudio_stream *st)
 {
 	struct hdaudio_softc *hda = sc->sc_hda;
 	int n = st->st_shift;
 
-	stream_run(sc, st, false);
+	hda_write1(hda, HDAUDIO_SD_CTL0(n), hda_read1(hda,
+	    HDAUDIO_SD_CTL0(n)) & ~(SD_CTL_RUN | SD_INT_MASK));
+	if (stream_poll(sc, n, SD_CTL_RUN, 0, 1000) != 0)
+		return ETIMEDOUT;
+	hda_write1(hda, HDAUDIO_SD_CTL0(n),
+	    hda_read1(hda, HDAUDIO_SD_CTL0(n)) | SD_CTL_SRST);
+	if (stream_poll(sc, n, SD_CTL_SRST, SD_CTL_SRST, 1000) != 0)
+		return ETIMEDOUT;
+	hda_write1(hda, HDAUDIO_SD_CTL0(n),
+	    hda_read1(hda, HDAUDIO_SD_CTL0(n)) & ~SD_CTL_SRST);
+	if (stream_poll(sc, n, SD_CTL_SRST, 0, 1000) != 0)
+		return ETIMEDOUT;
+	hda_write1(hda, HDAUDIO_SD_STS(n), SD_INT_MASK);
+	return 0;
+}
+
+/*
+ * Give the stream back to hdaudio.  Its buffers are freed only once the
+ * stream is known to have stopped; otherwise they are leaked, since the DMA
+ * engine may still own them.  The stream itself is always released, so no
+ * interrupt can reach this module's handler after it is unloaded.
+ */
+static int
+stream_teardown(struct sofdsp_softc *sc, struct hdaudio_stream *st)
+{
+	struct hdaudio_softc *hda = sc->sc_hda;
+	int n = st->st_shift;
+	int err;
+
+	err = stream_stop(sc, st);
 	hda_update4(sc, HDAUDIO_MMIO_INTCTL, __BIT(n), 0);
-	hda_write4(hda, HDAUDIO_SD_BDPL(n), 0);
-	hda_write4(hda, HDAUDIO_SD_BDPU(n), 0);
-	hda_write1(hda, HDAUDIO_SD_CTL0(n), 0);
+	if (err == 0) {
+		hda_write4(hda, HDAUDIO_SD_BDPL(n), 0);
+		hda_write4(hda, HDAUDIO_SD_BDPU(n), 0);
+		hda_write1(hda, HDAUDIO_SD_CTL0(n), 0);
+	}
 	hda_update4(sc, sc->sc_pp + PP_PPCTL, __BIT(n), 0);
-	dsp_dma_free(sc, &st->st_data);
-	dsp_dma_free(sc, &sc->sc_bdl[n]);
+	if (err == 0) {
+		dsp_dma_free(sc, &st->st_data);
+		dsp_dma_free(sc, &sc->sc_bdl[n]);
+	} else
+		printf("sofdsp: stream %d did not stop (ctl %#x);"
+		    " leaking its buffers\n", n,
+		    hda_read4(hda, HDAUDIO_SD_CTL0(n)) & 0xffffff);
 	hdaudio_stream_disestablish(st);
+	return err;
 }
 
 /* hdaudio_dma_alloc with our tag: the DSP gateway may not take 64-bit. */
@@ -552,10 +622,30 @@ fail:
 	return err;
 }
 
-static void
+/* Read LEN bytes at OFF, which must lie inside the uplink mailbox. */
+static int
 mbox_read(struct sofdsp_softc *sc, uint32_t off, void *buf, size_t len)
 {
+	if (off % 4 != 0 || len % 4 != 0 || off < MBOX_UPLINK ||
+	    len > MBOX_UPLINK_SIZE || off - MBOX_UPLINK > MBOX_UPLINK_SIZE - len)
+		return EINVAL;
 	bus_space_read_region_4(sc->sc_dspt, sc->sc_dsph, off, buf, len / 4);
+	return 0;
+}
+
+/* A firmware-reported mailbox window, as a BAR offset, or 0 if invalid. */
+static uint32_t
+window_base(struct sofdsp_softc *sc, const struct sof_ipc_window_elem *e)
+{
+	uint32_t base;
+
+	if (e->id >= SRAM_NWINDOWS || e->offset > SRAM_WINDOW_SIZE ||
+	    e->size > SRAM_WINDOW_SIZE - e->offset || e->offset % 4 != 0)
+		return 0;
+	base = SRAM_WINDOW(e->id) + e->offset;
+	if (base > sc->sc_dspsize || e->size > sc->sc_dspsize - base)
+		return 0;
+	return base;
 }
 
 static void
@@ -588,7 +678,7 @@ wait_fw_ready(struct sofdsp_softc *sc)
 		return ETIMEDOUT;
 	}
 
-	mbox_read(sc, MBOX_UPLINK, &hdr, sizeof(hdr));
+	(void)mbox_read(sc, MBOX_UPLINK, &hdr, sizeof(hdr));
 	printf("sofdsp: dsp message hipctdr %#x cmd %#x size %u after %d ms\n",
 	    v, hdr.cmd, hdr.size, ms);
 	if ((hdr.cmd & SOF_GLB_TYPE_MASK) != SOF_IPC_FW_READY) {
@@ -596,34 +686,44 @@ wait_fw_ready(struct sofdsp_softc *sc)
 		return EPROTO;
 	}
 
-	mbox_read(sc, MBOX_UPLINK, &fr, sizeof(fr));
+	(void)mbox_read(sc, MBOX_UPLINK, &fr, sizeof(fr));
 	printf("sofdsp: SOF %u.%u.%u build %u abi %#x tag %.6s, %.12s %.10s,"
 	    " flags %#" PRIx64 "\n",
 	    fr.version.major, fr.version.minor, fr.version.micro,
 	    fr.version.build, fr.version.abi_version, fr.version.tag,
 	    fr.version.date, fr.version.time, fr.flags);
 
-	/* Extended data: the mailbox windows. */
+	/*
+	 * Extended data: the mailbox windows.  Each record must be whole,
+	 * word-sized and inside the mailbox (mbox_read checks the extent);
+	 * a window record must hold its count and the windows it counts.
+	 */
 	off = MBOX_UPLINK + sizeof(fr);
 	for (;;) {
-		mbox_read(sc, off, &eh, sizeof(eh));
-		if (eh.hdr.cmd != SOF_IPC_FW_READY || eh.hdr.size < sizeof(eh) ||
-		    eh.hdr.size > 4096)
+		if (mbox_read(sc, off, &eh, sizeof(eh)) != 0)
 			break;
-		if (eh.type == SOF_IPC_EXT_WINDOW) {
+		if (eh.hdr.cmd != SOF_IPC_FW_READY || eh.hdr.size < sizeof(eh) ||
+		    eh.hdr.size % 4 != 0 ||
+		    off - MBOX_UPLINK > MBOX_UPLINK_SIZE - eh.hdr.size)
+			break;
+		if (eh.type == SOF_IPC_EXT_WINDOW &&
+		    eh.hdr.size >= sizeof(struct sof_ipc_window)) {
 			struct sof_ipc_window *w = kmem_alloc(eh.hdr.size,
 			    KM_SLEEP);
+			u_int nw;
 
-			mbox_read(sc, off, w, roundup(eh.hdr.size, 4));
-			for (i = 0; i < w->num_windows &&
-			    sizeof(*w) + (i + 1) * sizeof(w->window[0]) <=
-			    eh.hdr.size; i++) {
+			(void)mbox_read(sc, off, w, eh.hdr.size);
+			nw = MIN(w->num_windows, (eh.hdr.size - sizeof(*w)) /
+			    sizeof(w->window[0]));
+			for (i = 0; i < nw; i++) {
 				struct sof_ipc_window_elem *e = &w->window[i];
-				uint32_t base = SRAM_WINDOW(e->id) + e->offset;
+				uint32_t base = window_base(sc, e);
 
 				printf("sofdsp: window type %u id %u off %#x"
 				    " size %#x -> %#x\n", e->type, e->id,
 				    e->offset, e->size, base);
+				if (base == 0)
+					continue;
 				if (e->type == 0) {	/* DOWNBOX: host -> dsp */
 					sc->sc_hostbox = base;
 					sc->sc_hostbox_size = e->size;
@@ -734,10 +834,12 @@ out:
 	if (cl != NULL) {
 		hda_update4(sc, sc->sc_spib + SPIB_SPBFCCTL,
 		    __BIT(cl->st_shift), 0);
-		stream_teardown(sc, cl);
+		if (stream_teardown(sc, cl) != 0 && err == 0)
+			err = EIO;
 	}
 	if (icc != NULL) {
-		stream_teardown(sc, icc);
+		if (stream_teardown(sc, icc) != 0 && err == 0)
+			err = EIO;
 		hda_write1(hda, HDA_VS_INTEL_LTRP, ltrp);
 	}
 	clock_power_gating(sc, true);
@@ -758,7 +860,7 @@ sofdsp_attach(struct sofdsp_softc *sc)
 	struct hdaudio_softc *hda;
 	bus_addr_t base;
 	pcireg_t type;
-	int flags, err;
+	int flags, err, i;
 	uint32_t cap, off;
 
 	dv = device_find_by_xname("hdaudio0");
@@ -778,8 +880,9 @@ sofdsp_attach(struct sofdsp_softc *sc)
 	sc->sc_rtuse = true;
 
 	sc->sc_niss = HDAUDIO_GCAP_ISS(hda_read2(hda, HDAUDIO_MMIO_GCAP));
-	for (off = hda_read2(hda, HDA_LLCH); off != 0 && off < 0x4000;
-	    off = HDA_CAP_NEXT(cap)) {
+	for (i = 0, off = hda_read2(hda, HDA_LLCH);
+	    off != 0 && off % 4 == 0 && off <= hda->sc_memsize - 4 && i < 16;
+	    i++, off = HDA_CAP_NEXT(cap)) {
 		cap = hda_read4(hda, off);
 		if (HDA_CAP_ID(cap) == HDA_PP_CAP_ID)
 			sc->sc_pp = off;
@@ -794,6 +897,8 @@ sofdsp_attach(struct sofdsp_softc *sc)
 	type = pci_mapreg_type(sc->sc_pc, sc->sc_tag, PCI_BAR(4));
 	if (pci_mapreg_info(sc->sc_pc, sc->sc_tag, PCI_BAR(4), type, &base,
 	    &sc->sc_dspsize, &flags))
+		return ENXIO;
+	if (sc->sc_dspsize < SRAM_WINDOW(SRAM_NWINDOWS))
 		return ENXIO;
 	sc->sc_dspt = hda->sc_memt;
 	if ((err = bus_space_map(sc->sc_dspt, base, sc->sc_dspsize, 0,

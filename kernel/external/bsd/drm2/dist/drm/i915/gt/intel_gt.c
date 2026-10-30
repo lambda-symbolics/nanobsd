@@ -777,6 +777,15 @@ void intel_gt_invalidate_tlbs(struct intel_gt *gt)
 		intel_uncore_write_fw(uncore, rb.reg, rb.bit);
 	}
 
+	/*
+	 * LISPBSD: Wa_2207587034:tgl (Linux 180abeb2c503).  On gen12 the
+	 * OA unit has its own TLB; invalidating the engines' alone leaves
+	 * it holding translations to the pages about to be released.  The
+	 * GT is awake here (intel_gt_pm_get_if_awake above).
+	 */
+	if (IS_TIGERLAKE(i915))
+		intel_uncore_write_fw(uncore, GEN12_OA_TLB_INV_CR, 1);
+
 	spin_unlock_irq(&uncore->lock);
 
 	for_each_engine(engine, gt, id) {

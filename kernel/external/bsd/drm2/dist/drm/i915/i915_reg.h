@@ -2707,6 +2707,7 @@ static inline bool i915_mmio_reg_valid(i915_reg_t reg)
 #define GEN8_BTCR			_MMIO(0x426c)
 #define GEN8_VTCR			_MMIO(0x4270)
 #define GEN12_GFX_TLB_INV_CR		_MMIO(0xced8)
+#define GEN12_OA_TLB_INV_CR		_MMIO(0xceec)	/* LISPBSD: Wa_2207587034 */
 #define GEN12_VD_TLB_INV_CR		_MMIO(0xcedc)
 #define GEN12_VE_TLB_INV_CR		_MMIO(0xcee0)
 #define GEN12_BLT_TLB_INV_CR		_MMIO(0xcee4)

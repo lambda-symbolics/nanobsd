@@ -67,6 +67,7 @@ __KERNEL_RCSID(0, "$NetBSD: uvideo.c,v 1.85 2023/04/10 15:27:51 mlelstv Exp $");
 #include <sys/poll.h>
 #include <sys/queue.h>	/* SLIST */
 #include <sys/kthread.h>
+#include <sys/atomic.h>
 #include <sys/bus.h>
 
 #include <sys/videoio.h>
@@ -207,6 +208,7 @@ struct uvideo_bulk_xfer {
 	uint8_t			*bx_buffer;
 	int			bx_buflen;
 	bool			bx_running;
+	lwp_t			*bx_thread;	/* LISPBSD: joined on stop */
 	kcondvar_t		bx_cv;
 	kmutex_t		bx_lock;
 };
@@ -1623,15 +1625,16 @@ uvideo_stream_start_xfer(struct uvideo_stream *vs)
 		mutex_enter(&bx->bx_lock);
 		if (bx->bx_running == false) {
 			bx->bx_running = true;
-			ret = kthread_create(PRI_UVIDEO, 0, NULL,
+			ret = kthread_create(PRI_UVIDEO, KTHREAD_MUSTJOIN, NULL,
 			    uvideo_stream_recv_bulk_transfer, vs,
-			    NULL, "%s", device_xname(sc->sc_dev));
+			    &bx->bx_thread, "%s", device_xname(sc->sc_dev));
 			if (ret) {
 				DPRINTF(("uvideo: couldn't create kthread:"
-					 " %d\n", err));
+					 " %d\n", ret));
 				bx->bx_running = false;
+				bx->bx_thread = NULL;
 				mutex_exit(&bx->bx_lock);
-				return err;
+				return ret;
 			}
 		} else
 			aprint_error_dev(sc->sc_dev,
@@ -1745,6 +1748,7 @@ static int
 uvideo_stream_stop_xfer(struct uvideo_stream *vs)
 {
 	struct uvideo_bulk_xfer *bx;
+	lwp_t *thread;
 	struct uvideo_isoc_xfer *ix;
 	usbd_status err;
 	int i;
@@ -1753,20 +1757,29 @@ uvideo_stream_stop_xfer(struct uvideo_stream *vs)
 	case UE_BULK:
 		bx = &vs->vs_xfer.bulk;
 
+		/*
+		 * LISPBSD: the worker sleeps in a synchronous transfer with
+		 * no timeout, so cancel that first, keeping the pipe
+		 * suspended so the worker cannot start another one between
+		 * its bx_running check and the abort, then join it.  The
+		 * stock code waited for the worker before aborting (a hang
+		 * if no data came) and, on a signal, freed the transfer
+		 * while the worker could still be using it.
+		 */
 		DPRINTF(("uvideo_stream_stop_xfer: UE_BULK: "
 			 "waiting for thread to complete\n"));
 		mutex_enter(&bx->bx_lock);
-		if (bx->bx_running == true) {
-			bx->bx_running = false;
-			cv_wait_sig(&bx->bx_cv, &bx->bx_lock);
-		}
+		atomic_store_relaxed(&bx->bx_running, false);
+		thread = bx->bx_thread;
+		bx->bx_thread = NULL;
 		mutex_exit(&bx->bx_lock);
 
-		DPRINTF(("uvideo_stream_stop_xfer: UE_BULK: cleaning up\n"));
+		if (bx->bx_pipe)
+			usbd_suspend_pipe(bx->bx_pipe);
+		if (thread != NULL)
+			kthread_join(thread);
 
-		if (bx->bx_pipe) {
-			usbd_abort_pipe(bx->bx_pipe);
-		}
+		DPRINTF(("uvideo_stream_stop_xfer: UE_BULK: cleaning up\n"));
 
 		if (bx->bx_xfer) {
 			usbd_destroy_xfer(bx->bx_xfer);
@@ -1886,8 +1899,10 @@ uvideo_stream_recv_process(struct uvideo_stream *vs, uint8_t *buf, uint32_t len)
 
 	hdr = (uvideo_payload_header_t *)buf;
 
+	/* LISPBSD: also no longer than the packet (payload.size underflow) */
 	if (hdr->bHeaderLength > UVIDEO_PAYLOAD_HEADER_SIZE ||
-	    hdr->bHeaderLength < sizeof(uvideo_payload_header_t))
+	    hdr->bHeaderLength < sizeof(uvideo_payload_header_t) ||
+	    hdr->bHeaderLength > len)
 		return USBD_INVAL;
 	if (hdr->bHeaderLength == len && !(hdr->bmHeaderInfo & UV_END_OF_FRAME))
 		return USBD_INVAL;
@@ -1971,7 +1986,7 @@ uvideo_stream_recv_bulk_transfer(void *addr)
 		 "vs %p sc %p bx %p buffer %p\n", vs, vs->vs_parent, bx,
 		 bx->bx_buffer));
 
-	while (bx->bx_running) {
+	while (atomic_load_relaxed(&bx->bx_running)) {
 		len = bx->bx_buflen;
 		err = usbd_bulk_transfer(bx->bx_xfer, bx->bx_pipe,
 		    USBD_SHORT_XFER_OK, USBD_NO_TIMEOUT,
@@ -1984,12 +1999,6 @@ uvideo_stream_recv_bulk_transfer(void *addr)
 				 usbd_errstr(err)));
 		}
 	}
-
-	DPRINTF(("uvideo_stream_recv_bulk_transfer: notify complete\n"));
-
-	mutex_enter(&bx->bx_lock);
-	cv_broadcast(&bx->bx_cv);
-	mutex_exit(&bx->bx_lock);
 
 	DPRINTF(("uvideo_stream_recv_bulk_transfer: return\n"));
 

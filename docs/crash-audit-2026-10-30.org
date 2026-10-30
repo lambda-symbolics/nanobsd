@@ -1,0 +1,78 @@
+#+title: Crash-path audit of 2026-10-30: what was done
+
+An external review of the kernel changes since 4e863a5
+(nanobsd-crash-audit-2026-10-30.zip: REVIEW.md, host-only control-flow
+models).  Each finding was checked against the code; all six are real.
+Kernel 216 carries the fixes.  None of them is a proven cause of the
+post-resume corruption dumps (21-23); see [[file:post-resume-corruption.org]].
+
+* A. xHCI: ring freed after an unacknowledged stop and drop
+Confirmed.  =xhci_close_pipe= ignored the result of both STOP_ENDPOINT and
+the dropping CONFIGURE_ENDPOINT and freed the ring anyway;
+=xhci_event_transfer= asserted (or, without DIAGNOSTIC, dereferenced) a
+NULL ring for an event that arrived after the close.
+
+Fixed (bounded):
+- close records whether the controller is known to be done with the ring
+  (endpoint not running, or the stop acknowledged); if it is not and the
+  drop fails too, the ring is leaked instead of freed (its cookies were
+  already cleared) and the kernel says "did not stop; keeping its ring";
+- the event handler drops events with an out-of-range slot (the slot field
+  is 8 bits, the array is sc_maxslots + 1) and events for a slot or
+  endpoint with no ring.
+
+Not fixed: the abort path (=xhci_pipe_restart=) still reports a failed stop
+and goes on; the aborted transfers' buffers belong to the caller, and keeping
+them needs a controller reset path that does not exist.  The only recorded
+instance of this error family is an old SET_TR_DEQUEUE timeout on resume.
+
+* B. i915: OA unit TLB not invalidated on Tiger Lake
+Confirmed backport gap.  Kernel 211 ported Linux 7938d61591d3 (engine TLB
+flush before pages are released) but not its follow-up 180abeb2c503
+(Wa_2207587034): on gen12 the OA unit has its own TLB.  Kernel 216 writes 1
+to GEN12_OA_TLB_INV_CR (0xceec) after the engine invalidations, under the
+uncore lock, on Tiger Lake (the only one of the upstream platforms this
+i915 knows).
+
+* C. i915: a timed-out invalidation still lets the pages go
+Confirmed, not changed.  Upstream behaves the same in every version up to
+current (it logs "TLB invalidation did not complete" and carries on).
+Holding the pages back needs the object page-lifetime rules reworked.  The
+timeout has never been seen on the Nano (the 20-cycle stress run logged
+none); if it ever appears in dmesg it is the first thing to look at.
+
+* D. SOF: stream buffers freed without a confirmed stop
+Confirmed.  =stream_teardown= cleared RUN and freed the buffers at once.
+Now =stream_stop= clears RUN and the interrupt enables, polls RUN until it
+reads 0, then resets the stream checking both SRST edges (Linux
+=hda_dsp_stream_trigger= STOP and =hda_dsp_stream_reset=).  If that fails
+the buffers are leaked, not freed; the stream is always given back to
+hdaudio so no interrupt can reach the module after unload.  Verified with
+modload on the laptop: both streams stop and reset, buffers freed.
+
+Not changed: INTCTL read-modify-writes are not serialized with hdaudio's
+own (=hdaudio_stream_start/stop= take no lock for it either).
+
+* E. SOF: FW_READY mailbox parsing bounds
+Confirmed.  Now:
+- =mbox_read= refuses reads that are not word-aligned or leave the 4 KB
+  uplink mailbox (subtraction-form check);
+- each extended record must be word-sized and fit in the mailbox, and a
+  window record must hold at least =struct sof_ipc_window= before its
+  count is read; the count is capped by the record size;
+- window id, offset and size are checked against the four 128 KB SRAM
+  windows and the BAR before being kept as MMIO offsets;
+- the HDA capability walk is capped at 16 entries inside the HDA BAR;
+- the DSP BAR must cover all four windows.
+
+* F. uvideo bulk: stop waited before cancelling, ignored signals
+Confirmed (bulk cameras only; the Nano's camera is isochronous).  Stop now
+clears =bx_running=, suspends the pipe (cancels the worker's synchronous
+transfer and refuses new ones, so the worker cannot slip one in after its
+check), then =kthread_join=s the worker (created KTHREAD_MUSTJOIN) before
+destroying the transfer.  Also fixed: the start path returned the wrong
+variable when kthread_create failed.
+
+* Screened-out lead: payload header longer than the packet
+=uvideo_stream_recv_process= now rejects bHeaderLength > len; video(4)'s
+size check already stopped the underflowed length from being copied.
