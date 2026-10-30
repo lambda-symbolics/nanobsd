@@ -11232,6 +11232,14 @@ iwx_rx_pkt(struct iwx_softc *sc, struct iwx_rx_data *data)
 			break;
 
 		/*
+		 * LISPBSD: the reply to the HE station context; unhandled it
+		 * never completed the command, which timed out (error 35) and
+		 * left every 802.11ax association without HE.
+		 */
+		case IWX_WIDE_ID(IWX_DATA_PATH_GROUP, IWX_STA_HE_CTXT_CMD):
+			break;
+
+		/*
 		 * Ignore for now. The Linux driver only acts on this request
 		 * with 160Mhz channels in 11ax mode.
 		 */
