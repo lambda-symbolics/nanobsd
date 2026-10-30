@@ -1925,10 +1925,16 @@ uvideo_stream_recv_isoc_complete(struct usbd_xfer *xfer,
 		DPRINTF(("uvideo_stream_recv_isoc_complete: status=%s (%d)\n",
 			usbd_errstr(status), status));
 
+		/*
+		 * LISPBSD: only a cancelled xfer (close, abort, detach)
+		 * ends the stream.  Dropping the xfer on any other error
+		 * lost one of the UVIDEO_NXFERS for good, and after three
+		 * the camera froze on its last frame.
+		 */
+		if (status == USBD_CANCELLED)
+			return;
 		if (status == USBD_STALLED)
 			usbd_clear_endpoint_stall_async(ix->ix_pipe);
-		else
-			return;
 	} else {
 		usbd_get_xfer_status(xfer, NULL, NULL, &count, NULL);
 

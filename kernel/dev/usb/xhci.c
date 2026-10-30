@@ -4397,6 +4397,19 @@ xhci_event_transfer(struct xhci_softc * const sc,
 		case XHCI_TRB_ERROR_MISSED_SERVICE:
 		case XHCI_TRB_ERROR_RING_UNDERRUN:
 		case XHCI_TRB_ERROR_RING_OVERRUN:
+		case XHCI_TRB_ERROR_XACT:
+		case XHCI_TRB_ERROR_DATA_BUF:
+		case XHCI_TRB_ERROR_ISOC_OVERRUN:
+			/*
+			 * LISPBSD: a lost interval is an empty frame, not a
+			 * failed transfer.  Taking the status of the last TD
+			 * failed the whole xfer with USBD_IOERROR whenever
+			 * that one TD was missed; uvideo does not resubmit
+			 * on an I/O error, so the stream stopped.
+			 */
+			xfer->ux_frlengths[xx->xx_isoc_done] = 0;
+			err = USBD_NORMAL_COMPLETION;
+			break;
 		default:
 			xfer->ux_frlengths[xx->xx_isoc_done] = 0;
 			break;
@@ -6542,15 +6555,16 @@ xhci_device_isoc_enter(struct usbd_xfer *xfer)
 		    XHCI_TRB_3_TBC_SET(tbc) |
 		    XHCI_TRB_3_TLBPC_SET(tlbpc) |
 		    XHCI_TRB_3_IOC_BIT;
-		if (XHCI_HCC_CFC(sc->sc_hcc)) {
-			control |= XHCI_TRB_3_FRID_SET(xpipe->xp_isoc_next);
-#if 0
-		} else if (xpipe->xp_isoc_next == -1) {
-			control |= XHCI_TRB_3_FRID_SET(xpipe->xp_isoc_next);
-#endif
-		} else {
-			control |= XHCI_TRB_3_ISO_SIA_BIT;
-		}
+		/*
+		 * LISPBSD: always Start Isoch ASAP, as Linux does for
+		 * URB_ISO_ASAP (uvc, snd-usb-audio).  The Frame ID path
+		 * advanced one 1 ms frame per TD, but a high-speed
+		 * bInterval counts 125 us microframes: a camera polled
+		 * every microframe was served at 1/8 of its rate, its
+		 * FIFO overflowed and the schedule fell into a run of
+		 * Missed Service events that killed the stream.
+		 */
+		control |= XHCI_TRB_3_ISO_SIA_BIT;
 #if 0
 		if (i != xfer->ux_nframes - 1)
 			control |= XHCI_TRB_3_BEI_BIT;

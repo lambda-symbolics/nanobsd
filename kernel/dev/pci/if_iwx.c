@@ -7149,7 +7149,7 @@ iwx_wme_update(struct ieee80211com *ic)
  */
 static int iwx_ht = 0;
 static int iwx_vht = 0;		/* LISPBSD: hw.iwx.vht, needs hw.iwx.ht */
-static int iwx_he = 0;		/* LISPBSD: hw.iwx.he, needs hw.iwx.ht */
+static int iwx_he = 1;		/* LISPBSD: hw.iwx.he, needs hw.iwx.ht */
 
 static int
 iwx_ht_usable(struct iwx_softc *sc)
