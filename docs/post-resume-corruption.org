@@ -100,7 +100,7 @@ round and checked at the end of the next.
 | run | trigger                                                | rounds | changed pages      |
 |-----+--------------------------------------------------------+--------+--------------------|
 | F   | usb on + bt up, timed s2idle (20 s), roll 1500 MB       |      6 | 0 (fresh: 0)       |
-| G   | VA-API decode + scale_vaapi churn (ffmpeg8), roll 3000 MB |   20 | see below          |
+| G   | VA-API decode + scale_vaapi churn (ffmpeg8), roll 3000 MB |   20 | 0 (fresh: 0)       |
 
 F reproduced the state of dumps 22 and 23 (both controllers on, Bluetooth
 up, TCSS cut during the freeze, xhci0 cold recovery and xhci1 warm resume
@@ -132,3 +132,13 @@ GEN12_{GFX,VD,VE,BLT}_TLB_INV_CR (masked bits for VD/VE) and waits up to
 4 ms for completion, serialised with GT reset under uncore->lock and skipped
 when wedged.  It does not wake a parked GT (nothing is in flight and every
 request starts with a TLB-invalidating flush), so the idle cost is zero.
+
+Measured with dtrace (fbt) on kernel 211/213:
+- fresh boot, 10 s VA-API decode + scale: 118 calls, 6 full invalidations
+  (30 engine waits = 5 engines x 6), 8-100 us each; the rest found the GT
+  parked;
+- idle desktop, 20 s: 0 calls;
+- during s2stress load after a resume: 295-600 calls per 10-20 s, all with
+  the GT parked: it parks and unparks ~89 times a second during VA-API
+  decode (4500 execbuffers in 10 s), and the frees come after retirement.
+  Upstream skips a parked GT the same way (with_intel_gt_pm_if_awake).
