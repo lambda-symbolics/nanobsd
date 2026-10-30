@@ -1258,9 +1258,14 @@ sched_pstats(void)
 			lwp_unlock(l);
 
 			l->l_pctcpu = (l->l_pctcpu * ccpu) >> FSHIFT;
-			if (l->l_slptime != 0)
-				continue;
-
+			/*
+			 * LISPBSD: no l_slptime skip here.  It only saved work
+			 * when the estimate came from tick samples; with the
+			 * measured run time it threw away the last second of a
+			 * thread that happened to be asleep at this instant
+			 * (kernel 210: a 50 % burst load read 22 %, 17 % read
+			 * 1 %).  A thread that slept the whole second adds 0.
+			 */
 			lpctcpu = l->l_pctcpu;
 			(void)atomic_swap_uint(&l->l_cpticks, 0);
 			ran = ran_us * FSCALE / elapsed_us;
