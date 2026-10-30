@@ -99,9 +99,31 @@ byte crosses the air twice.
    =KNOB=hw.iwx.vht sh up-ab.sh= (ncat listener on the workstation).
 5. If good: =hw.iwx.vht=1= in /etc/sysctl.conf.
 
-* 802.11ax (HE): written 2026-10-22 evening, NOT yet run on the Nano
+* 802.11ax (HE): written 2026-10-22, works on the Nano since kernel 213 (2026-10-30)
+Tested 2026-10-30 03:19-03:26 with userland/iwx-ht/he-test.sh (dead-man:
+HE off and back to the Zyxel if the wg peer stays silent for 90 s):
+
+- Kernel 210-212: every HE association failed, "could not configure HE
+  (error 35)" after "unhandled firmware response 0x507/0x20000004": the
+  firmware answered STA_HE_CTXT_CMD (DATA_PATH group 5, id 7) but the
+  notification switch had no case for it, so the command never completed.
+  Kernel 213 (e70c813) completes it.  The dead-man brought the Nano home
+  each time.
+- Kernel 213, both ASUS networks:
+
+| network | band            | assoc | ping wg peer (120)  | down 50 MB | up 50 MB  |
+|---------+-----------------+-------+---------------------+------------+-----------|
+| net6    | 5 GHz ch 100/80 | he    | 0 % loss, 66 ms avg | 3.3 MB/s   | 2.3 MB/s  |
+| net2    | 2.4 GHz         | he    | 0 % loss, 69 ms avg | 3.1 MB/s   | 1.8 MB/s  |
+| Zyxel   | 5 GHz ch 40/80  | vht   | 64 ms avg           | 3.3 MB/s   |           |
+
+  rx_he counted 55 k HE frames per run, BSS color 37, MU EDCA present, no
+  UORA.  Throughput is the internet line's on all three, so the test shows
+  that HE works, not that it is faster.
+- hw.iwx.he stays 0 by default: two APs of one vendor are all it has met;
+  =sysctl -w hw.iwx.he=1= enables it (re-associate to take effect).
+
 Behind =hw.iwx.he= (default 0, needs =hw.iwx.ht=1, 2.4 and 5 GHz).
-Compile-checked in the gefs VM; nanobsd only, the Nano runs kernel 200.
 
 - net80211 (after OpenBSD): Element ID Extension parsing in beacons and
   the association response (HE Capabilities incl. PPE thresholds, HE
@@ -141,5 +163,5 @@ Compile-checked in the gefs VM; nanobsd only, the Nano runs kernel 200.
 - Idle and transfer power not measured yet (fewer airtime-seconds per byte
   should help; two chains during MIMO bursts cost some).
 - s2idle with HT associated is untested.
-- No 160 MHz (the Zyxel does not do it either); HE untested on hardware;
+- No 160 MHz (the Zyxel does not do it either); HE power not measured;
   no TWT (target wake time, an HE power saver needing AP support).
