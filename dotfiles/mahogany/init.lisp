@@ -81,7 +81,7 @@
 (defcommand volume-mute () (:method () (run-shell "volume mute")))
 (defcommand microphone-mute ()
   (:method ()
-    (run-shell "mixerctl -w record.mic2.mute=toggle 2>/dev/null || mixerctl -w record.mic.mute=toggle")))
+    (run-shell "mic toggle")))
 (defcommand brightness-up () (:method () (run-shell "brightness +10")))
 (defcommand brightness-down () (:method () (run-shell "brightness -10")))
 

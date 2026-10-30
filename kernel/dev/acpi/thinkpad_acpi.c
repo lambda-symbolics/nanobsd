@@ -100,7 +100,8 @@ typedef struct thinkpad_softc {
 #define	TP_PSW_SCISSORS_BUTTON	21
 #define	TP_PSW_BLUETOOTH_BUTTON	22
 #define	TP_PSW_KEYBOARD_BUTTON	23
-#define	TP_PSW_LAST		24
+#define	TP_PSW_MIC_MUTE		24	/* LISPBSD: FnF4, "mic-mute" */
+#define	TP_PSW_LAST		25
 
 	struct sysmon_pswitch	sc_smpsw[TP_PSW_LAST];
 	bool			sc_smpsw_valid;
@@ -113,6 +114,10 @@ typedef struct thinkpad_softc {
 	 */
 	int			sc_bios_brightness;
 	struct evcnt		sc_ev_brightness;
+
+	/* LISPBSD: mic mute key (HKEY 0x101b) and its LED (MMTS) */
+	struct evcnt		sc_ev_micmute;
+	int			sc_micmute_led;
 
 	struct sysmon_envsys	*sc_sme;
 	envsys_data_t		sc_sensor[THINKPAD_NSENSORS];
@@ -153,6 +158,7 @@ typedef struct thinkpad_softc {
 #define	THINKPAD_NOTIFY_Scissors	0x312
 #define	THINKPAD_NOTIFY_Bluetooth	0x314
 #define	THINKPAD_NOTIFY_Keyboard	0x315
+#define	THINKPAD_NOTIFY_MicMute		0x01b	/* LISPBSD */
 
 #define	THINKPAD_CMOS_BRIGHTNESS_UP	0x04
 #define	THINKPAD_CMOS_BRIGHTNESS_DOWN	0x05
@@ -218,6 +224,7 @@ static void	thinkpad_cmos(thinkpad_softc_t *, uint8_t);
 static void	thinkpad_battery_probe_support(device_t);
 static void	thinkpad_battery_sysctl_setup(device_t);
 static void	thinkpad_brightness_sysctl_setup(device_t);
+static int	thinkpad_micmute_led_sysctl(SYSCTLFN_PROTO);
 
 CFATTACH_DECL3_NEW(thinkpad, sizeof(thinkpad_softc_t),
     thinkpad_match, thinkpad_attach, thinkpad_detach, NULL, NULL, NULL,
@@ -275,6 +282,8 @@ thinkpad_attach(device_t parent, device_t self, void *opaque)
 	sc->sc_bios_brightness = 1;
 	evcnt_attach_dynamic(&sc->sc_ev_brightness, EVCNT_TYPE_MISC, NULL,
 	    device_xname(self), "brightness hotkey");
+	evcnt_attach_dynamic(&sc->sc_ev_micmute, EVCNT_TYPE_MISC, NULL,
+	    device_xname(self), "mic mute hotkey");
 	sc->sc_powhdl = NULL;
 	sc->sc_cmoshdl = NULL;
 	sc->sc_node = aa->aa_node;
@@ -350,6 +359,12 @@ thinkpad_attach(device_t parent, device_t self, void *opaque)
 		    (intmax_t)sc->sc_ver);
 	}
 
+	/*
+	 * LISPBSD: the mic mute key (0x101b) is not always in MHKA's mask;
+	 * Linux enables it regardless.  Without it the key does nothing.
+	 */
+	val |= __BIT(THINKPAD_NOTIFY_MicMute - 1);
+
 	/* Enable all supported events */
 	rv = thinkpad_mask_init(sc, val);
 	if (ACPI_FAILURE(rv)) {
@@ -410,6 +425,7 @@ thinkpad_attach(device_t parent, device_t self, void *opaque)
 	psw[TP_PSW_BLUETOOTH_BUTTON].smpsw_name	= PSWITCH_HK_BLUETOOTH_BUTTON;
 	psw[TP_PSW_KEYBOARD_BUTTON].smpsw_name	= PSWITCH_HK_KEYBOARD_BUTTON;
 #endif /* THINKPAD_NORMAL_HOTKEYS */
+	psw[TP_PSW_MIC_MUTE].smpsw_name		= "mic-mute";
 
 	for (i = 0; i < TP_PSW_LAST; i++) {
 		/* not supported yet */
@@ -466,6 +482,7 @@ thinkpad_detach(device_t self, int flags)
 	if (sc->sc_log != NULL)
 		sysctl_teardown(&sc->sc_log);
 	evcnt_detach(&sc->sc_ev_brightness);
+	evcnt_detach(&sc->sc_ev_micmute);
 
 	pmf_device_deregister(self);
 
@@ -527,6 +544,14 @@ thinkpad_get_hotkeys(void *opaque)
 			continue;
 
 		switch (event) {
+		case THINKPAD_NOTIFY_MicMute:
+			/* LISPBSD: powerd runs /etc/powerd/actions/mic-mute */
+			sc->sc_ev_micmute.ev_count++;
+			if (sc->sc_smpsw_valid == false)
+				break;
+			sysmon_pswitch_event(&sc->sc_smpsw[TP_PSW_MIC_MUTE],
+			    PSWITCH_EVENT_PRESSED);
+			break;
 		case THINKPAD_NOTIFY_BrightnessUp:
 			sc->sc_ev_brightness.ev_count++;
 			if (sc->sc_bios_brightness)
@@ -1329,9 +1354,44 @@ thinkpad_brightness_sysctl_setup(device_t self)
 			"through the BIOS (0: userland owns it)"),
 		    NULL, 0, &sc->sc_bios_brightness, 0,
 		    CTL_CREATE, CTL_EOL);
+	if (err == 0)
+		err = sysctl_createv(&sc->sc_log, 0, &rnode, NULL,
+		    CTLFLAG_READWRITE | CTLFLAG_ANYWRITE, CTLTYPE_INT, "micmute_led",
+		    SYSCTL_DESCR("Mic mute LED on the F4 key (MMTS)"),
+		    thinkpad_micmute_led_sysctl, 0, (void *)sc, 0,
+		    CTL_CREATE, CTL_EOL);
 	if (err)
 		aprint_error_dev(self,
 		    "unable to add the brightness sysctl (%d)\n", err);
+}
+
+/*
+ * LISPBSD: the mic mute LED.  MMTS takes 2 for on and 0 for off, as in
+ * Linux thinkpad_acpi (led "MMTS").  The firmware does not report the
+ * state, so the last value written is what reads back.
+ */
+static int
+thinkpad_micmute_led_sysctl(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	thinkpad_softc_t *sc = rnode->sysctl_data;
+	ACPI_STATUS rv;
+	int val, err;
+
+	val = sc->sc_micmute_led;
+	node.sysctl_data = &val;
+	err = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (err || newp == NULL)
+		return err;
+	if (val != 0 && val != 1)
+		return EINVAL;
+
+	rv = acpi_eval_set_integer(sc->sc_node->ad_handle, "MMTS",
+	    val ? 2 : 0);
+	if (ACPI_FAILURE(rv))
+		return EIO;
+	sc->sc_micmute_led = val;
+	return 0;
 }
 
 static bool

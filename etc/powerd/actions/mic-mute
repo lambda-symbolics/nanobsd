@@ -1,0 +1,7 @@
+#!/bin/sh
+# invoked by /etc/powerd/scripts/hotkey_button on the ThinkPad mic mute key
+# (F4, HKEY 0x101b; kernel 215 delivers it as the "mic-mute" hotkey).
+/usr/local/bin/mic toggle >/dev/null
+MAHOGANY_SOCKET=/var/run/user/1000/mahogany.sock \
+    /usr/local/bin/mahoganyctl '(idle-poke)' >/dev/null 2>&1
+exit 0

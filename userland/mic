@@ -1,0 +1,87 @@
+#!/bin/sh
+# mic [on|off|toggle|up|down|get|save|restore] - the capture path and its LED.
+#
+# The only microphone the HDA codec (Realtek 0287) sees is the headset jack
+# ("Mic In [Jack]").  The two built-in microphones are digital mics on the
+# Tiger Lake audio DSP (ACPI NHLT), which NetBSD does not drive, so without a
+# headset "on" records the jack's preamp noise.  A USB headset is a separate
+# audio device (uaudio) and is not touched here.
+#
+# The capture path has three switches: the record level mute, the mic pin
+# mute and the mic gain.  "off" sets both mutes, "on" clears them and makes
+# sure the gain is not zero (the codec's power-on value).  The F4 LED follows
+# through hw.acpi.thinkpad0.micmute_led (kernel 215).  The state is saved to
+# ~/.mic and replayed at boot after hdafg-hp-fix, which resets the mixer.
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin; export PATH
+STEP=${MIC_STEP:-85}	# record.mic has four levels: 0 85 170 255
+GAIN=${MIC_GAIN:-170}
+STATE="${HOME:-/home/mag}/.mic"
+MUTES="inputs.reclvl.mute record.mic2.mute"
+
+led() { sysctl -w hw.acpi.thinkpad0.micmute_led="$1" >/dev/null 2>&1; }
+bar() { pkill -USR1 -f '^/bin/sh /usr/local/bin/statusbard$' 2>/dev/null; }
+
+# mixerctl's += and -= round to the wrong level on this control, so step
+# from the current value and clamp.
+gain() {
+	g=$(mixerctl -n record.mic 2>/dev/null); g=$(( ${g%%,*} + $1 ))
+	[ $g -lt 0 ] && g=0; [ $g -gt 255 ] && g=255
+	mixerctl -w record.mic="$g,$g" >/dev/null 2>&1
+}
+
+muted() {
+	for c in $MUTES; do
+		[ "$(mixerctl -n "$c" 2>/dev/null)" = on ] && return 0
+	done
+	return 1
+}
+
+set_mute() {
+	for c in $MUTES; do mixerctl -w "$c=$1" >/dev/null 2>&1; done
+	if [ "$1" = off ]; then
+		case "$(mixerctl -n record.mic 2>/dev/null)" in
+		0,0|0) mixerctl -w record.mic="$GAIN,$GAIN" >/dev/null 2>&1 ;;
+		esac
+		mixerctl -w inputs.reclvl=200,200 >/dev/null 2>&1
+		led 0
+	else
+		led 1
+	fi
+}
+
+save() {
+	{
+		muted && echo muted || echo on
+		mixerctl -n record.mic 2>/dev/null
+	} > "$STATE.tmp" 2>/dev/null && mv "$STATE.tmp" "$STATE" 2>/dev/null
+}
+
+restore() {
+	if [ -r "$STATE" ]; then
+		{ read -r st; read -r gain; } < "$STATE"
+		case "$gain" in [0-9]*) GAIN=${gain%%,*} ;; esac
+		mixerctl -w record.mic="$GAIN,$GAIN" >/dev/null 2>&1
+		[ "$st" = muted ] && set_mute on || set_mute off
+	else
+		set_mute off
+	fi
+}
+
+get() {
+	muted && st=muted || st=on
+	printf 'mic %s, gain %s (jack only: built-in mics need the DSP)\n' \
+	    "$st" "$(mixerctl -n record.mic 2>/dev/null)"
+}
+
+case "${1:-get}" in
+on)	set_mute off; bar; save ;;
+off)	set_mute on; bar; save ;;
+toggle)	if muted; then set_mute off; else set_mute on; fi; bar; save; get ;;
+up)	gain $STEP; save; get ;;
+down)	gain -$STEP; save; get ;;
+get)	get ;;
+save)	save ;;
+restore) restore ;;
+*)	echo "usage: mic [on|off|toggle|up|down|get|save|restore]" >&2; exit 2 ;;
+esac
