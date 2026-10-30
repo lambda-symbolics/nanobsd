@@ -13,6 +13,15 @@ PATH=/usr/pkg/bin:/usr/X11R7/bin:/usr/local/bin:/bin:/usr/bin; export PATH
 DIR=${SCREENSHOT_DIR:-$HOME}
 OUT="$DIR/screenshot-$(date +%Y-%m-%d_%H-%M-%S).png"
 
+# One screenshot at a time: PrtSc pressed while the selection overlay is up
+# does nothing (it would capture the overlay and stack a second one on it).
+# The lock is fd 9, held until this script exits; the clipboard owners below
+# outlive it, so they are started with fd 9 closed.  sh(1) opens exec'd fds
+# close-on-exec, which would hide it from flock(1): fdflags clears that.
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/screenshot.lock"
+fdflags -s -cloexec 9
+flock -n 9 || exit 0
+
 # Dashed accent-coloured selection box, matching the status bar's palette.
 SELOPTS='--line style=dash,width=2,color=#E46876'
 
@@ -27,7 +36,7 @@ if [ -n "$WAYLAND_DISPLAY" ]; then
 	*)	echo "usage: screenshot [area|full|window]" >&2; exit 2 ;;
 	esac
 	[ -s "$OUT" ] || { echo "screenshot: capture produced nothing" >&2; exit 1; }
-	command -v wl-copy >/dev/null 2>&1 && wl-copy < "$OUT"
+	command -v wl-copy >/dev/null 2>&1 && wl-copy < "$OUT" 9>&-
 	echo "$OUT"
 	exit 0
 fi
@@ -45,6 +54,6 @@ esac
 # Clipboard: xclip must keep running to own the selection, so detach it.
 if command -v xclip >/dev/null 2>&1; then
 	nohup xclip -selection clipboard -t image/png -i "$OUT" \
-	    >/dev/null 2>&1 &
+	    >/dev/null 2>&1 9>&- &
 fi
 echo "$OUT"
