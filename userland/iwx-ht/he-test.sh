@@ -51,9 +51,9 @@ if up; then
 	state "$SSID up"
 	echo "--- ping peer 60 s"
 	ping -n -c 120 -i 0.5 $peer | tail -3
-	echo "--- download 200 MB (internet)"
+	echo "--- download 50 MB (internet; Cloudflare answers 403 above 100 MB)"
 	curl -s -o /dev/null --max-time 120 -w 'speed %{speed_download} B/s, %{size_download} B, %{time_total} s\n' \
-	    'https://speed.cloudflare.com/__down?bytes=200000000'
+	    'https://speed.cloudflare.com/__down?bytes=50000000'
 	echo "--- upload 50 MB (internet)"
 	dd if=/dev/urandom bs=1m count=50 2>/dev/null |
 	    curl -s -o /dev/null --max-time 120 -w 'speed %{speed_upload} B/s, %{size_upload} B\n' \
