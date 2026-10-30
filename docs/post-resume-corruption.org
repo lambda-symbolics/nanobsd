@@ -154,3 +154,17 @@ corruption hit roughly once a day of normal use and s2stress was never run
 on #208 for comparison.  If it comes back on 213, the dump plus the
 memwatch fresh region are the next tools; the USB experiments above remain
 the reference for what is already excluded.
+
+* Also reviewed: the CPU-side lazy TLB skip (machdep.tlb_lazyskip, kernel 130)
+Same failure class on the CPU side: a shootdown that skips a CPU idling
+with the process's pmap loaded.  Kept on: a skipped CPU is CAS-marked
+TLBSTATE_FLUSH and flushes in pmap_reactivate before it uses the pmap again
+(or reloads %cr3 on a switch); packets that free page tables or touch
+kernel mappings still go to every CPU (TP_NOSKIP); a lazy CPU runs only
+kernel code, which does not touch the process's user addresses; on since
+late September (a month before the first panic), with userland/tlbtest.c
+soaked 30 min.  If a dump on 213 points at user memory again, A/B it with
+machdep.tlb_lazyskip=0 (sysctl.conf line 54).
+
+Suspend on 213 still reaches SLP_S0: every s2stress freeze logged
+slp_s0=ok, PC10 89 % with both USB controllers and Bluetooth on.
