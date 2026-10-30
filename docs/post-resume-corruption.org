@@ -142,3 +142,15 @@ Measured with dtrace (fbt) on kernel 211/213:
   the GT parked: it parks and unparks ~89 times a second during VA-API
   decode (4500 execbuffers in 10 s), and the frees come after retirement.
   Upstream skips a parked GT the same way (with_intel_gt_pm_if_awake).
+
+* Kernel 213 stress (2026-10-30 03:27-04:39)
+s2stress.sh 20 30 180 with both USB controllers on and Bluetooth up (the
+state of all three panics), alongside memwatch 3000 MB locked + 2000 MB
+fresh region rolled every 15 s: 20 freeze/resume cycles, each followed by
+3 min of audio DMA, map churn, gefs writes, VA-API decode and network; 222
+memwatch rounds, 0 changed pages; no panic, fault, assertion or TLB timeout
+in dmesg.  This supports kernel 213 but does not prove the fix: the
+corruption hit roughly once a day of normal use and s2stress was never run
+on #208 for comparison.  If it comes back on 213, the dump plus the
+memwatch fresh region are the next tools; the USB experiments above remain
+the reference for what is already excluded.
