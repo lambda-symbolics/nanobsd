@@ -150,7 +150,7 @@ Config: =~/.emacs.d/init.el= (meow, eglot for Rust, org, sly).
 *Do not run a blanket =pkgin upgrade=*: these are built locally from
 /usr/pkgsrc with LispBSD patches and a binary upgrade
 would replace them with stock ones:
-- www/firefox (screen capture, cubeb audio, telemetry dispatcher fixes)
+- www/firefox (screen capture, cubeb audio, telemetry dispatcher fixes, links opened from other programs)
 - multimedia/mpv, multimedia/libva (hardware video decode under Wayland)
 - devel/libudev-bsd (monitor hotplug)
 =pkgin -n upgrade= shows what an upgrade would do; rebuild those from

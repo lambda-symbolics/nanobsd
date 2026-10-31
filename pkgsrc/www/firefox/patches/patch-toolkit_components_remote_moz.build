@@ -1,0 +1,17 @@
+$NetBSD$
+
+LISPBSD: hand URLs to the running instance over a Unix socket in
+XDG_RUNTIME_DIR (the X11 remote needs an X server, the D-Bus one a
+session bus; a plain Wayland session has neither).
+
+--- toolkit/components/remote/moz.build.orig
++++ toolkit/components/remote/moz.build
+@@ -39,6 +39,8 @@
+     else:
+         SOURCES += [
+             "nsGTKRemoteServer.cpp",
++            "nsSocketRemoteClient.cpp",
++            "nsSocketRemoteServer.cpp",
+             "nsXRemoteClient.cpp",
+             "nsXRemoteServer.cpp",
+         ]
