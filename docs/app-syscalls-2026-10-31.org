@@ -1,0 +1,80 @@
+#+title: Firefox, mpv, imv, Alacritty: syscalls, wakeups and CPU (2026-10-31)
+
+Question: Firefox's YouTube tab made ~9,400 syscalls a second; is there a
+NetBSD-specific bug behind that?  Measured on kernel 223/224 on AC, Firefox
+Nightly 153 (pkgsrc build), with the tools in userland/proftools.  Short
+answer: the syscall count itself costs little; the bugs found were in
+Mahogany and in the audio driver, not in Firefox.
+
+* What the syscalls are
+- Time queries (=clock_gettime=, =gettimeofday=): most of every count.  On
+  Linux they run in user space (vDSO); on NetBSD each is a system call, but
+  one costs 132 ns here (/var/tmp/cgbench), so YouTube's ~10,600 a second
+  are 1.4 ms of CPU per second, ~0.15 % of a core; Firefox scrolling X,
+  36,000/s, still under 0.5 %.  Not worth a kernel/libc vDSO project.
+- =sched_yield=: crossbeam-channel's back-off (spin, yield a few times,
+  then park) every time a channel goes empty.  Mostly
+  =glean.dispatcher=: Glean telemetry dispatches every recorded metric to
+  its thread, a few hundred a second while frames render (~800 yields/s
+  during video, ~3,600/s scrolling X).  Telemetry upload is off in this
+  profile, so Glean drops them all when they arrive: pure waste, but small
+  (the thread uses 0.6 % of a core during video).  Not NetBSD-specific.
+  Not patched (it needs a Rust rebuild of libxul); the fix would be an
+  atomic upload flag checked before =dispatcher::launch= in glean-core's
+  metric recording.
+- =madvise=/=mmap=/=munmap=: mozjemalloc purges and IPC shared memory.
+  While scrolling X, ~250 maps and ~150 unmaps a second per process and
+  ~1,480 TLB shootdowns/s (61 at idle); =pmap_tlb_shootnow= is the top
+  kernel function in the parent then.  Same code paths on Linux; NetBSD's
+  synchronous shootdown makes each one dearer.  Nothing quick to change.
+
+* Exact CPU per thread (lwptime), YouTube 1080p playing
+Parent 10.9 %: WRRenderBackend 4.8, Compositor 1.2, Renderer 1.1,
+MainThread 1.0, Socket Thread 0.9, glean 0.6.  Content 8.6 %: YouTube's
+main thread 3.8, the media pipeline ~3, cubeb's audio thread 0.55.
+DTrace's profile provider had put the audio thread at 5.3 %: it fires on
+the 100 Hz clock and the audio thread wakes in step with it (the same
+statclock bias as lpschedd's old input).  Use lwptime.
+
+Paused YouTube: the tab drops to ~170 syscalls/s and stops writing audio;
+kernel 223's idle stop puts the controller in D3 within 15 s.
+
+Scrolling X: parent ~44 %, the X tab ~78 %, 27 % of the parent in the
+kernel.  X idle: ~0 after the page settles.
+
+Local 1080p H.264 in Firefox (/var/tmp/cuvid.html): parent 8.3 %, media
+process 2.9 %, page 6.2 %, Mahogany 3.5 %, ~21 % in all.  The same clip in
+mpv: 3.2 % and 296 context switches/s (VA-API, gpu-next); its 8,900
+syscalls/s are again mostly time queries.
+
+imv with an image open, Alacritty, cclsh, ndevd, lpschedd, waytemp: 0
+syscalls and 0 wakeups per second at idle.
+
+* The WebRender native compositor
+=WEBRENDER_COMPOSITOR= (video and tiles in Wayland subsurfaces) is
+blocklisted for every Linux system in GfxInfo.cpp, not only here.  Forcing
+it (=gfx.webrender.compositor.force-enabled=) crashed Firefox in
+=RenderCompositorNative::CreateTile=: Firefox creates its Wayland native
+layer root only when the compositor offers =wp_fractional_scale_manager_v1=,
+which Mahogany did not.  Mahogany 35c2a6e creates it.  With it, forced on,
+Firefox runs and draws correctly, but measured no cheaper on the local clip
+(WRRenderBackend 1.46 % vs 1.58 %): the video is still drawn into tiles.  Not
+enabled.
+
+* The bug found on the way: volume reset by runtime resume
+On every runtime resume (codec and controller back from D3 after
+hw.hdaudio.power_save idle seconds) hdafg ran =hdafg_control_commit=, the
+attach-time initializer: every output amplifier to 0 dB, every input muted.
+The first sound after 10 quiet seconds came at full volume and recording
+levels were lost.  Reproduced: master 100, 20 s idle, play: master 255.
+System resume hid it because audio(4) restores its own mixer copy after.
+Kernel 224 (nanobsd 57794fc) writes the current levels back instead
+(=hdafg_control_restore=); verified: master 100 and mic 170 survive play
+and record from D3.
+
+* Lessons
+- Never put =timeout= around =gdb -p=: when timeout killed gdb its
+  breakpoint stayed in Firefox and the next =sched_yield= killed it with
+  SIGTRAP (the user's session restored its tabs).
+- NetBSD ps needs separate =-o= options for =name== style headers
+  (=-o lid= -o lname==), and shows the process total for every LWP.
