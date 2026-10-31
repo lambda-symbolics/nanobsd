@@ -32,6 +32,7 @@ sleep 1
 fails=0
 pass() { echo "PASS $*"; }
 fail() { echo "FAIL $*"; fails=$((fails + 1)); }
+ptr() { mhcu screen | sed -n 's/.*"pointer":\[\([-0-9.]*\),\([-0-9.]*\)\].*/\1 \2/p'; }
 out() { mahoganyctl '(hrt:output-name (group-current-output (state-current-group *compositor-state*)))' | tr -d '"'; }
 # the x of every window, sorted by id: windows on HEADLESS-2 have x >= 1280
 xs() { mhcu windows | tr '{' '\n' | sed -n 's/.*"x":\([-0-9]*\).*/\1/p' | tr '\n' ' '; }
@@ -57,8 +58,10 @@ mhcu move 300 360 >/dev/null; sleep 0.3
 	fail "focus $(out)"
 mhcu key super+shift+Right >/dev/null; sleep 0.3
 [ "$(out)" = HEADLESS-2 ] && pass "Super+Shift+Right focuses HEADLESS-2" || fail "Super+Shift+Right: $(out)"
+[ "$(ptr)" = "1920 360" ] && pass "the pointer is at HEADLESS-2's centre" || fail "pointer at $(ptr)"
 mhcu key super+shift+Left >/dev/null; sleep 0.3
 [ "$(out)" = HEADLESS-1 ] && pass "Super+Shift+Left focuses HEADLESS-1" || fail "Super+Shift+Left: $(out)"
+[ "$(ptr)" = "640 360" ] && pass "the pointer is at HEADLESS-1's centre" || fail "pointer at $(ptr)"
 
 mhcu key super+shift+Right >/dev/null; sleep 0.2
 mhcu key super+ctrl+shift+Left >/dev/null; sleep 0.5
@@ -66,6 +69,7 @@ x=$(xs); echo "after moving the column left, x: $x"
 case " $x" in *" 1"[2-9][0-9][0-9]*|*" "[2-9][0-9][0-9][0-9]*) fail "a window is still on HEADLESS-2 (x: $x)" ;;
 	*) pass "Super+Ctrl+Shift+Left moved the column to HEADLESS-1" ;; esac
 [ "$(out)" = HEADLESS-1 ] && pass "the focus went with the column" || fail "focus $(out)"
+[ "$(ptr)" = "640 360" ] && pass "and the pointer too" || fail "pointer at $(ptr)"
 mhcu key super+ctrl+shift+Right >/dev/null; sleep 0.5
 x=$(xs); echo "after moving it back right, x: $x"
 case " $x" in *" 1"[2-9][0-9][0-9]*|*" "[2-9][0-9][0-9][0-9]*) pass "Super+Ctrl+Shift+Right moved it to HEADLESS-2" ;;
