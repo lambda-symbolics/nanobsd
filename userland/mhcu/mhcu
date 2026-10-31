@@ -12,21 +12,25 @@ usage() {
 	cat >&2 <<'EOF'
 usage: mhcu screen | windows | focused
        mhcu focus ID | close ID | group N
-       mhcu move X Y | click X Y [BUTTON [COUNT]] | dclick X Y
+       mhcu move X Y | click X Y [BUTTON [COUNT]] | dclick X Y   [--mods M]
        mhcu down [BUTTON] | up [BUTTON]
-       mhcu drag X1 Y1 X2 Y2 [BUTTON [STEPS]]
-       mhcu scroll X Y DY [DX]            (DY > 0 scrolls down, in wheel clicks)
+       mhcu drag X1 Y1 X2 Y2 [X3 Y3 ...] [BUTTON [STEPS]]  [--mods M]
+            [--steps N] [--step-ms MS] [--pause MS] [--hold MS] [--nowait]
+       mhcu scroll X Y DY [DX] [--pixels] [--mods M]
+                                         (DY > 0 down; wheel clicks or pixels)
+       mhcu busy | abort                 (a drag still playing; stop it)
        mhcu key CHORD...                 (ctrl+l  super+Return  F5  alt+Tab)
        mhcu hold KEY down|up             (shift, ctrl, a key name)
        mhcu type TEXT                    (newlines become Return)
        mhcu shot [FILE] [SCALE] [X Y W H]  (PNG; prints path, scale, size)
+       mhcu wake                         (undim/unblank the panel, wait for it)
        mhcu launch COMMAND-LINE
        mhcu find APP_ID                  (the mapped windows with APP_ID)
        mhcu wait APP_ID [SECONDS]        (until a window with APP_ID maps)
        mhcu clip | setclip TEXT          (the clipboard)
        mhcu sleep MS
        mhcu eval FORM
-BUTTON: left right middle side extra
+BUTTON: left right middle side extra    M: ctrl, shift+alt, super...
 EOF
 	exit 2
 }
@@ -41,12 +45,50 @@ call() {
 	esac
 }
 
+# Wait until a timed sequence (click, drag) has played; print its answer.
+played() {
+	case $1 in *'"error"'*) echo "$1"; return 1 ;; esac
+	if [ -z "$nowait" ]; then
+		i=0
+		while [ $i -lt 600 ]; do
+			case $(call "(cu-busy)") in *false*) break ;; esac
+			sleep 0.02; i=$((i + 1))
+		done
+	fi
+	echo "$1"
+}
+
 hex() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
 num() { case $1 in ''|*[!0-9.-]*) echo "mhcu: not a number: $1" >&2; exit 2 ;; esac; }
 lispstr() { printf '"%s"' "$(printf '%s' "$1" | sed 's/["\\]/\\&/g')"; }
 
 [ $# -ge 1 ] || usage
 cmd=$1; shift
+
+# Options of the pointer commands; the rest stays positional.
+mods= pixels= steps= stepms= pause= hold= nowait=
+case $cmd in
+click|dclick|drag|scroll)
+	pos=
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--mods)    mods=$2; shift ;;
+		--pixels)  pixels=1 ;;
+		--steps)   steps=$2; shift ;;
+		--step-ms) stepms=$2; shift ;;
+		--pause)   pause=$2; shift ;;
+		--hold)    hold=$2; shift ;;
+		--nowait)  nowait=1 ;;
+		--*)       usage ;;
+		*)         pos="$pos $1" ;;
+		esac
+		shift
+	done
+	set -- $pos ;;
+esac
+modarg=
+[ -n "$mods" ] && modarg=" :mods $(lispstr "$mods")"
+
 case $cmd in
 screen)  call "(cu-screen)" ;;
 windows) call "(cu-windows)" ;;
@@ -56,14 +98,36 @@ close)   num "$1"; call "(cu-close $1)" ;;
 group)   num "$1"; call "(cu-select-group $1)" ;;
 move)    num "$1"; num "$2"; call "(cu-move $1 $2)" ;;
 click)   num "$1"; num "$2"
-	 call "(cu-click $1 $2 :button :${3:-left} :count ${4:-1})" ;;
-dclick)  num "$1"; num "$2"; call "(cu-click $1 $2 :count 2)" ;;
+	 played "$(call "(cu-click $1 $2 :button :${3:-left} :count ${4:-1}$modarg)")" ;;
+dclick)  num "$1"; num "$2"; played "$(call "(cu-click $1 $2 :count 2$modarg)")" ;;
 down)    call "(cu-button :${1:-left} :down)" ;;
 up)      call "(cu-button :${1:-left} :up)" ;;
-drag)    for a in "$1" "$2" "$3" "$4"; do num "$a"; done
-	 call "(cu-drag $1 $2 $3 $4 :button :${5:-left} :steps ${6:-10})" ;;
+drag)    pts= button=left
+	 while [ $# -gt 0 ]; do
+		case $1 in
+		[0-9-]*) num "$1"; pts="$pts $1" ;;
+		*) button=$1; [ -n "$2" ] && { num "$2"; steps=$2; shift; } ;;
+		esac
+		shift
+	 done
+	 opts=" :button :$button$modarg"
+	 [ -n "$steps" ] && opts="$opts :steps $steps"
+	 [ -n "$stepms" ] && opts="$opts :step-ms $stepms"
+	 [ -n "$pause" ] && opts="$opts :pause-ms $pause"
+	 [ -n "$hold" ] && opts="$opts :hold-ms $hold"
+	 played "$(call "(cu-drag '($pts)$opts)")" ;;
 scroll)  num "$1"; num "$2"; num "$3"
-	 call "(cu-scroll $1 $2 :dy $3 :dx ${4:-0})" ;;
+	 px=; [ -n "$pixels" ] && px=" :pixels t"
+	 call "(cu-scroll $1 $2 :dy $3 :dx ${4:-0}$px$modarg)" ;;
+wake)    call "(cu-wake)" >/dev/null; i=0
+	 while [ $i -lt 50 ]; do
+		case $(call "(cu-screen)") in *'"panel":"on"'*) break ;; esac
+		sleep 0.1; i=$((i + 1))
+	 done
+	 sleep 0.2	# the panel's first frames after power-on
+	 call "(cu-screen)" | sed 's/.*\("panel":"[a-z]*"\).*/{\1}/' ;;
+busy)    call "(cu-busy)" ;;
+abort)   call "(cu-abort)" ;;
 key)     [ $# -ge 1 ] || usage
 	 forms=""; for c in "$@"; do forms="$forms $(lispstr "$c")"; done
 	 call "(cu-key$forms)" ;;

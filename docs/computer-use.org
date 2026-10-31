@@ -47,6 +47,10 @@ Do not drive the desktop while the user is typing in it unless they asked.
   scale of 0.5 (1080x675) is a good default for a model: legible text,
   a quarter of the pixels.  A region shot (=mhcu shot FILE 1 X Y W H=)
   gives full detail of a part of the screen.
+- While the idle timer has the panel blanked a shot would be black, so
+  =shot= answers an error instead; =screen= reports =panel= (=on=,
+  =dimmed=, =blanked=) and =wake= turns it back on the way any input does.
+  The panel blanks again after its idle time.
 - grim takes the shot (wlr-screencopy) in the background, because the
   compositor's main thread has to serve its capture; mhcu waits up to 10 s
   for the file, which is written as FILE.part and renamed when complete.
@@ -67,11 +71,13 @@ Run as root (default socket /var/run/user/1000/mahogany.sock) or as mag.
 | =close ID=                       | ask it to close (like its close button)                  | ={"closed": ID}=                        |
 | =group N=                        | switch to group N (1-based)                              | ={"group": N}=                          |
 | =move X Y=                       | move the pointer                                         | ={"pointer": [x, y]}=                   |
-| =click X Y [BUTTON [COUNT]]=     | move, click (COUNT 2 = double click)                     | pointer                                 |
-| =dclick X Y=                     | double click                                             | pointer                                 |
+| =click X Y [BUTTON [COUNT]] [--mods M]= | move, click COUNT times (2 double, 3 triple) holding M | ={"pointer", "clicks", "duration_ms"}= |
+| =dclick X Y [--mods M]=          | double click                                             | same                                    |
 | =down [BUTTON]=, =up [BUTTON]=   | press / release where the pointer is                     | pointer                                 |
-| =drag X1 Y1 X2 Y2 [BUTTON [STEPS]]= | press, move in STEPS (10) motions, release            | pointer                                 |
-| =scroll X Y DY [DX]=             | move, then wheel clicks: DY > 0 down, DX > 0 right        | pointer                                 |
+| =drag X1 Y1 X2 Y2 [X3 Y3 ...] [BUTTON] [--mods M] [--steps N] [--step-ms MS] [--pause MS] [--hold MS] [--nowait]= | press at the first point, glide through the others, release at the last | ={"points", "duration_ms"}= |
+| =scroll X Y DY [DX] [--pixels] [--mods M]= | move, scroll: wheel clicks, or pixels as a continuous source; DY > 0 down | pointer          |
+| =busy=, =abort=                  | a click or drag still playing; stop it, release held buttons and keys | ={"busy"}=, ={"aborted"}=   |
+| =wake=                           | undim / unblank the panel and wait until it is on        | ={"panel": "on"}=                       |
 | =key CHORD...=                   | tap each chord in turn                                   | ={"keys": [...]}=                        |
 | =hold KEY down/up=               | hold a key or modifier across other commands             | ={"key", "state"}=                      |
 | =type TEXT=                      | type with the keymap; newline = Return, tab = Tab        | ={"typed": n, "skipped": [chars]}=       |
@@ -90,6 +96,29 @@ A window object:
 #+end_src
 The id is stable for the window's lifetime (its heart view address).
 Errors are ={"error": "message"}= with exit status 1.
+
+Clicks and drags are timed, like a hand: a press is held 15 ms, clicks
+of a double click are 70 ms apart, a drag holds 50 ms around the press
+and release and moves in steps 10 ms apart (STEPS per segment, PAUSE at
+each waypoint).  The compositor plays them from a timer on its main
+thread: toolkits start drag-and-drop only after they have handled the
+press, so an instant press-move-release never starts one, and a double
+click whose clicks share a millisecond reaches GTK mangled.  =cu-click=
+and =cu-drag= therefore return at once with =duration_ms=; mhcu waits
+until =cu-busy= is false (=--nowait= does not).  One sequence at a time;
+=abort= (or =*cu-enabled*= NIL) releases whatever it holds.
+
+=--mods= takes the modifier names of chords (=ctrl=, =shift+alt=) and
+holds them around the click, drag or scroll.  Modifier state reaches only
+the window with keyboard focus: a ctrl-click on an unfocused window
+focuses it and only the release carries ctrl, as with real hands.  Focus
+it first (=focus ID= or a plain click).
+
+Scrolling: wheel clicks are 15 units and v120 120 each, like libinput; GTK
+3 turns one into a discrete step plus a smooth delta of 1.5.  =--pixels=
+sends a continuous source (trackpoint-like, no kinetic fling) of DY units,
+the protocol's surface pixels; GTK 3 reports it as trackpoint scrolling of
+DY/10, Firefox scrolls about DY pixels.
 
 Chords: modifiers =ctrl shift alt super altgr= (also =control meta logo
 win=) joined with =+= to a key name.  Key names are xkb keysym names
@@ -129,7 +158,14 @@ chords, a Mahogany prefix keybinding (=ctrl+t g n=), scroll, drag,
 scaled and region screenshots, clipboard round trip, bad key names,
 unmappable characters.  Point mhcu at it with
 =MAHOGANY_SOCKET=/var/tmp/mhrun/mahogany.sock=.  Results of 2026-10-31:
-all pass.  /var/tmp/mhcu-cz-test.sh does the same on the user's =cz,us=
+all pass.  userland/mhcu/mhcu-pointer-test.sh runs userland/mhcu/cu-probe
+(a GTK3 window that prints every button, motion and scroll event with its
+modifiers and scroll source, with a drag source and a drop target):
+ctrl+shift click on a focused window carries shift,ctrl; double and
+triple clicks come out as GTK's own press/2press/3press sequences;
+alt+right click; wheel, pixel and ctrl+wheel scrolls; a three-point drag
+with a pause makes GTK start drag-and-drop and drop its payload on the
+target; abort stops a slow drag.  /var/tmp/mhcu-cz-test.sh does the same on the user's =cz,us=
 layout (=me@mag.wiki ž ěščřý 2+3=5 {[|]} <>#&$~= typed exactly, then after
 an alt+shift layout switch).
 
@@ -149,10 +185,11 @@ control socket directly when Autolith runs on the Nano):
 | =desktop_screen=  | {}                                                                    | =screen=                    |
 | =desktop_windows= | {app_id?: string}                                                     | =windows= / =find=          |
 | =desktop_screenshot= | {scale?: number = 0.5, region?: {x, y, width, height}}             | =shot= then fetch the PNG   |
-| =desktop_click=   | {x: int, y: int, button?: enum[left,right,middle], count?: int = 1}   | =click=                     |
+| =desktop_click=   | {x: int, y: int, button?: enum[left,right,middle,side,extra], count?: int = 1, mods?: [string]} | =click=  |
 | =desktop_move=    | {x: int, y: int}                                                      | =move=                      |
-| =desktop_drag=    | {from: [x, y], to: [x, y], button?, steps?: int}                      | =drag=                      |
-| =desktop_scroll=  | {x: int, y: int, dy: int, dx?: int}                                   | =scroll=                    |
+| =desktop_drag=    | {path: [[x, y], ...] (2+), button?, mods?: [string], steps?: int, pause_ms?: int} | =drag=           |
+| =desktop_scroll=  | {x: int, y: int, dy: number, dx?: number, unit?: enum[clicks,pixels], mods?: [string]} | =scroll=   |
+| =desktop_wake=    | {}                                                                    | =wake=                      |
 | =desktop_key=     | {chords: [string]}                                                    | =key=                       |
 | =desktop_type=    | {text: string}                                                        | =type=                      |
 | =desktop_focus=   | {id: int}                                                             | =focus=                     |
@@ -166,6 +203,8 @@ Notes for the implementation:
   screenshot pixels / scale.  Alternatively let the tools take
   screenshot-space coordinates plus the scale the model saw and convert in
   the tool; then a single scale per conversation avoids mistakes.
+- Call =wake= before observing when =screen= says the panel is not on
+  (the user is away: the idle timer dims after 2 min, blanks after 5).
 - After every action, a fresh screenshot (or at least =focused=) is the
   observation; actions return immediately, clients redraw a frame or more
   later (at 30 Hz panel refresh, ~35 ms; give a program that starts or
