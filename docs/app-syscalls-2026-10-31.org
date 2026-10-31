@@ -18,10 +18,8 @@ Mahogany and in the audio driver, not in Firefox.
   its thread, a few hundred a second while frames render (~800 yields/s
   during video, ~3,600/s scrolling X).  Telemetry upload is off in this
   profile, so Glean drops them all when they arrive: pure waste, but small
-  (the thread uses 0.6 % of a core during video).  Not NetBSD-specific.
-  Not patched (it needs a Rust rebuild of libxul); the fix would be an
-  atomic upload flag checked before =dispatcher::launch= in glean-core's
-  metric recording.
+  (the thread uses 0.6-1 % of a core during video).  Not NetBSD-specific.
+  Fixed the same day, see below.
 - =madvise=/=mmap=/=munmap=: mozjemalloc purges and IPC shared memory.
   While scrolling X, ~250 maps and ~150 unmaps a second per process and
   ~1,480 TLB shootdowns/s (61 at idle); =pmap_tlb_shootnow= is the top
@@ -72,7 +70,38 @@ Kernel 224 (nanobsd 57794fc) writes the current levels back instead
 (=hdafg_control_restore=); verified: master 100 and mic 170 survive play
 and record from D3.
 
+* Glean: metrics no ping would store are no longer dispatched
+Glean 67 records a metric only into pings that are enabled; with upload
+off, those that follow it are off, but a few pings have their own switch
+(usage-reporting, quick-suggest, onboarding-opt-out...), so "drop all
+when upload is off" would be wrong.  The patch (pkgsrc/www/firefox
+patch-third__party_rust_glean-core_*, plus the crate checksums in the
+Makefile) keeps two hints next to the dispatcher: the upload flag as of
+the last change put on the dispatcher, and every constructed ping with its
+enablement as of the last change put on it.  A metric call
+(=launch_recording=) skips the dispatcher when upload is off and none of
+the pings it is sent in is always-on (=glean_client_info=...), unknown, or
+enabled on its own.  The hints change when a change is dispatched, so a
+recording queued after an enable still runs.  Denominators (which record
+into their numerators' pings) and event listeners are left alone.
+
+A/B on the user's profile (telemetry off), Big Buck Bunny 1080p60 on
+YouTube, muted, 30 s of =lwptime= after 25 s of playback, same session,
+only libxul swapped: glean.dispatcher 0.96 % of a core before, below the
+0.01 % that lwptime lists after; the whole parent 17.9 % / 18.4 % (noise).
+The pre-patch libxul is /usr/pkg/lib/firefox/libxul.so.pre-glean.
+
+The incremental build recompiled all 339 Rust crates (the gefs copy's
+mtimes), 12 minutes on AC, then the 15 s libxul link
+(/var/tmp/ff-glean-build.sh).
+
 * Lessons
+- An idle-blanked panel suspends every window: Firefox stops rendering
+  and decoding, and a measurement taken then is worthless.  Turn the idle
+  timers off for a measurement (=mhcu eval '(setf
+  mahogany::*idle-blank-seconds* nil ...)'=) and back on after.
+- YouTube refuses an embed in a file:// page (error 153); its consent
+  dialog in a fresh profile ignored clicks.  Measure in the real profile.
 - Never put =timeout= around =gdb -p=: when timeout killed gdb its
   breakpoint stayed in Firefox and the next =sched_yield= killed it with
   SIGTRAP (the user's session restored its tabs).
