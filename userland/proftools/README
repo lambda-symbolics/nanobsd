@@ -1,0 +1,18 @@
+Profiling tools for finding where a program's CPU and wakeups go on NetBSD
+(docs/app-syscalls-2026-10-31.org).  Copied to /var/tmp on the Nano.
+
+lwptime PID [SECS]   exact CPU per thread over SECS, from kinfo_lwp l_rtime
+                     (measured at every context switch).  Use this, not DTrace
+                     profile-997: on NetBSD that provider fires on the 100 Hz
+                     clock and over-samples threads woken in step with it (the
+                     cubeb audio thread read 5.3 % there, 0.55 % here).
+sysprof.sh PID [SECS] syscall rates by call, by thread (with LWP names), and
+                     by thread x call, from ktrace.
+fftree.sh PID [SECS] lwptime for a process, all its descendants (Firefox's
+                     fork server makes content processes grandchildren) and
+                     Mahogany.
+ffsym.sh PROF PMAP NAMES  aggregate DTrace "tid pc kernel count" samples by
+                     library, thread and libxul symbol (unstripped libxul from
+                     the pkgsrc work dir, base from pmap).
+
+cc -O2 -o lwptime lwptime.c
