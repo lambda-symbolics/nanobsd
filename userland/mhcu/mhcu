@@ -1,0 +1,114 @@
+#!/bin/sh
+# mhcu: drive the Mahogany desktop (computer use) through its control socket.
+# Every command prints one JSON value.  Coordinates are layout pixels (the
+# panel is 2160x1350); screenshots can be scaled, coordinates never are.
+# See docs/computer-use.org.  Runs as root or as the session user.
+
+: ${MAHOGANY_SOCKET:=/var/run/user/1000/mahogany.sock}
+export MAHOGANY_SOCKET
+CTL=/usr/local/bin/mahoganyctl
+
+usage() {
+	cat >&2 <<'EOF'
+usage: mhcu screen | windows | focused
+       mhcu focus ID | close ID | group N
+       mhcu move X Y | click X Y [BUTTON [COUNT]] | dclick X Y
+       mhcu down [BUTTON] | up [BUTTON]
+       mhcu drag X1 Y1 X2 Y2 [BUTTON [STEPS]]
+       mhcu scroll X Y DY [DX]            (DY > 0 scrolls down, in wheel clicks)
+       mhcu key CHORD...                 (ctrl+l  super+Return  F5  alt+Tab)
+       mhcu hold KEY down|up             (shift, ctrl, a key name)
+       mhcu type TEXT                    (newlines become Return)
+       mhcu shot [FILE] [SCALE] [X Y W H]  (PNG; prints path, scale, size)
+       mhcu launch COMMAND-LINE
+       mhcu find APP_ID                  (the mapped windows with APP_ID)
+       mhcu wait APP_ID [SECONDS]        (until a window with APP_ID maps)
+       mhcu clip | setclip TEXT          (the clipboard)
+       mhcu sleep MS
+       mhcu eval FORM
+BUTTON: left right middle side extra
+EOF
+	exit 2
+}
+
+# Send FORM; print the JSON the command returned (a Lisp string, unquoted).
+call() {
+	out=$($CTL "$1") || { echo "{\"error\":\"mahoganyctl failed\"}"; return 1; }
+	case $out in
+	\"*\") printf '%s\n' "$out" | sed 's/^"//; s/"$//; s/\\\(.\)/\1/g' ;;
+	ERROR:*) printf '{"error":"%s"}\n' "$(printf '%s' "$out" | sed 's/["\\]/\\&/g')"; return 1 ;;
+	*) printf '%s\n' "$out" ;;
+	esac
+}
+
+hex() { printf '%s' "$1" | od -An -tx1 | tr -d ' \n'; }
+num() { case $1 in ''|*[!0-9.-]*) echo "mhcu: not a number: $1" >&2; exit 2 ;; esac; }
+lispstr() { printf '"%s"' "$(printf '%s' "$1" | sed 's/["\\]/\\&/g')"; }
+
+[ $# -ge 1 ] || usage
+cmd=$1; shift
+case $cmd in
+screen)  call "(cu-screen)" ;;
+windows) call "(cu-windows)" ;;
+focused) call "(cu-focused)" ;;
+focus)   num "$1"; call "(cu-focus $1)" ;;
+close)   num "$1"; call "(cu-close $1)" ;;
+group)   num "$1"; call "(cu-select-group $1)" ;;
+move)    num "$1"; num "$2"; call "(cu-move $1 $2)" ;;
+click)   num "$1"; num "$2"
+	 call "(cu-click $1 $2 :button :${3:-left} :count ${4:-1})" ;;
+dclick)  num "$1"; num "$2"; call "(cu-click $1 $2 :count 2)" ;;
+down)    call "(cu-button :${1:-left} :down)" ;;
+up)      call "(cu-button :${1:-left} :up)" ;;
+drag)    for a in "$1" "$2" "$3" "$4"; do num "$a"; done
+	 call "(cu-drag $1 $2 $3 $4 :button :${5:-left} :steps ${6:-10})" ;;
+scroll)  num "$1"; num "$2"; num "$3"
+	 call "(cu-scroll $1 $2 :dy $3 :dx ${4:-0})" ;;
+key)     [ $# -ge 1 ] || usage
+	 forms=""; for c in "$@"; do forms="$forms $(lispstr "$c")"; done
+	 call "(cu-key$forms)" ;;
+hold)    [ $# -eq 2 ] || usage; call "(cu-key-hold $(lispstr "$1") :$2)" ;;
+type)    [ $# -ge 1 ] || usage; call "(cu-type-hex \"$(hex "$*")\")" ;;
+launch)  [ $# -ge 1 ] || usage; call "(cu-launch-hex \"$(hex "$*")\")" ;;
+shot)
+	file=${1:-/tmp/mhcu-$$.png}; scale=${2:-1}
+	case $file in /*) ;; *) file=$PWD/$file ;; esac
+	rm -f "$file"
+	if [ $# -ge 6 ]; then
+		for a in "$3" "$4" "$5" "$6"; do num "$a"; done
+		r=$(call "(cu-screenshot $(lispstr "$file") :scale $scale :x $3 :y $4 :width $5 :height $6)") || { echo "$r"; exit 1; }
+	else
+		r=$(call "(cu-screenshot $(lispstr "$file") :scale $scale)") || { echo "$r"; exit 1; }
+	fi
+	i=0
+	while [ ! -s "$file" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+	if [ ! -s "$file" ]; then
+		echo "{\"error\":\"screenshot did not appear\",\"path\":\"$file\"}"; exit 1
+	fi
+	size=$(file -b "$file" | sed -n 's/.* \([0-9]*\) x \([0-9]*\).*/\1 \2/p')
+	set -- $size
+	printf '{"path":"%s","scale":%s,"width":%s,"height":%s}\n' \
+	    "$file" "$scale" "${1:-0}" "${2:-0}" ;;
+wait)
+	[ $# -ge 1 ] || usage; t=$(( ${2:-10} * 10 )); i=0
+	while [ $i -lt $t ]; do
+		w=$(call "(cu-find-app $(lispstr "$1"))")
+		case $w in \[\]|\{\"error*) ;; *) printf '%s\n' "$w"; exit 0 ;; esac
+		sleep 0.1; i=$((i + 1))
+	done
+	echo "{\"error\":\"no window with app_id $1\"}"; exit 1 ;;
+find)    [ $# -eq 1 ] || usage; call "(cu-find-app $(lispstr "$1"))" ;;
+clip)    XDG_RUNTIME_DIR=${MAHOGANY_SOCKET%/*} WAYLAND_DISPLAY=wayland-0 \
+	     /usr/pkg/bin/wl-paste -n 2>/dev/null |
+	 awk 'BEGIN { ORS = ""; print "{\"clipboard\":\"" }
+	      { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t")
+	        if (NR > 1) print "\\n"; print }
+	      END { print "\"}\n" }' ;;
+setclip) [ $# -ge 1 ] || usage
+	 printf '%s' "$*" | XDG_RUNTIME_DIR=${MAHOGANY_SOCKET%/*} \
+	     WAYLAND_DISPLAY=wayland-0 /usr/pkg/bin/wl-copy &&
+	     echo '{"clipboard":"set"}' ;;
+sleep)   num "$1"; sleep "$(echo "scale=3; $1 / 1000" | bc)"; echo '{"slept":'"$1"'}' ;;
+eval)    [ $# -eq 1 ] || usage; $CTL "$1" ;;
+*)       usage ;;
+esac

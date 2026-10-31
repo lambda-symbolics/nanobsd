@@ -1,0 +1,184 @@
+#+title: Computer use: driving the Mahogany desktop remotely
+
+An agent (Claude over ssh today, Autolith later) can look at the Nano's
+screen and operate it like a person at the keyboard: list windows, take
+screenshots, move and click the pointer, scroll, drag, press key chords,
+type text, focus windows, launch programs, read and set the clipboard.  It
+exists for tests that need a GUI program driven (Firefox, mpv, the
+screenshot overlay, Mahogany's own keybindings), the way xdotool plus
+screenshots serve under X.
+
+Pieces:
+- Mahogany (lambda-symbolics/mahogany 783de55):
+  - heart/src/computer_use.c: a virtual pointer attached to the seat's
+    cursor and a virtual keyboard in the seat's keyboard group, created on
+    first use;
+  - lisp/computer-use.lisp: the =cu-*= commands, evaluated over the
+    control socket (control.lisp), each answering one JSON value;
+  - doc/computer-use.org: that API.
+- nanobsd userland/mhcu/mhcu, installed as /usr/local/bin/mhcu: the
+  command-line client.  Every subcommand prints one JSON value.
+
+* How input is injected, and why it is faithful
+The virtual devices are real wlroots input devices inside the compositor,
+not a protocol client (there is no virtual-keyboard/virtual-pointer
+protocol involved and no client can use them).  An injected key goes
+through the keyboard group exactly like a key from the ThinkPad keyboard:
+Mahogany's keybindings see it first (=ctrl+t g n= runs the prefix map),
+then the focused client.  An injected motion moves the real cursor, so
+sloppy focus, click-to-focus, cursor shapes and pointer enter/leave behave
+as with the trackpad.  The idle timer counts it as activity (it unblanks
+the panel).  The seat gains pointer and keyboard capabilities when the
+devices appear, so it works even with no real devices (the headless test
+compositor, or with USB off).
+
+Consequence: whatever the agent does, it does to the user's live session.
+Do not drive the desktop while the user is typing in it unless they asked.
+
+* Coordinates and screenshots
+- Coordinates are layout pixels.  The Nano's panel is one output at 0,0,
+  2160x1350 (=mhcu screen= reports the layout, outputs, the pointer and
+  the groups).
+- Window geometry (=mhcu windows=) is the client area in layout pixels,
+  without Mahogany's border.  A window in another group, or hidden behind
+  a fullscreen one, has =visible: false=; its x/y are then stale.
+- =mhcu shot FILE SCALE= scales the image, never the coordinates: a click
+  on a point seen at (u, v) in a 0.5 screenshot is =mhcu click 2u 2v=.  A
+  scale of 0.5 (1080x675) is a good default for a model: legible text,
+  a quarter of the pixels.  A region shot (=mhcu shot FILE 1 X Y W H=)
+  gives full detail of a part of the screen.
+- grim takes the shot (wlr-screencopy) in the background, because the
+  compositor's main thread has to serve its capture; mhcu waits up to 10 s
+  for the file, which is written as FILE.part and renamed when complete.
+  The file belongs to the session user (mag); root can read it.
+
+* mhcu reference
+Run as root (default socket /var/run/user/1000/mahogany.sock) or as mag.
+=MAHOGANY_SOCKET= selects another compositor (the headless test one).
+
+| command                          | effect                                                   | answer                                  |
+|----------------------------------+----------------------------------------------------------+-----------------------------------------|
+| =screen=                         | layout, outputs, pointer, current group, groups          | object                                  |
+| =windows=                        | every mapped window in every group                       | array of window objects                 |
+| =focused=                        | the focused window                                       | window or null                          |
+| =find APP_ID=                    | mapped windows with that app_id                          | array                                   |
+| =wait APP_ID [SECONDS]=          | poll until one maps (default 10 s)                       | array, or error                         |
+| =focus ID=                       | switch to its group, focus it                            | window                                  |
+| =close ID=                       | ask it to close (like its close button)                  | ={"closed": ID}=                        |
+| =group N=                        | switch to group N (1-based)                              | ={"group": N}=                          |
+| =move X Y=                       | move the pointer                                         | ={"pointer": [x, y]}=                   |
+| =click X Y [BUTTON [COUNT]]=     | move, click (COUNT 2 = double click)                     | pointer                                 |
+| =dclick X Y=                     | double click                                             | pointer                                 |
+| =down [BUTTON]=, =up [BUTTON]=   | press / release where the pointer is                     | pointer                                 |
+| =drag X1 Y1 X2 Y2 [BUTTON [STEPS]]= | press, move in STEPS (10) motions, release            | pointer                                 |
+| =scroll X Y DY [DX]=             | move, then wheel clicks: DY > 0 down, DX > 0 right        | pointer                                 |
+| =key CHORD...=                   | tap each chord in turn                                   | ={"keys": [...]}=                        |
+| =hold KEY down/up=               | hold a key or modifier across other commands             | ={"key", "state"}=                      |
+| =type TEXT=                      | type with the keymap; newline = Return, tab = Tab        | ={"typed": n, "skipped": [chars]}=       |
+| =shot [FILE] [SCALE] [X Y W H]=  | PNG screenshot (default /tmp/mhcu-PID.png, scale 1)       | ={"path", "scale", "width", "height"}=  |
+| =launch COMMAND-LINE=            | start a shell command in the session, detached           | ={"pid": n}=                             |
+| =clip=, =setclip TEXT=           | read / set the clipboard (wl-paste / wl-copy)            | ={"clipboard": text}=                    |
+| =sleep MS=                       | wait                                                     | ={"slept": ms}=                          |
+| =eval FORM=                      | any Lisp form in the compositor (raw printed result)     | raw                                     |
+
+A window object:
+#+begin_src json
+{"id":128418814995200, "app_id":"foot", "title":"foot", "pid":7317,
+ "group":1, "group_name":"DEFAULT", "current_group":true,
+ "x":17, "y":34, "width":614, "height":669,
+ "visible":true, "focused":true, "fullscreen":false}
+#+end_src
+The id is stable for the window's lifetime (its heart view address).
+Errors are ={"error": "message"}= with exit status 1.
+
+Chords: modifiers =ctrl shift alt super altgr= (also =control meta logo
+win=) joined with =+= to a key name.  Key names are xkb keysym names
+(=Return=, =Escape=, =F5=, =Left=, =Prior=, =XF86AudioMute=, =a=, =A=,
+=plus=) or aliases (=enter esc del bs pgup pgdn space tab up down left
+right prtsc=).  A key that needs Shift on the keymap gets it
+automatically: =key A= types a capital.  Only the first layout's first two
+levels are searched, so =type= skips characters such as =ž= that the us
+keymap cannot produce (they are listed in =skipped=); paste those with
+=setclip= and =key ctrl+v=.
+
+Text and command lines travel hex-encoded (UTF-8) because the control
+protocol is one form per line; newlines and quotes are therefore fine.
+
+* Remote use (from another machine)
+#+begin_src sh
+ssh root@10.0.0.25 /bin/sh -s <<'EOF'
+mhcu windows
+mhcu shot /tmp/s.png 0.5
+EOF
+scp root@10.0.0.25:/tmp/s.png .
+#+end_src
+root's login shell is cclsh: pass commands through =/bin/sh -s= on stdin,
+never as ssh arguments.  A loop of observe (shot), decide, act (click /
+type / key), observe again is the whole method; =wait= and =sleep= cover
+programs that take time to react.
+
+* Testing without the user's session
+The headless compositor never touches the session: /var/tmp/mhcu-test.sh
+starts =build/mahogany= with =WLR_BACKENDS=headless= (1280x720,
+/var/tmp/mhtest.sh), launches foot running /bin/sh, then exercises every
+command: typing shifted punctuation into a file and reading it back, key
+chords, a Mahogany prefix keybinding (=ctrl+t g n=), scroll, drag,
+scaled and region screenshots, clipboard round trip, bad key names,
+unmappable characters.  Point mhcu at it with
+=MAHOGANY_SOCKET=/var/tmp/mhrun/mahogany.sock=.  Results of 2026-10-31:
+all pass.
+
+* For Autolith: tools to build on this
+The CLI already has the shape of a tool set: small actions, JSON answers,
+stateless except for the screen itself.  Suggested tools (JSON Schema
+inputs; each maps to one mhcu call over ssh, or to the =cu-*= form on the
+control socket directly when Autolith runs on the Nano):
+
+| tool              | input                                                                 | mhcu                        |
+|-------------------+-----------------------------------------------------------------------+-----------------------------|
+| =desktop_screen=  | {}                                                                    | =screen=                    |
+| =desktop_windows= | {app_id?: string}                                                     | =windows= / =find=          |
+| =desktop_screenshot= | {scale?: number = 0.5, region?: {x, y, width, height}}             | =shot= then fetch the PNG   |
+| =desktop_click=   | {x: int, y: int, button?: enum[left,right,middle], count?: int = 1}   | =click=                     |
+| =desktop_move=    | {x: int, y: int}                                                      | =move=                      |
+| =desktop_drag=    | {from: [x, y], to: [x, y], button?, steps?: int}                      | =drag=                      |
+| =desktop_scroll=  | {x: int, y: int, dy: int, dx?: int}                                   | =scroll=                    |
+| =desktop_key=     | {chords: [string]}                                                    | =key=                       |
+| =desktop_type=    | {text: string}                                                        | =type=                      |
+| =desktop_focus=   | {id: int}                                                             | =focus=                     |
+| =desktop_launch=  | {command: string, wait_app_id?: string, timeout_s?: int}              | =launch= (+ =wait=)         |
+| =desktop_close=   | {id: int}                                                             | =close=                     |
+| =desktop_clipboard= | {set?: string}                                                      | =clip= / =setclip=          |
+
+Notes for the implementation:
+- Return the screenshot to the model as an image, with its scale, and
+  state in the tool description that coordinates are layout pixels =
+  screenshot pixels / scale.  Alternatively let the tools take
+  screenshot-space coordinates plus the scale the model saw and convert in
+  the tool; then a single scale per conversation avoids mistakes.
+- After every action, a fresh screenshot (or at least =focused=) is the
+  observation; actions return immediately, clients redraw a frame or more
+  later (at 30 Hz panel refresh, ~35 ms; give a program that starts or
+  loads 0.5-2 s, or use =wait=).
+- Prefer semantic targets when they exist: =windows= gives geometry and
+  app_id, =focus= by id beats clicking a title bar (there are none: the
+  strip layout has no decorations), =key ctrl+l= beats finding a URL bar.
+- The kill switch: =(setf *cu-enabled* nil)= (=mhcu eval=, or bound to
+  a key in init.lisp) makes every command answer an error until it is set
+  back.  The user's own input always works alongside the agent's.
+- Logs: every control request is logged with its caller's pid and command
+  line in Mahogany's log (=control: (cu-click ...) from PID ...=).
+
+* Limits and not done
+- Single seat, first keyboard layout, levels 1-2 (no AltGr typing).
+- No touch or tablet; no pointer acceleration (absolute motion only); no
+  key repeat (a held key is pressed once).
+- Popups and menus are part of their parent's surface tree; their
+  geometry is not listed, find them in a screenshot.
+- Layer-shell surfaces (the bar, the screenshot overlay, rofi) are not in
+  =windows=; they take input normally.
+- No per-window capture of hidden windows (grim copies what is on the
+  panel); no OCR or accessibility tree.
+- No rate limit for agent input; access control is the control socket's
+  (XDG_RUNTIME_DIR 0700: mag and root only); =*cu-enabled*= is the off
+  switch.
