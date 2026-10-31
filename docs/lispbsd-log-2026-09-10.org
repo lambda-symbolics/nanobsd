@@ -1,0 +1,225 @@
+#+TITLE: LispBSD development log, September-October 2026
+#+STARTUP: showall
+
+Dated engineering notes that used to sit at the end of the user guide
+(docs/LISPBSD.org, ~/LISPBSD.org), moved here unchanged on 2026-10-31.  They
+describe the machine as it was then: much of it (X, StumpWM, estd, the
+CSTATE kernel, the wedged GPU) no longer applies.  Later work is in the
+dedicated documents in this directory.
+
+* Update 2026-09-16 — corrections and fixes
+
+Several earlier notes were wrong. Current truth:
+
+** Emacs "void: file-name-sans-extension" — FIXED
+This was never an exwm problem. Root cause: cclsh launches programs with
+posix_spawn(3), and on NetBSD a program started as the *direct* posix_spawn
+child of the threaded SBCL shell starts with a corrupted runtime. Emacs then
+errors on file-name-sans-extension at its first idle timer. Interposing one
+ordinary execve fixes it (=sh -c 'exec emacs'= is clean; a direct =emacs= is
+void). Fix: a tiny re-exec shim installed as =/usr/local/bin/emacs= (source
+/root/nbsd11/emacs-shim.c) that execs /usr/pkg/bin/emacs. Just run =emacs= as
+usual. The cclsh source was also fixed (source/sbcl/process.lisp resets
+SIGTTIN/TTOU/TSTP in children) but that alone does not fix emacs; the live
+login image was left as-is. The exwm block was removed from ~/.emacs.d/init.el.
+
+** CPU speed / battery — use HWP, not estd
+There is no =machdep.est= on this Tiger Lake, so estd could never work
+(=estd=NO= now). Frequency is governed by the *hwp* kernel module (Intel Speed
+Shift), autoloaded via =/etc/modules.conf=. Tunable: =sysctl -w
+machdep.hwp.epp=N= (0 = full performance, 255 = max power saving, 128 =
+balanced; powerd sets it per AC/battery). With HWP the CPU turbos to ~4.4 GHz
+on demand instead of being stuck near 1.2 GHz — this was the main cause of the
+sluggish screen/input.
+
+** Native resolution — automatic now
+genfb starts at 1024x768 unless GOP is set. =/boot.cfg= now runs =gop 2160x1350= (select the GOP mode by resolution; =gop 1= is mode index 1 = 640x480 on this firmware) before
+booting (default entry), giving native 2160x1350 with no manual step. If the
+screen is ever blank at boot, pick menu entry 2 ("without gop").
+
+** Mouse — reverted to the ws driver
+xorg.conf uses =Driver "ws"= again (it works). =Driver "mouse"= killed the
+pointer. Restart X after any xorg.conf change. TrackPoint middle-button scroll
+is not available in X on this hardware (the kernel pms driver emits no scroll
+events); it would need a kernel patch.
+
+** CSTATE kernel — abandoned
+/netbsd.cstate black-screens on boot; it is removed from the boot menu. GENERIC
+(C1 only) is the boot kernel. The power win is HWP, above.
+
+** Timezone
+=/etc/localtime= now points at Europe/Prague.
+
+* Update 2026-09-16 (afternoon) — PAT fix, MTRR warning, stumpwm spin
+- *Screen redraw was 100x slower on 7 of 8 CPUs.* NetBSD 11 programs the x86 PAT
+  (page attribute table) only on CPU 0 (=pat_init()= runs from =cpu_attach= on the
+  boot CPU; =cpu_hatch= never calls it), so write-combining mappings such as the
+  framebuffer are effectively uncached on CPUs 1-7 (67 MB/s vs 6.7 GB/s; a full
+  2160x1350 repaint took 200 ms). Fix: kernel module =patfix= (source
+  =/usr/src/sys/modules/patfix=, installed =/stand/amd64/11.0/modules/patfix=,
+  autoloaded from =/etc/modules.conf=). =sysctl machdep.patfix.pat= shows the PAT
+  per CPU; test with =schedctl -A <cpu> /var/tmp/fbprobe=.
+- *Never use x86_64_set_mtrr / MTRR tools on this kernel.* NetBSD's MTRR code
+  truncates bases/masks to 36 bits; any MTRR change rewrites the firmware entries
+  wrongly (the 64-bit MMIO entries become base 0 / mask 0 = whole memory UC) and
+  the machine crawls at ~7 MB/s RAM bandwidth until a reboot. Not needed anyway:
+  PAT WC works once patfix is loaded.
+- *Reboot hangs after "syncing disks"* also when issued over ssh (not a su/cclsh
+  problem). Root fs is clean at next boot, so the hang is in device shutdown or
+  the final reset. To debug: reboot from a text console (Ctrl+Alt+F1, log in,
+  =shutdown -r now=) and note the last line printed.
+- *stumpwm mode-line spin:* with the mode-line enabled stumpwm burns ~13% CPU and
+  X ~10-17% doing ~1400 X round trips/s (32-byte replies); =s-o= (toggle
+  mode-line) stops it instantly. Root cause still open.
+- Boot menu now selects the GOP mode by resolution (=gop 2160x1350=).
+
+* Update 2026-09-16 (evening) — perf/battery deep dive
+- PATFIX (biggest win): NetBSD 11 programs the CPU page-attribute table only on CPU 0,
+  so the framebuffer was uncached on CPUs 1-7 -> 67 MB/s vs 6.7 GB/s writes, ~200 ms per
+  full repaint. That was the "dystopic" Emacs/Firefox redraw. Module =patfix= now programs
+  PAT on every CPU (autoloads via /etc/modules.conf; =sysctl machdep.patfix.pat=).
+- Deep C-states: module =cidle= installs an MWAIT idle loop with a tunable hint
+  (=sysctl machdep.cidle.hint=, 0x60 default) because acpicpu(4) only ever picks C1.
+  Cores now reach C7 ~96%. Saves ~0.35 W. =sysctl machdep.cidle.residency= shows the MSRs.
+- Battery floor now ~6.3 W (was ~8-10) = ~7 h. Remaining drain: the iGPU never
+  power-gates (RC6 disabled: GEN6_RC_CONTROL reads 0) so the package is stuck at PC2;
+  reaching PC6+ needs GPU RC6, which needs the i915 driver (see below).
+- Reboot hang root cause: =reboot= panics in the iwx driver (recursive rw-lock:
+  iwx_ioctl -> ifioctl_common -> in6_ifattach -> iwx_ioctl again; the rw_write_held()
+  recursion guard does not catch it). WORKAROUND: reboot from a text console with
+  =shutdown -r now= (does the clean rc.d shutdown first) — this works. Fix pending in
+  the driver (track the owning LWP explicitly instead of rw_write_held()).
+- stumpwm mode-line spin = a stumpwm/X busy loop (~14000 GetInputFocus round-trips/s),
+  NOT a kernel bug (a C replica of its select() blocks correctly). =s-o= (toggle the
+  mode-line off) stops it and saves ~1 W. Root cause in stumpwm still open.
+- Xauthority lock errors after a forced power-off = stale =~/.Xauthority-c/-l= lock
+  files. Fix: =rm -f ~/.Xauthority-c ~/.Xauthority-l= then restart X.
+- WiFi: iwx module rebuilt to advertise IEEE80211_C_PMGT so =ifconfig iwx0 powersave=
+  is accepted (installed, active next boot).
+- Boot menu selects the GOP mode by resolution (=gop 2160x1350=), not index.
+
+* i915 GPU debug attempt (2026-09-16) — firmware + capture setup
+- Root of "i915 doesn't work": NetBSD 11's drm is a Jan-2020 Linux snapshot (DRIVER_DATE
+  20200114 ~ Linux 5.6). Tiger Lake (dev 0x9a40) is present but behind require_force_probe
+  (Linux itself marked it experimental then; has_rps=false /* disabled for debugging */).
+  Linux 5.9/5.10 made it stable. So the fix is a *targeted* backport of the TGL fixes from
+  Linux 5.7-5.9, not a full re-import.
+- First mandatory prerequisite was MISSING: the i915 firmware was not installed at all.
+  Installed the exact blobs the driver requests, from kernel.org linux-firmware:
+    /libdata/firmware/i915drmkms/i915/{tgl_dmc_ver2_04.bin, tgl_guc_35.2.0.bin, tgl_huc_7.0.3.bin}
+  (also copied to /libdata/firmware/i915/ as a path fallback). Driver name is i915drmkms;
+  request_firmware path = /libdata/firmware/<cd_name>/<image>.
+- Debug boot: boot.cfg has a non-default "DEBUG i915 GPU kernel" entry -> boot /netbsd.i915
+  (GENERIC #1 with DDB, DDB_COMMANDONENTER="trace;show registers"; onpanic defaults to 1
+  during early autoconf, before sysctl.conf lowers it). i915 attaches before root is mounted
+  rw, so a hang/panic there is safe to power-cycle. Crash dumps work (dev dk2, savecore=YES,
+  /var/crash) — a panic (even black-screen) can be captured with a blind `sync` at db{0}>.
+- Capture procedure: boot the DEBUG entry. If db{0}> trace appears -> photograph it, then
+  `sync` to dump+reboot. If black screen -> try Ctrl-Alt-Esc (fromconsole=1) then blind
+  `sync`; else hold power, boot GENERIC. Read the dump with crash(8) -N /var/crash/netbsd.N.
+
+* i915 progress (2026-09-16 afternoon) — firmware works, DEBUG_GEM fix
+- With the TGL firmware installed, /netbsd.i915 now attaches: DMC firmware loads
+  (tgl_dmc_ver2_04.bin v2.4), driver probes, reaches GPU engine init. First real fault:
+  gen8_reset_engines times out on bcs0/vcs0/vcs2/vecs0 (NOT rcs0) -> the driver wedges
+  the GT -> a debug-only assertion (intel_lrc.c:2370 process_csb) turned that into a fatal
+  panic. Root: NetBSD force-set CONFIG_DRM_I915_DEBUG_GEM=1 (# XXX) in
+  i915drm/files.i915drmkms; production Linux builds it =0, where GEM_BUG_ON is a no-op and
+  i915 keeps KMS alive on a wedged GT (see i915_gem_init: "-EIO ... keep KMS alive").
+- Fix applied + rebuilt /netbsd.i915 (GENERIC #3): files.i915drmkms -> DEBUG_GEM=0, and
+  i915_gem.h line 40 "#ifdef" -> "#if" so the value 0 selects the no-op GEM_BUG_ON
+  (NetBSD's IS_ENABLED(x) is just (x), so the flag must be *defined to 0*, not undefined;
+  backups .bak-debuggem). Next: boot menu entry 4; expect either a working (wedged, no 3D)
+  KMS display, or a new/different assertion -> crash dump -> iterate. Deeper TODO: the
+  engine-reset timeout itself (forcewake is held FORCEWAKE_ALL, so it's a TGL reset-domain
+  issue, likely a Linux 5.7-5.9 backport).
+
+* i915 WORKS for display (2026-09-16) — GENERIC #4 /netbsd.i915
+- Boot menu entry 4 now brings up the real i915 KMS display: intelfb0 at native
+  2160x1350x32, wsdisplay0/console on intelfb0 (not genfb), X at 2160x1350 (wsfb on
+  intelfb), StumpWM + Firefox running. Framebuffer 7 GB/s on all CPUs.
+- Two fixes made it work (both in-tree, rebuilt via compile/GENERIC): (1) CONFIG_DRM_I915_DEBUG_GEM
+  0 not 1 + i915_gem.h #ifdef->#if, so the survivable GPU-reset failure stops being a fatal BUG;
+  (2) HAS_RPS guard in intel_rps_mark_interactive (RPS is off on TGL, its power.mutex is unusable).
+- LIMITATIONS: GPU render engines are WEDGED (gen8_reset_engines times out on all engines) =>
+  NO 3D acceleration (Firefox etc. are software-rendered). And the powered-but-not-power-gated
+  GPU keeps the package out of all package C-states (pc2..pc10 = 0, was 87% pc2 on genfb) =>
+  BATTERY IS WORSE on this kernel than plain GENERIC. Net: great for display/resolution, bad for
+  battery, no accel. Default boot stays GENERIC; entry 4 is opt-in.
+- Note: ACPI backlight nodes now appear (hw.acpi.acpiout15/16.brightness) with i915's opregion;
+  may replace the iblc MMIO hack (untested). gop in boot.cfg is redundant now (i915 self-modesets)
+  but harmless.
+- NEXT to make it fully good: fix the engine-reset timeout (forcewake is held, so a TGL reset-
+  domain issue; backport the Linux 5.7-5.9 gen11/gen12 reset fix). That un-wedges the GPU ->
+  enables RC6/RPS (battery) and render accel.
+
+* i915 accel blocker isolated (2026-09-16) — execlists submission
+- Instrumented boot proved: GPU interrupts WORK (irq_calls=28 handled=28), but the
+  render ring is never loaded (RING_START=0/CTL=0) => the execlists context submission
+  (ELSP) doesn't put a ring on the engine, so the default-context batch never executes
+  and wedges accel. NOT a reset or interrupt problem (both fine).
+- State: native KMS display + battery both work (entry 4 / /netbsd.i915 GENERIC #9).
+  Accel remains blocked on TGL execlists context/LRC/PPGTT submission (deep, uncertain).
+
+* Boot screen (2026-10-13)
+
+The first boot.cfg entry boots the kernel with =-q=: the kernel prints
+only errors on the console and /etc/defaults/rc.conf derives
+=rc_silent=YES= from =kern.boothowto= (AB_QUIET, 0x10000), so rc prints
+nothing (=rc_silent_cmd=":"= in rc.conf).  =rc.d/bootsplash= (right after
+wscons in rcorder) starts =/usr/local/sbin/bootsplash=, which switches the
+console screen to dumb-framebuffer mode, paints the lfetch lambda scaled to
+a third of the panel height in the six greens, and waits;
+=rc.d/bootsplash_done= (after LOGIN, last in rcorder) sends it SIGTERM, it
+restores text mode and clears the screen, and the autologin getty takes
+over.  The second menu entry boots without =-q= for the full log; the
+precmd of rc.d/bootsplash only starts it on a quiet boot unless
+=bootsplash_always=YES=.  Sources: =userland/bootsplash= (bootsplash.c,
+logo.h made by mkbitmap.py from lfetch's logo.lisp, fbdump.c to read the
+framebuffer back for a remote check, the two rc.d scripts).  The green
+kernel text is =msg.kernel.fg=green= in wscons; it is simply not shown now.
+
+** Boot screen, second round (2026-10-13 evening)
+The first version showed the lambda only from rc.d/wscons on: =-q= leaves
+the kernel's short attach lines and all of rc on the console (rc_silent
+follows =-z=, AB_SILENT 0x40000, not =-q=).  Now:
+- boot.cfg default: =splash /lambda.png;boot netbsd.i915.rpm.151 -z=.
+  =-z= silences the loader, the kernel's attach lines and rc.  The loader
+  hands the PNG to the kernel as a module (x86_machdep recognises the PNG
+  magic).
+- kernel 151 = 150 + =options SPLASHSCREEN= (dev/splash + dev/stbi).
+  genfb, including intelfb through drmfb, renders the image centered at
+  attach and turns console drawing off, unless booted with -v, -s, -c, -a
+  or -d (DISABLESPLASH).  =etc/lambda.png= is the full 2160x1350 frame
+  with the lambda exactly where and how =bootsplash= paints it
+  (=userland/bootsplash/mkpng.py= from logo.h), so the handover from the
+  kernel splash to the rc one changes no pixel.
+- rc.d/bootsplash: REQUIRE root, BEFORE DISKS (9th in rcorder), accepts
+  -q or -z; bootsplash sends WSDISPLAYIO_SSPLASH 0 before clearing the
+  text screen at the end, which re-enables console drawing.
+- Still visible: the copyright banner for the moment before genfb
+  attaches, and the loader's menu itself.
+
+* Update 2026-10-17 — kernels 177-180, power results
+Default boot kernel: =netbsd.i915.rpm.180= (boot.cfg; 179 and 177 kept as
+fallbacks).  What changed and what it measured: docs/power-levers.org
+"Results (2026-10-17, kernels 177-180)".  In short: TSC-measured tickless
+tick accounting, callout deadline cache, TSC-low timecounter (sysctl.conf),
+USB runtime PM by deadlines, a ubt fix (the parked radio no longer dies after
+its first wake), TGL SAGV on (=lispbsd_sagv=1=, -0.8 W under video; never set
+it back to 0 without a reboot), Wi-Fi U-APSD built in but off for good
+(+50 ms latency, no saving), wg keepalive timer stops on ifconfig down.
+Panel off on battery: ~1.05 W.  Never run =usbdevs= while =usb off=.
+
+* Update 2026-10-17 evening — cleanup before the gefs+ migration
+Root 78 GB -> 42 GB.  Removed from the laptop: 117 old kernels (kept
+=netbsd=, 176, 177, 179, 180, 181), the CSTATE/GENERIC_S3/GENERIC_S3_NOGPU/
+LISPBSD compile directories, all crash dumps, pkgsrc work directories except
+Firefox's (kept with the distfiles), VA-API build trees (tarballs and patches
+kept), old traces/logs/captures, the niri and xwayland-satellite builds and
+binaries.  The X session is gone from this machine: StumpWM, rofi, dunst,
+xterm (and libnotify, luit, startup-notification, xcb-util-xrm), ~/.xinitrc,
+~/.stumpwmrc, ~/.stumpwm.d, ~/.Xresources, startx-safe and the switch-to
+scripts.  Mahogany is the only session; the text console is the fallback.
+The StumpWM dotfiles and docs stay in nanobsd as an option for other
+installs.  Xorg (base set) and /etc/X11/xorg.conf remain.

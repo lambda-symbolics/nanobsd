@@ -5,9 +5,7 @@ Short, task-shaped. Each heading = one thing you might want to do.
 =cheatsheet [pattern]= prints the same kind of list for the local tools.
 Remote commands from another box: =ssh root@10.0.0.25 /bin/sh -s= with the
 commands on stdin (root's login shell is cclsh, which mangles inline
-commands).  Every change to this machine lives in the nanobsd repository
-(kernel sources, etc/, userland/, dotfiles/, docs/); this file is
-docs/LISPBSD.org there.  Updated 2026-10-31.
+commands).
 
 * Network
 ** Which interface is which
@@ -61,7 +59,6 @@ The level is remembered separately for AC and battery (=brightness restore ac|ba
   Run =usb on= before plugging anything in; =usb off= refuses while a USB-C device is attached.
 - Wi-Fi power save (=wifi-powersave on|off=), audio hardware off shortly after the last sound,
   panel at 30 Hz while the picture is still, GPU at its lowest clock when idle.
-- Measuring: =powermeas=, =pcsample=; never compare numbers taken within 10 minutes of a boot.
 
 * Displays
 ** The panel
@@ -102,7 +99,6 @@ Notes:
 - From another machine: =mhcu mirror status= (outputs and mirrors),
   =mhcu mirror shot FILE= (a PNG of what the projector shows), =mhcu mirror fit cover=,
   =mhcu mirror region X Y W H= (mirror only part of the panel), =mhcu mirror freeze= / =thaw=.
-- How it works: Mahogany doc/mirror.org.
 ** Screenshots
 Print = freeze the screen, drag a region (click: whole screen; Esc cancels);
 Shift+Print = whole screen.  Saved as =~/screenshot-DATE.png= and copied to the clipboard.
@@ -120,10 +116,10 @@ Shift+Print = whole screen.  Saved as =~/screenshot-DATE.png= and copied to the 
 - Super+semicolon command line · prefix key Super+Z
 - Keyboard: cz and us, Alt+Shift switches.  Focus follows the pointer.
 - TrackPoint, and the touchpad through =imt(4)= (one-finger motion, two-finger scroll;
-  knobs =machdep.imt.*=, see docs/imt-touchpad.org).
-- Config: =~/.config/mahogany/init.lisp= (nanobsd dotfiles/mahogany/init.lisp).
+  speed and direction knobs: =sysctl machdep.imt=).
+- Config: =~/.config/mahogany/init.lisp=.
   Log: =~/.mahogany.log=.  =mahoganyctl FORM= evaluates Lisp in the running session.
-- An agent can drive the desktop remotely (=mhcu=, docs/computer-use.org).
+- An agent can drive the desktop remotely: =mhcu= (run it alone for its commands).
 
 * Audio, Bluetooth, camera
 - =volume up|down|mute|get=, =mic=; the keys do the same.
@@ -146,7 +142,7 @@ Config: =~/.emacs.d/init.el= (meow, eglot for Rust, org, sly).
 ** Packages (pkgsrc, NetBSD 11.0)
 =pkgin install foo=, =pkgin remove foo=, =pkgin search foo= are fine.
 *Do not run a blanket =pkgin upgrade=*: these are built locally from
-/usr/pkgsrc with LispBSD patches (nanobsd pkgsrc/ and userland/) and a binary upgrade
+/usr/pkgsrc with LispBSD patches and a binary upgrade
 would replace them with stock ones:
 - www/firefox (screen capture, cubeb audio, telemetry dispatcher fixes)
 - multimedia/mpv, multimedia/libva (hardware video decode under Wayland)
@@ -157,7 +153,7 @@ SBCL (futex build), Emacs pgtk, the iHD video driver, wpa_supplicant 2.11,
 Mahogany and the tools listed by =cheatsheet=.  Never run two pkgin or pkgsrc
 builds at once.
 ** Base system and kernel
-The kernel is LispBSD's (nanobsd kernel/, built in
+The kernel is LispBSD's (built in
 /usr/src/sys/arch/amd64/compile/GENERIC, installed as /netbsd.i915.rpm.N),
 and so are the modules in /stand (hwp, cidle, patfix, if_iwx, if_wg).
 =sysupgrade= would replace them: do not run it without rebuilding those.
@@ -178,11 +174,3 @@ installing it.
 - Firefox profile: =~/.config/mozilla/firefox/f0d23glq.default-default=.
 - Logs: =/var/log/messages=, =dmesg=, =~/.mahogany.log=.
 
-* History
-The dated notes that used to be here (September: StumpWM and X, the i915
-bring-up, PAT, C-states; October: boot screen, kernels 177-181, the X
-session's removal) are in this file's git history and in nanobsd docs/
-(power-levers.org, mahogany.org, gefs-migration.org, the dated findings).
-In short: X and StumpWM were removed on 2026-10-17 (Mahogany is the only
-session), the root moved to gefs+ on 2026-10-18, and since kernel 225
-(2026-10-31) plugging in a monitor is reported to the session.
