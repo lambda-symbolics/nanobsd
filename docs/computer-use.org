@@ -136,6 +136,19 @@ those with =setclip= and =key ctrl+v=, or switch layout with
 Text and command lines travel hex-encoded (UTF-8) because the control
 protocol is one form per line; newlines and quotes are therefore fine.
 
+** mirror: a projector or second monitor
+=mhcu mirror= drives Mahogany's output mirroring (Mahogany doc/mirror.org):
+the panel shown on another output, zero copy.  =status= lists outputs and
+mirrors; =start [TARGET [SOURCE]]= (default: the panel onto the other
+output), =stop=, =toggle=, =fit contain|cover|stretch|exact=,
+=region X Y W H= (layout pixels of the source; no numbers: all of it),
+=freeze= / =thaw=, =rescan= (NetBSD reports no hotplug: look for monitors
+plugged in or pulled out), =shot [FILE]= (what the target shows, as a PNG:
+=shot= and grim cannot see a target, it is out of the layout).  The user's
+keys: super+m mirrors or stops, super+shift+m cycles the fit.  On the
+Nano the USB-C ports are powered off from boot (=usb off= in rc.local,
+TCSS D3cold); a USB-C display or HDMI adapter needs =usb on usbc= first.
+
 * Remote use (from another machine)
 #+begin_src sh
 ssh root@10.0.0.25 /bin/sh -s <<'EOF'
@@ -196,6 +209,7 @@ control socket directly when Autolith runs on the Nano):
 | =desktop_launch=  | {command: string, wait_app_id?: string, timeout_s?: int}              | =launch= (+ =wait=)         |
 | =desktop_close=   | {id: int}                                                             | =close=                     |
 | =desktop_clipboard= | {set?: string}                                                      | =clip= / =setclip=          |
+| =desktop_mirror=  | {action: enum[status,start,stop,fit,region,freeze,thaw,shot,rescan], target?, fit?, region?} | =mirror ...= |
 
 Notes for the implementation:
 - Return the screenshot to the model as an image, with its scale, and

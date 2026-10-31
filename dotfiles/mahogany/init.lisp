@@ -142,6 +142,8 @@
  "s-O"              #'monitors-off
  "s-semicolon"      #'colon
  "s-b"              #'bar-toggle
+ "s-m"              #'mirror-screen
+ "s-M"              #'mirror-next-fit
  "s-R"              #'refresh-toggle
  "XF86AudioRaiseVolume"  #'volume-up
  "XF86AudioLowerVolume"  #'volume-down

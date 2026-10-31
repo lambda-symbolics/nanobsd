@@ -28,6 +28,9 @@ usage: mhcu screen | windows | focused
        mhcu find APP_ID                  (the mapped windows with APP_ID)
        mhcu wait APP_ID [SECONDS]        (until a window with APP_ID maps)
        mhcu clip | setclip TEXT          (the clipboard)
+       mhcu mirror [status | start [TARGET [SOURCE]] | stop [TARGET] | toggle |
+                    fit contain|cover|stretch|exact | region [X Y W H] |
+                    freeze | thaw | shot [FILE] | rescan]
        mhcu sleep MS
        mhcu eval FORM
 BUTTON: left right middle side extra    M: ctrl, shift+alt, super...
@@ -172,6 +175,22 @@ setclip) [ $# -ge 1 ] || usage
 	 printf '%s' "$*" | XDG_RUNTIME_DIR=${MAHOGANY_SOCKET%/*} \
 	     WAYLAND_DISPLAY=wayland-0 /usr/pkg/bin/wl-copy &&
 	     echo '{"clipboard":"set"}' ;;
+mirror)  act=${1:-status}; [ $# -gt 0 ] && shift
+	 case $act in
+	 shot)	file=${1:-/tmp/mhcu-mirror-$$.png}
+		case $file in /*) ;; *) file=$PWD/$file ;; esac
+		rm -f "$file"
+		r=$(call "(mirror-command \"shot\" $(lispstr "$file"))")
+		case $r in *'"error"'*) echo "$r"; exit 1 ;; esac
+		i=0; while [ ! -s "$file" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+		[ -s "$file" ] && printf '{"path":"%s"}\n' "$file" ||
+		    { echo "{\"error\":\"no frame from the mirror target\"}"; exit 1; } ;;
+	 region) [ $# -eq 0 ] || [ $# -eq 4 ] || usage
+		for a in "$@"; do num "$a"; done
+		call "(mirror-command \"region\"$(for a in "$@"; do printf ' %s' "$a"; done))" ;;
+	 *)	forms=""; for a in "$@"; do forms="$forms $(lispstr "$a")"; done
+		call "(mirror-command $(lispstr "$act")$forms)" ;;
+	 esac ;;
 sleep)   num "$1"; sleep "$(echo "scale=3; $1 / 1000" | bc)"; echo '{"slept":'"$1"'}' ;;
 eval)    [ $# -eq 1 ] || usage; $CTL "$1" ;;
 *)       usage ;;
