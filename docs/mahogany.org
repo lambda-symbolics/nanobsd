@@ -209,12 +209,12 @@ stays installed for the colon prompt.
 
 ** Not done
 
-- Screen sharing: Firefox and Chromium capture Wayland screens only through
-  xdg-desktop-portal + PipeWire; both are pkgsrc-wip only and the wlroots
-  portal backend is not packaged at all.  Screenshots work (grim over
-  wlr-screencopy).  Cheapest real fix: a libwebrtc DesktopCapturer backend
-  on wlr-screencopy (as OBS's wlroots capturer does) and a Firefox rebuild;
-  until then share from the X session.
+- Screen sharing (WebRTC, video calls): Firefox and Chromium capture Wayland
+  screens only through xdg-desktop-portal + PipeWire, which are not packaged.
+  Since 2026-10-13 the installed Firefox has a libwebrtc capturer on
+  wlr-screencopy instead (pkgsrc/www/firefox, a40cd72); never tested with a
+  real call yet.  (Mirroring to a projector is a different thing and works:
+  doc/mirror.org in Mahogany, LISPBSD.org "Displays".)
 - Bluetooth audio: base has bta2dpd(8), A2DP with SBC, fed from pad(4)
   (=bta2dpd -n -d ubt0 -a ADDR /dev/pad0=, players on the pad's audio
   device).  Pairing a modern SSP headset with the classic stack is untested.
