@@ -106,6 +106,14 @@
  "s-End"            #'strip-focus-last
  "s-C-Home"         #'strip-move-first
  "s-C-End"          #'strip-move-last
+ "s-S-Left"         #'focus-monitor-left
+ "s-S-Right"        #'focus-monitor-right
+ "s-S-Up"           #'focus-monitor-up
+ "s-S-Down"         #'focus-monitor-down
+ "s-C-S-Left"       #'move-column-to-monitor-left
+ "s-C-S-Right"      #'move-column-to-monitor-right
+ "s-C-S-Up"         #'move-column-to-monitor-up
+ "s-C-S-Down"       #'move-column-to-monitor-down
  "s-c"              #'group-select-1
  "s-i"              #'group-select-2
  "s-e"              #'group-select-3

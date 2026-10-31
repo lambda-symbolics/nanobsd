@@ -73,7 +73,10 @@ similar), because USB-C carries DisplayPort and the dongle converts it.
    internal controller, not the USB-C one.
 2. Plug in the cable (or dongle, then the cable), with the monitor on.
    Within a second or two it lights up and the desktop *extends* onto it:
-   it is a second screen next to the panel.
+   it is a second screen to the right of the panel.  Move the pointer onto
+   it and it has the focus (new windows open there, even when it is empty);
+   Super+Shift+Left/Right switch screens from the keyboard and
+   Super+Ctrl+Shift+Left/Right move the focused column to the other screen.
 3. *Super+M*: mirror.  The projector shows exactly what the panel shows,
    pointer included, and your windows move back to the panel.  The picture
    is fitted with black bars at the sides (the panel is 16:10, most
@@ -108,6 +111,7 @@ Shift+Print = whole screen.  Saved as =~/screenshot-DATE.png= and copied to the 
   =startmh=).  Super+Shift+E quits it back to the console shell; =startmh= starts it again.
 - Super+Return terminal (alacritty) · Super+P launcher (wmenu) · Super+U Emacs · Super+Q close
 - Super+Arrows focus · Super+Ctrl+Arrows move · Super+Home/End first/last column
+- Super+Shift+Arrows focus another screen · Super+Ctrl+Shift+Arrows move the column there
 - Super+C/I/E/A/H/T groups 1–6 · Super+Ctrl+letter move the column there
 - Windows sit in columns on a scrolling strip (niri style): Super+R width presets, Super+F full width,
   Super+Shift+F fullscreen, Super+D/W narrower/wider, Super+Shift+D/W height,
