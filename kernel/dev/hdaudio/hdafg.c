@@ -288,6 +288,8 @@ struct hdaudio_audiodev {
 	void				(*ad_captureintr)(void *);
 	void				*ad_captureintrarg;
 	int				ad_capturenid[HDAUDIO_MAXPINS];
+	/* LispBSD: open's runtime PM reference given back (idle stop) */
+	bool				ad_rt_parked;
 	struct hdaudio_assoc		*ad_captureassoc;
 };
 
@@ -401,6 +403,8 @@ static int	hdafg_open(void *, int);
 static void	hdafg_close(void *);
 static void	hdafg_rt_suspend(device_t);
 static void	hdafg_rt_resume(device_t);
+static void	hdafg_idle_sleep(void *);
+static int	hdafg_idle_wake(void *);
 static void	hdafg_suspend_hw(struct hdafg_softc *);
 static void	hdafg_resume_hw(struct hdafg_softc *);
 
@@ -3933,6 +3937,8 @@ hdafg_attach(device_t parent, device_t self, void *opaque)
 	hda_debug(sc, "attaching audio device\n");
 	sc->sc_audiodev.ad_audiodev = audio_attach_mi(&hdafg_hw_if,
 	    &sc->sc_audiodev, self);
+	audio_set_idle_hooks(sc->sc_audiodev.ad_audiodev, hdafg_idle_wake,
+	    hdafg_idle_sleep, &sc->sc_audiodev);
 }
 
 static int
@@ -4070,7 +4076,43 @@ hdafg_close(void *opaque)
 {
 	struct hdaudio_audiodev *ad = opaque;
 
+	/* LispBSD: an idle stop already gave the reference back. */
+	if (ad->ad_rt_parked)
+		ad->ad_rt_parked = false;
+	else
+		hdaudio_rt_release(ad->ad_sc->sc_host);
+}
+
+/*
+ * LispBSD: audio(4) halted the play mixer of an open device that had
+ * nothing to play (idle stop): give back the reference the open took, so
+ * the controller and codecs power down after hw.hdaudio.power_save, and
+ * take it again before a mixer starts.  Called under audio(4)'s exclusive
+ * lock without a mutex held.
+ */
+static void
+hdafg_idle_sleep(void *opaque)
+{
+	struct hdaudio_audiodev *ad = opaque;
+
+	if (ad->ad_rt_parked)
+		return;
+	ad->ad_rt_parked = true;
 	hdaudio_rt_release(ad->ad_sc->sc_host);
+}
+
+static int
+hdafg_idle_wake(void *opaque)
+{
+	struct hdaudio_audiodev *ad = opaque;
+	int error;
+
+	if (!ad->ad_rt_parked)
+		return 0;
+	if ((error = hdaudio_rt_use(ad->ad_sc->sc_host)) != 0)
+		return error;
+	ad->ad_rt_parked = false;
+	return 0;
 }
 
 /*

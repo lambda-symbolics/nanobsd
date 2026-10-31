@@ -148,6 +148,9 @@ struct audio_attach_args {
 
 /* Attach the MI driver(s) to the MD driver. */
 device_t audio_attach_mi(const struct audio_hw_if *, void *, device_t);
+/* LispBSD: power the hardware down while an open play mixer idles */
+void audio_set_idle_hooks(device_t, int (*)(void *), void (*)(void *),
+    void *);
 int	audioprint(void *, const char *);
 
 extern int audio_query_format(const struct audio_format *, int,

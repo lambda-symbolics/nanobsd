@@ -670,6 +670,9 @@ static int  audio_pmixer_mix_track(audio_trackmixer_t *, audio_track_t *, int);
 static void audio_pmixer_output(struct audio_softc *);
 static int  audio_pmixer_halt(struct audio_softc *);
 static void audio_rmixer_start(struct audio_softc *);
+static bool audio_idle_due(struct audio_softc *);
+static void audio_idle_wake(struct audio_softc *);
+static void audio_idle_work(struct work *, void *);
 static void audio_rmixer_process(struct audio_softc *);
 static void audio_rmixer_input(struct audio_softc *);
 static int  audio_rmixer_halt(struct audio_softc *);
@@ -1111,6 +1114,7 @@ audioattach(device_t parent, device_t self, void *aux)
 	    sc->sc_inports.allports, sc->sc_inports.master,
 	    sc->sc_outports.allports, sc->sc_outports.master);
 
+	sc->sc_idle_stop_ms = 5000;
 	sysctl_createv(&sc->sc_log, 0, NULL, &node,
 	    0,
 	    CTLTYPE_NODE, device_xname(sc->sc_dev),
@@ -1133,6 +1137,20 @@ audioattach(device_t parent, device_t self, void *aux)
 		    CTLTYPE_BOOL, "multiuser",
 		    SYSCTL_DESCR("allow multiple user access"),
 		    audio_sysctl_multiuser, 0, (void *)sc, 0,
+		    CTL_HW, node->sysctl_num, CTL_CREATE, CTL_EOL);
+
+		/* LispBSD: idle stop */
+		sysctl_createv(&sc->sc_log, 0, NULL, NULL,
+		    CTLFLAG_READWRITE,
+		    CTLTYPE_INT, "idle_stop_ms",
+		    SYSCTL_DESCR("Halt a play mixer with open but empty or paused tracks after this many msec (0: never)"),
+		    NULL, 0, &sc->sc_idle_stop_ms, 0,
+		    CTL_HW, node->sysctl_num, CTL_CREATE, CTL_EOL);
+		sysctl_createv(&sc->sc_log, 0, NULL, NULL,
+		    CTLFLAG_READONLY,
+		    CTLTYPE_QUAD, "idle_stops",
+		    SYSCTL_DESCR("Play mixer halts for idleness"),
+		    NULL, 0, &sc->sc_idle_stops, 0,
 		    CTL_HW, node->sysctl_num, CTL_CREATE, CTL_EOL);
 
 #if defined(AUDIO_DEBUG)
@@ -1477,6 +1495,13 @@ audiodetach(device_t self, int flags)
 
 	pmf_device_deregister(self);
 
+	/* LispBSD: sc_dying makes a queued idle stop return at once. */
+	if (sc->sc_idle_wq != NULL) {
+		workqueue_wait(sc->sc_idle_wq, &sc->sc_idle_work);
+		workqueue_destroy(sc->sc_idle_wq);
+		sc->sc_idle_wq = NULL;
+	}
+
 	/* Free resources */
 	if (sc->sc_pmixer) {
 		audio_mixer_destroy(sc, sc->sc_pmixer);
@@ -1711,6 +1736,13 @@ audio_track_waitio(struct audio_softc *sc, audio_track_t *track,
 			return 0;
 		}
 	}
+	/*
+	 * LispBSD: a mixer stopped for idleness posts no completions; a
+	 * writer on a full paused track sleeps until the unpause restarts
+	 * it.
+	 */
+	if (error == EWOULDBLOCK && sc->sc_idle_stopped)
+		error = 0;
 	if (sc->sc_dying) {
 		error = EIO;
 	}
@@ -2731,6 +2763,13 @@ audio_unlink(struct audio_softc *sc, audio_file_t *file)
 
 		/* Restore mixing volume if all tracks are gone. */
 		if (sc->sc_popens == 0) {
+			/*
+			 * LispBSD: no recording either (an idle stop needs
+			 * the record mixer halted), so hw close follows and
+			 * the driver drops its parked state there.
+			 */
+			sc->sc_idle_stopped = false;
+
 			/* intr_lock is not necessary, but just manners. */
 			mutex_enter(sc->sc_intr_lock);
 			sc->sc_pmixer->volume = 256;
@@ -3012,6 +3051,20 @@ audio_write(struct audio_softc *sc, struct uio *uio, int ioflag,
 		}
 
 		audio_track_lock_exit(track);
+
+		/*
+		 * LispBSD: an idle stop that looked at this track before
+		 * the copy announced itself first (audio_idle_work); start
+		 * the mixer again or the data would wait for the next write.
+		 */
+		if (__predict_false(sc->sc_idle_stopped)) {
+			error = audio_exlock_mutex_enter(sc);
+			if (error)
+				goto abort;
+			if (sc->sc_pbusy == false && sc->sc_idle_stopped)
+				audio_pmixer_start(sc, false);
+			audio_exlock_mutex_exit(sc);
+		}
 	}
 
 abort:
@@ -5508,9 +5561,12 @@ audio_pmixer_start(struct audio_softc *sc, bool force)
 	KASSERT(sc->sc_exlock);
 	KASSERT(sc->sc_pbusy == false);
 
+	audio_idle_wake(sc);
+
 	mutex_enter(sc->sc_intr_lock);
 
 	mixer = sc->sc_pmixer;
+	mixer->idle_blocks = 0;
 	TRACE(2, "%smixseq=%d hwseq=%d hwbuf=%d/%d/%d%s",
 	    (audiodebug >= 3) ? "begin " : "",
 	    (int)mixer->mixseq, (int)mixer->hwseq,
@@ -5640,7 +5696,10 @@ audio_pmixer_process(struct audio_softc *sc)
 		/* Silence */
 		memset(mixer->mixsample, 0,
 		    frametobyte(&mixer->mixfmt, frame_count));
+		if (mixer->idle_blocks < UINT_MAX)
+			mixer->idle_blocks++;
 	} else {
+		mixer->idle_blocks = 0;
 		if (mixed > 1) {
 			/* If there are multiple tracks, do auto gain control */
 			audio_pmixer_agc(mixer, sample_count);
@@ -6012,6 +6071,8 @@ audio_rmixer_start(struct audio_softc *sc)
 	KASSERT(sc->sc_exlock);
 	KASSERT(sc->sc_rbusy == false);
 
+	audio_idle_wake(sc);
+
 	mutex_enter(sc->sc_intr_lock);
 
 	TRACE(2, "%s", (audiodebug >= 3) ? "begin" : "");
@@ -6313,6 +6374,159 @@ audio_pmixer_halt(struct audio_softc *sc)
 }
 
 /*
+ * LispBSD: idle stop.
+ *
+ * Once started, the play mixer runs until the last playback track
+ * closes, mixing silence for tracks that are empty or paused, so a
+ * program that keeps the device open (a paused player) keeps the
+ * hardware streaming: the HD audio controller at D0 with 100 interrupts
+ * a second, which costs ~0.5 W and all package C10 residency on the
+ * X1 Nano.  For drivers that registered hooks, a play mixer that mixed
+ * no track for sc_idle_stop_ms is halted here, the driver may power
+ * down, and whatever starts a mixer wakes it first (audio_idle_wake).
+ */
+
+/*
+ * Has the play mixer mixed nothing for sc_idle_stop_ms?
+ */
+static bool
+audio_idle_due(struct audio_softc *sc)
+{
+	audio_trackmixer_t *mixer = sc->sc_pmixer;
+	int ms = sc->sc_idle_stop_ms;
+
+	if (ms <= 0 || mixer == NULL)
+		return false;
+	return (uint64_t)mixer->idle_blocks * 1000 * mixer->blktime_n >=
+	    (uint64_t)ms * mixer->blktime_d;
+}
+
+/*
+ * Wake the hardware before a mixer starts after an idle stop.
+ * Must be called with sc_lock && sc_exlock held; drops sc_lock around
+ * the driver's hook, which may sleep.
+ */
+static void
+audio_idle_wake(struct audio_softc *sc)
+{
+	int error;
+
+	KASSERT(mutex_owned(sc->sc_lock));
+	KASSERT(sc->sc_exlock);
+
+	if (!sc->sc_idle_stopped)
+		return;
+	mutex_exit(sc->sc_lock);
+	error = (*sc->sc_idle_wake)(sc->sc_idle_arg);
+	mutex_enter(sc->sc_lock);
+	if (error)
+		audio_printf(sc, "waking the hardware after an idle stop "
+		    "failed: errno=%d\n", error);
+	sc->sc_idle_stopped = false;
+}
+
+static void
+audio_idle_work(struct work *wk, void *arg)
+{
+	struct audio_softc *sc = arg;
+	audio_trackmixer_t *mixer;
+	audio_file_t *f;
+	bool busy;
+	int error;
+
+	atomic_store_relaxed(&sc->sc_idle_queued, 0);
+	if (audio_exlock_mutex_enter(sc) != 0)
+		return;
+	if (sc->sc_pbusy == false || sc->sc_rbusy || sc->sc_idle_stopped ||
+	    !audio_idle_due(sc)) {
+		audio_exlock_mutex_exit(sc);
+		return;
+	}
+
+	/*
+	 * Announce the stop before looking at the tracks.  audio_write
+	 * copies into a track under its track lock without sc_lock, then
+	 * reads sc_idle_stopped: a copy we missed sees the flag and
+	 * restarts the mixer once we let go of sc_exlock.
+	 */
+	sc->sc_idle_stopped = true;
+	membar_sync();
+	busy = false;
+	SLIST_FOREACH(f, &sc->sc_files, entry) {
+		audio_track_t *track = f->ptrack;
+
+		if (track == NULL || track->is_pause)
+			continue;
+		audio_track_lock_enter(track);
+		/* The same test as audio_track_drain's. */
+		if (track->usrbuf.used >= frametobyte(&track->inputfmt, 1) ||
+		    track->outbuf.used > 0 || track->mmapped)
+			busy = true;
+		audio_track_lock_exit(track);
+		if (busy)
+			break;
+	}
+	if (busy) {
+		sc->sc_idle_stopped = false;
+		audio_exlock_mutex_exit(sc);
+		return;
+	}
+
+	mixer = sc->sc_pmixer;
+	mutex_enter(sc->sc_intr_lock);
+	error = sc->hw_if->halt_output(sc->hw_hdl);
+	sc->sc_pbusy = false;
+	mixer->hwbuf.head = 0;
+	mixer->hwbuf.used = 0;
+	/*
+	 * The discarded blocks were silence.  Keep mixseq: open tracks
+	 * remember the seq they were last mixed at, and drain waits for
+	 * hwseq to reach it.
+	 */
+	mixer->hwseq = mixer->mixseq;
+	mutex_exit(sc->sc_intr_lock);
+	if (error)
+		audio_printf(sc, "halt_output failed: errno=%d (ignored)\n",
+		    error);
+	sc->sc_idle_stops++;
+
+	/* Keep sc_exlock: nothing may start a mixer before the hook ran. */
+	mutex_exit(sc->sc_lock);
+	(*sc->sc_idle_sleep)(sc->sc_idle_arg);
+	audio_exlock_exit(sc);
+}
+
+/*
+ * Register a hardware driver's idle stop hooks (see audio_idle_work).
+ * wake is called before a mixer starts again and may fail with an
+ * errno; sleep after the play mixer was halted.  Both are called with
+ * the device's exclusive lock held and no mutex, and may sleep.
+ */
+void
+audio_set_idle_hooks(device_t dev, int (*wake)(void *),
+    void (*sleep)(void *), void *arg)
+{
+	struct audio_softc *sc;
+	struct workqueue *wq;
+
+	if (dev == NULL)
+		return;
+	sc = device_private(dev);
+	if (sc->sc_idle_wq != NULL)
+		return;
+	if (workqueue_create(&wq, "audioidle", audio_idle_work, sc,
+	    PRI_NONE, IPL_SCHED, WQ_MPSAFE) != 0) {
+		aprint_error_dev(dev, "no idle stop workqueue\n");
+		return;
+	}
+	sc->sc_idle_wake = wake;
+	sc->sc_idle_sleep = sleep;
+	sc->sc_idle_arg = arg;
+	membar_producer();
+	sc->sc_idle_wq = wq;
+}
+
+/*
  * Halts recording mixer.
  * This function also clears related parameters, so call this function
  * instead of calling halt_input directly.
@@ -6585,6 +6799,12 @@ audio_softintr_wr(void *cookie)
 
 	/* Notify to audio_write() that outbuf available. */
 	cv_broadcast(&sc->sc_pmixer->outcv);
+
+	/* LispBSD: halt an idle play mixer from a thread. */
+	if (sc->sc_idle_wq != NULL && sc->sc_pbusy && !sc->sc_rbusy &&
+	    audio_idle_due(sc) &&
+	    atomic_swap_uint(&sc->sc_idle_queued, 1) == 0)
+		workqueue_enqueue(sc->sc_idle_wq, &sc->sc_idle_work, NULL);
 
 	mutex_exit(sc->sc_lock);
 }
@@ -7445,6 +7665,17 @@ audio_file_setinfo(struct audio_softc *sc, audio_file_t *file,
 		if (ptrack)
 			ptrack->is_pause = pi->pause;
 		sc->sc_sound_ppause = pi->pause;
+		/*
+		 * LispBSD: a paused track's writer can be asleep on a full
+		 * buffer; unpausing has to restart a mixer stopped for
+		 * idleness.
+		 */
+		if (ptrack && !pi->pause) {
+			mutex_enter(sc->sc_lock);
+			if (sc->sc_pbusy == false && sc->sc_idle_stopped)
+				audio_pmixer_start(sc, false);
+			mutex_exit(sc->sc_lock);
+		}
 	}
 	if (pchanges) {
 		if (ptrack) {

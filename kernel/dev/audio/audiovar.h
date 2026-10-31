@@ -72,6 +72,7 @@
 #include <sys/pserialize.h>
 #include <sys/psref.h>
 #include <sys/queue.h>
+#include <sys/workqueue.h>
 
 #include <dev/audio/audio_if.h>
 #include <dev/audio/audiofil.h>
@@ -256,6 +257,25 @@ struct audio_softc {
 	struct au_mixer_ports sc_outports;
 	int		sc_monitor_port;
 	u_int	sc_lastgain;
+
+	/*
+	 * LispBSD: idle stop.  A play mixer that mixed nothing (every track
+	 * empty or paused) for sc_idle_stop_ms is halted although tracks
+	 * are open, and sc_idle_sleep lets the hardware driver power down;
+	 * sc_idle_wake comes first when anything restarts a mixer.  Only
+	 * for drivers that registered the hooks (audio_set_idle_hooks).
+	 * sc_idle_stopped: protected by sc_exlock (written with sc_lock
+	 * held too; audio_write peeks at it without either).
+	 */
+	int		(*sc_idle_wake)(void *);
+	void		(*sc_idle_sleep)(void *);
+	void		*sc_idle_arg;
+	int		sc_idle_stop_ms;
+	volatile bool	sc_idle_stopped;
+	volatile u_int	sc_idle_queued;
+	struct workqueue *sc_idle_wq;
+	struct work	sc_idle_work;
+	uint64_t	sc_idle_stops;
 };
 
 #ifdef DIAGNOSTIC

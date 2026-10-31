@@ -272,6 +272,12 @@ struct audio_trackmixer {
 
 	/* XXX */
 	uint64_t	hw_complete_counter;
+
+	/*
+	 * LispBSD: blocks in a row in which no track was mixed (idle stop).
+	 * Must be protected by sc_intr_lock for modifying.
+	 */
+	u_int		idle_blocks;
 };
 
 /*
