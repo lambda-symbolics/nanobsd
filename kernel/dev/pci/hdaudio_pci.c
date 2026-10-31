@@ -44,6 +44,7 @@ __KERNEL_RCSID(0, "$NetBSD: hdaudio_pci.c,v 1.13 2022/09/13 11:47:54 msaitoh Exp
 #include <sys/bus.h>
 #include <sys/intr.h>
 #include <sys/module.h>
+#include <sys/proc.h>
 
 #include <dev/pci/pcidevs.h>
 #include <dev/pci/pcivar.h>
@@ -82,6 +83,7 @@ static bool	hdaudio_pci_suspend(device_t, const pmf_qual_t *);
 static bool	hdaudio_pci_resume(device_t, const pmf_qual_t *);
 static bool	hdaudio_pci_rt_suspend(struct hdaudio_softc *);
 static bool	hdaudio_pci_rt_resume(struct hdaudio_softc *);
+static bool	hdaudio_pci_resume_cycle(struct hdaudio_pci_softc *);
 
 CFATTACH_DECL2_NEW(
     hdaudio_pci,
@@ -361,7 +363,37 @@ hdaudio_pci_resume(device_t self, const pmf_qual_t *qual)
 
 	hdaudio_pci_init(sc);
 	ok = hdaudio_resume(&sc->sc_hdaudio);
+	if (ok)
+		ok = hdaudio_pci_resume_cycle(sc);
 	hdaudio_rt_pmf_resumed(&sc->sc_hdaudio);
+	return ok;
+}
+
+/*
+ * LISPBSD: after an s2idle resume the ALC287 sometimes buzzed on every
+ * output, at any volume, until a cold boot.  Codec registers and the PCM
+ * data were the same as after a clean boot, and one runtime power cycle
+ * (codecs in D3, controller D3hot, then back) cured it every time.  The
+ * system path is that same sequence with platform S0ix in the middle, so
+ * repeat the controller half here without it: the function groups are
+ * still in D3 from hdafg_suspend and are programmed by hdafg_resume next,
+ * before audio(4) restarts any stream.
+ */
+static bool
+hdaudio_pci_resume_cycle(struct hdaudio_pci_softc *sc)
+{
+	struct hdaudio_softc *hsc = &sc->sc_hdaudio;
+	bool ok;
+
+	callout_halt(&hsc->sc_rt_callout, NULL);
+	mutex_enter(&hsc->sc_rt_lock);
+	hsc->sc_rt_lastbusy = getticks();	/* a queued worker waits */
+	if (hdaudio_pci_rt_suspend(hsc))
+		kpause("hdacyc", false, MAX(1, mstohz(50)), &hsc->sc_rt_lock);
+	ok = hdaudio_pci_rt_resume(hsc);
+	mutex_exit(&hsc->sc_rt_lock);
+	aprint_normal_dev(hsc->sc_dev, "resume: controller power cycled (%s)\n",
+	    ok ? "ok" : "failed");
 	return ok;
 }
 
