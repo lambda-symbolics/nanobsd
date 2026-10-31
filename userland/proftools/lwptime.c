@@ -28,7 +28,14 @@ take(int pid)
 int
 main(int argc, char **argv)
 {
-	int pid = atoi(argv[1]), secs = argc > 2 ? atoi(argv[2]) : 5, i, j;
+	int pid, secs, i, j;
+
+	if (argc < 2) {
+		fprintf(stderr, "usage: lwptime PID [SECS]\n");
+		return 2;
+	}
+	pid = atoi(argv[1]);
+	secs = argc > 2 ? atoi(argv[2]) : 5;
 	struct snap a = take(pid), b;
 	double tot = 0;
 
