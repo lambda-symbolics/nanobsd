@@ -61,8 +61,8 @@ Run as root (default socket /var/run/user/1000/mahogany.sock) or as mag.
 | =screen=                         | layout, outputs, pointer, current group, groups          | object                                  |
 | =windows=                        | every mapped window in every group                       | array of window objects                 |
 | =focused=                        | the focused window                                       | window or null                          |
-| =find APP_ID=                    | mapped windows with that app_id                          | array                                   |
-| =wait APP_ID [SECONDS]=          | poll until one maps (default 10 s)                       | array, or error                         |
+| =find APP_ID=                    | mapped windows whose app_id is or starts with APP_ID     | array                                   |
+| =wait APP_ID [SECONDS]=          | poll until one maps (default 10 s); prefix match too     | array, or error                         |
 | =focus ID=                       | switch to its group, focus it                            | window                                  |
 | =close ID=                       | ask it to close (like its close button)                  | ={"closed": ID}=                        |
 | =group N=                        | switch to group N (1-based)                              | ={"group": N}=                          |
@@ -95,11 +95,14 @@ Chords: modifiers =ctrl shift alt super altgr= (also =control meta logo
 win=) joined with =+= to a key name.  Key names are xkb keysym names
 (=Return=, =Escape=, =F5=, =Left=, =Prior=, =XF86AudioMute=, =a=, =A=,
 =plus=) or aliases (=enter esc del bs pgup pgdn space tab up down left
-right prtsc=).  A key that needs Shift on the keymap gets it
-automatically: =key A= types a capital.  Only the first layout's first two
-levels are searched, so =type= skips characters such as =ž= that the us
-keymap cannot produce (they are listed in =skipped=); paste those with
-=setclip= and =key ctrl+v=.
+right prtsc=).  Characters and keys are looked up in the layout in
+effect (the Nano has =cz,us=, toggled with alt+shift), at any level, and
+the modifiers xkb says that level needs are held for it: =key A= types a
+capital, =@= on cz is AltGr+2, =ž= is a plain key.  Characters the
+current layout cannot produce are skipped and listed in =skipped=; paste
+those with =setclip= and =key ctrl+v=, or switch layout with
+=key alt+shift_l=.  Chords name keysyms, not physical keys: on cz,
+=super+2= holds Shift too because 2 is a shifted symbol there.
 
 Text and command lines travel hex-encoded (UTF-8) because the control
 protocol is one form per line; newlines and quotes are therefore fine.
@@ -126,7 +129,14 @@ chords, a Mahogany prefix keybinding (=ctrl+t g n=), scroll, drag,
 scaled and region screenshots, clipboard round trip, bad key names,
 unmappable characters.  Point mhcu at it with
 =MAHOGANY_SOCKET=/var/tmp/mhrun/mahogany.sock=.  Results of 2026-10-31:
-all pass.
+all pass.  /var/tmp/mhcu-cz-test.sh does the same on the user's =cz,us=
+layout (=me@mag.wiki ž ěščřý 2+3=5 {[|]} <>#&$~= typed exactly, then after
+an alt+shift layout switch).
+
+First live run (2026-10-31): opened Firefox, the me@mag.wiki inbox and a
+message, read it with region screenshots.  It found the two bugs fixed
+above: =@= was dropped (AltGr level) and =wait firefox= missed Nightly's
+=firefox-default= app_id.  Firefox's app_id is =firefox-default=.
 
 * For Autolith: tools to build on this
 The CLI already has the shape of a tool set: small actions, JSON answers,
@@ -170,7 +180,7 @@ Notes for the implementation:
   line in Mahogany's log (=control: (cu-click ...) from PID ...=).
 
 * Limits and not done
-- Single seat, first keyboard layout, levels 1-2 (no AltGr typing).
+- Single seat; typing uses the layout in effect only.
 - No touch or tablet; no pointer acceleration (absolute motion only); no
   key repeat (a held key is pressed once).
 - Popups and menus are part of their parent's surface tree; their
