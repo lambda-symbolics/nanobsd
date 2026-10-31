@@ -5,8 +5,9 @@ of 79ec275: the governor's CPU input, CPU settings that can read back
 "applied" while the hardware differs, Bluetooth transport suspension, and
 audio power.  Each finding was checked against the code.  The changes were
 written and tested the night of 2026-10-30 while the laptop sat in s2idle
-(unreachable: see below), so they are compiled and VM-tested, *not yet
-deployed or tried on the Nano*.
+(unreachable: see below) and deployed on 2026-10-31: kernel 221 (findings
+1, 2, 5), kernel 223 (finding 4: audio idle stop); results under each
+finding and in "Deployed 2026-10-31".
 
 * 1. lpschedd judged load from statclock samples
 Confirmed.  =cpu_busy()= read =kern.cp_time=, whose counters statclock()
@@ -46,8 +47,24 @@ reports 300 ms deep idle then busy-waits 100 ms reads 0.249-0.250 busy over
 the interval in progress is counted; the sysctl is EOPNOTSUPP before and
 after (the VM cannot run cidle: KVM hides MONITOR/MWAIT from the guest).
 
-Not done: comparing governor input and chosen profile against the duty
-tests on the Nano.
+On the Nano (kernel 221, 2026-10-31, /var/tmp/dutycmp: a thread pinned to
+one CPU busy-waits then usleeps; measured vs kern.cp_time busy over the
+same window):
+| load on cpu2           | measured | cp_time |
+|------------------------+----------+---------|
+| none                   |    0.000 |   0.002 |
+| 25 ms busy / 75 ms     |    0.228 |   0.186 |
+| 2 ms busy / 8 ms       |    0.105 |   0.002 |
+| 5 ms busy / 5 ms       |    0.254 |   0.000 |
+| 50 ms busy / 50 ms     |    0.455 |   0.457 |
+| always busy            |    1.000 |   1.000 |
+(usleep rounds up, so the real duty is below the nominal one: 5/5 runs
+5 ms per ~20 ms.)  Short jobs that wake on the tick finish before the next
+statclock sample and were invisible to cp_time.  With 8 ms busy / 5 ms on
+all eight CPUs, cp_time read 0.000-0.002 everywhere, the measured input
+0.403, and lpschedd went powersave -> batch 5 s later; the old daemon
+would have stayed in powersave.  cpu0 idle: 0.001 measured vs 0.028
+cp_time (the tick's own work sampled as busy).
 
 * 2. CPU settings that read back as applied when the hardware differs
 Confirmed both.
@@ -65,7 +82,9 @@ Confirmed both.
 - lpschedd's existing 30 s check now also compares =epp_hw= with the
   profile's EPP and rewrites it on a mismatch (8 IPIs per 30 s).
 
-Compiled; not testable in the VM (no HWP MSRs under KVM).
+On the Nano: =epp_hw= 240 = =epp=, =pl1_enabled= 1, both unchanged across
+an s2idle cycle.  A mismatch (firmware rewriting the request) has not been
+provoked: NetBSD's cpuctl cannot write MSRs.
 
 * 3. Bluetooth: AVDTP SUSPEND handled as START
 Confirmed, and wider than reported: after any control message in states
@@ -87,9 +106,33 @@ channel.  Now:
 
 Tested: =userland/bta2dpd/bta2dpd/bttest.c= (includes bta2dpd.c, drives
 =do_ctlreq= over socketpairs) 25 checks pass; bta2dpd builds with its
-WARNS=6/-Wconversion/-Werror.  Not tried against the headphones yet.
+WARNS=6/-Wconversion/-Werror.  
+2026-10-31, the host half: the sink-initiated SUSPEND alone does not save
+anything while a paused player keeps the audio device open, because pad(4)
+then feeds silence and bta2dpd encodes and sends it.  =stream()= now
+reports whether a packet was all zeros; after =-s= msecs (default 5000, 0
+never) of them bta2dpd sends AVDTP SUSPEND itself and, accepted, goes to
+state 8 where watch_ev sends START at the first sound.  A refused SUSPEND
+(now told apart: =avdtpCheckResponse= fills the message type) keeps
+streaming and is not repeated until sound has come back.  bttest grew to
+cover it (silence -> SUSPEND once -> accept -> sound -> START; reject ->
+keep streaming, no repeat; sound resets; -s 0), all pass on the Nano.
+Installed in /usr/local/sbin.  Not tried against the headphones yet:
+check that the PerL Pro accepts a source-initiated SUSPEND and resumes on
+START.
 
 * 4. Audio stays awake while a descriptor is open
+Measured on kernel 221 (/var/tmp/audiohold + astage.sh: controller PMCSR,
+stream interrupts, package RAPL, PC10 over each stage):
+| stage                          | ctrl | irq/s | package | PC10   |
+|--------------------------------+------+-------+---------+--------|
+| nothing open                   | D3   |     0 | 0.153 W | 98.7 % |
+| open, drained, not paused      | D0   |   100 | 0.632 W | 0 %    |
+| open, paused                   | D0   |   100 | 0.643 W | 0 %    |
+| closed +15 s                   | D3   |     0 | 0.164 W | 98.8 % |
+A program that keeps the device open costs ~0.48 W and all PC10, paused or
+not.
+
 Partly confirmed, with a different shape.  hdafg holds its runtime-PM
 reference from open to close, but audio(4) also only calls =halt_output=
 when the last playback track closes (=audio_unlink=: =sc_popens == 0=): once
@@ -99,9 +142,42 @@ occurs; the real cost is the mixer itself.  A fix has to stop the play mixer
 after some seconds in which every track only produced silence (restarting
 on write), then let hdafg drop its reference while halted and take it in a
 sleepable place before the next trigger (=trigger_output= runs under the
-interrupt lock).  Not changed: it touches audio(4)'s mixer and needs the
-measurement the review proposes first (play, pause with the program open,
-wait, close: controller power state and stream interrupts at each stage).
+interrupt lock).
+
+Fixed in kernel 223 (audio idle stop):
+- audio(4) counts mixer blocks in which no track was mixed; after
+  =hw.audioN.idle_stop_ms= (default 5000, 0 = stock behaviour) of them the
+  write softint queues a work item that, under the exclusive lock, halts
+  the play mixer (=hw.audioN.idle_stops= counts it) and calls the
+  driver's sleep hook.  Only drivers that register hooks
+  (=audio_set_idle_hooks=) get this: hdafg does; pad(4) (bta2dpd) and the
+  rest keep stock behaviour.  Not while recording.
+- Whatever starts a mixer (write, unpause, record open, mmap) calls the
+  wake hook first, without a mutex held (the old open path called
+  hdaudio_rt_use under the interrupt spin lock).
+- Races: the stop announces itself before it checks the tracks, and a
+  writer reads the flag after copying, so data written past the check
+  restarts the mixer; the halt keeps mixseq and sets hwseq to it, so
+  drain and the per-track seq stay consistent; a writer asleep on a full
+  paused track ignores the I/O timeout while the mixer is stopped (stock
+  relied on the running mixer's wakeups: kernel 222 got "device timeout"
+  there, found by the test).
+- hdafg's sleep hook gives back the open's runtime PM reference (the
+  controller suspends hw.hdaudio.power_save later), wake takes it again,
+  close skips the release when it is parked.
+Tests (/var/tmp/idlestop-test on the Nano, all pass): stop while open,
+3 s after a stop plays in 3.06 s; an 8 s writer blocked across a 12 s
+pause finishes in 19.6 s; drain while stopped returns at once; a 1002-byte
+write after a stop drains.  mpv: paused 17 s -> controller D3, 0 irq/s;
+unpause resumes at the right position.
+A/B on kernel 223, same boot, settled (up 11 min), device open with
+nothing playing, 30 s windows:
+| hw.audio0.idle_stop_ms | ctrl | irq/s | package | PC10   |
+|------------------------+------+-------+---------+--------|
+| 0 (stock behaviour)    | D0   |   100 | 0.630 W | 0 %    |
+| 5000                   | D3   |     0 | 0.144 W | 98.7 % |
+| (closed, for reference)| D3   |     0 | 0.130 W | 98.7 % |
+An open idle descriptor now costs what a closed one does.
 
 * 5. A failed audio controller suspend recorded as done
 Confirmed.  =hdaudio_rt_suspend_locked= logged a failed bus suspend
@@ -111,7 +187,14 @@ controller stays marked awake, =sc_rt_suspend_fails= counts it and the
 worker retries after power_save seconds, doubling, at most an hour; a
 success resets the backoff.  Compiled.
 
-* Deploying (kernel 221)
+* Deployed 2026-10-31
+Kernel 221 then 223 (boot.cfg: 223 default, 221 previous), new cidle and
+hwp modules (old ones kept as cidle.kmod.220 / hwp.kmod.220: a fallback to
+220 needs them back), lpschedd (logs "busy from measured idle time"),
+bta2dpd.  An s2idle cycle on 221 (freeze_timeout 30): GPU job, audio in
+real time, EPP/PL1 intact, measured idle still right after resume.
+
+* Deploying (kernel 221, as planned)
 Everything must go together:
 1. kernel sources: sys/lpsched.h, kern/kern_lpsched.c,
    dev/hdaudio/hdaudio.c, dev/hdaudio/hdaudiovar.h into /usr/src/sys, build.
