@@ -164,8 +164,8 @@ The kernel is LispBSD's (built in
 and so are the modules in /stand (hwp, cidle, patfix, if_iwx, if_wg).
 =sysupgrade= would replace them: do not run it without rebuilding those.
 ** Kernels in the boot menu
-1 = the current kernel (225), 2 = the same kernel verbose (all messages, no
-splash), 3 = the previous one (224), 4 = boot prompt.  If the default
+1 = the current kernel (226), 2 = the same kernel verbose (all messages, no
+splash), 3 = the previous one (225), 4 = boot prompt.  If the default
 misbehaves, pick 3 at the menu.  Editing /boot.cfg: a menu title must not
 contain ":" and no line may contain "#"; check with =bootcfg-check FILE= before
 installing it.

@@ -1747,8 +1747,19 @@ lwp_userret(struct lwp *l)
 		if ((f & LW_WSUSPEND) != 0) {
 			pcu_save_all(l);
 			mutex_enter(p->p_lock);
-			p->p_nrlwps--;
 			lwp_lock(l);
+			/*
+			 * LISPBSD: f was read unlocked.  lwp_continue() may have
+			 * cleared LW_WSUSPEND since; it saw us not LSSUSPENDED
+			 * and did nothing, so suspending now would never end
+			 * (Firefox's main thread after an s2idle thaw).
+			 */
+			if ((l->l_flag & LW_WSUSPEND) == 0) {
+				lwp_unlock(l);
+				mutex_exit(p->p_lock);
+				continue;
+			}
+			p->p_nrlwps--;
 			l->l_stat = LSSUSPENDED;
 			lwp_unlock(l);
 			mutex_exit(p->p_lock);
