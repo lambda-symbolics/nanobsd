@@ -73,3 +73,5 @@ u_int FLS(uint8_t);
 ssize_t stream(int, int, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t,
     size_t, int);
 ssize_t recvstream(int, int);
+/* stream(): every sample of the last packet sent was zero */
+extern bool stream_silent;

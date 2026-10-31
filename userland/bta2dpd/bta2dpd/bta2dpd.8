@@ -47,6 +47,7 @@
 .Op Fl M Ar mtu
 .Op Fl m Ar mode
 .Op Fl r Ar rate
+.Op Fl s Ar msecs
 .Op Fl V Ar volume
 .Op Fl w Ar seconds
 .Fl a Ar address
@@ -115,6 +116,13 @@ or as a sink once it listens, and exits 1 if the daemon gave up first.
 Do not close connection on end of file (EOF).
 Useful for
 .Xr pad 4 .
+.It Fl s Ar msecs
+Ask the sink to suspend the stream after
+.Ar msecs
+of digital silence (default 5000, 0 never), and to start it again at the
+first sound.
+.Xr pad 4
+produces silence while any program keeps the audio device open.
 .It Fl d Ar device
 Local device address.
 May be given as BDADDR or device name.

@@ -837,6 +837,8 @@ readloop(int fd, void *buf, size_t nbytes)
 	return (ssize_t) count;
 }
 
+bool stream_silent;
+
 ssize_t
 stream(int in, int outfd, uint8_t mode, uint8_t freq, uint8_t bands, uint8_t
     blocks, uint8_t alloc_method, uint8_t bitpool, size_t mtu, int volume)
@@ -853,6 +855,8 @@ stream(int in, int outfd, uint8_t mode, uint8_t freq, uint8_t bands, uint8_t
 	static uint16_t seqnumber = 0;
 	static time_t prevTime, readTime, sleepTime, timeNow;
 	int numpkts, tries;
+	bool silent = true;
+	size_t i;
 
 	global_mode = mode;
 	global_bitpool = bitpool;
@@ -922,6 +926,9 @@ stream(int in, int outfd, uint8_t mode, uint8_t freq, uint8_t bands, uint8_t
 		readTime += (time_t)readsize;
 		if (len < (int)readsize)
 			break;
+		for (i = 0; silent && i < readsize / sizeof(music[0]); i++)
+			if (music[i] != 0)
+				silent = false;
 
 		pkt_len = make_frame(frameData + next_pkt, music);
 
@@ -940,6 +947,7 @@ stream(int in, int outfd, uint8_t mode, uint8_t freq, uint8_t bands, uint8_t
 	}
 
 	readTime = readTime * 1000000 / 2 / global_chan / (time_t)frequency;
+	stream_silent = silent;
 
 	myHeader.numFrames = (uint8_t)numpkts;
 	whole = malloc(totalSize);

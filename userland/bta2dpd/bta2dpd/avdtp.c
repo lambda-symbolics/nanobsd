@@ -91,6 +91,8 @@ avdtpCheckResponse(int recvfd, bool *isCommand, uint8_t *trans, uint8_t
 
 	*trans = (uint8_t)((buffer[0] & TRANSACTIONLABEL) >> TRANSACTIONLABEL_S);
 	*signalId = buffer[1] & SIGNALID_MASK;
+	if (pkt_type)
+		*pkt_type = buffer[0] & MESSAGETYPE;
 	if ((buffer[0] & MESSAGETYPE) == COMMAND) {
 		if (datasize)
 			*datasize = 0;

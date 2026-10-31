@@ -30,6 +30,58 @@ rsp(uint8_t sig)
 	do_ctlreq(ctl[0], EV_READ, NULL);
 }
 
+static void
+rej(uint8_t sig)
+{
+	uint8_t b[3] = { 0x10 | RESPONSEREJECT, sig, 0x31 };	/* BAD_STATE */
+
+	(void)write(ctl[1], b, sizeof(b));
+	do_ctlreq(ctl[0], EV_READ, NULL);
+}
+
+/* Throw away the media packets stream() sent. */
+static void
+drain_media(void)
+{
+	uint8_t b[2048];
+
+	while (read(med[1], b, sizeof(b)) > 0)
+		;
+}
+
+/* Feed n bytes of silence (or sound) and stream them. */
+static void
+feed(int loud, int n)
+{
+	int16_t b[512];
+	int i;
+
+	for (i = 0; i < 512; i++)
+		b[i] = loud ? (int16_t)(i * 37) : 0;
+	for (; n > 0; n -= (int)sizeof(b))
+		(void)write(aud[1], b, sizeof(b));
+}
+
+static void
+drain_aud(void)
+{
+	char junk[4096];
+
+	while (read(audfile, junk, sizeof(junk)) > 0)
+		;
+}
+
+/* One packet of silence (or sound) through do_interrupt. */
+static void
+one(int loud)
+{
+	drain_aud();
+	feed(loud, 8192);
+	do_interrupt(audfile, EV_READ, NULL);
+	drain_media();
+	drain_aud();
+}
+
 /* The next message the "sink" received: (type << 8) | signal, or -1. */
 static int
 peer(void)
@@ -51,6 +103,10 @@ main(void)
 	    socketpair(AF_LOCAL, SOCK_DGRAM, 0, med) == -1 || pipe(aud) == -1)
 		err(1, "setup");
 	fcntl(ctl[1], F_SETFL, O_NONBLOCK);
+	fcntl(med[1], F_SETFL, O_NONBLOCK);
+	fcntl(aud[1], F_SETFL, O_NONBLOCK);
+	mtu = 672;
+	bitpool = 32;
 	fcntl(aud[0], F_SETFL, O_NONBLOCK);
 	hc = ctl[0];
 	sc = sc0 = med[0];
@@ -107,6 +163,59 @@ main(void)
 	CHECK(event_pending(&interrupt_ev, EV_READ, NULL));
 	CHECK(!event_pending(&watch_ev, EV_READ, NULL));
 	CHECK(sc == sc0);
+
+	printf("-- silence while streaming: we ask the sink to suspend\n");
+	silence_ms = 200;
+	one(0);
+	one(0);
+	CHECK(peer() == -1);		/* not silent long enough yet */
+	usleep(250000);
+	one(0);
+	CHECK(peer() == ((COMMAND << 8) | AVDTP_SUSPEND));
+	CHECK(state == ST_STREAMING);
+	CHECK(suspend_asked);
+	one(0);
+	CHECK(peer() == -1);		/* asked once */
+	rsp(AVDTP_SUSPEND);
+	CHECK(state == ST_SUSPENDED);
+	CHECK(event_pending(&watch_ev, EV_READ, NULL));
+	CHECK(!event_pending(&interrupt_ev, EV_READ, NULL));
+
+	printf("-- sound after our suspend: START\n");
+	drain_aud();
+	feed(1, 1024);
+	event_loop(EVLOOP_NONBLOCK);
+	CHECK(state == ST_STARTING);
+	CHECK(peer() == ((COMMAND << 8) | AVDTP_START));
+	rsp(AVDTP_START);
+	CHECK(state == ST_STREAMING);
+	CHECK(!suspend_asked);
+	CHECK(event_pending(&interrupt_ev, EV_READ, NULL));
+	drain_aud();
+
+	printf("-- the sink refuses our suspend: keep streaming, no repeat\n");
+	one(0);
+	usleep(250000);
+	one(0);
+	CHECK(peer() == ((COMMAND << 8) | AVDTP_SUSPEND));
+	rej(AVDTP_SUSPEND);
+	CHECK(state == ST_STREAMING);
+	CHECK(event_pending(&interrupt_ev, EV_READ, NULL));
+	usleep(250000);
+	one(0);
+	CHECK(peer() == -1);
+
+	printf("-- sound resets it; -s 0 never suspends\n");
+	one(1);
+	CHECK(!suspend_asked);
+	CHECK(silent_since == 0);
+	silence_ms = 0;
+	one(0);
+	usleep(250000);
+	one(0);
+	CHECK(peer() == -1);
+	CHECK(state == ST_STREAMING);
+	drain_aud();
 
 	printf("-- stream() failure with -n backs off instead of spinning\n");
 	close(aud[1]);			/* EOF: always readable */

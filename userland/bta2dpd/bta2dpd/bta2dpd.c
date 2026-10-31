@@ -239,6 +239,16 @@ static struct event ctl_ev;			/* avdtp ctl event */
 static struct event watch_ev;			/* suspended: sound again? */
 static struct event retry_ev;			/* -n: stream() failed */
 static int		retry_ms;
+/*
+ * LISPBSD: pad(4) also feeds silence while a program merely keeps the audio
+ * device open (a paused player), and streaming it keeps the radio and the
+ * USB controller busy.  After silence_ms of digital silence (-s) we ask the
+ * sink to SUSPEND; watch_ev sends START at the first sound.  A sink that
+ * rejects it is asked again only after the next sound.
+ */
+static int		silence_ms = 5000;
+static uint64_t		silent_since;	/* ms; 0 while there is sound */
+static bool		suspend_asked;
 
 struct l2cap_info	info;
 static bool		runasDaemon;
@@ -289,6 +299,7 @@ static void do_watch(int, short, void *);
 static void do_retry(int, short, void *);
 static void ev_del(struct event *);
 static void stream_suspend(void);
+static void check_silence(void);
 static void stream_resume(void);
 static void do_recv(int, short, void *);
 static void do_ctlreq(int, short, void *);
@@ -318,7 +329,7 @@ main(int ac, char *av[])
 	alloc_config[0] = alloc_method;
 	channel_config[0] = channel_mode;
 
-	while ((ch = getopt(ac, av, "A:a:B:b:Dd:e:f:IKnM:m:p:r:tV:vw:")) !=
+	while ((ch = getopt(ac, av, "A:a:B:b:Dd:e:f:IKnM:m:p:r:s:tV:vw:")) !=
 	    EOF) {
 		switch (ch) {
 		case 'A':
@@ -450,6 +461,9 @@ main(int ac, char *av[])
 			break;
 		case 'n':
 			dontStop = true;
+			break;
+		case 's':
+			silence_ms = atoi(optarg);
 			break;
 		case 'p':
 			l2cap_psm = (uint16_t)atoi(optarg);
@@ -619,8 +633,8 @@ usage(void)
 {
 	fprintf(stderr,
 	    "usage:\t%s [-v] [-D] [-n] [-d device] [-m mode] [-r rate] [-w secs]\n"
-	    "\t\t[-M mtu] [-V volume] [-f mode] [-b blocks] [-e bands]\n"
-	    "\t\t[-A alloc] [-B bitpool] -a address files...\n"
+	    "\t\t[-s msecs] [-M mtu] [-V volume] [-f mode] [-b blocks]\n"
+	    "\t\t[-e bands] [-A alloc] [-B bitpool] -a address files...\n"
 	    "\t%s [-v] [-D] [-d device] [-m mode] [-p psm] [-B bitpool]\n"
 	    "\t\t[-a address] [-M mtu] [-r rate] [-I] -K file\n"
 	    "\t%s -t [-v] [-K] [-r rate] [-M mtu] [-V volume] [-f mode]\n"
@@ -632,6 +646,8 @@ usage(void)
 	    "\t-v           Verbose output\n"
 	    "\t-D           Run in the background once connected\n"
 	    "\t-w secs      Keep retrying the connection this long (60)\n"
+	    "\t-s msecs     Suspend the stream after this much silence (5000,\n"
+	    "\t             0: never)\n"
 	    "\t-M mtu       MTU for transmission\n"
 	    "\t-B bitpool   Maximum bitpool value for encoding\n"
 	    "\t-V volume    Volume multiplier 0,1,2.\n"
@@ -693,7 +709,7 @@ static void
 do_ctlreq(int fd, short ev, void *arg)
 {
 	bool isCommand;
-	uint8_t sep, signal;
+	uint8_t sep, signal, msgtype = RESPONSEACCEPT;
 	static struct sockaddr_bt addr;
 	size_t bufflen;
 	socklen_t len, mtusize;
@@ -702,7 +718,7 @@ do_ctlreq(int fd, short ev, void *arg)
 	static size_t offset = 0;
 	int result;
 
-	if(avdtpCheckResponse(fd, &isCommand, &trans, &signal, NULL, buff,
+	if(avdtpCheckResponse(fd, &isCommand, &trans, &signal, &msgtype, buff,
 	    &bufflen, &sep) == ENOMEM) {
 		event_del(&ctl_ev);
 		close(fd);
@@ -814,10 +830,16 @@ do_ctlreq(int fd, short ev, void *arg)
 				state = 5;
 			break;
 		case AVDTP_SUSPEND:
+			if (msgtype != RESPONSEACCEPT) {
+				log_info("The sink refused to suspend");
+				break;
+			}
 			if (state == ST_STREAMING)
 				stream_suspend();
 			break;
 		case AVDTP_START:
+			if (msgtype != RESPONSEACCEPT)
+				log_info("The sink refused to start");
 			if (state == ST_STARTING || state == ST_SUSPENDED)
 				stream_resume();
 			else if (state < 6)
@@ -939,6 +961,8 @@ do_interrupt(int fd, short ev, void *arg)
 
 	len = stream(fd, sc, channel_mode, frequency, bands, blocks,
 	    alloc_method, bitpool, mtu, volume);
+	if (len >= 0 && state == ST_STREAMING)
+		check_silence();
 
 
 next_file:
@@ -1028,11 +1052,47 @@ stream_resume(void)
 		return;
 	ev_del(&watch_ev);
 	retry_ms = 0;
+	silent_since = 0;
+	suspend_asked = false;
 	event_set(&interrupt_ev, audfile, EV_READ | EV_PERSIST,
 	    do_interrupt, NULL);
 	if (event_add(&interrupt_ev, NULL) < 0)
 		log_err(EXIT_FAILURE, "interrupt_ev: %m");
 	log_info("Streaming to %s again", bt_ntoa(&info.raddr, NULL));
+}
+
+static uint64_t
+mono_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+/* Streaming: ask the sink to suspend after silence_ms of silence. */
+static void
+check_silence(void)
+{
+	uint64_t now;
+
+	if (!stream_silent) {
+		silent_since = 0;
+		suspend_asked = false;
+		return;
+	}
+	if (silence_ms <= 0 || suspend_asked)
+		return;
+	now = mono_ms();
+	if (silent_since == 0)
+		silent_since = now;
+	else if (now - silent_since >= (uint64_t)silence_ms) {
+		suspend_asked = true;
+		avdtpSuspend(hc, hc, mySepInfo.sep);
+		if (verbose)
+			log_debug("Silent for %d ms: asked the sink to suspend",
+			    silence_ms);
+	}
 }
 
 /*
