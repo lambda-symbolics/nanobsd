@@ -685,6 +685,8 @@ xhci_detach(struct xhci_softc *sc, int flags)
 	mutex_exit(&sc->sc_intr_lock);
 	callout_halt(&sc->sc_rt_callout, NULL);
 	callout_destroy(&sc->sc_rt_callout);
+	if (sc->sc_rt_wq != NULL)
+		workqueue_destroy(sc->sc_rt_wq);
 
 	/* verify: */
 	xhci_rt_write_4(sc, XHCI_IMAN(0), 0);
@@ -763,7 +765,10 @@ xhci_suspend(device_t self, const pmf_qual_t *qual)
 	KASSERT(sc->sc_suspender == NULL);
 	mutex_enter(&sc->sc_intr_lock);
 	sc->sc_suspender = curlwp;
+	sc->sc_parked = qual == PMF_Q_DRVCTL;
 	mutex_exit(&sc->sc_intr_lock);
+	/* Parked: commands already waiting fail instead (xhci_parked_p). */
+	cv_broadcast(&sc->sc_cmdbusy_cv);
 	while (sc->sc_command_addr != 0)
 		cv_wait(&sc->sc_cmdbusy_cv, &sc->sc_lock);
 	mutex_exit(&sc->sc_lock);
@@ -990,6 +995,7 @@ out:	mutex_exit(&sc->sc_rhlock);
 		KASSERT(sc->sc_suspender == curlwp);
 		mutex_enter(&sc->sc_intr_lock);
 		sc->sc_suspender = NULL;
+		sc->sc_parked = false;
 		sc->sc_suspendresume_failed = true;
 		/* PMF will not call driver resume after a failed suspend. */
 		sc->sc_rt_paused = false;
@@ -1223,6 +1229,8 @@ xhci_resume(device_t self, const pmf_qual_t *qual)
 		sc->sc_suspendresume_failed = false;
 	}
 	KASSERT(sc->sc_suspender);
+	/* Resuming: other threads wait for it again instead of failing. */
+	sc->sc_parked = false;
 	mutex_exit(&sc->sc_intr_lock);
 	mutex_exit(&sc->sc_lock);
 
@@ -1823,7 +1831,9 @@ xhci_start(struct xhci_softc *sc)
  * hw.usbpm.deferrable=0 makes it exact.  Resume retries (I/O is waiting)
  * arm the callout non-deferrable.  The callout only queues the slot's USB
  * task (want 1 or 2); eligibility checks, PMF parking and port writes run
- * in that task (USB_TASKQ_HC, KERNEL_LOCK held).
+ * in that task (the controller's workqueue, KERNEL_LOCK held; not
+ * USB_TASKQ_HC, where transfer timeouts run: the task's synchronous
+ * requests must be able to time out).
  *
  * Ownership is unchanged: xs_rt_owner (the task or a pipe opener) owns a
  * slot's transition; the callout skips owned slots and slots with a
@@ -1862,6 +1872,40 @@ enum xhci_rt_susp {
 };
 
 static void xhci_rt_task(void *);
+static void xhci_rt_work(struct work *, void *);
+
+/*
+ * The runtime PM task runs on sc_rt_wq (see xs_rt_work in xhcivar.h).
+ * xhci_rt_queue queues it once, like usb_add_task; xhci_rt_wait waits
+ * until it is neither queued nor running, like usb_rem_task_wait (a queued
+ * run still happens: callers clear xs_rt_init or pause first, and the task
+ * then returns at once).
+ */
+static void
+xhci_rt_queue(struct xhci_softc *sc, struct xhci_slot *xs)
+{
+	if (atomic_cas_uint(&xs->xs_rt_queued, 0, 1) == 0)
+		workqueue_enqueue(sc->sc_rt_wq, &xs->xs_rt_work, NULL);
+}
+
+static void
+xhci_rt_wait(struct xhci_softc *sc, struct xhci_slot *xs)
+{
+	workqueue_wait(sc->sc_rt_wq, &xs->xs_rt_work);
+}
+
+static void
+xhci_rt_work(struct work *wk, void *arg)
+{
+	struct xhci_slot * const xs = (struct xhci_slot *)
+	    ((char *)wk - offsetof(struct xhci_slot, xs_rt_work));
+
+	atomic_swap_uint(&xs->xs_rt_queued, 0);
+	/* PMF callbacks and the subdevice walk require KERNEL_LOCK. */
+	KERNEL_LOCK(1, NULL);
+	xhci_rt_task(xs);
+	KERNEL_UNLOCK_ONE(NULL);
+}
 static void xhci_rt_callout(void *);
 
 static kmutex_t xhci_rt_list_lock;	/* xhci_rt_list; before sc_intr_lock */
@@ -2153,7 +2197,7 @@ xhci_rt_release_locked(struct xhci_softc *sc, struct xhci_slot *xs)
 	cv_broadcast(&sc->sc_rt_cv);
 	if (xs->xs_rt_want != 0 && xs->xs_rt_init && xs->xs_dev != NULL &&
 	    !sc->sc_rt_paused && !sc->sc_dying)
-		usb_add_task(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC);
+		xhci_rt_queue(sc, xs);
 	/* Invariant: an awake slot has a deadline unless it is dormant. */
 	if (!xs->xs_idle_armed && !xs->xs_retry_armed && !xs->xs_dormant &&
 	    xs->xs_rt_want == 0 && !xs->xs_suspended && !xs->xs_resuming)
@@ -2216,8 +2260,7 @@ xhci_rt_bind(struct xhci_softc *sc, struct xhci_slot *xs,
 		xs->xs_ctlrport = xhci_rhport2ctlrport(sc, xs->xs_bus,
 		    dev->ud_powersrc->up_portno);
 	}
-	/* PMF callbacks and the subdevice walk require KERNEL_LOCK. */
-	usb_init_task(&xs->xs_rt_task, xhci_rt_task, xs, 0);
+	xs->xs_rt_queued = 0;
 	xhci_populated_update(sc, 1);
 	mutex_enter(&sc->sc_intr_lock);
 	xs->xs_rt_init = true;
@@ -2242,11 +2285,8 @@ xhci_rt_unbind(struct xhci_softc *sc, struct xhci_slot *xs)
 	xhci_populated_update(sc, -1);
 	if (locked)
 		mutex_exit(&sc->sc_lock);
-	if (xs->xs_dev != NULL) {
-		usb_rem_task(xs->xs_dev, &xs->xs_rt_task);
-		usb_rem_task_wait(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC,
-		    NULL);
-	}
+	if (xs->xs_dev != NULL)
+		xhci_rt_wait(sc, xs);
 	mutex_enter(&sc->sc_intr_lock);
 	while (xs->xs_rt_owner != NULL)
 		cv_wait(&sc->sc_rt_cv, &sc->sc_intr_lock);
@@ -2298,11 +2338,9 @@ xhci_rt_pause(struct xhci_softc *sc)
 	for (int i = 1; i <= sc->sc_maxslots; i++) {
 		struct xhci_slot *xs = &sc->sc_slots[i];
 		if (xs->xs_rt_init && xs->xs_dev != NULL) {
-			/* A running task can also have a queued rerun. Remove
-			 * that first, then join the current execution. */
-			usb_rem_task(xs->xs_dev, &xs->xs_rt_task);
-			usb_rem_task_wait(xs->xs_dev, &xs->xs_rt_task,
-			    USB_TASKQ_HC, NULL);
+			/* A running task can also have a queued rerun: wait
+			 * for both (paused, the rerun returns at once). */
+			xhci_rt_wait(sc, xs);
 		}
 	}
 	mutex_enter(&sc->sc_intr_lock);
@@ -2319,7 +2357,7 @@ xhci_rt_kick(struct xhci_softc *sc, struct xhci_slot *xs, int want)
 	    xs->xs_dev != NULL && xs->xs_rt_init) {
 		/* An idle scan must not overwrite an already requested wake. */
 		xs->xs_rt_want = MAX(xs->xs_rt_want, want);
-		usb_add_task(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC);
+		xhci_rt_queue(sc, xs);
 	}
 	mutex_exit(&sc->sc_intr_lock);
 }
@@ -2356,7 +2394,7 @@ xhci_rt_reconcile_locked(struct xhci_softc *sc, int flags)
 			xs->xs_rt_want = 2;
 		/* A request the pause or an owner left behind. */
 		if (xs->xs_rt_want != 0 && xs->xs_rt_owner == NULL)
-			usb_add_task(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC);
+			xhci_rt_queue(sc, xs);
 		if (xs->xs_retry_armed)
 			xhci_rt_slot_rearm_locked(sc, xs);
 		else
@@ -2968,7 +3006,7 @@ xhci_rt_callout(void *arg)
 			xhci_rt_dl_clear_locked(sc, xs);
 			n--;
 			xs->xs_rt_want = MAX(xs->xs_rt_want, want);
-			usb_add_task(xs->xs_dev, &xs->xs_rt_task, USB_TASKQ_HC);
+			xhci_rt_queue(sc, xs);
 			continue;
 		}
 		if (!any || xhci_rt_tdiff(due, next) < 0)
@@ -3476,6 +3514,13 @@ xhci_init(struct xhci_softc *sc)
 	/* LispBSD USB runtime power management: the deadline callout */
 	callout_init(&sc->sc_rt_callout, CALLOUT_MPSAFE | CALLOUT_DEFERRABLE);
 	callout_setfunc(&sc->sc_rt_callout, xhci_rt_callout, sc);
+	err = workqueue_create(&sc->sc_rt_wq, "xhcirt", xhci_rt_work, sc,
+	    PRI_NONE, IPL_USB, WQ_MPSAFE);
+	if (err) {
+		aprint_error_dev(sc->sc_dev, "runtime PM workqueue: %d\n", err);
+		rv = err;
+		goto bad;
+	}
 	if (sc->sc_slots == NULL) {
 		aprint_error_dev(sc->sc_dev, "slots init fail, err %d\n", err);
 		rv = ENOMEM;
@@ -3540,6 +3585,22 @@ static inline bool
 xhci_polling_p(struct xhci_softc * const sc)
 {
 	return sc->sc_bus.ub_usepolling || sc->sc_bus2.ub_usepolling;
+}
+
+/*
+ * LISPBSD: a controller suspended through drvctl (usb off) stays suspended
+ * for as long as the policy wants, hours.  Meanwhile it takes no new
+ * transfers, pipes or commands from other threads: they fail at once
+ * instead of waiting for the resume.  Waiting blocked USB_TASKQ_HC, and
+ * every transfer timeout with it, when a timed-out transfer's abort waited
+ * for its Stop Endpoint command.  A system suspend still defers them; it
+ * ends within seconds.  sc_lock held (or polling).
+ */
+static inline bool
+xhci_parked_p(struct xhci_softc * const sc)
+{
+	return sc->sc_parked && sc->sc_suspender != NULL &&
+	    sc->sc_suspender != curlwp;
 }
 
 int
@@ -3888,7 +3949,7 @@ xhci_open(struct usbd_pipe *pipe)
 	DPRINTFN(1, " mps %ju ival %ju", UGETW(ed->wMaxPacketSize),
 	    ed->bInterval, 0, 0);
 
-	if (sc->sc_dying)
+	if (sc->sc_dying || xhci_parked_p(sc))
 		return USBD_IOERROR;
 
 	/* Root Hub */
@@ -4201,7 +4262,22 @@ xhci_pipe_restart(struct usbd_pipe *pipe)
 		quiet = false;
 	}
 
-	(void)xhci_set_dequeue(pipe);
+	if (xhci_set_dequeue(pipe) != USBD_NORMAL_COMPLETION) {
+		/*
+		 * The ring was reset on our side but the controller's
+		 * dequeue pointer was not moved: the next TD would sit
+		 * behind stale TRBs until it timed out.  Stop the endpoint
+		 * again (Set TR Dequeue needs it stopped) and repeat once.
+		 */
+		if (xhci_get_epstate(sc, xs, dci) == XHCI_EPSTATE_HALTED)
+			xhci_reset_endpoint(pipe);
+		else if (xhci_get_epstate(sc, xs, dci) == XHCI_EPSTATE_RUNNING)
+			xhci_stop_endpoint(pipe);
+		if (xhci_set_dequeue(pipe) != USBD_NORMAL_COMPLETION)
+			device_printf(sc->sc_dev, "endpoint 0x%x: dequeue pointer"
+			    " not reset; its next transfer will time out\n",
+			    pipe->up_endpoint->ue_edesc->bEndpointAddress);
+	}
 
 	if (quiet && xhci_rt_inject(&xhci_inject_stopfail)) {
 		device_printf(sc->sc_dev, "endpoint 0x%x: injected stop"
@@ -5229,10 +5305,10 @@ xhci_do_command_locked(struct xhci_softc * const sc,
 	KASSERTMSG(!cpu_intr_p() && !cpu_softintr_p(), "called from intr ctx");
 	KASSERT(mutex_owned(&sc->sc_lock));
 
-	while (sc->sc_command_addr != 0 ||
-	    (sc->sc_suspender != NULL && sc->sc_suspender != curlwp))
+	while (!xhci_parked_p(sc) && (sc->sc_command_addr != 0 ||
+	    (sc->sc_suspender != NULL && sc->sc_suspender != curlwp)))
 		cv_wait(&sc->sc_cmdbusy_cv, &sc->sc_lock);
-	if (sc->sc_suspendresume_failed)
+	if (sc->sc_suspendresume_failed || xhci_parked_p(sc))
 		return USBD_IOERROR;
 
 	/*
@@ -6475,6 +6551,9 @@ xhci_device_ctrl_start(struct usbd_xfer *xfer)
 
 	KASSERT((xfer->ux_rqflags & URQ_REQUEST) != 0);
 
+	if (sc->sc_dying || xhci_parked_p(sc))
+		return USBD_IOERROR;
+
 	if (tr->is_halted)
 		goto out;
 
@@ -6602,7 +6681,7 @@ xhci_device_isoc_enter(struct usbd_xfer *xfer)
 
 	KASSERT(polling || mutex_owned(&sc->sc_lock));
 
-	if (sc->sc_dying)
+	if (sc->sc_dying || xhci_parked_p(sc))
 		return USBD_IOERROR;
 
 	KASSERT(xfer->ux_nframes != 0 && xfer->ux_frlengths);
@@ -6749,7 +6828,7 @@ xhci_device_bulk_start(struct usbd_xfer *xfer)
 
 	KASSERT(polling || mutex_owned(&sc->sc_lock));
 
-	if (sc->sc_dying)
+	if (sc->sc_dying || xhci_parked_p(sc))
 		return USBD_IOERROR;
 
 	KASSERT((xfer->ux_rqflags & URQ_REQUEST) == 0);
@@ -6879,7 +6958,7 @@ xhci_device_intr_start(struct usbd_xfer *xfer)
 
 	KASSERT(polling || mutex_owned(&sc->sc_lock));
 
-	if (sc->sc_dying)
+	if (sc->sc_dying || xhci_parked_p(sc))
 		return USBD_IOERROR;
 
 	if (tr->is_halted)

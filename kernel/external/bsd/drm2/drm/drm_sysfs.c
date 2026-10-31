@@ -32,8 +32,14 @@
 #include <sys/cdefs.h>
 __KERNEL_RCSID(0, "$NetBSD: drm_sysfs.c,v 1.9 2021/12/19 12:30:31 riastradh Exp $");
 
+#include <sys/device.h>
+#include <sys/systm.h>
+
+#include <prop/proplib.h>
+
 #include <drm/drm_device.h>
 #include <drm/drm_connector.h>
+#include <drm/drm_file.h>
 #include <drm/drm_sysfs.h>
 
 #include "../dist/drm/drm_internal.h"
@@ -50,9 +56,29 @@ drm_sysfs_connector_remove(struct drm_connector *connector)
 {
 }
 
+/*
+ * LISPBSD: Linux sends a HOTPLUG=1 uevent here, and compositors rescan
+ * their connectors on it.  Post the drvctl event "drm-hotplug" for the
+ * card's node instead: ndevd forwards it and libudev-bsd (pkgsrc patch)
+ * turns it into a udev "change" of dri/cardN, which carries HOTPLUG=1.
+ * Called from the hotplug work, which may sleep.
+ */
 void
 drm_sysfs_hotplug_event(struct drm_device *dev)
 {
+	prop_dictionary_t ev;
+	char node[32];
+
+	if (dev->primary == NULL)
+		return;
+	ev = prop_dictionary_create();
+	if (ev == NULL)
+		return;
+	snprintf(node, sizeof(node), "dri/card%d", dev->primary->index);
+	if (!prop_dictionary_set_string(ev, "device", node) ||
+	    !prop_dictionary_set_string(ev, "parent", device_xname(dev->dev)) ||
+	    (*devmon_insert_vec)("drm-hotplug", ev) != 0)
+		prop_object_release(ev);
 }
 
 void

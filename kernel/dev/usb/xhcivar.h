@@ -39,6 +39,7 @@
 #include <sys/queue.h>
 
 #include <sys/callout.h>
+#include <sys/workqueue.h>
 #include <dev/usb/usbdi.h>
 #include <dev/usb/usbdivar.h>
 
@@ -101,8 +102,15 @@ struct xhci_slot {
 	bool xs_parked_drv;		/* PMF_Q_SELF holds for runtime parking */
 	u_int xs_parked_ndevs;		/* attempted prefix of ud_subdevs */
 	uint32_t xs_dbpending;		/* doorbells to ring after the resume, bit per dci */
-	int xs_rt_want;			/* 1: suspend, 2: resume (for xs_rt_task) */
-	struct usb_task xs_rt_task;
+	int xs_rt_want;			/* 1: suspend, 2: resume (for xs_rt_work) */
+	/*
+	 * The runtime PM task runs on the controller's own workqueue, not on
+	 * USB_TASKQ_HC: it issues synchronous control requests, and transfer
+	 * timeouts are handled on USB_TASKQ_HC, so a request that never
+	 * completed there could never time out (every USB timeout stopped).
+	 */
+	struct work xs_rt_work;
+	volatile u_int xs_rt_queued;	/* xs_rt_work is on the workqueue */
 
 	/*
 	 * Deadlines (sc_intr_lock).  At most one is armed per slot.  The idle
@@ -189,6 +197,8 @@ struct xhci_softc {
 
 	/* LispBSD USB runtime power management */
 	callout_t sc_rt_callout;	/* earliest slot deadline; idle when none */
+	struct workqueue *sc_rt_wq;	/* runs the slots' xs_rt_work */
+	bool sc_parked;			/* sc_lock+sc_intr_lock: suspended by drvctl */
 	int sc_rt_bound;		/* device slots bound (populated) */
 	bool sc_rt_paused;		/* sc_intr_lock: no new runtime PM tasks */
 	u_int sc_rt_openers;		/* sc_intr_lock: synchronous port wakes */
