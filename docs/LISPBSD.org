@@ -56,7 +56,8 @@ The level is remembered separately for AC and battery (=brightness restore ac|ba
   (=machdep.hwp.epp=) from AC, input and load: perf on AC, powersave when nothing happens on battery.
 - Deep idle: =cidle= (MWAIT C-states, tickless idle), =patfix= (write-combining on every CPU).
 - USB is off from boot: =usb on|off|status= (both controllers; about 0.8 W).
-  Run =usb on= before plugging anything in; =usb off= refuses while a USB-C device is attached.
+  Run =usb on= before plugging in a USB device (a monitor needs nothing);
+  =usb off= refuses while a USB-C device is attached.
 - Wi-Fi power save (=wifi-powersave on|off=), audio hardware off shortly after the last sound,
   panel at 30 Hz while the picture is still, GPU at its lowest clock when idle.
 
@@ -68,27 +69,28 @@ at boot, take the "verbose" entry in the boot menu (see Kernels).
 The X1 Nano has only USB-C ports: use a USB-C to HDMI cable or a dongle
 with HDMI.  The monitor shows up as a DisplayPort output (=DP-3= or
 similar), because USB-C carries DisplayPort and the dongle converts it.
-1. =usb on= (in a terminal).  USB is powered off from boot, and USB-C video
-   needs it on.  Both controllers matter: a dongle's USB side hangs off the
-   internal controller, not the USB-C one.
-2. Plug in the cable (or dongle, then the cable), with the monitor on.
+1. Plug in the cable (or dongle, then the cable), with the monitor on.
    Within a second or two it lights up and the desktop *extends* onto it:
-   it is a second screen to the right of the panel.  Move the pointer onto
-   it and it has the focus (new windows open there, even when it is empty);
+   it is a second screen to the right of the panel (one already connected
+   at boot can come up on the left).  Video needs nothing else; only the
+   dongle's own USB ports (and its ethernet) need =usb on= first.  Move the
+   pointer onto it and it has the focus (new windows open there, even when
+   it is empty);
    Super+Shift+Left/Right switch screens from the keyboard and
    Super+Ctrl+Shift+Left/Right move the focused column to the other screen.
-3. *Super+M*: mirror.  The projector shows exactly what the panel shows,
+2. *Super+M*: mirror.  The projector shows exactly what the panel shows,
    pointer included, and your windows move back to the panel.  The picture
    is fitted with black bars at the sides (the panel is 16:10, most
    projectors are 16:9).
-4. *Super+Shift+M* cycles the fit:
+3. *Super+Shift+M* cycles the fit:
    - contain: all of the panel, as large as fits, black bars (the default)
    - cover: fills the projector, cuts a strip off the panel's top and bottom
    - stretch: fills the projector, slightly distorted
    - exact: one pixel per pixel, centred (a black border on a bigger screen,
      only the middle of the panel on a smaller one)
-5. *Super+M* again: stop mirroring; the projector becomes a second screen again.
-6. When done: unplug, then =usb off= to save the power again.
+4. *Super+M* again: stop mirroring; the projector becomes a second screen again.
+5. When done: unplug.  (If you ran =usb on= for the dongle's ports, =usb off=
+   saves that power again.)
 Notes:
 - Keep the lid open while mirroring: the panel is the picture.  Closing the
   lid suspends the machine (or with /etc/lid-nosuspend only turns the panel

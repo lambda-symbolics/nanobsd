@@ -30,7 +30,7 @@
      ("bta2dpd -m encrypt ..." "base A2DP source; -m encrypt is what makes a modern headset pair"))
     ("Session and screen"
      ("startmh" "the Mahogany session the console autologin starts (X and StumpWM are gone)")
-     ("super+m / super+shift+m" "mirror the panel onto the projector / cycle the fit; plug in after 'usb on'")
+     ("super+m / super+shift+m" "mirror the panel onto the projector / cycle the fit (video needs no 'usb on')")
      ("mhcu mirror status|shot" "what the mirror does / what the projector shows (PNG)")
      ("mahoganyctl FORM" "evaluate Lisp in the running Mahogany (never after a defstruct change)")
      ("screenshot [area|full]" "PrtSc: freeze, select a region, save timestamped, copy")
