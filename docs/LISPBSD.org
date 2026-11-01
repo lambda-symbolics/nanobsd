@@ -138,6 +138,7 @@ Shift+Print = whole screen.  Saved as =~/screenshot-DATE.png= and copied to the 
 - Terminals attach to a per-user shared server, prewarmed at boot (=cclshd status|start|stop=).
   A login taking seconds means the server is wedged: =cclshd start= replaces it.
 - Emergency shell: =/bin/sh=.
+- Chez Scheme: =scheme= (or =chezscheme=; =petite= is the interpreter-only build), =scheme --script FILE.ss=.
 
 * Emacs
 =emacs= runs the pgtk build in /usr/local/emacs-pgtk under Wayland (the
