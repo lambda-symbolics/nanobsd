@@ -49,8 +49,12 @@ SENS=/tmp/.statusbar.sensors WIFI=/tmp/.statusbar.wifi
   section=="@audio" {
     split($0, pair, "="); audio[pair[1]]=pair[2]
   }
-  section=="@wifi" && /ssid/ {
-    for (i=1; i<=NF; i++) if ($i=="ssid") { ssid=$(i+1); break }
+  section=="@wifi" && match($0, /(^|[ \t])ssid /) {
+    # ifconfig quotes an SSID with spaces: ssid "Villa Mascagni" nwkey ...
+    v=substr($0, RSTART+RLENGTH)
+    if (substr(v, 1, 1)=="\"") { v=substr(v, 2); v=substr(v, 1, index(v, "\"")-1) }
+    else sub(/[ \t].*/, "", v)
+    ssid=v
   }
   section=="@clock" { clk=$0 }
   END {
@@ -80,6 +84,6 @@ SENS=/tmp/.statusbar.sensors WIFI=/tmp/.statusbar.wifi
     if (ac=="TRUE" && bats=="dis") bats="plug"
     if (ac=="TRUE" && bat==100) bats="full"
     if (absent) bats="none"
-    printf "ram=%s cpu=%s temp=%s vol=%s volm=%s mic=%s micm=%s bat=%s bats=%s ssid=%s clk=%s\n", ram,cpu,temp,vol,volm,mic,micm,bat,bats,ssid,clk
+    printf "ram=%s cpu=%s temp=%s vol=%s volm=%s mic=%s micm=%s bat=%s bats=%s clk=%s ssid=%s\n", ram,cpu,temp,vol,volm,mic,micm,bat,bats,clk,ssid
   }
 ' - "$SENS" "$WIFI"
