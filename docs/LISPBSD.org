@@ -109,7 +109,7 @@ Notes:
   =mhcu mirror shot FILE= (a PNG of what the projector shows), =mhcu mirror fit cover=,
   =mhcu mirror region X Y W H= (mirror only part of the panel), =mhcu mirror freeze= / =thaw=.
 ** Screenshots
-Print = freeze the screen, drag a region (click: whole screen; Esc cancels);
+Print = freeze the screen, drag a region (click, Space or Return: whole screen; Esc cancels);
 Shift+Print = whole screen.  Saved as =~/screenshot-DATE.png= and copied to the clipboard.
 
 * Desktop (Mahogany, Super = Mod)

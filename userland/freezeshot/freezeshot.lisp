@@ -4,8 +4,8 @@
 ;;;;
 ;;;;   freezeshot FILE.png   -> prints FILE.png, exit 0; exit 1 if cancelled
 ;;;;
-;;;; Drag with the left button.  A click (no drag) or Return takes the whole
-;;;; output under the pointer.  Escape, q or the right button cancel, and so
+;;;; Drag with the left button.  A click (no drag), Return or Space takes the
+;;;; whole output under the pointer.  Escape, q or the right button cancel, and so
 ;;;; does a minute without input.
 ;;;; The Wayland side (capture, overlay, input, PNG) is libfreezeshot.so.
 
@@ -56,7 +56,7 @@
 (defconstant +btn-left+ #x110)
 (defconstant +btn-right+ #x111)
 (defparameter *cancel-keys* '(1 16))    ; Escape, q
-(defparameter *whole-keys* '(28 96))    ; Return, keypad Enter
+(defparameter *whole-keys* '(28 96 57)) ; Return, keypad Enter, Space
 
 (defun die (fmt &rest args)
   (format *error-output* "freezeshot: ~?~%" fmt args)
