@@ -16,6 +16,7 @@
      ("hcisniff [ubt0]" "every HCI command, event and ACL packet with direction and decoded headers (root)")
      ("btconfig ubt0 up" "base: brings the radio up, loading the Intel firmware on the first up")
      ("wifi" "Common Lisp Wi-Fi TUI: scan, join, forget (never scan on hotel Wi-Fi remotely)")
+     ("wifi on|off" "radio off for a plane (wpa_supplicant stopped, iwx0 down) and back; off until 'on' or a reboot")
      ("wifi-powersave on|off" "iwx power save, about 1.5 W; live only")
      ("webcam on|off|status" "attach/detach the internal camera (uvideo)"))
     ("Power"

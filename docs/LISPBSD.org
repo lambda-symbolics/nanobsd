@@ -30,6 +30,10 @@ commands).
 3. DHCP happens by itself (dhcpcd).
 - wpa_supplicant is the patched 2.11 in /usr/local/sbin (=/etc/rc.conf.d/wpa_supplicant=):
   base 2.11 cannot join Braiins-Public (RSNXE mismatch).
+** WiFi off (a plane)
+=wifi off= stops wpa_supplicant and takes =iwx0= down (radio and firmware off);
+=wifi on= brings it back and reports the saved network it joined.  Off lasts until
+=wifi on= or a reboot.  WireGuard and every remote session go with it.
 ** Reset WiFi if it wedges
 #+begin_src sh
 service wpa_supplicant restart; sleep 10; ifconfig iwx0
