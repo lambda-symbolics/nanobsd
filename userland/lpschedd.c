@@ -33,9 +33,12 @@
  *   machdep.hwp.epp, machdep.lpsched.{enabled,pack,coalesce_ms,fgpid}
  *   machdep.hwp.pl1 (RAPL long-term package limit): lowered on battery to
  *   pl1_bat (-P, mW; 0 leaves it alone), the boot value on AC and at exit.
- *   Bursts (PL2) are untouched, so short work stays quick and only sustained
- *   work (a build left running, a busy background page) is capped.  The
- *   value and its enable bit are re-checked every PL_CHECK_MS, as are
+ *   machdep.hwp.pl2 (the burst limit): lowered on battery to pl2_bat (-Q,
+ *   mW; 0, the default, leaves bursts alone), never below the PL1 in force,
+ *   the boot value on AC and at exit.  PL1 caps sustained work (a build
+ *   left running, a busy background page); PL2 caps the first seconds of
+ *   it, which PL1's averaging window lets run far above PL1.  The
+ *   values and PL1's enable bit are re-checked every PL_CHECK_MS, as are
  *   the EPP every CPU's HWP request register really holds
  *   (machdep.hwp.epp_hw; machdep.hwp.epp only echoes the last write), as
  *   firmware may reset either at a
@@ -124,6 +127,8 @@ static double	 one_lo = 0.60;			/* below this releases that latch */
 static int	 ncpu = 1;
 static int	 pl1_bat = 10000;		/* -P: battery PL1, mW (0: leave) */
 static int	 pl1_boot = 0;			/* machdep.hwp.pl1_boot */
+static int	 pl2_bat = 0;			/* -Q: battery PL2, mW (0: leave) */
+static int	 pl2_boot = 0;			/* machdep.hwp.pl2_boot */
 static bool	 debug = false;			/* -d: foreground, log to stderr */
 static bool	 dryrun = false;		/* -n: don't write sysctls */
 static int	 sockfd = -1;
@@ -405,26 +410,59 @@ cpu_busy(double *busy_max)
 	return busy;
 }
 
-/* The PL1 for this supply; re-applied when it drifted (resume, firmware). */
+/*
+ * The PL2 for this supply: pl2_bat on battery but never below the PL1 in
+ * force (want1, 0 when PL1 is left alone), the boot value on AC.
+ */
 static void
-apply_pl1(int ac)
+apply_pl2(int ac, int want1)
+{
+	int want, cur;
+
+	if (pl2_bat <= 0 || pl2_boot <= 0)
+		return;
+	want = ac == 0 ? (pl2_bat < pl2_boot ? pl2_bat : pl2_boot) : pl2_boot;
+	if (want < want1)
+		want = want1;
+	if (sysctl_get("machdep.hwp.pl2", &cur) == -1)
+		return;
+	if (cur > want - 125 && cur < want + 125)
+		return;
+	logmsg(LOG_INFO, "package PL2 %d -> %d mW (%s)", cur, want,
+	    ac == 0 ? "battery" : "AC");
+	sysctl_set("machdep.hwp.pl2", want);
+}
+
+/* The PL1 and PL2 for this supply; re-applied when they drifted (resume, firmware). */
+static void
+apply_pl(int ac)
 {
 	int want, cur, en;
 
-	if (pl1_bat <= 0 || pl1_boot <= 0)
+	if (pl1_bat <= 0 || pl1_boot <= 0) {
+		apply_pl2(ac, 0);
 		return;
+	}
 	want = ac == 0 ? (pl1_bat < pl1_boot ? pl1_bat : pl1_boot) : pl1_boot;
+	/*
+	 * Going to battery lowers PL1 first, coming back raises PL2 first, so
+	 * PL2 is never below PL1 in between.
+	 */
+	if (ac != 0)
+		apply_pl2(ac, want);
 	if (sysctl_get("machdep.hwp.pl1", &cur) == -1)
 		return;
 	/* A value with PL1_ENABLE clear is not enforced (older hwp: assume). */
 	if (sysctl_get("machdep.hwp.pl1_enabled", &en) == -1)
 		en = 1;
 	/* The register holds 1/8 W steps: allow for the rounding. */
-	if (en && cur > want - 125 && cur < want + 125)
-		return;
-	logmsg(LOG_INFO, "package PL1 %d%s -> %d mW (%s)", cur,
-	    en ? "" : " (not enabled)", want, ac == 0 ? "battery" : "AC");
-	sysctl_set("machdep.hwp.pl1", want);	/* sets PL1_ENABLE too */
+	if (!en || cur <= want - 125 || cur >= want + 125) {
+		logmsg(LOG_INFO, "package PL1 %d%s -> %d mW (%s)", cur,
+		    en ? "" : " (not enabled)", want, ac == 0 ? "battery" : "AC");
+		sysctl_set("machdep.hwp.pl1", want);	/* sets PL1_ENABLE too */
+	}
+	if (ac == 0)
+		apply_pl2(ac, want);
 }
 
 /*
@@ -547,6 +585,9 @@ cleanup(void)
 	sysctl_set("machdep.lpsched.coalesce_ms", 0);
 	sysctl_set("machdep.lpsched.fgpid", 0);
 	sysctl_set("machdep.hwp.epp", orig_epp);
+	/* PL2 first: it may not drop below the PL1 being restored. */
+	if (pl2_bat > 0 && pl2_boot > 0)
+		sysctl_set("machdep.hwp.pl2", pl2_boot);
 	if (pl1_bat > 0 && pl1_boot > 0)
 		sysctl_set("machdep.hwp.pl1", pl1_boot);
 	if (!dryrun)
@@ -561,7 +602,7 @@ usage(void)
 {
 
 	fprintf(stderr, "usage: lpschedd [-dn] [-b boost_ms] [-i interactive_ms] "
-	    "[-H busy_hi] [-L busy_lo] [-P pl1_bat_mw]\n");
+	    "[-H busy_hi] [-L busy_lo] [-P pl1_bat_mw] [-Q pl2_bat_mw]\n");
 	exit(1);
 }
 
@@ -575,12 +616,13 @@ main(int argc, char **argv)
 	uint64_t pending_since = 0, pl_checked = 0;
 	double load, load_max = 0.0;
 
-	while ((c = getopt(argc, argv, "dnb:i:H:L:P:")) != -1) {
+	while ((c = getopt(argc, argv, "dnb:i:H:L:P:Q:")) != -1) {
 		switch (c) {
 		case 'd': debug = true; break;
 		case 'n': dryrun = true; break;
 		case 'b': boost_ms = atoi(optarg); break;
 		case 'P': pl1_bat = atoi(optarg); break;
+		case 'Q': pl2_bat = atoi(optarg); break;
 		case 'i': interactive_ms = atoi(optarg); break;
 		case 'H': load_hi = atof(optarg); break;
 		case 'L': load_lo = atof(optarg); break;
@@ -620,10 +662,13 @@ main(int argc, char **argv)
 	}
 	if (pl1_bat > 0 && sysctl_get("machdep.hwp.pl1_boot", &pl1_boot) == -1)
 		pl1_boot = 0;		/* hwp without RAPL: leave PL1 alone */
+	if (pl2_bat > 0 && sysctl_get("machdep.hwp.pl2_boot", &pl2_boot) == -1)
+		pl2_boot = 0;
 	logmsg(LOG_INFO, "started: ac=%d boost=%dms interactive=%dms "
-	    "busy_hi=%.2f busy_lo=%.2f epp(orig)=%d pl1 boot=%d bat=%d mW",
+	    "busy_hi=%.2f busy_lo=%.2f epp(orig)=%d pl1 boot=%d bat=%d mW "
+	    "pl2 boot=%d bat=%d mW",
 	    ac, boost_ms, interactive_ms, load_hi, load_lo, orig_epp,
-	    pl1_boot, pl1_bat);
+	    pl1_boot, pl1_bat, pl2_boot, pl2_bat);
 	{
 		int n;
 		size_t nlen = sizeof(n);
@@ -666,7 +711,7 @@ main(int argc, char **argv)
 		if (sysctl_get("machdep.lpsched.idle_ms", &idle_ms) == -1)
 			idle_ms = 0;
 		if (ac != last_ac || now_ms() - pl_checked >= PL_CHECK_MS) {
-			apply_pl1(ac);
+			apply_pl(ac);
 			verify_epp(cur);
 			last_ac = ac;
 			pl_checked = now_ms();
