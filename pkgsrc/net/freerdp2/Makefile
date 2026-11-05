@@ -1,0 +1,61 @@
+# $NetBSD: Makefile,v 1.65 2026/07/13 04:36:24 wiz Exp $
+
+DISTNAME=	freerdp-2.11.7
+PKGNAME=	${DISTNAME:S/freerdp-/freerdp2-/1}
+PKGREVISION=	15
+CATEGORIES=	net
+MASTER_SITES=	https://pub.freerdp.com/releases/
+
+MAINTAINER=	pkgsrc-users@NetBSD.org
+HOMEPAGE=	https://www.freerdp.com/
+COMMENT=	Free implementation of the Remote Desktop Protocol (major version 2)
+LICENSE=	apache-2.0
+
+TOOL_DEPENDS+=	docbook-xsl-[0-9]*:../../textproc/docbook-xsl
+TOOL_DEPENDS+=	libxslt-[0-9]*:../../textproc/libxslt
+
+.include "../../devel/cmake/build.mk"
+
+USE_TOOLS+=	pkg-config
+USE_LANGUAGES=	c c++
+
+CMAKE_CONFIGURE_ARGS+=	-DWITH_SERVER=ON
+CMAKE_CONFIGURE_ARGS+=	-DWITH_CHANNELS=ON
+CMAKE_CONFIGURE_ARGS+=	-DWITH_JPEG=ON
+CMAKE_CONFIGURE_ARGS+=	-DWITH_GSTREAMER_1_0=OFF
+
+CFLAGS.SunOS+=	-Du_int8_t=uint8_t -Du_int16_t=uint16_t -Du_int32_t=uint32_t -Du_int64_t=uint64_t
+
+.include "../../mk/oss.buildlink3.mk"
+
+.if ${OSS_TYPE} != "none"
+CMAKE_CONFIGURE_ARGS+=	-DWITH_OSS=ON
+LDFLAGS+=	${LIBOSSAUDIO}
+.else
+CMAKE_CONFIGURE_ARGS+=	-DWITH_OSS=OFF
+.endif
+CMAKE_CONFIGURE_ARGS+=	-DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
+.include "../../mk/bsd.prefs.mk"
+
+# backtrace(3)
+LDFLAGS.NetBSD+=	-lexecinfo
+
+PKGCONFIG_OVERRIDE+=	freerdp.pc.in
+
+INSTALLATION_DIRS+=	${PKGMANDIR}/man1 ${PKGMANDIR}/man7
+
+post-install:
+	${MV} ${DESTDIR}${PREFIX}/bin/xfreerdp \
+		${DESTDIR}${PREFIX}/bin/xfreerdp2 || ${TRUE}
+
+.include "options.mk"
+.include "../../devel/libusb1/buildlink3.mk"
+.include "../../devel/zlib/buildlink3.mk"
+.include "../../security/openssl/buildlink3.mk"
+.include "../../mk/jpeg.buildlink3.mk"
+.if defined(OPSYS_HAS_KQUEUE)
+CFLAGS+=	-I${BUILDLINK_PREFIX.libepoll-shim}/include/libepoll-shim
+.include "../../devel/libepoll-shim/buildlink3.mk"
+.endif
+.include "../../mk/bsd.pkg.mk"
