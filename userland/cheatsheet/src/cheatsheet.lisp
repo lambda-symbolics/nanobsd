@@ -40,7 +40,8 @@
      ("screentemp [K] [-d]" "colour temperature of the panel")
      ("statusbar / statusbard" "a status snapshot / the daemon publishing it to the bar")
      ("waytemp" "temperatures under Wayland")
-     ("wmenu-run" "launcher"))
+     ("wmenu-run" "launcher")
+     ("wlfreerdp /v:HOST /u:USER [/f] +clipboard" "RDP client, native Wayland (FreeRDP 2, no H.264: built without FFmpeg)"))
     ("System"
      ("lsblk [-p|-c] [disk]" "disks, wedges, probed file systems, mounts and usage in real units, NVMe health")
      ("lfetch" "the fetch, Genera style")
