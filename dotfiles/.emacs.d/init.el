@@ -17,7 +17,7 @@
 ;; refresh it once whenever something below still has to be installed.
 (defconst mag/packages
   '(meow vertico orderless marginalia consult corfu smartparens drag-stuff
-    rust-mode sly org-appear org-auto-tangle eat))
+    rust-mode sly org-appear org-auto-tangle eat magit))
 (unless (seq-every-p #'package-installed-p mag/packages)
   (package-refresh-contents))
 
@@ -280,6 +280,21 @@
 
 (use-package eat
   :bind ("C-c t" . eat))
+
+;; Magit, SPC g as on the workstation.  Status and diffs take the current
+;; window (one frame on a 13" panel); a new commit message starts in insert.
+(use-package magit
+  :commands (magit-status magit-dispatch magit-file-dispatch)
+  :init
+  (setq magit-display-buffer-function
+        #'magit-display-buffer-same-window-except-diff-v1)
+  :config
+  (add-hook 'git-commit-setup-hook
+            (lambda ()
+              (when (and (bound-and-true-p meow-mode)
+                         (save-excursion (goto-char (point-min))
+                                         (looking-at-p "[ \t]*$")))
+                (meow-insert)))))
 
 ;;; Meow
 

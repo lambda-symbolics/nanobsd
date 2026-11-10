@@ -338,7 +338,7 @@
  '("S-<left>" . meow-left-expand)
  '("S-<right>" . meow-right-expand))
 
-(dolist (mode '(eat-mode vterm-mode term-mode eshell-mode shell-mode
+(dolist (mode '(eat-mode vterm-mode term-mode magit-mode eshell-mode shell-mode
                 message-mode))
   (add-to-list 'meow-mode-state-list `(,mode . insert)))
 
@@ -423,7 +423,7 @@
   "w" mag/leader-window-map
   "c" mag/leader-code-map
   "t" mag/leader-toggle-map
-  "g" #'vc-dir
+  "g" #'magit-status
   "h" help-map
   "q q" #'save-buffers-kill-terminal)
 
