@@ -150,3 +150,14 @@ fstab) once gefs+ has run for a while.
   count, statvfs inode counts consistent (df -i was negative).
   tests/readdir-regress.c fails 5 checks before, 0 after (VM, also after a
   remount); fsxlite 2x20000 ok.  Kernel 186 = 185 + the fixes.
+- 2026-11-10: Emacs said "changed on disk" on files nobody else touched.
+  Cause: the page-cache path (gefswrite with a new size, from write-behind
+  and the syncer) stamped mtime = nsec() when the pages were put, up to 30 s
+  after write(2); Emacs had recorded the mtime of the save.  The same flush
+  overwrote mtimes set with utimes (cp -p, tar x, rsync -t).  Reproduced on
+  the Nano: a file written once moved its mtime 23 s later.  Fixed in
+  gefs-netbsd f1793d9: page puts store de->mtime (set by write(2) before its
+  write-behind, by utimes, or by gop_markupdate for mmap writes, which was
+  empty); tests/gefstest.c phase 9 fails before, all passed after.  Kernel
+  228 = 227 + the fix, boot default from the next reboot (227 is the
+  previous entry).
