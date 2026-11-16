@@ -268,6 +268,12 @@ static kcondvar_t	acpi_freeze_cv;
 static volatile int	acpi_freeze_req;
 static volatile int	acpi_freeze_busy;
 static int		acpi_freeze_timeout = 120;
+/*
+ * LISPBSD: times userland was frozen and thawed again (hw.acpi.sleep.
+ * freeze_resumes).  A program that sees it move knows it was frozen,
+ * which a timer firing late alone does not prove (Mahogany's idle timer).
+ */
+static int acpi_freeze_resumes;
 static int		acpi_freeze_ltr_ignore;
 static int		acpi_freeze_storage;
 static int		acpi_freeze_keep_net;
@@ -1849,6 +1855,11 @@ SYSCTL_SETUP(sysctl_acpi_setup, "sysctl hw.acpi subtree setup")
 	    CTL_CREATE, CTL_EOL);
 
 	(void)sysctl_createv(NULL, 0, &snode, NULL,
+	    CTLFLAG_PERMANENT | CTLFLAG_READONLY, CTLTYPE_INT,
+	    "freeze_resumes", SYSCTL_DESCR("Times userland was thawed after an s2idle freeze"),
+	    NULL, 0, &acpi_freeze_resumes, 0, CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(NULL, 0, &snode, NULL,
 	    CTLFLAG_PERMANENT | CTLFLAG_READWRITE, CTLTYPE_INT,
 	    "freeze_timeout", SYSCTL_DESCR("s2idle test timeout in seconds; 0 waits for wake"),
 	    NULL, 0, &acpi_freeze_timeout, 0, CTL_CREATE, CTL_EOL);
@@ -2945,6 +2956,8 @@ acpi_s0_freeze_userspace(bool freeze)
 	struct proc *p;
 	struct lwp *l;
 
+	if (!freeze)
+		atomic_inc_uint((volatile unsigned int *)&acpi_freeze_resumes);
 	mutex_enter(&proc_lock);
 	PROCLIST_FOREACH(p, &allproc) {
 		mutex_enter(p->p_lock);

@@ -92,6 +92,8 @@ static int	pad_set_format(void *, int,
 static int	pad_start_output(void *, void *, int,
 		    void (*)(void *), void *);
 static int	pad_halt_output(void *);
+static int	pad_idle_wake(void *);
+static void	pad_idle_sleep(void *);
 static int	pad_getdev(void *, struct audio_device *);
 static int	pad_set_port(void *, mixer_ctrl_t *);
 static int	pad_get_port(void *, mixer_ctrl_t *);
@@ -227,6 +229,18 @@ pad_attach(device_t parent, device_t self, void *opaque)
 	sc->sc_buflen = 0;
 	sc->sc_rpos = sc->sc_wpos = 0;
 	sc->sc_audiodev = audio_attach_mi(&pad_hw_if, sc, sc->sc_dev);
+	/*
+	 * LISPBSD: let audio(4) halt a play mixer that has mixed nothing
+	 * for hw.audioN.idle_stop_ms (a paused player keeping the device
+	 * open).  Otherwise the mixer feeds silence every block for as long
+	 * as the player stays open, and its reader (bta2dpd, with the
+	 * headphones' transport suspended) wakes for every block to drain
+	 * it.  Halted, pad produces nothing, as with the device closed; the
+	 * next write starts the mixer again.  There is no hardware, so the
+	 * hooks have nothing to do.
+	 */
+	audio_set_idle_hooks(sc->sc_audiodev, pad_idle_wake, pad_idle_sleep,
+	    sc);
 
 	if (!pmf_device_register(sc->sc_dev, NULL, NULL))
 		aprint_error_dev(sc->sc_dev,
@@ -620,6 +634,18 @@ pad_halt_output(void *opaque)
 	sc->sc_rpos = sc->sc_wpos = 0;
 
 	return 0;
+}
+
+static int
+pad_idle_wake(void *opaque)
+{
+
+	return 0;
+}
+
+static void
+pad_idle_sleep(void *opaque)
+{
 }
 
 static void

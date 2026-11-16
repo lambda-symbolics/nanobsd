@@ -276,6 +276,12 @@ struct audio_softc {
 	struct workqueue *sc_idle_wq;
 	struct work	sc_idle_work;
 	uint64_t	sc_idle_stops;
+	/*
+	 * LispBSD: the hardware is open but no mixer runs (opened for
+	 * playback and not written yet, or recording ended while a playback
+	 * descriptor stays open): park it too after sc_idle_stop_ms.
+	 */
+	callout_t	sc_idle_park;
 };
 
 #ifdef DIAGNOSTIC

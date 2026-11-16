@@ -672,6 +672,8 @@ static int  audio_pmixer_halt(struct audio_softc *);
 static void audio_rmixer_start(struct audio_softc *);
 static bool audio_idle_due(struct audio_softc *);
 static void audio_idle_wake(struct audio_softc *);
+static void audio_idle_park(void *);
+static void audio_idle_arm(struct audio_softc *);
 static void audio_idle_work(struct work *, void *);
 static void audio_rmixer_process(struct audio_softc *);
 static void audio_rmixer_input(struct audio_softc *);
@@ -991,6 +993,8 @@ audioattach(device_t parent, device_t self, void *aux)
 	sc->sc_blk_ms = AUDIO_BLK_MS;
 	SLIST_INIT(&sc->sc_files);
 	cv_init(&sc->sc_exlockcv, "audiolk");
+	callout_init(&sc->sc_idle_park, CALLOUT_MPSAFE);
+	callout_setfunc(&sc->sc_idle_park, audio_idle_park, sc);
 	sc->sc_am_capacity = 0;
 	sc->sc_am_used = 0;
 	sc->sc_am = NULL;
@@ -1496,6 +1500,7 @@ audiodetach(device_t self, int flags)
 	pmf_device_deregister(self);
 
 	/* LispBSD: sc_dying makes a queued idle stop return at once. */
+	callout_halt(&sc->sc_idle_park, NULL);
 	if (sc->sc_idle_wq != NULL) {
 		workqueue_wait(sc->sc_idle_wq, &sc->sc_idle_work);
 		workqueue_destroy(sc->sc_idle_wq);
@@ -1521,6 +1526,7 @@ audiodetach(device_t self, int flags)
 	callout_destroy(&sc->sc_idle_counter);
 #endif
 
+	callout_destroy(&sc->sc_idle_park);
 	cv_destroy(&sc->sc_exlockcv);
 
 #if defined(AUDIO_DEBUG)
@@ -2612,6 +2618,9 @@ audio_open(dev_t dev, struct audio_softc *sc, int flags, int ifmt,
 	mutex_enter(sc->sc_intr_lock);
 	SLIST_INSERT_HEAD(&sc->sc_files, af, entry);
 	mutex_exit(sc->sc_intr_lock);
+	/* LispBSD: opened for playback, the mixer waits for the first write. */
+	if (!sc->sc_pbusy && !sc->sc_rbusy)
+		audio_idle_arm(sc);
 	mutex_exit(sc->sc_lock);
 	inserted = true;
 
@@ -2793,6 +2802,9 @@ audio_unlink(struct audio_softc *sc, audio_file_t *file)
 				    error);
 			}
 		}
+		/* LispBSD: a playback descriptor left that never played. */
+		if (sc->sc_ropens == 0 && sc->sc_popens > 0 && !sc->sc_pbusy)
+			audio_idle_arm(sc);
 
 	}
 
@@ -6437,8 +6449,26 @@ audio_idle_work(struct work *wk, void *arg)
 	atomic_store_relaxed(&sc->sc_idle_queued, 0);
 	if (audio_exlock_mutex_enter(sc) != 0)
 		return;
-	if (sc->sc_pbusy == false || sc->sc_rbusy || sc->sc_idle_stopped ||
-	    !audio_idle_due(sc)) {
+	if (sc->sc_rbusy || sc->sc_idle_stopped || sc->sc_idle_stop_ms <= 0 ||
+	    sc->sc_popens + sc->sc_ropens == 0) {
+		audio_exlock_mutex_exit(sc);
+		return;
+	}
+	if (sc->sc_pbusy == false) {
+		/*
+		 * The hardware is open and no mixer runs (audio_idle_arm):
+		 * nothing to halt, only the driver's reference to give back.
+		 * Whatever starts a mixer wakes it first, under sc_exlock,
+		 * which we hold until the hook has run.
+		 */
+		sc->sc_idle_stopped = true;
+		sc->sc_idle_stops++;
+		mutex_exit(sc->sc_lock);
+		(*sc->sc_idle_sleep)(sc->sc_idle_arg);
+		audio_exlock_exit(sc);
+		return;
+	}
+	if (!audio_idle_due(sc)) {
 		audio_exlock_mutex_exit(sc);
 		return;
 	}
@@ -6494,6 +6524,30 @@ audio_idle_work(struct work *wk, void *arg)
 	mutex_exit(sc->sc_lock);
 	(*sc->sc_idle_sleep)(sc->sc_idle_arg);
 	audio_exlock_exit(sc);
+}
+
+/*
+ * The hardware is open with no mixer running: look again after
+ * sc_idle_stop_ms, from the idle stop's thread (audio_idle_work).
+ */
+static void
+audio_idle_arm(struct audio_softc *sc)
+{
+	int ms = sc->sc_idle_stop_ms;
+
+	if (sc->sc_idle_wq == NULL || ms <= 0)
+		return;
+	callout_schedule(&sc->sc_idle_park, MAX(mstohz(ms), 1));
+}
+
+static void
+audio_idle_park(void *arg)
+{
+	struct audio_softc *sc = arg;
+
+	if (sc->sc_idle_wq != NULL &&
+	    atomic_swap_uint(&sc->sc_idle_queued, 1) == 0)
+		workqueue_enqueue(sc->sc_idle_wq, &sc->sc_idle_work, NULL);
 }
 
 /*
