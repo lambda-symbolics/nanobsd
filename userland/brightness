@@ -14,8 +14,9 @@
 # dim N and undim belong to the compositor's idle timer.  dim lowers the
 # panel to N without touching the remembered level and marks it dimmed;
 # undim, a step or a new level put the remembered level back.  A restore
-# (AC transition, lid) while dimmed leaves the panel dimmed, and the next
-# undim applies the level of the supply in use by then.
+# (AC transition, lid) while dimmed leaves the panel dimmed, at the new
+# supply's level if that is lower than the dim level, and the next undim
+# applies the level of the supply in use by then.
 #
 # The state files are NOT under $HOME.  The keybindings run as mag, but the
 # powerd(8) hooks run as root, and both have to read and write the same
@@ -100,7 +101,14 @@ restore)
 	lock
 	src=${2:-$(ac_state)}
 	new=$(read_state "$src")
-	[ -e "$DIMMED" ] || apply "$new"
+	# Dimmed, the panel shows the dim level, or this supply's own level
+	# when that is lower still (unplugged onto a battery level below it).
+	if [ -e "$DIMMED" ]; then
+		dl=$(cat "$DIMMED" 2>/dev/null)
+		[ -n "$dl" ] && apply "$([ "$new" -lt "$dl" ] && echo "$new" || echo "$dl")"
+	else
+		apply "$new"
+	fi
 	echo "$new"; exit 0 ;;
 dim)
 	lock
