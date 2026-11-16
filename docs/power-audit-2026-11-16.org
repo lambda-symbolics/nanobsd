@@ -1,0 +1,76 @@
+#+title: The 2026-11-15 power audit, checked and fixed (2026-11-16)
+
+An outside audit of nanobsd 5aacec3 (kernel 228), Mahogany 40d28c5 and
+gefs-netbsd f1793d9 made ten claims.  Each was checked against the source
+and, where it could be, on the Nano.  Kernel 229 carries the kernel fixes
+and booted the same day.
+
+* 1. PL2 enable bit never checked (lpschedd) -- true, fixed
+=apply_pl2= compared only the power field, so a 15 W PL2 with
+=PL2_ENABLE= clear passed as applied.  hwp now has
+=machdep.hwp.pl2_enabled= (read-only, like =pl1_enabled=), and lpschedd
+rewrites PL2 when the bit is clear (the write sets it).  The "never below
+PL1" floor now also reads the PL1 the register holds (enabled), not only
+the one being written, so a failed PL1 write or =-P 0= cannot leave PL2
+under PL1.  The firmware leaving the bit clear after a resume is not
+observed; the battery path runs at the next unplug (log line
+"package PL2 ... (not enabled)" if it ever happens).  nanobsd a2bbab9;
+hwp.kmod reloaded live (reloading resets EPP to 128: put 192 back before
+restarting lpschedd, or it records 128 as the original).
+
+* 2. GEFS lazy deadline anchored to the last commit -- true in the source, not reproduced; fixed
+=gefs_cmtdue= measured Lazymax from =gd_lastcmt=.  On the Nano (kernel
+228, scratch gefs on vnd0, lazymax 20 s, an atime-eligible read after 26,
+55 and 90 s of quiet) the read never committed at once: =gd_lastcmt= is
+only updated when the mutator next looks, and a commit leaving frees
+chains lazy commits that move it along.  The anchor was still wrong, so
+lazy updates now wait Lazymax from when the first of them appeared
+(=gd_lazyat=, cleared by every commit).  On 229 the same read commits
+about 21 s later.  gefs-netbsd 6551e9d.
+
+* 3. Mahogany takes any late idle timer for a suspension -- true, fixed
+The kernel now counts userland thaws (=hw.acpi.sleep.freeze_resumes=,
+incremented in =acpi_s0_freeze_userspace(false)=, so the real resume, an
+aborted freeze and the stage-1 test all count).  Mahogany resets the idle
+baseline only when that counter moved; the lateness heuristic remains only
+for kernels without it.  Verified: a 20 s s2idle (freeze_timeout set
+first) moved the counter to 1 and Mahogany logged "Idle: userland was
+frozen (s2idle)".  Mahogany bdffc48.
+
+* 4a. HDA held at D0 by an open device with no mixer running -- true, fixed
+Playback open only initialises the output; the play mixer starts at the
+first write or mmap, and the idle stop ran only from that mixer.  A device
+opened and never written (a player with a stream created but not started),
+or left with a playback descriptor after recording ended, kept the open's
+runtime-PM reference until close.  audio(4) now arms a callout in those
+two cases and, after =hw.audioN.idle_stop_ms=, parks the device through
+the same work item and driver hook (nothing to halt).  Measured: open
+without writing, D0 at once, parked at 5 s (=idle_stops= 1), controller
+D3 at 17 s, a write afterwards plays and wakes it.
+
+* 4b. pad(4) feeds silence to bta2dpd while a player stays open -- true, fixed
+Only hdafg registered the idle hooks.  pad registers no-op hooks now, so
+audio(4) halts pad's mixer after 5 s with no track mixed and pad produces
+nothing, as when the device is closed (bta2dpd already sleeps in its read
+then).  Measured with a reader on /dev/pad0: 1 s of audio, output stopped
+6 s after the start, restarted by the next write.  Stock pad.c committed
+first (e41068e).
+
+* 4c. Unplugging while dimmed kept the dim level above a lower battery level -- true, fixed
+=brightness restore= left the panel alone while dimmed.  Now it shows the
+lower of the dim level and the new supply's level (dim 15 on AC 60,
+unplug onto battery 5 -> 5, plug back -> 15, undim -> 60).  nanobsd
+dfc1b9b.
+
+* 4d. Output reconfiguration leaves the refresh policy believing 30 Hz -- true, fixed
+=process-output-changes= re-applies every output's configured (60 Hz) mode;
+refresh.lisp never heard of it.  A new =*output-change-hook*= entry puts
+slow outputs back on the fast mode explicitly and measures afresh.  Not
+exercised on hardware (needs a monitor plugged in).  Mahogany bdffc48.
+
+* 5. =lpschedd -n= is not observational -- true, fixed
+A dry run took the pid file, unlinked and rebound /var/run/lpsched.sock
+(leaving the daemon deaf to Mahogany) and unlinked it at exit.  Now a dry
+run writes no pid file, opens no socket (it polls for input as with no
+compositor) and writes no state files.  Verified beside the running
+daemon: socket inode and pid file unchanged, daemon alive.
