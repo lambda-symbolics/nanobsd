@@ -849,3 +849,13 @@ in-process Wayland proxy (a =wayland-proxy-PID= socket in XDG_RUNTIME_DIR),
 and a test Firefox outlived its compositor through it.  A stalled proxy
 would freeze every window of the process at once, the chooser included;
 a hypothesis for the freeze, to check in the next capture.
+
+* 2026-11-16: Super+arrow no longer leaks the arrow into the window it focuses (mahogany f368eaf, libheart installed, active at the next session start)
+heart swallowed a bound key's press but forwarded its release, and the
+focus change passed the keyboard's held keys (the arrow still down) in the
+new window's enter event.  The window it focused got the arrow's release
+for a press it never saw (a video player seeked).  heart now remembers the
+keys whose press a binding consumed: their release is not forwarded and
+they are left out of the enter event.  Verified headless with
+userland/keylog (before: =enter keys: 125 105= then =key 105 released=;
+after: =enter keys: 125=, no arrow).

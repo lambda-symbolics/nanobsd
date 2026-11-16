@@ -1,0 +1,15 @@
+keylog NAME: a bare xdg toplevel that prints every wl_keyboard event it
+receives (enter with its held-key array, key, modifiers, leave).
+
+Build on the Nano (in /var/tmp/kl):
+  X=/usr/pkg/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
+  wayland-scanner client-header $X xdg-shell-client-protocol.h
+  wayland-scanner private-code $X xdg-shell-protocol.c
+  clang -O1 -o keylog keylog.c xdg-shell-protocol.c -I. -I/usr/pkg/include \
+      -L/usr/pkg/lib -Wl,-rpath,/usr/pkg/lib -lwayland-client
+
+run.sh LABEL starts headless Mahogany from the build tree with two keylog
+windows and focuses between them with super+Left/Right through mhcu (once
+as a quick chord, once held like a person does), then a plain Right.  Used
+for mahogany f368eaf: before it the newly focused window got the arrow in
+its enter keys and the arrow's release.
