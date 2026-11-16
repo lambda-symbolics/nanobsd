@@ -820,3 +820,32 @@ no record).  Now:
 - recovery without a reboot: =mahoganyctl '(lid-opened)'= as mag.
 Installed /usr/local/bin/mahogany (previous kept as mahogany.pre-lidfile);
 the running session was hot-loaded with the changed functions.
+
+* 2026-11-16: computer use keeps the panel on; popups placed on the output (mahogany, installed, active at the next session start)
+An Autolith uploading images to X.com froze Firefox and its GTK file
+chooser three times (the user rebooted each time); not reproduced headless,
+so the cause is still open (capture next time with =mh-freeze-capture=,
+docs/computer-use.org).  The investigation found three bugs:
+- The idle timer read only the kernel's input counter
+  (=machdep.lpsched.idle_ms=, wskbd/wsmouse), which injected input never
+  resets.  During computer use every deadline stayed overdue: the panel
+  dimmed or blanked about every 30 s (output off, every window suspended)
+  and the next injected event woke it again.  =%idle-elapsed-ms= now takes
+  the shorter of the kernel's count and heart's time since any seat input
+  (=hrt_ms_since_activity=, real and injected).  Headless test
+  (/var/tmp/fctest/idle-test.sh, deadlines 4 s / 8 s): the old image dims
+  under one move per second, the new one stays on, then dims and blanks on
+  time once the input stops.
+- =popup_unconstrain= (heart/src/xdg_shell.c) gave wlroots the output box
+  in layout coordinates; wlroots wants it relative to the toplevel's
+  surface.  A menu of a window not at 0,0 could run off the output: a
+  Firefox context menu opened near the right edge of the right-hand column
+  was cut off; now it flips back inside (A/B screenshots, old and new
+  libheart).
+- =mhcu setclip= left wl-copy holding the caller's stdout: over ssh the
+  call never returned (the Autolith's tool timed out, exit 137).
+Seen while testing: Firefox talks to the compositor through its own
+in-process Wayland proxy (a =wayland-proxy-PID= socket in XDG_RUNTIME_DIR),
+and a test Firefox outlived its compositor through it.  A stalled proxy
+would freeze every window of the process at once, the chooser included;
+a hypothesis for the freeze, to check in the next capture.

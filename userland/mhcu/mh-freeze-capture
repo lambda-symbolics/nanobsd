@@ -1,0 +1,57 @@
+#!/bin/sh
+# mh-freeze-capture: run as root (over ssh) while windows have stopped
+# drawing or answering, BEFORE killing anything or rebooting.  Records what
+# the compositor, the windows and Firefox's threads are doing into
+# /var/tmp/freeze-DATE.txt and prints that path.  Socket probes have a time
+# limit (a wedged compositor must not wedge the capture); gdb has none: on
+# NetBSD a traced process whose tracer dies is killed, so a gdb must never
+# be timed out.  MH_PID and FF_PIDS override the processes looked at.
+
+out=/var/tmp/freeze-$(date +%Y%m%d-%H%M%S).txt
+T=/usr/bin/timeout
+MHLOG=/home/mag/.mahogany.log
+export MAHOGANY_SOCKET=${MAHOGANY_SOCKET:-/var/run/user/1000/mahogany.sock}
+
+section() { printf '\n===== %s\n' "$*"; }
+
+{
+section date; date; uptime
+section idle counter; /sbin/sysctl machdep.lpsched.idle_ms
+
+mh=${MH_PID:-$(pgrep -x mahogany | head -1)}
+section "mahogany pid ${mh:-none}"
+[ -n "$mh" ] && ps -s -o pid,lid,lstate,wchan,%cpu,lname -p "$mh"
+
+alive=
+section mhcu screen;  $T 5 /usr/local/bin/mhcu screen && alive=1 || echo "(no answer: $?)"
+section mhcu windows; $T 5 /usr/local/bin/mhcu windows || echo "(no answer: $?)"
+section mhcu focused; $T 5 /usr/local/bin/mhcu focused || echo "(no answer: $?)"
+section "views: id app_id suspended"
+$T 5 /usr/local/bin/mahoganyctl '(loop for v in (mahogany::%cu-views) collect (list (mahogany::%cu-view-id v) (hrt::hrt-view-app-id (hrt:view-hrt-view v)) (hrt::view-suspended v)))' ||
+    echo "(no answer: $?)"
+
+section clipboard owners; ps -axo pid,ppid,lstate,etime,args | grep -E '[w]l-(copy|paste)'
+
+ff=${FF_PIDS:-$(ps -axo pid,args | awk '$2 ~ /\/firefox$/ && !/-contentproc/ { print $1 }')}
+section "firefox parent(s): ${ff:-none}"
+ps -axo pid,ppid,lstate,%cpu,rss,etime,args | awk 'NR == 1 || /[f]irefox/' | cut -c1-200
+for p in $ff; do
+	section "firefox $p threads"
+	ps -s -o lid,lstate,wchan,%cpu,lname -p "$p"
+	section "firefox $p stacks"
+	gdb -p "$p" -batch -nx -ex 'set pagination off' \
+	    -ex 'thread apply all bt 25' 2>&1 | grep -v '^\[New LWP'
+done
+
+# Only a compositor that stopped answering: gdb stops it for a while.
+if [ -n "$mh" ] && [ -z "$alive" ]; then
+	section "mahogany $mh stacks (C frames only for Lisp threads)"
+	gdb -p "$mh" -batch -nx -ex 'set pagination off' \
+	    -ex 'thread apply all bt 15' 2>&1 | grep -v '^\[New LWP'
+fi
+
+section "mahogany log (last 150 lines)"; tail -150 "$MHLOG"
+section "kernel messages (last 40)"; /sbin/dmesg | tail -40
+} > "$out" 2>&1
+
+echo "$out"

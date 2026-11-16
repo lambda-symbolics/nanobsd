@@ -172,8 +172,10 @@ clip)    XDG_RUNTIME_DIR=${MAHOGANY_SOCKET%/*} WAYLAND_DISPLAY=wayland-0 \
 	        if (NR > 1) print "\\n"; print }
 	      END { print "\"}\n" }' ;;
 setclip) [ $# -ge 1 ] || usage
+	 # wl-copy stays behind to serve the clipboard: it must not keep our
+	 # stdout and stderr, or a caller reading them (ssh) never sees EOF.
 	 printf '%s' "$*" | XDG_RUNTIME_DIR=${MAHOGANY_SOCKET%/*} \
-	     WAYLAND_DISPLAY=wayland-0 /usr/pkg/bin/wl-copy &&
+	     WAYLAND_DISPLAY=wayland-0 /usr/pkg/bin/wl-copy >/dev/null 2>&1 &&
 	     echo '{"clipboard":"set"}' ;;
 mirror)  act=${1:-status}; [ $# -gt 0 ] && shift
 	 case $act in

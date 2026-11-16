@@ -27,8 +27,12 @@ through the keyboard group exactly like a key from the ThinkPad keyboard:
 Mahogany's keybindings see it first (=ctrl+t g n= runs the prefix map),
 then the focused client.  An injected motion moves the real cursor, so
 sloppy focus, click-to-focus, cursor shapes and pointer enter/leave behave
-as with the trackpad.  The idle timer counts it as activity (it unblanks
-the panel).  The seat gains pointer and keyboard capabilities when the
+as with the trackpad.  The idle timer counts it as activity: it unblanks
+the panel, and an agent at work keeps the panel from dimming or blanking
+as a user would.  (Until mahogany 2026-11-16 the timer read only the
+kernel's input counter, which never sees injected input, so during
+computer use the panel dimmed or blanked about every 30 s and every
+injected event woke it again.)  The seat gains pointer and keyboard capabilities when the
 devices appear, so it works even with no real devices (the headless test
 compositor, or with USB off).
 
@@ -226,6 +230,24 @@ Notes for the implementation:
 - Prefer semantic targets when they exist: =windows= gives geometry and
   app_id, =focus= by id beats clicking a title bar (there are none: the
   strip layout has no decorations), =key ctrl+l= beats finding a URL bar.
+- File dialogs (Firefox's GTK "File Upload" chooser): it opens as its
+  own strip column.  =key ctrl+l=, =type= the full path, then *click the
+  Open button*: Return in the location field does nothing in Firefox's
+  chooser, which is easy to mistake for a frozen window.  A path the
+  chooser cannot read brings up a modal error dialog that replaces the
+  chooser in =windows=.
+- Rich (HTML) clipboard: =setclip= sets text only.  For HTML run
+  =wl-copy --type text/html <FILE >/dev/null 2>&1 &= as the session user
+  (XDG_RUNTIME_DIR=/var/run/user/1000).  wl-copy stays behind to serve the
+  clipboard; with its output still on an ssh connection, that ssh call
+  never returns (=setclip= redirects it since 2026-11-16).
+- If windows stop drawing or answering (2026-11-16: Firefox and its file
+  chooser froze together, three times, during an X.com upload), run
+  =mh-freeze-capture= as root before anything is killed or rebooted: it
+  writes the compositor's answers, every window's suspended state, the
+  clipboard owners, Firefox's thread states and stacks (gdb), the session
+  log and the kernel messages to /var/tmp/freeze-DATE.txt.  It attaches gdb
+  to Mahogany only if the compositor itself stopped answering.
 - The kill switch: =(setf *cu-enabled* nil)= (=mhcu eval=, or bound to
   a key in init.lisp) makes every command answer an error until it is set
   back.  The user's own input always works alongside the agent's.
