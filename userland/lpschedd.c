@@ -38,7 +38,7 @@
  *   the boot value on AC and at exit.  PL1 caps sustained work (a build
  *   left running, a busy background page); PL2 caps the first seconds of
  *   it, which PL1's averaging window lets run far above PL1.  The
- *   values and PL1's enable bit are re-checked every PL_CHECK_MS, as are
+ *   values and both enable bits are re-checked every PL_CHECK_MS, as are
  *   the EPP every CPU's HWP request register really holds
  *   (machdep.hwp.epp_hw; machdep.hwp.epp only echoes the last write), as
  *   firmware may reset either at a
@@ -411,26 +411,38 @@ cpu_busy(double *busy_max)
 }
 
 /*
- * The PL2 for this supply: pl2_bat on battery but never below the PL1 in
- * force (want1, 0 when PL1 is left alone), the boot value on AC.
+ * The PL2 for this supply: pl2_bat on battery, the boot value on AC, but
+ * never below PL1: neither the PL1 being set (want1, 0 when PL1 is left
+ * alone) nor the one the register holds, which a failed write or -P 0
+ * leaves where it was.  A value with PL2_ENABLE clear is not enforced, so
+ * a matching value alone is not enough.
  */
 static void
 apply_pl2(int ac, int want1)
 {
-	int want, cur;
+	int want, cur, en, pl1, pl1en;
 
 	if (pl2_bat <= 0 || pl2_boot <= 0)
 		return;
 	want = ac == 0 ? (pl2_bat < pl2_boot ? pl2_bat : pl2_boot) : pl2_boot;
 	if (want < want1)
 		want = want1;
+	if (sysctl_get("machdep.hwp.pl1", &pl1) == 0) {
+		if (sysctl_get("machdep.hwp.pl1_enabled", &pl1en) == -1)
+			pl1en = 1;
+		if (pl1en && want < pl1)
+			want = pl1;
+	}
 	if (sysctl_get("machdep.hwp.pl2", &cur) == -1)
 		return;
-	if (cur > want - 125 && cur < want + 125)
+	/* Older hwp has no pl2_enabled: assume enforced. */
+	if (sysctl_get("machdep.hwp.pl2_enabled", &en) == -1)
+		en = 1;
+	if (en && cur > want - 125 && cur < want + 125)
 		return;
-	logmsg(LOG_INFO, "package PL2 %d -> %d mW (%s)", cur, want,
-	    ac == 0 ? "battery" : "AC");
-	sysctl_set("machdep.hwp.pl2", want);
+	logmsg(LOG_INFO, "package PL2 %d%s -> %d mW (%s)", cur,
+	    en ? "" : " (not enabled)", want, ac == 0 ? "battery" : "AC");
+	sysctl_set("machdep.hwp.pl2", want);	/* sets PL2_ENABLE too */
 }
 
 /* The PL1 and PL2 for this supply; re-applied when they drifted (resume, firmware). */
@@ -592,9 +604,10 @@ cleanup(void)
 		sysctl_set("machdep.hwp.pl1", pl1_boot);
 	if (!dryrun)
 		unlink(EPP_FILE);
-	if (sockfd != -1)
+	if (sockfd != -1) {
 		close(sockfd);
-	unlink(SOCK_PATH);
+		unlink(SOCK_PATH);
+	}
 }
 
 static void
@@ -637,7 +650,13 @@ main(int argc, char **argv)
 			return 1;
 		}
 	}
-	pidfile(NULL);
+	/*
+	 * A dry run observes beside the running daemon: it must not take its
+	 * pid file, its socket or its state files (an unlinked and rebound
+	 * socket would leave the daemon alive but deaf to the compositor).
+	 */
+	if (!dryrun)
+		pidfile(NULL);
 	signal(SIGTERM, on_signal);
 	signal(SIGINT, on_signal);
 	signal(SIGHUP, SIG_IGN);
@@ -651,13 +670,14 @@ main(int argc, char **argv)
 	if (read_epp_file(&orig_epp) == -1) {
 		if (sysctl_get("machdep.hwp.epp", &orig_epp) == -1)
 			orig_epp = 128;
-		write_epp_file(orig_epp);
+		if (!dryrun)
+			write_epp_file(orig_epp);
 	}
 
 	ac = read_ac_file();
 	if (ac == -1) {
 		ac = seed_ac_envstat();
-		if (ac != -1)
+		if (ac != -1 && !dryrun)
 			write_ac_file(ac);
 	}
 	if (pl1_bat > 0 && sysctl_get("machdep.hwp.pl1_boot", &pl1_boot) == -1)
@@ -678,7 +698,8 @@ main(int argc, char **argv)
 	}
 	(void)cpu_busy(&load_max);
 
-	sockfd = open_socket();
+	/* Without the socket a dry run polls for input, as with no compositor. */
+	sockfd = dryrun ? -1 : open_socket();
 	sysctl_set("machdep.lpsched.enabled", 1);
 
 	while (!quit) {

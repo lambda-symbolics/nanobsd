@@ -16,7 +16,7 @@
  * policy can lower the sustained budget on battery and keep the bursts:
  *
  *	machdep.hwp.pl1, machdep.hwp.pl2	(int, RW)  milliwatts
- *	machdep.hwp.pl1_enabled			(int, RO)  PL1_ENABLE bit
+ *	machdep.hwp.pl1_enabled, pl2_enabled	(int, RO)  PL1/PL2_ENABLE bits
  *	machdep.hwp.pl1_window			(int, RO)  ms, PL1 time window
  *	machdep.hwp.pl_locked			(int, RO)  1: firmware locked them
  *	machdep.hwp.pl1_boot, machdep.hwp.pl2_boot (int, RO) as found at load
@@ -262,9 +262,12 @@ hwp_sysctl_epp_hw(SYSCTLFN_ARGS)
 	return sysctl_lookup(SYSCTLFN_CALL(&node));
 }
 
-/* machdep.hwp.pl1_enabled: whether the firmware or we left PL1 enforced. */
+/*
+ * machdep.hwp.pl1_enabled / pl2_enabled: whether the firmware or we left
+ * that limit enforced (sysctl_data NULL: PL1, non-NULL: PL2).
+ */
 static int
-hwp_sysctl_pl1_enabled(SYSCTLFN_ARGS)
+hwp_sysctl_pl_enabled(SYSCTLFN_ARGS)
 {
 	struct sysctlnode node = *rnode;
 	uint64_t lim;
@@ -272,7 +275,7 @@ hwp_sysctl_pl1_enabled(SYSCTLFN_ARGS)
 
 	if (rdmsr_safe(MSR_PKG_POWER_LIMIT, &lim) != 0)
 		return EIO;
-	val = (lim & PL1_ENABLE) != 0;
+	val = (lim & (rnode->sysctl_data != NULL ? PL2_ENABLE : PL1_ENABLE)) != 0;
 	node.sysctl_data = &val;
 	return sysctl_lookup(SYSCTLFN_CALL(&node));
 }
@@ -424,7 +427,13 @@ hwp_sysctl_setup(void)
 	error = sysctl_createv(&hwp_sysctl_log, 0, &hnode, NULL,
 	    CTLFLAG_READONLY, CTLTYPE_INT, "pl1_enabled",
 	    SYSCTL_DESCR("PL1_ENABLE: the PL1 value is enforced"),
-	    hwp_sysctl_pl1_enabled, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+	    hwp_sysctl_pl_enabled, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+	if (error != 0)
+		return error;
+	error = sysctl_createv(&hwp_sysctl_log, 0, &hnode, NULL,
+	    CTLFLAG_READONLY, CTLTYPE_INT, "pl2_enabled",
+	    SYSCTL_DESCR("PL2_ENABLE: the PL2 value is enforced"),
+	    hwp_sysctl_pl_enabled, 0, &hwp_pl2_boot, 0, CTL_CREATE, CTL_EOL);
 	if (error != 0)
 		return error;
 
