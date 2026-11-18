@@ -8509,7 +8509,26 @@ audio_suspend(device_t dv, const pmf_qual_t *qual)
 	audio_mixer_capture(sc);
 
 	if (sc->sc_pbusy) {
+		/*
+		 * LispBSD: keep the mixer's sequence across the suspend.
+		 * audio_pmixer_halt starts it again from 0, which is right
+		 * at the last close but not here: every open track remembers
+		 * the sequence it was last mixed at (track->seq), the mixer
+		 * skips a track whose seq is ahead of its own, and drain
+		 * waits for hwseq to reach it.  A stream playing at suspend
+		 * fell silent after the resume, its writer and its close
+		 * blocked, until the mixer had run as long again as it had
+		 * before (hours), and the stuck track kept the idle stop
+		 * from ever halting the mixer.  The blocks in the hardware
+		 * buffer are dropped, as stock did.
+		 */
+		uint64_t seq = sc->sc_pmixer->mixseq;
+
 		audio_pmixer_halt(sc);
+		mutex_enter(sc->sc_intr_lock);
+		sc->sc_pmixer->mixseq = seq;
+		sc->sc_pmixer->hwseq = seq;
+		mutex_exit(sc->sc_intr_lock);
 		/* Reuse this as need-to-restart flag while suspending */
 		sc->sc_pbusy = true;
 	}

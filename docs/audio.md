@@ -185,3 +185,26 @@ Still open (not changed here): audio(4) calls the driver's open with its
 interrupt spin lock held, and `hdafg_open` takes the runtime PM adaptive mutex
 and may resume the controller there (latent since kernel 153; uncontended in
 practice).  A descriptor error stops the DMA and is only logged, not restarted.
+
+## Playback stuck after a suspend (kernel 230, 2026-11-18)
+
+Suspending while something played left that stream silent after the resume,
+and playback started afterwards sounded broken.  `audio_suspend` stops the
+play mixer with `audio_pmixer_halt`, which resets the mixer's block sequence
+(`mixseq`, `hwseq`) to 0.  That is right at the last close, but at a suspend
+the tracks stay open, and each remembers the sequence it was last mixed at:
+the mixer skips a track whose `seq` is ahead of its own, and drain waits for
+`hwseq` to reach it.  So every stream open across the suspend stayed silent
+until the mixer had run as long again as before the suspend (hours), its
+writer blocked in `audiowr`, its close blocked in drain (a killed player sat
+in state `DE`), and the stuck track, never empty, kept the idle stop from
+halting the mixer (100 interrupts a second of silence with the HDA at D0).
+Stock NetBSD; the idle stop had already met it and keeps the sequence.
+
+Kernel 230 keeps `mixseq` across the suspend and sets `hwseq` to it, like
+the idle stop.  Reproduced on 229 at volume 0 with
+`userland/hdaudio-test/sndsusp.sh` (tone across a 20 s timed s2idle: the
+ring holds the tone before, only zeros after, audioplay still in `audiowr`)
+and `sndpmf.sh` (the same through `drvctl -S audio0` / `drvctl -R audio0`
+without sleeping the machine).  A new stream started after such a resume
+was clean in the DMA ring.
