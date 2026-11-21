@@ -718,13 +718,13 @@ void intel_panel_set_backlight_acpi(const struct drm_connector_state *conn_state
 
 	WARN_ON(panel->backlight.max == 0);
 
-		hw_level = clamp_user_to_hw(connector, user_level, user_max);
-		panel->backlight.level = hw_level;
-		/* A positive request at hw min is valid; firmware zero is off. */
-		if (user_level > 0) {
-			panel->backlight.lispbsd_lastgood = hw_level;
-			panel->backlight.lispbsd_lastgood_valid = true;
-		}
+	hw_level = clamp_user_to_hw(connector, user_level, user_max);
+	panel->backlight.level = hw_level;
+	/* A positive request at hw min is valid; firmware zero is off. */
+	if (user_level > 0) {
+		panel->backlight.lispbsd_lastgood = hw_level;
+		panel->backlight.lispbsd_lastgood_valid = true;
+	}
 
 	/*
 	 * Lack of crtc may occur during driver init because
