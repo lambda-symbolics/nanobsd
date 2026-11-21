@@ -1,0 +1,160 @@
+#+title: GEFS+ recovery and panel brightness audit, 2026-11-21
+
+* Scope
+
+Source: gefs-netbsd 6551e9d, nanobsd 13aef02, Mahogany f368eaf. On the
+laptop, NetBSD #230 was running with /dev/dk1 mounted as the GEFS root.
+The installed brightness, s0ix, AC adapter, lid and two brightness-key
+scripts matched the repository by cksum and length. Laptop observations were
+read-only. No power cut, remount, brightness write or display transition was
+requested. A report of a visible flash is not a measurement of PWM duty.
+
+* GEFS+
+
+** P1: Page writes to an unlinked but still open file are discarded
+
+Removing the last name moves a regular file into Qorphan and sets de->orphan
+(ops.c:1188-1211). The file is still accessible through existing descriptors;
+gefs_inactive handles the last user separately (gefs_vnops.c:1558-1569).
+But gefs_bufio skips *every* write when de->orphan is set, not just final
+teardown. The worker completes the skipped I/O with zero error and zero
+residual (gefs_work.c:64-76,102-108,125-128). The same page can look correct
+while cached, then read back as old bytes or zeros after clean-page eviction.
+An application need not crash or lose power. Anonymous temporary files are
+an ordinary use case. This path was traced in source, not run on the Nano.
+
+Keep writing to the orphan's data until final release. Verify through a
+still-open descriptor after page writeback, eviction and reread on a
+disposable NetBSD mount; a read satisfied from the same cached page is
+not a useful check.
+
+** P1: Two successive commits can leave no recoverable arena header
+
+In sys/fs/gefs/sync.c:126-169, GEFS hashes the new arena header, flushes the
+primary copy, then publishes and flushes the superblocks that name that hash.
+It writes the backup arena header at :171-180 with wrwait(0). This waits for
+I/O completion but does not flush the device cache (sync.c:38-48,
+p9kern.c:445-458). The next commit overwrites the primary before its first
+flush. Write completion is not a promise about persistence order on a device
+with a volatile cache.
+
+Consider an arena whose header changes on two consecutive commits (the used
+byte count is part of the hash, pack.c:465-475). While the durable superblocks
+still name generation N, the device may have persisted the primary for N+1
+before the backup for N. After power loss the two copies can be N+1 and N-1.
+Neither matches N. Both superblocks can be intact and loadarena still fails
+(load.c:25-35; blk.c:246-254). This is a source-level crash window, not a
+finding of corruption on the Nano. A reboot after a clean commit does not
+test it.
+
+Require a durable copy matching the published superblock before overwriting
+the other copy. Options include a footer flush before the next primary write,
+or alternating copy slots with an explicit generation protocol. Also handle
+the first commit after a mount that found only one usable copy. Verify in a
+volatile-cache model across consecutive commits, including fallback mounts.
+
+** P2: Failed truncate can leave the vnode at the new size
+
+gefs_setattr zeroes the tail page on shrink, changes v_size, and discards
+pages before asking the mutator to truncate (gefs_vnops.c:695-732). A
+partial-block shrink can fail rewriting the last block before the new
+length is stored (ops.c:904-919,935-936). The error returns to the caller,
+but getattr reports v_size (:534 in gefs_vnops.c), not the old tree length.
+Dirty bytes from discarded pages cannot be recovered by restoring v_size
+alone. Keep the VM and tree changes under the existing exclusion against
+read-ahead; arrange the fallible work before irreversible page discard.
+
+** P2: Device I/O completion
+
+p9kern.c:435-458 initializes b_resid, calls VOP_STRATEGY and biowait, then
+returns the entire requested byte count whenever biowait reports no errno.
+It never inspects b_resid before releasing the buffer. A successful short
+transfer would therefore be reported to the core as a full block. Reject
+nonzero residuals for exact block I/O, or return the actual byte count to the
+caller. Audit the flush contract separately: :484-486 also treats ENOTTY
+and ENODEV as successful cache flushes; lack of ioctl support alone does not
+establish that volatile caching is disabled. Neither condition was observed
+on the laptop.
+
+** Lower priority: sparse files appear fully allocated
+
+gefs_getattr derives va_bytes by rounding the logical size up to Blksz
+(gefs_vnops.c:534,543). Holes therefore count as allocated space in
+stat and du even when the file has no corresponding data blocks.
+
+** Checks run
+
+Rebuilt the host tools from a git archive and ran check-boundaries,
+run-deadlisttest (including old and new committed images), and gefstest on a
+fresh sparse 512 MiB image. All passed. An initial 256 MiB gefstest run failed
+the two phase-7 capacity expectations for a 512 MiB image; the correctly
+sized run passed. These suites exercise the core, not NetBSD vnode I/O or
+power-failure persistence ordering. The live kernel logged orphan cleanup at
+boot; this alone does not imply a damaged filesystem.
+
+* Brightness
+
+At inspection the machine was on battery. Saved AC was 1, saved battery was
+71; both ACPI outputs read 71. Mahogany's configured dim level is 15 at 120 s
+and blank is at 300 s. Its log contains dim, off and on transitions but no
+frame-level brightness values. The two steady supply preferences are distinct
+from a flash through a third level.
+
+** Confirmed script defect: losing the dim state when AC is already low
+
+Mahogany marks itself dimmed before calling the script (idle.lisp:118-123).
+The script only creates brightness.dimmed if the old supply's preference
+exceeds the dim threshold (userland/brightness:113-121). With AC=1, dim 15
+leaves the panel alone, correctly, but writes no marker. Unplug before blank
+or activity, and restore bat reads the absent marker and requests 71 rather
+than 15 (:97-112). This can last until blank or another event; it is not by
+itself proof of a one-frame flash.
+
+Verified with the deployed script revision, temporary state files and the
+hardware writer replaced by a recorder. AC=1 -> dim 15 -> battery=71 emitted
+71. Control: dim on battery 71 -> AC 1 -> battery 71 -> undim emitted
+15, 1, 15, 71. The fix is to record the dim cap for every dim request and
+apply min(preference, cap), even when the first dim needs no hardware write.
+Propagate apply failures; the script's restore output currently describes the
+saved preference, not necessarily the level it requested or achieved.
+
+** Physical keys: more than one writer is enabled on this boot
+
+hw.acpi.thinkpad0.bios_brightness, hw.acpi.acpiout15.hotkeys and
+hw.acpi.acpiout16.hotkeys all read 1. thinkpad0's brightness-hotkey counter
+and acpiout15's brightness-notify counter each read 1. The ThinkPad HKEY
+handler asks for a BIOS step and signals powerd (thinkpad_acpi.c:555-575).
+The ACPI output notify handler separately schedules its own step
+(acpi_display.c:989-993,1101-1129,1133ff). The installed powerd actions ask
+for +/-10 from the saved preference, then poke Mahogany. The shell lock does
+not serialize the kernel or firmware paths. Counters confirm both kinds of
+event have occurred, not what the panel displayed or which event was last.
+If a physical key is the trigger, capture one press, then compare with powerd
+as the sole key owner before changing defaults. Use a known non-minimum level.
+
+** Wake and idle blank have different failure modes
+
+- An ACPI target is saved even while the panel is off (intel_panel.c:721-743),
+  but a request that clamps to the minimum (:500-511) does not replace
+  lastgood. On enable, i915 substitutes lastgood or maximum (:1213-1226).
+  The Nano's existing /var/tmp/vbt.bin (BDB 240, panel 2, block 43, entry
+  4ade030658aa) specifies a PWM minimum of 6/255, about 2.35%, and 990 Hz.
+  These fields follow intel_vbt_defs.h:776-795 and intel_bios.c:436-457;
+  intel_panel.c:1591-1613 uses that coefficient. An ASLE request of 1..6
+  out of 255 therefore lands at the minimum on this path. We did not
+  measure which ASLE value the firmware sent for AC setting 1. If it falls
+  in that range, enable can light the panel at an older, brighter target
+  before the restore takes effect. Distinguish an intentional low target
+  from a firmware off request. Check the ASLE value and first lit PWM duty
+  in the same trace: ASLE runs on a work item (intel_opregion.c:592,622).
+- If an idle inhibitor expires after both deadlines, Mahogany can request dim
+  and then blank on the same timer callback (idle.lisp:228-234). Prefer blank
+  directly when both are overdue. Also check the output commit result before
+  undimming behind a supposedly dark panel (:142-155); on a failed power-off
+  the restore is visible. No failure at the reported event was established.
+- A black frame during a refresh switch is different from a change in panel
+  light output. The useful next observation is the triggering action and
+  supply, then a time-correlated duty/period, panel-power and refresh trace
+  for that one transition. An ACPI level or a screenshot alone cannot
+  distinguish them. Confirm the active panel/controller before using any
+  register-based probe; the old blprobe has a hard-coded BAR and pipe.
