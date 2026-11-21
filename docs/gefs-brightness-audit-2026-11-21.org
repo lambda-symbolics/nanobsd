@@ -158,3 +158,38 @@ as the sole key owner before changing defaults. Use a known non-minimum level.
   for that one transition. An ACPI level or a screenshot alone cannot
   distinguish them. Confirm the active panel/controller before using any
   register-based probe; the old blprobe has a hard-coded BAR and pipe.
+
+* Fixes and verification
+
+GEFS dfe18ee flushes both arena copies on opposite sides of superblock
+publication and writes the bad slot first after a fallback mount. Short
+block transfers and unsupported flushes with unknown write-cache state now
+fail. The disk format is unchanged. In =sbin/gefs=, =make -f Makefile.host
+run-arena-cuts= checked two disk images, one for each damaged slot. Across
+two changes to the published arena hash on each image, the test checked
+possible persistence orders at actual write and flush calls for arena 0.
+Each run saw six flushes and passed a subsequent offline check without
+fallback. This model covers whole-block writes, not torn sectors. The host
+boundary, deadlist and 512 MiB core suites passed.
+
+GEFS ca20650 writes back open-unlinked files, clips queued page writes at
+the dent's current EOF, saves the tail before a fallible shrink, and reports
+allocated data blocks for regular files. In a disposable NetBSD guest,
+=open-unlinked= lost the pattern after eviction on 6551e9d and passed on
+ca20650. =vnode-size= checked holes, allocation after fsync, dirty mmap
+shrink and zeroes after regrowth. A test-only build returned ENOSPC before
+the partial-block rewrite: the old length and dirty tail bytes survived.
+=fsxlite -m= passed 2,200 operations (seed 181). Device short completions
+and a controller that refuses cache flushes were not fault-injected.
+
+nanobsd b219d65 fixes the dim cap across supply changes; 55fae57 keeps a
+positive target at the i915 PWM floor for wake. The recorder test passed
+for AC preferences 1 and 15, battery 71 and failed writes. The changed
+=intel_panel.o= compiled against the guest's NetBSD GENERIC kernel tree.
+Mahogany 908ecfc blanks directly when both deadlines are overdue and
+undims only after every output accepts power-off. Standalone SBCL tests
+covered partial output failure, reentrant output callbacks and wake retry.
+
+All changes were tested off-device and committed locally. No Nano kernel,
+scripts, display settings or hotkey ownership were changed. The cause of
+the reported physical flash still needs a measurement on the panel.
