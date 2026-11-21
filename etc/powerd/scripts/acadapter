@@ -19,15 +19,20 @@ esac
 case "$2" in
 pressed)
 	echo 1 > /var/run/lpsched.ac
-	logger -p info -t acadapter \
-	    "AC connected: brightness $(brightness restore ac)"
+	state=connected; supply=ac
 	;;
 released)
 	echo 0 > /var/run/lpsched.ac
-	logger -p info -t acadapter \
-	    "AC disconnected: brightness $(brightness restore bat)"
+	state=disconnected; supply=bat
 	;;
 esac
+if [ -n "${supply:-}" ]; then
+	if level=$(brightness restore "$supply"); then
+		logger -p info -t acadapter "AC $state: requested brightness $level"
+	else
+		logger -p err -t acadapter "AC $state: brightness restore failed"
+	fi
+fi
 # Sample package C-states once things settle: does plugging or pulling the
 # (USB-C) charger leave the package out of PC10?  See /var/log/pcstate.log.
 case "$2" in

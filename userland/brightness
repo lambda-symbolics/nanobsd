@@ -63,7 +63,10 @@ read_state() {
 }
 
 apply() {
-	$SUDO /sbin/sysctl -w "$N15=$1" "$N16=$1" >/dev/null 2>&1
+	$SUDO /sbin/sysctl -w "$N15=$1" "$N16=$1" >/dev/null || {
+		echo "brightness: failed to apply $1" >&2
+		return 1
+	}
 }
 
 # The compositor, powerd and the keys can all run this at once; one at a
@@ -89,11 +92,9 @@ lock() {
 	trap 'rm -f "$LOCK"' EXIT
 }
 
-cur=$(sysctl -n "$N15" 2>/dev/null); [ -z "$cur" ] && cur=100
-
 case "${1:-}" in
 "")
-	echo "$cur"; exit 0 ;;
+	exec /sbin/sysctl -n "$N15" ;;
 restore)
 	# Reapply the level remembered for this supply.  Deliberately does not
 	# save: restoring is not the user choosing a level, and saving here
@@ -103,27 +104,35 @@ restore)
 	new=$(read_state "$src")
 	# Dimmed, the panel shows the dim level, or this supply's own level
 	# when that is lower still (unplugged onto a battery level below it).
+	target=$new
 	if [ -e "$DIMMED" ]; then
 		dl=$(cat "$DIMMED" 2>/dev/null)
-		[ -n "$dl" ] && apply "$([ "$new" -lt "$dl" ] && echo "$new" || echo "$dl")"
-	else
-		apply "$new"
+		[ -n "$dl" ] && target=$([ "$new" -lt "$dl" ] && echo "$new" || echo "$dl")
 	fi
-	echo "$new"; exit 0 ;;
+	apply "$target" || exit 1
+	echo "$target"; exit 0 ;;
 dim)
 	lock
 	want=${2:-15}
 	new=$(read_state "$(ac_state)")
+	# Record the cap even when the remembered level is already at or below it.
+	# That marker keeps a later supply transition dim until undim is requested.
 	if [ "$new" -gt "$want" ]; then
-		echo "$want" > "$DIMMED" 2>/dev/null
-		apply "$want"
+		apply "$want" || exit 1
+	fi
+	if ! printf '%s\n' "$want" > "$DIMMED" 2>/dev/null; then
+		echo "brightness: failed to record dim level $want" >&2
+		exit 1
 	fi
 	exit 0 ;;
 undim)
 	lock
-	rm -f "$DIMMED"
 	new=$(read_state "$(ac_state)")
-	apply "$new"
+	apply "$new" || exit 1
+	if ! rm -f "$DIMMED"; then
+		echo "brightness: failed to clear dim state" >&2
+		exit 1
+	fi
 	echo "$new"; exit 0 ;;
 +[0-9]*|-[0-9]*|[0-9]*)
 	lock
@@ -140,7 +149,10 @@ esac
 
 [ "$new" -lt 1 ] && new=1
 [ "$new" -gt 100 ] && new=100
-rm -f "$DIMMED"
-apply "$new"
-echo "$new" > "$(state_file "$src")" 2>/dev/null
+apply "$new" || exit 1
+if ! printf '%s\n' "$new" > "$(state_file "$src")" 2>/dev/null; then
+	echo "brightness: failed to save $src brightness" >&2
+	exit 1
+fi
+rm -f "$DIMMED" || exit 1
 echo "$new"

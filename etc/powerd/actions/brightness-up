@@ -2,7 +2,7 @@
 # invoked by /etc/powerd/scripts/hotkey_button on the ThinkPad brightness-up key
 # brightness-probe holds the key off to see what the kernel and firmware do alone.
 [ -e /var/run/brightness.hold ] && exit 0
-/usr/local/bin/brightness +10 >/dev/null
+if ! /usr/local/bin/brightness +10 >/dev/null; then exit 1; fi
 # The key arrives through ACPI, not wskbd, so the session's idle timer never
 # saw it: tell Mahogany, which undims and counts its deadlines from now.
 MAHOGANY_SOCKET=/var/run/user/1000/mahogany.sock \
