@@ -193,3 +193,30 @@ covered partial output failure, reentrant output callbacks and wake retry.
 All changes were tested off-device and committed locally. No Nano kernel,
 scripts, display settings or hotkey ownership were changed. The cause of
 the reported physical flash still needs a measurement on the panel.
+
+* Deployment on the Nano (kernel 231, 2026-11-21)
+
+Kernel 231 is kernel 230 with gefs-netbsd ca20650 and nanobsd 55fae57
+(plus the indentation fix 2a959a2). It is the boot default, and kernel 230
+is the previous entry. The brightness scripts from b219d65 are installed in
+/etc/powerd and /usr/local/bin. Mahogany 908ecfc is installed as
+/usr/local/bin/mahogany. The old binary is kept as mahogany.pre-908ecfc.
+
+Checked before the build:
+- The flush ioctl on dk1 returns 0 (dkctl dk1 synccache), and the write-back
+  cache is reported as enabled. The stricter p9devflush therefore accepts
+  the root device.
+- All laptop sources matched the base commits by MD5.
+
+Checked after the boot at 17:24:
+- The root mounted with no fallback arena message. A commit now costs three
+  cache flushes (42 flushes for 14 commits) instead of two.
+- open-unlinked passed three times and vnode-size passed once on the root
+  in /var/tmp.
+- A 100 MB sparse file with one written byte reports 16 KB in du and ls -s.
+- The first ls -lR /usr/pkg/lib after the boot took 0.27 s. Warm runs took
+  0.20 s, against 0.19 s on kernel 230. Only the first stat of each file
+  pays for counting the data blocks.
+
+Not checked: the panel brightness at wake and after an unplug while dimmed
+needs a person at the panel.
