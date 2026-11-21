@@ -208,11 +208,12 @@ struct intel_panel {
 		u32 min;
 		u32 max;
 		/*
-		 * LISPBSD: the last level above min that was asked for.
-		 * The firmware's display-off _DSM leaves level at min, and
-		 * enabling a panel at <= min used to jump to max.
+		 * LISPBSD: the last level requested through ACPI.  A positive
+		 * request may clamp to min; firmware zero means display off.
 		 */
 		u32 lispbsd_lastgood;
+		/* A positive ACPI request may legitimately clamp to hw min. */
+		bool lispbsd_lastgood_valid;
 		bool enabled;
 		bool combination_mode;	/* gen 2/4 only */
 		bool active_low_pwm;
